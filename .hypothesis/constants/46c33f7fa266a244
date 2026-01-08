@@ -1,0 +1,4 @@
+# file: /home/ubuntu/LMCache/lmcache/v1/storage_backend/batched_message_sender.py
+# hypothesis_version: 6.148.8
+
+[0.001, 0.01, 1.0, 'LMCacheWorker', 'kv_msg_batch_size', 'kv_msg_batch_timeout', 'location must be set']

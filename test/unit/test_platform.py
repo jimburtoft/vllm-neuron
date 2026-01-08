@@ -1270,3 +1270,97 @@ def test_integration_monkey_patch_application():
 
 
 # Tests from neuron-staging branch for other features
+
+
+def test_get_device_capability():
+    """Test get_device_capability method for Neuron device detection.
+    
+    Verifies:
+    - Device detection functionality works correctly
+    - Returns proper device information structure
+    - Handles cases where devices are available or not available
+    - Provides detailed device information including cores and memory
+    
+    This test validates that the platform can properly detect and report
+    Neuron devices in the system, which is critical for LMCache integration.
+    """
+    platform = NeuronPlatform()
+    
+    # Test device detection
+    devices = platform.get_device_capability()
+    
+    if devices is not None:
+        # If devices are detected, validate the structure
+        assert isinstance(devices, dict)
+        assert 'device_count' in devices
+        assert 'total_cores' in devices
+        assert 'platform' in devices
+        assert devices['platform'] == 'neuron'
+        
+        # Validate device count is positive
+        assert devices['device_count'] > 0
+        assert devices['total_cores'] > 0
+        
+        # Validate devices list structure
+        if 'devices' in devices:
+            assert isinstance(devices['devices'], list)
+            assert len(devices['devices']) == devices['device_count']
+            
+            for device in devices['devices']:
+                assert 'device_id' in device
+                assert 'cores' in device
+                assert 'memory' in device
+                assert isinstance(device['device_id'], int)
+                assert isinstance(device['cores'], int)
+                assert device['cores'] > 0
+        
+        print(f"✅ Device detection successful: {devices['device_count']} device(s), {devices['total_cores']} cores")
+    else:
+        # If no devices detected, this might be expected in test environments
+        print("⚠️  No Neuron devices detected (may be expected in test environment)")
+        # The method should still return None gracefully, not crash
+        assert devices is None
+
+
+def test_device_detection_integration():
+    """Test integration between platform device detection and LMCache components.
+    
+    Verifies:
+    - NeuronDeviceDetector uses platform detection correctly
+    - Device information is consistent across components
+    - Error handling works properly when devices are not available
+    
+    This test ensures that the LMCache integration components properly
+    use the platform's device detection capabilities.
+    """
+    try:
+        from vllm_neuron.lmcache_integration import NeuronDeviceDetector
+        
+        # Test device availability check
+        is_available = NeuronDeviceDetector.is_neuron_available()
+        device_count = NeuronDeviceDetector.get_neuron_device_count()
+        device_info = NeuronDeviceDetector.get_neuron_device_info()
+        
+        # Validate consistency between methods
+        if is_available:
+            assert device_count > 0
+            assert device_info is not None
+            assert device_info['device_count'] == device_count
+            print(f"✅ Device detector integration: {device_count} device(s) detected")
+        else:
+            # If not available, count should be 0 and info should be None
+            assert device_count == 0
+            print("⚠️  Device detector: No devices available (may be expected in test environment)")
+        
+        # Test runtime info
+        runtime_info = NeuronDeviceDetector.get_neuron_runtime_info()
+        assert isinstance(runtime_info, dict)
+        assert 'devices_available' in runtime_info
+        assert 'device_count' in runtime_info
+        assert runtime_info['devices_available'] == is_available
+        assert runtime_info['device_count'] == device_count
+        
+    except ImportError:
+        # If LMCache integration is not available, skip this test
+        pytest.skip("LMCache integration not available for testing")
+

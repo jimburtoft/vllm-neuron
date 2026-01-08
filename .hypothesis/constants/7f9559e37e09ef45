@@ -1,0 +1,4 @@
+# file: /home/ubuntu/LMCache/lmcache/v1/storage_backend/gds_backend.py
+# hypothesis_version: 6.148.8
+
+[b' ', 1024, 4096, '.kvcache.safetensors', '.metadata', '.tmp', '.weka1', '/', '/proc/mounts', '<Q', 'BF16', 'F16', 'F32', 'F64', 'F8E4M3FN', 'F8E5M2', 'GDS backend closed.', 'I16', 'I32', 'I64', 'I8', 'Not using cufile', 'U16', 'U32', 'U64', 'U8', 'Using cufile', '_', '__metadata__', 'base_pointer', 'cuda', 'data', 'data_offsets', 'dtype', 'fmt', 'gds_io_threads', 'kvcache', 'libcudart.so', 'lmcache_version', 'overlayfs', 'r', 'r+', 'rb', 'shape', 'tmpfs', 'true', 'use_cufile', 'use_direct_io', 'utf-8', 'wb', 'weka-gds-io', 'wekafs']

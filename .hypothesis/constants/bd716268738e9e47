@@ -1,0 +1,4 @@
+# file: /home/ubuntu/LMCache/lmcache/v1/storage_backend/p2p_backend.py
+# hypothesis_version: 6.148.8
+
+[0.1, 'Closing P2P backend', 'LMCacheWorker', 'P2PBackend', 'bind', 'both', 'connect', 'cum_chunk_lengths', 'offsets', 'p2p_max_retry_count', 'receiver_id', 'remote_indexes', 'sender_id', 'target_peer_init_url', 'tcp', 'transfer_channel']

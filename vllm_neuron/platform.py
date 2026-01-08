@@ -200,6 +200,13 @@ class NeuronPlatform(Platform):
         # Ensure config overrides are applied in every process
         cls._ensure_config_overrides_applied()
 
+        # Initialize LMCache integration if available
+        try:
+            from vllm_neuron.lmcache_integration import integrate_lmcache_with_neuron
+            integrate_lmcache_with_neuron(vllm_config)
+        except Exception as e:
+            logger.warning(f"LMCache integration failed: {e}")
+
         # As of 0.10.2 check_and_update_config is being called every time
         # a VllmConfig object is created, even a default one, to validate params.
         # Our checks are not compatible with an empty VllmConfig. Currently one
@@ -359,3 +366,59 @@ class NeuronPlatform(Platform):
                          available_cores[device_id])
             return available_cores[device_id]
         return device_id
+
+    @classmethod
+    def get_device_capability(cls) -> dict:
+        """Get Neuron device capabilities and information."""
+        try:
+            import subprocess
+            
+            # Use neuron-ls to detect available devices
+            result = subprocess.run(['neuron-ls'], capture_output=True, text=True, timeout=10)
+            
+            if result.returncode != 0:
+                logger.warning(f"neuron-ls command failed: {result.stderr}")
+                return None
+            
+            # Parse neuron-ls output to extract device information
+            lines = result.stdout.strip().split('\n')
+            devices = []
+            
+            for line in lines:
+                # Look for device lines (contain | but not headers)
+                if '|' in line and 'NEURON' not in line and '+-' not in line and line.strip():
+                    parts = [part.strip() for part in line.split('|')]
+                    if len(parts) >= 7 and parts[1].isdigit():  # Valid device line
+                        device_info = {
+                            'device_id': int(parts[1]),
+                            'cores': int(parts[2]),
+                            'core_ids': parts[3],
+                            'memory': parts[4],
+                            'pci_bdf': parts[5],
+                            'cpu_affinity': parts[6],
+                            'numa_node': parts[7] if len(parts) > 7 else None
+                        }
+                        devices.append(device_info)
+            
+            if devices:
+                capability = {
+                    'device_count': len(devices),
+                    'devices': devices,
+                    'total_cores': sum(device['cores'] for device in devices),
+                    'platform': 'neuron'
+                }
+                logger.info(f"Detected {len(devices)} Neuron device(s) with {capability['total_cores']} total cores")
+                return capability
+            else:
+                logger.warning("No Neuron devices found in neuron-ls output")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            logger.error("neuron-ls command timed out")
+            return None
+        except FileNotFoundError:
+            logger.error("neuron-ls command not found - ensure Neuron SDK is installed")
+            return None
+        except Exception as e:
+            logger.error(f"Error detecting Neuron devices: {e}")
+            return None

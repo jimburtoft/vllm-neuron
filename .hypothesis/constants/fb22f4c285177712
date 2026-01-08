@@ -1,0 +1,4 @@
+# file: /home/ubuntu/LMCache/lmcache/v1/rpc_utils.py
+# hypothesis_version: 6.148.8
+
+[10000, 30000, '/tmp/vllm_rpc', '127.0.0.1', '8.8.8.8', 'VllmConfig', 'bind', 'connect', 'lookup', 'lookup_scheduler', 'lookup_worker', 'offload']

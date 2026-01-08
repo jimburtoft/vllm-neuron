@@ -1,0 +1,4 @@
+# file: /home/ubuntu/LMCache/lmcache/v1/transfer_channel/transfer_utils.py
+# hypothesis_version: 6.148.8
+
+['cpu', 'cuda']

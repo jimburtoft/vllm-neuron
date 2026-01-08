@@ -1,0 +1,107 @@
+# Advanced LMCache Configuration for AWS Neuron vLLM
+# Production-ready configuration with remote storage and comprehensive monitoring
+# Suitable for multi-node deployments and production workloads
+
+# Core cache settings
+chunk_size: 256                    # Token chunk size for cache storage
+local_cpu: true                    # Use CPU storage (required for Neuron)
+max_local_cpu_size: 8              # Larger CPU cache size for production (8GB)
+save_unfull_chunk: true            # Save partial chunks for better utilization
+save_decode_cache: true            # Cache decode phase tokens
+
+# Storage backend configuration
+storage_backend: "hybrid"          # Use hybrid local + remote storage
+remote_url: "redis://lmcache-redis:6379/0"  # Redis backend for shared cache
+# Alternative remote storage options:
+# remote_url: "fs://shared-nfs:0/mnt/lmcache"  # Shared filesystem
+# remote_url: "s3://my-lmcache-bucket/cache"   # S3 backend (if available)
+
+# Advanced optimization settings
+extra_config:
+  # Metadata and debugging
+  save_chunk_meta: true            # Save chunk metadata for debugging
+  enable_detailed_logging: true    # Enable detailed operation logging
+  
+  # Neuron-specific optimizations
+  use_gpu_connector_v3: false      # Disable GPU connector (not applicable for Neuron)
+  enable_async_loading: true       # Enable async loading for better performance
+  use_layerwise: true              # Enable layerwise caching for memory efficiency
+  enable_blending: true            # Enable cache blending for better hit rates
+  
+  # Memory management
+  priority_limit: 1000             # Limit high-priority cache entries
+  eviction_policy: "lru_with_priority"  # Advanced eviction with priority
+  memory_pressure_threshold: 0.85  # Start eviction at 85% memory usage
+  
+  # Performance optimizations
+  prefetch_enabled: true           # Enable intelligent prefetching
+  prefetch_window_size: 128        # Prefetch up to 128 tokens ahead
+  compression_enabled: true        # Enable compression for remote storage
+  compression_algorithm: "lz4"     # Fast compression algorithm
+  
+  # Networking and reliability
+  connection_pool_size: 10         # Connection pool for remote storage
+  retry_attempts: 3                # Retry failed operations
+  retry_backoff_ms: [100, 500, 2000]  # Exponential backoff
+  timeout_ms: 5000                 # 5 second timeout for remote operations
+  
+  # Cache coherency
+  enable_cache_invalidation: true  # Enable cache invalidation
+  invalidation_check_interval: 30  # Check for invalidations every 30s
+  cache_version_tracking: true     # Track cache versions for consistency
+  
+  # Monitoring and observability
+  enable_metrics: true             # Enable comprehensive metrics
+  metrics_interval: 30             # Collect metrics every 30 seconds
+  enable_prometheus: true          # Export Prometheus metrics
+  prometheus_port: 8080            # Prometheus metrics port
+  
+  # Health checks and alerting
+  enable_health_checks: true       # Enable health check endpoints
+  health_check_port: 8081          # Health check HTTP port
+  health_check_interval: 60        # Health check every 60 seconds
+  enable_alerting: true            # Enable alerting system
+  
+  # Performance targets and SLAs
+  target_hit_rate: 0.70            # Target 70% cache hit rate
+  max_lookup_latency_ms: 10        # Maximum 10ms lookup latency
+  max_storage_latency_ms: 50       # Maximum 50ms storage latency
+  
+  # Advanced features
+  enable_cache_warming: true       # Enable cache warming on startup
+  cache_warming_patterns: [        # Patterns for cache warming
+    "common_prompts/*.txt",
+    "system_prompts/*.txt"
+  ]
+  enable_analytics: true           # Enable usage analytics
+  analytics_sampling_rate: 0.1     # Sample 10% of requests for analytics
+
+# Multi-node configuration
+cluster_config:
+  node_id: "${HOSTNAME}"           # Use hostname as node ID
+  cluster_discovery: "redis"       # Use Redis for cluster discovery
+  heartbeat_interval: 30           # Heartbeat every 30 seconds
+  node_failure_timeout: 120        # Consider node failed after 2 minutes
+
+# Security settings (if applicable)
+security:
+  enable_encryption: false         # Enable encryption for remote storage
+  # encryption_key_file: "/etc/lmcache/encryption.key"
+  enable_authentication: false     # Enable authentication for remote access
+  # auth_token_file: "/etc/lmcache/auth.token"
+
+# Environment-specific overrides
+# LMCACHE_REMOTE_URL - Override remote storage URL
+# LMCACHE_MAX_CPU_SIZE - Override local cache size
+# LMCACHE_ENABLE_BLENDING - Override cache blending
+# LMCACHE_PROMETHEUS_PORT - Override Prometheus port
+# LMCACHE_HEALTH_CHECK_PORT - Override health check port
+# LMCACHE_NODE_ID - Override cluster node ID
+
+# Usage notes:
+# - This configuration is optimized for production workloads
+# - Requires Redis or another remote storage backend
+# - Includes comprehensive monitoring and alerting
+# - Supports multi-node deployments with cache sharing
+# - Memory usage can scale up to 8GB for local cache
+# - All advanced features enabled for maximum performance

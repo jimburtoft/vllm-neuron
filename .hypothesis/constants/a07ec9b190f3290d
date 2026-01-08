@@ -1,0 +1,4 @@
+# file: /home/ubuntu/LMCache/lmcache/storage_backend/serde/cachegen_encoder.py
+# hypothesis_version: 6.148.8
+
+['config', 'fp_k', 'fp_v', 'huggingface', 'key_first_bins', 'key_first_layers', 'key_second_bins', 'key_second_layers', 'key_third_bins', 'value_first_bins', 'value_first_layers', 'value_second_bins']

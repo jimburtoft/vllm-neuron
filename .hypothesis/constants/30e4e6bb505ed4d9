@@ -1,0 +1,4 @@
+# file: /home/ubuntu/LMCache/lmcache/observability.py
+# hypothesis_version: 6.148.8
+
+[0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0, 2.5, 5.0, 7.5, 10.0, 60.0, 100, 128, 250, 256, 500, 512, 750, 1000, 1024, 2048, 2500, 4096, 5000, 7500, 8192, 10000, 16384, 32768, 65536, 'LMCStatsMonitor', 'PrometheusLogger', 'done', 'livemostrecent', 'lmcache:store_speed', 'model_name', 'not_found', 'ongoing', 'role', 'served_model_name', 'sum', 'worker_id']

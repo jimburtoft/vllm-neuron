@@ -1,0 +1,4 @@
+# file: /home/ubuntu/LMCache/lmcache/v1/storage_backend/remote_backend.py
+# hypothesis_version: 6.148.8
+
+[-1000000.0, 1000, 'Returning False', 'Returning None', 'cuda', 'use_exists_sync']

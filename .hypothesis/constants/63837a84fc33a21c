@@ -1,0 +1,4 @@
+# file: /home/ubuntu/LMCache/lmcache/v1/storage_backend/local_cpu_backend.py
+# hypothesis_version: 6.148.8
+
+[0.1, 1024, 'LMCacheWorker', 'align_bytes', 'cpu', 'cuda', 'save_only_first_rank']

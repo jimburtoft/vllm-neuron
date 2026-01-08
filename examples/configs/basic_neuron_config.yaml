@@ -1,0 +1,42 @@
+# Basic LMCache Configuration for AWS Neuron vLLM
+# Suitable for development, testing, and small-scale deployments
+# Uses local CPU storage with filesystem backend
+
+# Core cache settings
+chunk_size: 256                    # Token chunk size for cache storage
+local_cpu: true                    # Use CPU storage (required for Neuron)
+max_local_cpu_size: 2              # Maximum CPU cache size in GB
+save_unfull_chunk: true            # Save partial chunks for better utilization
+save_decode_cache: true            # Cache decode phase tokens
+
+# Storage backend configuration
+storage_backend: "local_cpu"       # Use CPU-based storage backend
+remote_url: "fs://localhost:0/tmp/lmcache_neuron_basic"  # Local filesystem storage
+
+# Basic optimization settings
+extra_config:
+  # Neuron-specific settings
+  use_gpu_connector_v3: false      # Disable GPU connector (not applicable for Neuron)
+  enable_async_loading: false      # Disable async loading for simplicity
+  use_layerwise: false             # Disable layerwise caching for simplicity
+  enable_blending: false           # Disable cache blending for stability
+  
+  # Memory management
+  priority_limit: null             # No priority limits
+  
+  # Performance settings
+  # Monitoring (basic)
+  # Note: Metrics collection is handled by the integration layer
+
+# Environment-specific overrides (can be set via environment variables)
+# LMCACHE_CHUNK_SIZE - Override chunk_size
+# LMCACHE_MAX_CPU_SIZE - Override max_local_cpu_size  
+# LMCACHE_REMOTE_URL - Override remote_url
+# LMCACHE_ENABLE_METRICS - Override enable_metrics
+
+# Usage notes:
+# - This configuration prioritizes simplicity and stability
+# - Suitable for single-node deployments
+# - Uses local filesystem storage (ensure /tmp has sufficient space)
+# - Memory usage will be limited to 2GB for cache storage
+# - No advanced features enabled to minimize complexity

@@ -1,0 +1,138 @@
+# Performance-Optimized LMCache Configuration for AWS Neuron vLLM
+# Tuned for maximum performance and throughput
+# Suitable for high-traffic production workloads with performance requirements
+
+# Core cache settings - optimized for performance
+chunk_size: 512                    # Larger chunk size for better batching
+local_cpu: true                    # Use CPU storage (required for Neuron)
+max_local_cpu_size: 16             # Large CPU cache size for maximum hit rates (16GB)
+save_unfull_chunk: true            # Save partial chunks for better utilization
+save_decode_cache: true            # Cache decode phase tokens
+
+# Storage backend configuration - optimized for speed
+storage_backend: "optimized_cpu"   # Use performance-optimized CPU backend
+remote_url: "memory://shared-cache:0"  # In-memory shared cache for fastest access
+# Alternative high-performance options:
+# remote_url: "redis://redis-cluster:6379/0?pipeline=true"  # Redis with pipelining
+# remote_url: "fs://nvme-storage:0/cache?direct_io=true"    # NVMe with direct I/O
+
+# Performance-first optimization settings
+extra_config:
+  # Metadata and debugging - minimal for performance
+  save_chunk_meta: false           # Disable metadata to reduce overhead
+  enable_detailed_logging: false   # Disable detailed logging for performance
+  
+  # Neuron-specific optimizations
+  use_gpu_connector_v3: false      # Disable GPU connector (not applicable for Neuron)
+  enable_async_loading: true       # Enable async loading for non-blocking operations
+  use_layerwise: true              # Enable layerwise caching for memory efficiency
+  enable_blending: true            # Enable cache blending for maximum hit rates
+  
+  # Aggressive memory management
+  priority_limit: 5000             # Large priority cache for hot data
+  eviction_policy: "adaptive_lru"  # Adaptive LRU with performance hints
+  memory_pressure_threshold: 0.95  # Use almost all available memory
+  aggressive_prefetch: true        # Aggressive prefetching for performance
+  
+  # Performance optimizations
+  prefetch_enabled: true           # Enable intelligent prefetching
+  prefetch_window_size: 256        # Large prefetch window
+  prefetch_threads: 4              # Multiple prefetch threads
+  compression_enabled: false       # Disable compression for speed
+  
+  # High-performance networking
+  connection_pool_size: 20         # Large connection pool
+  connection_keepalive: true       # Keep connections alive
+  tcp_nodelay: true                # Disable Nagle's algorithm for low latency
+  socket_buffer_size: 65536        # Large socket buffers
+  
+  # Minimal retry logic for performance
+  retry_attempts: 1                # Minimal retries to avoid latency
+  retry_backoff_ms: [50]           # Fast retry
+  timeout_ms: 2000                 # Short timeout for fast failure
+  
+  # Cache coherency - optimized
+  enable_cache_invalidation: false # Disable for performance (eventual consistency)
+  cache_version_tracking: false    # Disable version tracking overhead
+  
+  # Optimized monitoring
+  enable_metrics: true             # Enable metrics but optimized
+  metrics_interval: 10             # Frequent metrics for performance monitoring
+  metrics_buffer_size: 1000        # Large metrics buffer
+  enable_prometheus: true          # Export Prometheus metrics
+  prometheus_port: 8080            # Prometheus metrics port
+  
+  # Minimal health checks
+  enable_health_checks: true       # Enable health checks
+  health_check_port: 8081          # Health check HTTP port
+  health_check_interval: 30        # Less frequent health checks
+  enable_alerting: true            # Enable alerting for critical issues only
+  
+  # Aggressive performance targets
+  target_hit_rate: 0.85            # Target 85% cache hit rate
+  max_lookup_latency_ms: 5         # Maximum 5ms lookup latency
+  max_storage_latency_ms: 20       # Maximum 20ms storage latency
+  
+  # Performance-focused features
+  enable_cache_warming: true       # Enable cache warming for immediate performance
+  cache_warming_aggressive: true   # Aggressive cache warming
+  cache_warming_threads: 8         # Multiple warming threads
+  enable_hot_data_tracking: true   # Track and prioritize hot data
+  hot_data_threshold: 10           # Consider data hot after 10 accesses
+  
+  # Memory optimization
+  memory_mapping: true             # Use memory mapping for large caches
+  huge_pages: true                 # Use huge pages if available
+  numa_aware: true                 # NUMA-aware memory allocation
+  cpu_affinity: true               # Set CPU affinity for cache threads
+  
+  # Batch processing optimizations
+  batch_size: 32                   # Large batch sizes for efficiency
+  batch_timeout_ms: 1              # Short batch timeout
+  enable_request_coalescing: true  # Coalesce similar requests
+  
+  # Advanced caching strategies
+  enable_predictive_caching: true  # Predict and cache likely requests
+  prediction_window: 1000          # Look ahead 1000 tokens for prediction
+  enable_semantic_caching: true    # Cache based on semantic similarity
+  semantic_similarity_threshold: 0.95  # High similarity threshold
+
+# High-performance cluster configuration
+cluster_config:
+  node_id: "${HOSTNAME}"           # Use hostname as node ID
+  cluster_discovery: "memory"      # Fast in-memory cluster discovery
+  heartbeat_interval: 10           # Frequent heartbeats
+  node_failure_timeout: 30         # Fast failure detection
+  load_balancing: "performance"    # Performance-based load balancing
+
+# Resource allocation - maximize for performance
+resource_limits:
+  max_memory_gb: 32                # Allow up to 32GB total memory usage
+  max_cpu_cores: 16                # Use up to 16 CPU cores
+  max_network_bandwidth_mbps: 10000  # 10Gbps network bandwidth
+  max_disk_iops: 50000             # High IOPS for storage operations
+
+# Performance monitoring and tuning
+performance_tuning:
+  auto_tuning_enabled: true        # Enable automatic performance tuning
+  tuning_interval: 300             # Retune every 5 minutes
+  performance_baseline_window: 3600  # 1 hour baseline window
+  adaptive_chunk_size: true        # Adapt chunk size based on workload
+  adaptive_prefetch: true          # Adapt prefetch based on patterns
+  
+# Environment-specific overrides for performance
+# LMCACHE_MAX_CPU_SIZE - Override cache size (recommend 16-32GB)
+# LMCACHE_CHUNK_SIZE - Override chunk size (recommend 512-1024)
+# LMCACHE_PREFETCH_THREADS - Override prefetch thread count
+# LMCACHE_BATCH_SIZE - Override batch size
+# LMCACHE_ENABLE_HUGE_PAGES - Override huge pages setting
+# LMCACHE_CPU_AFFINITY - Override CPU affinity
+
+# Usage notes:
+# - This configuration prioritizes performance over everything else
+# - Requires significant system resources (16GB+ RAM recommended)
+# - May sacrifice some reliability for performance gains
+# - Suitable for high-throughput, latency-sensitive workloads
+# - Monitor system resources carefully to avoid oversubscription
+# - Consider eventual consistency trade-offs
+# - Benchmark thoroughly before production deployment

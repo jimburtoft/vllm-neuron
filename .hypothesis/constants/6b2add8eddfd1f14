@@ -1,0 +1,4 @@
+# file: /home/ubuntu/LMCache/lmcache/v1/storage_backend/local_disk_backend.py
+# hypothesis_version: 6.148.8
+
+[0.0, 420, 1024, '-', '.pt', '/', 'LMCacheWorker', 'LocalDiskBackend', 'cpu', 'cuda', 'delete', 'prefetch', 'put', 'rb', 'use_odirect', 'wb']

@@ -1,0 +1,4 @@
+# file: /home/ubuntu/LMCache/lmcache/v1/cache_controller/commands/full_sync.py
+# hypothesis_version: 6.148.8
+
+['LMCacheWorker', 'full_sync']
