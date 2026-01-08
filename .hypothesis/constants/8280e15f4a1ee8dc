@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/v1/system_detection.py
-# hypothesis_version: 6.148.8
-
-[0.0, 1024, 'auto', 'gpu_to_numa_mapping', 'manual']

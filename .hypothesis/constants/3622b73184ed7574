@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/utils.py
-# hypothesis_version: 6.148.8
-
-['%', ',', '@', 'CacheEngineKey', 'LayerCacheEngineKey', 'NA', 'Unclosed bracket', '[', ']', '^\\[(\\d+),(\\d+)\\]$', '__commit_id__', '__type__', '__version__', 'bfloat16', 'blue', 'bool', 'chunk_hash', 'double', 'dtype', 'error', 'exception', 'float', 'float8_e4m3fn', 'float8_e4m3fnuz', 'float8_e5m2', 'float8_e5m2fnuz', 'fmt', 'fp8_e4m3', 'fp8_e5m2', 'green', 'half', 'int16', 'int32', 'int64', 'int8', 'lmcache', 'lmcache.tag.', 'message', 'model_name', 'purple', 'rapids', 'request_configs', 'uint8', 'worker_id', 'world_size']

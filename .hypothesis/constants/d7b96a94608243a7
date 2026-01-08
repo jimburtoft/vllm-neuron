@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/v1/transfer_channel/__init__.py
-# hypothesis_version: 6.148.8
-
-['backends', 'mock_memory', 'nixl']

@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/config.py
-# hypothesis_version: 6.148.8
-
-[0.15, 256, '(.*)://(.*):(\\d+)', 'LMCacheEngineConfig', '[BLEND_SEP]', 'blend_min_tokens', 'blend_separator', 'chunk_size', 'cpu', 'cuda', 'enable_blending', 'file://(.*)/', 'local_device', 'max_local_cache_size', 'pipelined_backend', 'r', 'remote_serde', 'remote_url', 'save_decode_cache', 'torch']

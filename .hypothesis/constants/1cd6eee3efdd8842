@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/v1/cache_controller/worker.py
-# hypothesis_version: 6.148.8
-
-[0.0, 'Communication error', 'FullSyncSender', 'LMCacheEngine', 'LocalCPUBackend', 'LocalDiskBackend', 'bind', 'connect', 'tcp']

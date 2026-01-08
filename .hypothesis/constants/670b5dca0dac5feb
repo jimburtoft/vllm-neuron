@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/v1/lazy_memory_allocator.py
-# hypothesis_version: 6.148.8
-
-[5.0, 'LMCacheEngineConfig', 'MemoryExpander', 'async_expander', 'composite_buffer', 'cpu', 'numa_mapping']

@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/v1/memory_management.py
-# hypothesis_version: 6.148.8
-
-[4096, 'AdHocMemoryAllocator', 'BufferAllocator', 'FreeBlock', 'GPUMemoryAllocator', 'HostMemoryAllocator', 'MemoryObjMetadata', 'MixedMemoryAllocator', 'PDMemoryAllocator', 'PinMemoryAllocator', 'SC_PAGESIZE', '__type__', 'address', 'align_bytes', 'cpu', 'cpu:0', 'cuda', 'dtype', 'dtypes', 'fmt', 'gpu', 'numa_mapping', 'phy_size', 'ref_count', 'shape', 'shapes', 'torch.']

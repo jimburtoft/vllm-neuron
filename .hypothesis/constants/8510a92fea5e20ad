@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/integration/vllm/utils.py
-# hypothesis_version: 6.148.8
-
-[65535, '0', 'LMCACHE_CONFIG_FILE', 'ModelConfig', 'PlaceholderRange', 'Request', 'True', 'false', 'mm_features', 'mm_hashes', 'n', 'no', 'off', 'use_mla', 'vllm', 'vllm-instance']

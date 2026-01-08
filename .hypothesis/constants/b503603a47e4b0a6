@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/logging.py
-# hypothesis_version: 6.148.8
-
-['\x1b[0m', '\x1b[1m', '\x1b[31;1m', '\x1b[31;20m', '\x1b[32;20m', '\x1b[33;20m', '\x1b[3m', 'Critical message', 'Debug message', 'Error message', 'INFO', 'Info message', 'LMCACHE_LOG_LEVEL', 'Warning message', '__main__']

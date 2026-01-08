@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/connections.py
-# hypothesis_version: 6.148.8
-
-[128, 'LMCache', 'User-Agent', 'http', 'https', 'wb']

@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/storage_backend/serde/cachegen_basics.py
-# hypothesis_version: 6.148.8
-
-[256, 'CacheGenConfig', 'Qwen/Qwen-7B', 'THUDM/glm-4-9b-chat']

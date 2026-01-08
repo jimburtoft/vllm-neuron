@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/usage_context.py
-# hypothesis_version: 6.148.8
-
-[100, 250, 500, 750, 1000, 2500, 5000, '%Y-%m-%d %H:%M:%S', ',', '/proc/1/cgroup', '600', 'AWS', 'AZURE', 'CONDA', 'DOCKER', 'EngineMessage', 'EnvMessage', 'GCP', 'LMCACHE_TRACK_USAGE', 'LMCache', 'LMCacheStats', 'MetadataMessage', 'OCI', 'PIP', 'RUNPOD', 'RUNPOD_DC_ID', 'UNKNOWN', 'a', 'amazon', 'brand_raw', 'cache-lifespan', 'cache-usage', 'conda', 'context', 'count', 'docker', 'false', 'family', 'google', 'list', 'model', 'oraclecloud', 'r', 'stepping', '{}: {}\n']

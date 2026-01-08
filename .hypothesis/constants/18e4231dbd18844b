@@ -1,4 +1,0 @@
-# file: /home/ubuntu/LMCache/lmcache/v1/storage_backend/cache_policy/base_policy.py
-# hypothesis_version: 6.148.8
-
-['KeyType', 'MapType']
