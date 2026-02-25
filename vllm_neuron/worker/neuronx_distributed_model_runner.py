@@ -85,6 +85,8 @@ class ModelInputForNeuron:
     # Boolean tensor to indicate if the request is ready
     # for sampling. Needed by chunked prefill.
     prefill_completion_state: torch.Tensor | None = None
+    # Pre-computed prompt embeddings (bypasses token embedding lookup)
+    inputs_embeds: torch.Tensor | None = None
 
 
 # This class is used for constructing ModelInputForNeuron and
@@ -102,6 +104,8 @@ class IntermediateInputData:
     prefill_completion_state: list[bool] = field(default_factory=list)
     adapter_ids: list[int] = field(default_factory=list)
     multi_modal_kwargs: BatchedTensorInputs = None
+    # Pre-computed prompt embeddings for the prefill request
+    inputs_embeds: torch.Tensor | None = None
 
 
 class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
@@ -470,7 +474,13 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
             int: The 0-indexed position of the last processed token.
         """
 
-        return len(state.prompt_token_ids) + len(state.output_token_ids) - 1
+        if state.prompt_token_ids is not None:
+            prompt_len = len(state.prompt_token_ids)
+        elif state.prompt_embeds is not None:
+            prompt_len = state.prompt_embeds.shape[0]
+        else:
+            raise ValueError("Either prompt_token_ids or prompt_embeds must be set")
+        return prompt_len + len(state.output_token_ids) - 1
 
     def load_model(self) -> None:
         # Update LoRA config
@@ -917,6 +927,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                prompt_embeds=new_req_data.prompt_embeds,
             )
             self.requests[req_id] = req_state
 
@@ -1005,6 +1016,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
             sampling_params=model_input.sampling_params,
             adapter_ids=model_input.adapter_ids,
             prefill_completion_state=model_input.prefill_completion_state,
+            inputs_embeds=model_input.inputs_embeds,
             **_mm_kwargs_to_device(model_input.multi_modal_kwargs, self.device),
         )
         return hidden_states
@@ -1188,10 +1200,27 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
 
         data.request_ids.append(request_data.req_id)
 
-        data.input_tokens.append(request_data.prompt_token_ids)
-        if len(request_data.prompt_token_ids) > self.max_prompt_length:
+        # Determine prompt length and token IDs.
+        # When prompt_embeds is provided without prompt_token_ids, create
+        # dummy token IDs of the correct length. The NxDI model will use
+        # inputs_embeds instead of looking up embeddings from input_ids.
+        if request_data.prompt_token_ids is not None:
+            prompt_token_ids = request_data.prompt_token_ids
+            prompt_len = len(prompt_token_ids)
+        elif request_data.prompt_embeds is not None:
+            prompt_len = request_data.prompt_embeds.shape[0]
+            # Dummy token IDs (zeros); these won't be used for embedding
+            # lookup since inputs_embeds will be provided.
+            prompt_token_ids = [0] * prompt_len
+        else:
             raise ValueError(
-                f"Prompt length ({len(request_data.prompt_token_ids)} tokens) exceeds the maximum "
+                "Either prompt_token_ids or prompt_embeds must be provided"
+            )
+
+        data.input_tokens.append(prompt_token_ids)
+        if prompt_len > self.max_prompt_length:
+            raise ValueError(
+                f"Prompt length ({prompt_len} tokens) exceeds the maximum "
                 f"prompt length ({self.max_prompt_length} tokens) for this Neuron model. "
                 f'To handle this gracefully during online serving, add "max_prompt_length": '
                 f"{self.max_prompt_length} to --additional-config. This will return a 400 error "
@@ -1200,10 +1229,10 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
                 f"a shorter prompt or recompile the Neuron model with a larger max_prompt_length "
                 f'by setting "max_context_length": <desired_length> in override_neuron_config when compiling.'
             )
-        data.position_ids.append(list(range(len(request_data.prompt_token_ids))))
+        data.position_ids.append(list(range(prompt_len)))
         data.input_block_ids.append(assigned_slot)
 
-        data.full_context_lens.append(len(request_data.prompt_token_ids))
+        data.full_context_lens.append(prompt_len)
         data.prefill_completion_state.append(None)
         data.adapter_ids.append(self._prepare_adapter_id_in_new_request(request_data))
 
@@ -1216,6 +1245,13 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
             data.multi_modal_kwargs = self._process_multi_modal_data_neuron(
                 request_data.mm_features
             )
+
+        # Pass through pre-computed prompt embeddings if provided.
+        # When prompt_embeds is set, the model will skip the token embedding
+        # lookup and use these embeddings directly.
+        # Add batch dimension: [seq_len, hidden] -> [1, seq_len, hidden]
+        if request_data.prompt_embeds is not None:
+            data.inputs_embeds = request_data.prompt_embeds.unsqueeze(0)
 
     def _process_new_request_for_continuous_batching_with_prefix_caching(
         self, request_data: NewRequestData, data: IntermediateInputData
@@ -1233,7 +1269,16 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
 
         data.computed_context_lens.append(request_data.num_computed_tokens)
 
-        prompt_len = len(request_data.prompt_token_ids)
+        # Determine prompt length: use prompt_token_ids if available,
+        # otherwise infer from prompt_embeds shape.
+        if request_data.prompt_token_ids is not None:
+            prompt_len = len(request_data.prompt_token_ids)
+        elif request_data.prompt_embeds is not None:
+            prompt_len = request_data.prompt_embeds.shape[0]
+        else:
+            raise ValueError(
+                "Either prompt_token_ids or prompt_embeds must be provided"
+            )
         slot_mapping_for_cur_seq = [
             (block_table[i // block_size] * block_size + i % block_size)
             if i < prompt_len
@@ -1418,6 +1463,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
             sampling_params=self.get_nxd_sampling_params(input_tokens),
             multi_modal_kwargs=data.multi_modal_kwargs,
             adapter_ids=lora_adapter_ids,
+            inputs_embeds=data.inputs_embeds,
         )
 
     def _process_new_request_for_chunked_prefill(
