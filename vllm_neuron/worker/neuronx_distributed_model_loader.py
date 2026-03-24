@@ -705,6 +705,156 @@ class NeuronLlama4ForCausalLM(NeuronMultiModalCausalLM):
         )
 
 
+class NeuronMistral3ForCausalLM(NeuronMultiModalCausalLM):
+    """vllm-neuron wrapper for Ministral-3-14B-Instruct-2512 (Leanstral).
+
+    Extends NeuronMultiModalCausalLM with Mistral3-specific handling:
+    - Applies SHARD_OVER_HEADS and multi-KV-head TKG kernel patches before model load
+    - Enables fused_qkv + qkv_nki_kernel by default (+14-17% decode throughput)
+    - attn_block_tkg_nki_kernel NOT enabled by default (neuronx-cc 2.28 compiler ICE)
+    - Maps image_token_index = 10 (Mistral3 [IMG] token)
+    - CPU PatchMerger projector loaded by the NxDI model class
+    """
+
+    IMAGE_TOKEN_ID = 10
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.vision_token_id = self.IMAGE_TOKEN_ID
+
+    def load_weights(self, model_name_or_path: str, architecture: str, **kwargs):
+        # Apply Leanstral patches before NxDI model classes are instantiated
+        from neuronx_distributed_inference.models.leanstral.modeling_leanstral import (
+            NeuronLeanstralForCausalLM,
+            _ensure_patches_applied,
+        )
+
+        _ensure_patches_applied()
+
+        # Enable optimized NKI kernels by default via override_neuron_config.
+        # fused_qkv + qkv_nki_kernel give +14-17% decode throughput (Phase A.2).
+        # attn_block_tkg_nki_kernel is DISABLED by default due to neuronx-cc 2.28
+        # compiler ICE (NCC_ITEN404) on TKG buckets >= 512 with multi-KV-head
+        # SHARD_OVER_HEADS. Users can opt-in by setting these in neuron_config.json.
+        override_neuron_config = kwargs.get("override_neuron_config", {})
+        text_overrides = override_neuron_config.get("text_neuron_config", {})
+        text_overrides.setdefault("fused_qkv", True)
+        text_overrides.setdefault("qkv_nki_kernel_enabled", True)
+        # Add smaller CTE buckets for lower TTFT on short prompts.
+        # Default auto-bucketing starts at 128; adding 32 and 64 reduces
+        # padding overhead for short text prompts (e.g., 2-token → 32 pad
+        # instead of 128 pad, ~4x less compute).
+        text_overrides.setdefault(
+            "context_encoding_buckets",
+            [32, 64, 128, 256, 512, 1024, 2048, 4096],
+        )
+        override_neuron_config["text_neuron_config"] = text_overrides
+        kwargs["override_neuron_config"] = override_neuron_config
+
+        # Cannot call super().load_weights() because it uses
+        # load_pretrained_config() which calls AutoConfig.from_pretrained(),
+        # and AutoConfig fails for Mistral3 (model_type "ministral3" is not
+        # registered in transformers CONFIG_MAPPING). Instead, replicate the
+        # parent NeuronMultiModalCausalLM.load_weights() logic with our
+        # custom config loader that reads config.json directly.
+        neuronx_model_cls = _get_neuron_model_cls(architecture)
+
+        # Custom config loader needs a local path with config.json.
+        # If model_name_or_path is a HuggingFace hub name (not local),
+        # download it first so we can read config.json directly.
+        if not os.path.exists(model_name_or_path):
+            model_name_or_path = self._save_pretrained_model(model_name_or_path)
+
+        default_neuron_config = kwargs["neuron_config"]
+        validated_override = _validate_image_to_text_override_neuron_config(
+            kwargs["override_neuron_config"]
+        )
+
+        vision_neuron_config = copy.deepcopy(default_neuron_config)
+        vision_neuron_config.update(validated_override.get("vision_neuron_config", {}))
+        # Vision encoder is called per-item (BS=1) in forward_atomic_prefill,
+        # even when tkg_batch_size > 1. Force vision batch_size=1 to match.
+        vision_neuron_config["batch_size"] = 1
+        vision_neuron_config["ctx_batch_size"] = 1
+        vision_neuron_config["tkg_batch_size"] = 1
+        vision_neuron_config = neuronx_model_cls.get_neuron_config_cls()(
+            **vision_neuron_config
+        )
+
+        text_neuron_config = copy.deepcopy(default_neuron_config)
+        text_neuron_config.update(validated_override.get("text_neuron_config", {}))
+        text_neuron_config = neuronx_model_cls.get_neuron_config_cls()(
+            **text_neuron_config
+        )
+
+        # Use custom config loader that bypasses AutoConfig
+        custom_load_config = NeuronLeanstralForCausalLM.load_pretrained_config(
+            model_name_or_path
+        )
+        config = neuronx_model_cls.get_config_cls()(
+            text_neuron_config=text_neuron_config,
+            vision_neuron_config=vision_neuron_config,
+            load_config=custom_load_config,
+        )
+
+        success, compiled_model_path, _ = self._load_weights_common(
+            model_name_or_path, neuronx_model_cls, config=config, **kwargs
+        )
+
+        if not success:
+            self._compile_and_load_model(
+                model_name_or_path, neuronx_model_cls, config, compiled_model_path
+            )
+        return success, compiled_model_path
+
+    def execute_model(self, model_input):
+        """Helper to run model with defaults for missing multimodal inputs."""
+        vision_mask = (model_input.input_tokens == self.IMAGE_TOKEN_ID).unsqueeze(-1)
+
+        if (
+            model_input.multi_modal_kwargs is not None
+            and model_input.multi_modal_kwargs.get("pixel_values") is not None
+        ):
+            image_sizes = model_input.multi_modal_kwargs.get("image_sizes")
+        else:
+            image_sizes = torch.tensor([[512, 512]], dtype=torch.int32)
+
+        return super().execute_model(
+            model_input, vision_mask=vision_mask, image_sizes=image_sizes
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_block_ids: torch.Tensor,
+        sampling_params: torch.Tensor,
+        pixel_values: Union[torch.Tensor, list] | None = None,
+        image_sizes: torch.Tensor | None = None,
+        vision_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Forward pass with multimodal support for Mistral3/Leanstral."""
+        # Cast vision tensors to the configured dtype
+        if pixel_values is not None:
+            dtype = self.model.config.vision_config.neuron_config.torch_dtype
+            if isinstance(pixel_values, torch.Tensor):
+                pixel_values = pixel_values.to(dtype)
+            elif isinstance(pixel_values, list):
+                pixel_values = [p.to(dtype) for p in pixel_values]
+
+        return super().forward(
+            input_ids,
+            positions,
+            input_block_ids=input_block_ids,
+            sampling_params=sampling_params,
+            pixel_values=pixel_values,
+            vision_mask=vision_mask,
+            image_sizes=image_sizes,
+            **kwargs,
+        )
+
+
 def _get_model_configs(config: PretrainedConfig) -> str:
     logger.debug("PretrainedConfig: %s", config)
 
@@ -735,6 +885,27 @@ def _camel_to_kebab(name: str) -> str:
     return re.sub("([a-z0-9])([A-Z])", r"\1-\2", s1).lower()
 
 
+def _read_original_architecture(model_path: str) -> str | None:
+    """Read the original architecture from config.json on disk.
+
+    vllm remaps some architectures (e.g. Mistral3 → Pixtral). This function
+    reads the original config.json to recover the true architecture string.
+    Returns the first architecture string, or None if not found.
+    """
+    import json
+
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+        archs = cfg.get("architectures", [])
+        return archs[0] if archs else None
+    except Exception:
+        return None
+
+
 def _get_neuron_model_cls(architecture: str):
     try:
         if "For" in architecture:
@@ -748,6 +919,9 @@ def _get_neuron_model_cls(architecture: str):
 
             if architecture == "LlavaForConditionalGeneration":
                 model = "pixtral"
+
+            if architecture == "Mistral3ForConditionalGeneration":
+                model = "leanstral"
 
             return MODEL_TYPES[model][task]
         else:
@@ -771,10 +945,23 @@ def get_neuron_model(
         model_config.hf_config
     )
 
+    # vllm remaps Mistral3ForConditionalGeneration → PixtralForConditionalGeneration
+    # in model_config.hf_config. Detect this by reading the original config.json and
+    # restore the true architecture so our Leanstral model class is used.
+    if architecture == "PixtralForConditionalGeneration":
+        _original_arch = _read_original_architecture(model_config.model)
+        if _original_arch == "Mistral3ForConditionalGeneration":
+            architecture = _original_arch
+
     if architecture == "LlavaForConditionalGeneration":
+        model = NeuronPixtralForCausalLM(model_config.hf_config)
+    elif architecture == "PixtralForConditionalGeneration":
+        # True Pixtral (not remapped Mistral3)
         model = NeuronPixtralForCausalLM(model_config.hf_config)
     elif architecture == "Llama4ForConditionalGeneration":
         model = NeuronLlama4ForCausalLM(model_config.hf_config)
+    elif architecture == "Mistral3ForConditionalGeneration":
+        model = NeuronMistral3ForCausalLM(model_config.hf_config)
     else:
         model = NeuronCausalLM(model_config.hf_config)
 

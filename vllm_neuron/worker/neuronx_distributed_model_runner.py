@@ -1079,6 +1079,13 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
 
         if self.model.model.config.model_type == "llava":
             mm_kwargs = self._process_multi_modal_data_neuron_llava(mm_kwargs)
+        elif self.model.model.config.model_type == "leanstral":
+            # vllm's Pixtral/Mistral3 preprocessor produces "images" key,
+            # but NxDI's Llava handler expects "pixel_values". Remap keys
+            # and delegate to the Llava processing path.
+            if "images" in mm_kwargs and "pixel_values" not in mm_kwargs:
+                mm_kwargs["pixel_values"] = mm_kwargs.pop("images")
+            mm_kwargs = self._process_multi_modal_data_neuron_llava(mm_kwargs)
         elif self.model.model.config.model_type == "llama4":
             pass  # llama4 doesn't require special processing
         else:
