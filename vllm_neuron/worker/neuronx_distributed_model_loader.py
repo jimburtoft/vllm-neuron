@@ -42,6 +42,23 @@ from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 from neuronx_distributed_inference.utils.constants import MODEL_TYPES
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 from transformers import AutoModelForCausalLM, PretrainedConfig
+
+# Register Qwen3.5-35B-A3B contrib model in NxDI MODEL_TYPES if available.
+# The contrib model is not part of core NxDI, so we inject it at runtime.
+# The contrib src directory must be on sys.path (e.g. via PYTHONPATH or
+# pip install -e on the NxDI fork that contains the contrib model).
+if "qwen3_5_moe" not in MODEL_TYPES:
+    try:
+        from modeling_qwen35_moe import NeuronQwen35MoeForCausalLM
+
+        MODEL_TYPES["qwen3_5_moe"] = {"causal-lm": NeuronQwen35MoeForCausalLM}
+        logging.getLogger(__name__).info(
+            "Registered Qwen3.5-35B-A3B contrib model in MODEL_TYPES"
+        )
+    except ImportError:
+        logging.getLogger(__name__).debug(
+            "Qwen3.5 contrib model not found on sys.path, skipping registration"
+        )
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -908,6 +925,19 @@ def _get_model_configs(config: PretrainedConfig) -> str:
         hidden_size = getattr(config, "hidden_size", None)
         if num_attention_heads and hidden_size:
             head_dim = hidden_size // num_attention_heads
+    # Fallback to text_config for models with nested config layout (e.g. Qwen3.5-MoE)
+    if (not num_key_value_heads or not head_dim) and hasattr(config, "text_config"):
+        tc = config.text_config
+        if tc is not None:
+            num_key_value_heads = getattr(
+                tc, "num_key_value_heads", num_key_value_heads
+            )
+            head_dim = getattr(tc, "head_dim", None)
+            if not head_dim:
+                num_attention_heads = getattr(tc, "num_attention_heads", None)
+                hidden_size = getattr(tc, "hidden_size", None)
+                if num_attention_heads and hidden_size:
+                    head_dim = hidden_size // num_attention_heads
     if not num_key_value_heads or not head_dim:
         raise ValueError("Missing required fields in the pretrained config.")
     return architecture, int(num_key_value_heads), int(head_dim)
@@ -959,6 +989,9 @@ def _get_neuron_model_cls(architecture: str):
 
             if model == "qwen3moe":
                 model = "qwen3_moe"
+
+            if model == "qwen3_5moe":
+                model = "qwen3_5_moe"
 
             if model == "qwen2vl":
                 model = "qwen2_vl"
