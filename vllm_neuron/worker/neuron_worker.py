@@ -220,7 +220,23 @@ class NeuronWorker(WorkerBase):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         supported_tasks = list[GenerationTask]()
-        supported_tasks.append("generate")
+
+        # Check if the loaded model is Whisper (transcription-only)
+        is_whisper = False
+        if hasattr(self, "model_runner") and hasattr(self.model_runner, "model"):
+            from vllm_neuron.worker.constants import NEURON_WHISPER_MODELS
+
+            if hasattr(self.model_runner.model, "architecture"):
+                if self.model_runner.model.architecture in NEURON_WHISPER_MODELS:
+                    is_whisper = True
+
+        if is_whisper:
+            # Whisper is transcription-only — do NOT include "generate"
+            # (matches upstream WhisperForConditionalGeneration.supports_transcription_only = True)
+            supported_tasks.append("transcription")
+        else:
+            supported_tasks.append("generate")
+
         return supported_tasks
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

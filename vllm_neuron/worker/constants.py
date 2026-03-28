@@ -9,6 +9,10 @@ NEURON_MULTI_MODAL_MODELS = [
     "Qwen3VLForConditionalGeneration",
 ]
 
+NEURON_WHISPER_MODELS = [
+    "WhisperForConditionalGeneration",
+]
+
 TORCH_DTYPE_TO_NEURON_AMP = {
     "auto": "float32",
     "half": "float16",

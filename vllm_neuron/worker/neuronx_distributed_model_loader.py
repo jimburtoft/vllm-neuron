@@ -55,6 +55,7 @@ from vllm.v1.sample import sampler as Sampler
 
 from vllm_neuron.worker.constants import (
     NEURON_MULTI_MODAL_MODELS,
+    NEURON_WHISPER_MODELS,
     TORCH_DTYPE_TO_NEURON_AMP,
 )
 
@@ -892,6 +893,113 @@ class NeuronLlama4ForCausalLM(NeuronMultiModalCausalLM):
         )
 
 
+class NeuronWhisperModel(NeuronModelBase):
+    """
+    Whisper encoder-decoder model for speech-to-text on Neuron.
+
+    Wraps NeuronApplicationWhisper from NxDI (or the contrib model).
+    The encoder runs once to produce audio features, then the decoder
+    runs autoregressively. The NEFF manages its own KV cache internally
+    via input_output_aliases.
+
+    The model runner (_execute_model_for_whisper) handles the step-by-step
+    generation logic. This class just provides model loading and access
+    to encoder/decoder.
+    """
+
+    def __init__(self, config: PretrainedConfig) -> None:
+        super().__init__(config)
+        self.whisper_model = None  # NeuronApplicationWhisper instance
+        self.inference_config = None  # WhisperInferenceConfig
+
+    def forward(self, input_ids, input_block_ids, **kwargs):
+        """Not used directly — the model runner calls encoder/decoder separately."""
+        raise NotImplementedError(
+            "NeuronWhisperModel.forward() should not be called directly. "
+            "Use _execute_model_for_whisper() in the model runner instead."
+        )
+
+    def sample(self, logits: torch.Tensor) -> SamplerOutput | None:
+        # Whisper uses CPU sampling — let the model runner handle it
+        raise RuntimeError(
+            "CPU sampling should be handled by the model runner, not the model."
+        )
+
+    def load_weights(self, model_name_or_path: str, architecture: str, **kwargs):
+        """
+        Load and compile Whisper model using NxDI's NeuronApplicationWhisper.
+        """
+        from neuronx_distributed_inference.models.whisper.modeling_whisper import (
+            NeuronApplicationWhisper,
+            WhisperInferenceConfig,
+        )
+        from neuronx_distributed_inference.models.config import NeuronConfig
+
+        neuron_config_dict = kwargs.get("neuron_config", {})
+
+        # Create NeuronConfig with Whisper-appropriate defaults.
+        # Whisper does not use on-device sampling.
+        # Set seq_len to n_text_ctx (max decoder sequence length, typically 448).
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(model_name_or_path)
+        n_text_ctx = getattr(hf_config, "max_target_positions", 448)
+
+        neuron_config = NeuronConfig(
+            batch_size=neuron_config_dict.get("batch_size", 1),
+            torch_dtype=neuron_config_dict.get("torch_dtype", torch.bfloat16),
+            tp_degree=neuron_config_dict.get("tp_degree", 1),
+            seq_len=n_text_ctx,
+        )
+
+        # load_pretrained_config() returns a callable that sets HF config
+        # attributes on an InferenceConfig instance. This is the standard
+        # NxDI pattern used for all models.
+        inference_config = WhisperInferenceConfig(
+            neuron_config,
+            load_config=load_pretrained_config(model_name_or_path),
+        )
+
+        # Check for pre-compiled artifacts
+        compiled_path = os.getenv("NEURON_COMPILED_ARTIFACTS")
+        if compiled_path and os.path.exists(compiled_path):
+            logger.info("Loading pre-compiled Whisper from %s", compiled_path)
+            self.whisper_model = NeuronApplicationWhisper(
+                compiled_path, config=inference_config
+            )
+            self.whisper_model.load(compiled_path)
+        else:
+            # Compile from scratch
+            config_hash = hashlib.md5(
+                str(inference_config.__dict__).encode()
+            ).hexdigest()[:12]
+            compiled_path = os.path.join(
+                "local-models",
+                model_name_or_path.replace("/", "_"),
+                "neuron-compiled-artifacts",
+                config_hash,
+            )
+            os.makedirs(compiled_path, exist_ok=True)
+
+            logger.info("Compiling Whisper model to %s", compiled_path)
+            self.whisper_model = NeuronApplicationWhisper(
+                model_name_or_path, config=inference_config
+            )
+            self.whisper_model.compile(compiled_path)
+            self.whisper_model.load(compiled_path)
+
+        # Store references for downstream access
+        self.model = self.whisper_model
+        self.inference_config = inference_config
+        logger.info("Whisper model loaded successfully")
+        return True, compiled_path
+
+    def get_kv_caches(self):
+        # Whisper manages its own KV cache via input_output_aliases in the NEFF.
+        # Return empty list since vLLM's KV cache management doesn't apply.
+        return []
+
+
 def _get_model_configs(config: PretrainedConfig) -> str:
     logger.debug("PretrainedConfig: %s", config)
 
@@ -899,6 +1007,19 @@ def _get_model_configs(config: PretrainedConfig) -> str:
     if not archs:
         raise ValueError("No architectures specified in the pretrained config.")
     architecture = archs[0]
+
+    # Whisper has a different config structure (encoder/decoder attention heads, d_model)
+    if architecture in NEURON_WHISPER_MODELS:
+        decoder_attention_heads = getattr(config, "decoder_attention_heads", None)
+        d_model = getattr(config, "d_model", None)
+        if decoder_attention_heads and d_model:
+            head_dim = d_model // decoder_attention_heads
+            return architecture, int(decoder_attention_heads), int(head_dim)
+        else:
+            raise ValueError(
+                "Whisper config missing decoder_attention_heads or d_model."
+            )
+
     if architecture in NEURON_MULTI_MODAL_MODELS:
         config = getattr(config, "text_config", None)
     num_key_value_heads = getattr(config, "num_key_value_heads", None)
@@ -994,6 +1115,29 @@ def get_neuron_model(
     architecture, num_key_value_heads, head_dim = _get_model_configs(
         model_config.hf_config
     )
+
+    # Whisper uses a completely different model architecture (encoder-decoder)
+    # with its own compilation and loading pipeline via NeuronApplicationWhisper.
+    if architecture in NEURON_WHISPER_MODELS:
+        model = NeuronWhisperModel(model_config.hf_config)
+        # Whisper's NxDI decoder uses input_output_aliases for KV cache
+        # management. The compiled NEFFs have fixed batch dimensions.
+        # Use batch_size=1 for now (single-request processing).
+        neuron_config_dict = {
+            "batch_size": 1,
+            "torch_dtype": model_config.dtype,
+            "tp_degree": parallel_config.tensor_parallel_size,
+        }
+        model.load_weights(
+            model_name_or_path=model_config.model,
+            architecture=architecture,
+            neuron_config=neuron_config_dict,
+        )
+        model.neuron_config = model.inference_config.neuron_config
+        model.architecture = architecture
+        model.num_key_value_heads = num_key_value_heads
+        model.head_dim = head_dim
+        return model.eval()
 
     if architecture == "LlavaForConditionalGeneration":
         model = NeuronPixtralForCausalLM(model_config.hf_config)

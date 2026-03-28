@@ -42,7 +42,10 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorOutput,
 )
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm_neuron.worker.constants import NEURON_MULTI_MODAL_MODELS
+from vllm_neuron.worker.constants import (
+    NEURON_MULTI_MODAL_MODELS,
+    NEURON_WHISPER_MODELS,
+)
 from vllm_neuron.worker.neuronx_distributed_model_loader import get_neuron_model
 from vllm_neuron.worker.utils import get_num_layers_from_hf_config
 
@@ -189,6 +192,8 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         # For deferred sampling (structured outputs)
         self._cached_logits: Optional[torch.Tensor] = None
         self._cached_model_input: Optional[ModelInputForNeuron] = None
+        # For Whisper: pre-computed ModelRunnerOutput returned by sample_tokens()
+        self._cached_whisper_output: Optional[ModelRunnerOutput] = None
 
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -199,12 +204,21 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         Handles both on-device (hardware) sampling and CPU sampling.
         Note: Structured outputs (grammar bitmask) is only supported with CPU sampling.
 
+        For Whisper: returns the pre-computed ModelRunnerOutput from
+        _execute_model_for_whisper_full() without any sampling.
+
         Args:
             grammar_output: Contains grammar_bitmask and request IDs for
                         structured output requests. None if no constraints.
         Returns:
             ModelRunnerOutput with sampled tokens
         """
+        # Whisper path: execute_model() already computed the full output
+        if self._cached_whisper_output is not None:
+            output = self._cached_whisper_output
+            self._cached_whisper_output = None
+            return output
+
         sample_start = time.perf_counter()
 
         if self._cached_logits is None:
@@ -702,8 +716,24 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         """
         Execute model forward pass.
 
-        Always returns None to defer sampling to sample_tokens().
+        Returns None to defer sampling to sample_tokens().
+        For Whisper: caches the self-contained ModelRunnerOutput for
+        sample_tokens() to return, and returns None.
         """
+        # Whisper uses a completely separate execution path that bypasses
+        # _update_states and _prepare_model_input (which assume KV cache
+        # block management). Whisper manages its own KV cache via NxDI's
+        # input_output_aliases.
+        if self.model.architecture in NEURON_WHISPER_MODELS:
+            whisper_output = self._execute_model_for_whisper_full(scheduler_output)
+            if not scheduler_output.total_num_scheduled_tokens:
+                # No work to do (cleanup step) — return directly since the
+                # engine won't call sample_tokens() when model_executed=False
+                return whisper_output
+            # Cache for sample_tokens() to return
+            self._cached_whisper_output = whisper_output
+            return None
+
         execute_start = time.perf_counter()
         batch_size = len(scheduler_output.scheduled_new_reqs) + len(
             scheduler_output.scheduled_cached_reqs.req_ids
@@ -898,6 +928,12 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
+        # Whisper manages its own KV cache internally via input_output_aliases
+        # in the compiled NEFFs. Return empty spec to use vLLM's
+        # "attention-free" code path (no block allocation, trivial scheduling).
+        if self.model.architecture in NEURON_WHISPER_MODELS:
+            return {}
+
         # Get number of layers from model config
         num_layers = get_num_layers_from_hf_config(self.model_config.hf_config)
 
@@ -931,6 +967,10 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
             self.requests.pop(req_id, None)
             if self.lora_config is not None:
                 self.lora_manager.remove_req_id(req_id)
+
+            # Clean up Whisper per-request state (encoder cache, pad_mask, etc.)
+            if hasattr(self, "_whisper_request_state"):
+                self._whisper_request_state.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -1081,6 +1121,176 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         hidden_states = self.model.execute_model(model_input)
         return hidden_states
 
+    def _execute_model_for_whisper_full(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> ModelRunnerOutput:
+        """Self-contained Whisper execution that bypasses standard batch management.
+
+        Whisper uses NxDI's input_output_aliases for KV cache, so it doesn't
+        need vLLM's block table allocation. This method handles the full pipeline:
+        scheduling → model forward → sampling → output construction.
+
+        For new requests (prefill): encode audio + decoder prefill
+        For cached requests (decode): single-token decoder step
+        """
+        if not hasattr(self, "_whisper_request_state"):
+            self._whisper_request_state = {}
+
+        whisper_model = self.model.whisper_model
+        dtype = self.model.inference_config.neuron_config.torch_dtype
+        n_text_ctx = whisper_model.dims.n_text_ctx
+
+        # Clean up finished requests
+        for req_id in scheduler_output.finished_req_ids:
+            self._whisper_request_state.pop(req_id, None)
+
+        if not scheduler_output.total_num_scheduled_tokens:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        # Collect request info
+        new_reqs = scheduler_output.scheduled_new_reqs
+        cached_req_ids = list(scheduler_output.scheduled_cached_reqs.req_ids)
+
+        req_ids = []
+        sampled_tokens = []
+
+        # Process new requests (prefill)
+        for new_req in new_reqs:
+            req_id = new_req.req_id
+            req_ids.append(req_id)
+
+            # Extract token IDs from the new request
+            token_ids = new_req.prompt_token_ids
+            if hasattr(new_req, "output_token_ids") and new_req.output_token_ids:
+                token_ids = list(token_ids) + list(new_req.output_token_ids)
+            tokens = torch.tensor([token_ids], dtype=torch.int32)
+            seq_len = tokens.shape[-1]
+
+            # Extract audio features from multimodal data
+            # Structure: mm_features[0] = MultiModalFeatureSpec
+            #   .data = MultiModalKwargsItem (MutableMapping, not plain dict)
+            #     {'input_features': MultiModalFieldElem(.data = tensor)}
+            mm_data = new_req.mm_features
+            mel = None
+            if mm_data:
+                for mm_spec in mm_data:
+                    kwargs_item = getattr(mm_spec, "data", None)
+                    if kwargs_item is None:
+                        continue
+                    # Try direct key access first (MutableMapping supports [])
+                    try:
+                        field_elem = kwargs_item["input_features"]
+                        mel = getattr(field_elem, "data", field_elem)
+                        if isinstance(mel, list) and len(mel) > 0:
+                            mel = mel[0]
+                        break
+                    except (KeyError, TypeError):
+                        pass
+                    # Fallback: iterate items() looking for input_features
+                    try:
+                        for key, field_elem in kwargs_item.items():
+                            if "input_features" in str(key):
+                                mel = getattr(field_elem, "data", field_elem)
+                                if isinstance(mel, list) and len(mel) > 0:
+                                    mel = mel[0]
+                                break
+                    except (TypeError, AttributeError):
+                        pass
+                    if mel is not None:
+                        break
+                    # Last resort: if kwargs_item itself is a tensor
+                    if isinstance(kwargs_item, torch.Tensor):
+                        mel = kwargs_item
+                        break
+
+            if mel is None:
+                raise RuntimeError(
+                    f"Whisper prefill for request {req_id}: no audio features found. "
+                    f"mm_features={mm_data}"
+                )
+
+            if mel.dim() == 2:
+                mel = mel.unsqueeze(
+                    0
+                )  # [n_mels, n_audio_ctx] → [1, n_mels, n_audio_ctx]
+            mel = mel.to(dtype)
+
+            # Run encoder
+            audio_features = whisper_model.encoder(mel)
+
+            # Prepare decoder inputs (pad to n_text_ctx)
+            pad_mask = torch.zeros(1, n_text_ctx, dtype=torch.int32)
+            pad_mask[0, :seq_len] = 1
+            padded_tokens = torch.zeros(1, n_text_ctx, dtype=torch.int32)
+            padded_tokens[0, :seq_len] = tokens[0]
+            last_pos = torch.tensor([seq_len - 1], dtype=torch.int32)
+
+            # Run decoder prefill
+            logits = whisper_model.decoder(
+                padded_tokens, audio_features, last_pos, pad_mask
+            )
+            logits = logits[:, seq_len - 1, :]  # [1, vocab]
+
+            # Greedy sample
+            next_token = int(logits.argmax(dim=-1).item())
+            sampled_tokens.append([next_token])
+
+            # Cache state for decode
+            self._whisper_request_state[req_id] = {
+                "audio_features": audio_features,
+                "pad_mask": pad_mask.clone(),
+                "token_count": seq_len,
+                "last_sampled_token": next_token,
+            }
+
+        # Process cached requests (decode)
+        for req_id in cached_req_ids:
+            req_ids.append(req_id)
+            state = self._whisper_request_state.get(req_id)
+            if state is None:
+                raise RuntimeError(
+                    f"Whisper decode for request {req_id} without prior prefill"
+                )
+
+            # Use the last sampled token from the previous step
+            token_id = state["last_sampled_token"]
+            tokens = torch.tensor([[token_id]], dtype=torch.int32)
+
+            # Update pad_mask
+            pos = state["token_count"]
+            if pos < n_text_ctx:
+                state["pad_mask"][0, pos] = 1
+            state["token_count"] = pos + 1
+
+            last_pos = torch.tensor([pos], dtype=torch.int32)
+
+            # Run decoder decode
+            logits = whisper_model.decoder(
+                tokens, state["audio_features"].to(dtype), last_pos, state["pad_mask"]
+            )
+            logits = logits[:, -1, :]  # [1, vocab]
+
+            # Greedy sample
+            next_token = int(logits.argmax(dim=-1).item())
+            sampled_tokens.append([next_token])
+
+            # Store last sampled token for next decode step
+            state["last_sampled_token"] = next_token
+
+        # Build ModelRunnerOutput
+        req_id_to_index = {rid: idx for idx, rid in enumerate(req_ids)}
+
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=sampled_tokens,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=None,
+        )
+
     def _process_multi_modal_data_neuron(
         self, mm_data: list[MultiModalFeatureSpec]
     ) -> BatchedTensorInputs:
@@ -1100,6 +1310,10 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
                     mm_kwargs[k].append(v.data)
 
         logger.debug("mm_data in _process_multi_modal_data_neuron: %s", mm_kwargs)
+
+        # Whisper audio data: input_features (mel spectrogram) passes through directly
+        if self.model.architecture in NEURON_WHISPER_MODELS:
+            return mm_kwargs
 
         if self.model.model.config.model_type == "llava":
             mm_kwargs = self._process_multi_modal_data_neuron_llava(mm_kwargs)
@@ -1762,6 +1976,12 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         """Execute a dummy forward pass for engine initialization and warmup."""
         if self.model is None:
             logger.warning("Model is not loaded, skipping dummy run")
+            return
+
+        # Whisper models compile encoder + decoder NEFFs during load_weights().
+        # No dummy forward pass is needed (or possible — would require audio input).
+        if self.model.architecture in NEURON_WHISPER_MODELS:
+            logger.info("Skipping dummy run for Whisper model (compiled at load time)")
             return
 
         try:
