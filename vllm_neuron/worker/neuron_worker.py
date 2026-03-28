@@ -220,7 +220,21 @@ class NeuronWorker(WorkerBase):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         supported_tasks = list[GenerationTask]()
-        supported_tasks.append("generate")
+
+        # Check if the loaded model is Voxtral (supports both generate and transcription)
+        is_voxtral = False
+        if hasattr(self, "model_runner") and hasattr(self.model_runner, "model"):
+            from vllm_neuron.worker.constants import NEURON_VOXTRAL_MODELS
+
+            if hasattr(self.model_runner.model, "architecture"):
+                if self.model_runner.model.architecture in NEURON_VOXTRAL_MODELS:
+                    is_voxtral = True
+
+        if is_voxtral:
+            supported_tasks.append("generate")
+        else:
+            supported_tasks.append("generate")
+
         return supported_tasks
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

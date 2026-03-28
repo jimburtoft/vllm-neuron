@@ -55,6 +55,7 @@ from vllm.v1.sample import sampler as Sampler
 
 from vllm_neuron.worker.constants import (
     NEURON_MULTI_MODAL_MODELS,
+    NEURON_VOXTRAL_MODELS,
     TORCH_DTYPE_TO_NEURON_AMP,
 )
 
@@ -828,6 +829,95 @@ class NeuronQwen3VLForCausalLM(NeuronQwen2VLForCausalLM):
         return saved_path
 
 
+class NeuronVoxtralModel(NeuronModelBase):
+    """
+    Voxtral audio-language model for speech-to-text and audio understanding
+    on Neuron.
+
+    Wraps NeuronApplicationVoxtral from the NxDI contrib model. The application
+    manages three components internally:
+    - Audio encoder: torch_neuronx traced NEFF
+    - Projector: CPU nn.Module
+    - Text decoder: NxDI ImageToTextModelWrapper (Llama backbone)
+
+    The model uses NxDI's HuggingFaceGenerationAdapter for autoregressive
+    decoding, managing its own KV cache via compiled NEFFs. vLLM uses the
+    "attention-free" scheduling path (empty KV cache spec).
+    """
+
+    def __init__(self, config: PretrainedConfig) -> None:
+        super().__init__(config)
+        self.voxtral_app = None  # NeuronApplicationVoxtral instance
+
+    def forward(self, input_ids, input_block_ids, **kwargs):
+        """Not used directly -- the model runner calls the Voxtral execution path."""
+        raise NotImplementedError(
+            "NeuronVoxtralModel.forward() should not be called directly. "
+            "Use _execute_model_for_voxtral() in the model runner instead."
+        )
+
+    def sample(self, logits: torch.Tensor) -> SamplerOutput | None:
+        raise RuntimeError(
+            "CPU sampling should be handled by the model runner, not the model."
+        )
+
+    def load_weights(self, model_name_or_path: str, architecture: str, **kwargs):
+        """
+        Load and compile Voxtral model using NeuronApplicationVoxtral from
+        the NxDI contrib.
+        """
+        from modeling_voxtral import NeuronApplicationVoxtral
+
+        neuron_config_dict = kwargs.get("neuron_config", {})
+        tp_degree = neuron_config_dict.get("tp_degree", 1)
+        seq_len = neuron_config_dict.get("seq_len", 2048)
+        n_positions = neuron_config_dict.get("n_positions", 4096)
+        dtype = neuron_config_dict.get("torch_dtype", torch.bfloat16)
+
+        self.voxtral_app = NeuronApplicationVoxtral(
+            model_path=model_name_or_path,
+            tp_degree=tp_degree,
+            seq_len=seq_len,
+            n_positions=n_positions,
+            dtype=dtype,
+        )
+
+        # Check for pre-compiled artifacts
+        compiled_path = os.getenv("NEURON_COMPILED_ARTIFACTS")
+        if compiled_path and os.path.exists(
+            os.path.join(compiled_path, "text_decoder", "text_model", "model.pt")
+        ):
+            logger.info("Loading pre-compiled Voxtral from %s", compiled_path)
+            self.voxtral_app.load(compiled_path)
+        else:
+            # Compile from scratch
+            if not compiled_path:
+                config_hash = hashlib.md5(
+                    f"{tp_degree}_{seq_len}_{n_positions}_{dtype}".encode()
+                ).hexdigest()[:12]
+                compiled_path = os.path.join(
+                    "local-models",
+                    model_name_or_path.replace("/", "_"),
+                    "neuron-compiled-artifacts",
+                    config_hash,
+                )
+            os.makedirs(compiled_path, exist_ok=True)
+
+            logger.info("Compiling Voxtral model to %s", compiled_path)
+            self.voxtral_app.compile(compiled_path)
+            self.voxtral_app.load(compiled_path)
+
+        # Store reference for downstream access
+        self.model = self.voxtral_app
+        logger.info("Voxtral model loaded successfully")
+        return True, compiled_path
+
+    def get_kv_caches(self):
+        # Voxtral manages its own KV cache via NxDI's compiled NEFFs.
+        # Return empty list since vLLM's KV cache management does not apply.
+        return []
+
+
 class NeuronLlama4ForCausalLM(NeuronMultiModalCausalLM):
     def __init__(self, config):
         super().__init__(config)
@@ -899,6 +989,24 @@ def _get_model_configs(config: PretrainedConfig) -> str:
     if not archs:
         raise ValueError("No architectures specified in the pretrained config.")
     architecture = archs[0]
+
+    # Voxtral has a nested config: text_config contains the Llama backbone config
+    if architecture in NEURON_VOXTRAL_MODELS:
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+            h_dim = getattr(text_config, "head_dim", None)
+            if not h_dim:
+                n_heads = getattr(text_config, "num_attention_heads", None)
+                h_size = getattr(text_config, "hidden_size", None)
+                if n_heads and h_size:
+                    h_dim = h_size // n_heads
+            if num_kv_heads and h_dim:
+                return architecture, int(num_kv_heads), int(h_dim)
+        raise ValueError(
+            "Voxtral config missing text_config with num_key_value_heads or hidden_size."
+        )
+
     if architecture in NEURON_MULTI_MODAL_MODELS:
         config = getattr(config, "text_config", None)
     num_key_value_heads = getattr(config, "num_key_value_heads", None)
@@ -994,6 +1102,27 @@ def get_neuron_model(
     architecture, num_key_value_heads, head_dim = _get_model_configs(
         model_config.hf_config
     )
+
+    # Voxtral uses a completely different model architecture (encoder + projector + decoder)
+    # with its own compilation and loading pipeline via NeuronApplicationVoxtral.
+    if architecture in NEURON_VOXTRAL_MODELS:
+        model = NeuronVoxtralModel(model_config.hf_config)
+        neuron_config_dict = {
+            "tp_degree": parallel_config.tensor_parallel_size,
+            "torch_dtype": model_config.dtype,
+            "seq_len": min(model_config.max_model_len, 2048),
+            "n_positions": model_config.max_model_len,
+        }
+        model.load_weights(
+            model_name_or_path=model_config.model,
+            architecture=architecture,
+            neuron_config=neuron_config_dict,
+        )
+        model.neuron_config = None  # Voxtral manages its own config
+        model.architecture = architecture
+        model.num_key_value_heads = num_key_value_heads
+        model.head_dim = head_dim
+        return model.eval()
 
     if architecture == "LlavaForConditionalGeneration":
         model = NeuronPixtralForCausalLM(model_config.hf_config)
