@@ -44,7 +44,6 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm_neuron.worker.constants import (
     NEURON_MULTI_MODAL_MODELS,
-    NEURON_VOXTRAL_MODELS,
 )
 from vllm_neuron.worker.neuronx_distributed_model_loader import get_neuron_model
 from vllm_neuron.worker.utils import get_num_layers_from_hf_config
@@ -192,8 +191,6 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         # For deferred sampling (structured outputs)
         self._cached_logits: Optional[torch.Tensor] = None
         self._cached_model_input: Optional[ModelInputForNeuron] = None
-        # For Voxtral: pre-computed ModelRunnerOutput returned by sample_tokens()
-        self._cached_voxtral_output: Optional[ModelRunnerOutput] = None
 
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -204,21 +201,12 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         Handles both on-device (hardware) sampling and CPU sampling.
         Note: Structured outputs (grammar bitmask) is only supported with CPU sampling.
 
-        For Voxtral: returns the pre-computed ModelRunnerOutput from
-        _execute_model_for_voxtral() without any sampling.
-
         Args:
             grammar_output: Contains grammar_bitmask and request IDs for
                         structured output requests. None if no constraints.
         Returns:
             ModelRunnerOutput with sampled tokens
         """
-        # Voxtral path: execute_model() already computed the full output
-        if self._cached_voxtral_output is not None:
-            output = self._cached_voxtral_output
-            self._cached_voxtral_output = None
-            return output
-
         sample_start = time.perf_counter()
 
         if self._cached_logits is None:
@@ -717,23 +705,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         Execute model forward pass.
 
         Returns None to defer sampling to sample_tokens().
-        For Voxtral: caches the self-contained ModelRunnerOutput for
-        sample_tokens() to return, and returns None.
         """
-        # Voxtral uses a completely separate execution path that bypasses
-        # _update_states and _prepare_model_input (which assume KV cache
-        # block management). Voxtral manages its own KV cache via NxDI's
-        # compiled NEFFs and HuggingFaceGenerationAdapter.
-        if self.model.architecture in NEURON_VOXTRAL_MODELS:
-            voxtral_output = self._execute_model_for_voxtral(scheduler_output)
-            if not scheduler_output.total_num_scheduled_tokens:
-                # No work to do (cleanup step) -- return directly since the
-                # engine won't call sample_tokens() when model_executed=False
-                return voxtral_output
-            # Cache for sample_tokens() to return
-            self._cached_voxtral_output = voxtral_output
-            return None
-
         execute_start = time.perf_counter()
         batch_size = len(scheduler_output.scheduled_new_reqs) + len(
             scheduler_output.scheduled_cached_reqs.req_ids
@@ -928,12 +900,6 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
-        # Voxtral manages its own KV cache internally via NxDI compiled NEFFs.
-        # Return empty spec to use vLLM attention-free code path
-        # (no block allocation, trivial scheduling).
-        if self.model.architecture in NEURON_VOXTRAL_MODELS:
-            return {}
-
         # Get number of layers from model config
         num_layers = get_num_layers_from_hf_config(self.model_config.hf_config)
 
@@ -967,10 +933,6 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
             self.requests.pop(req_id, None)
             if self.lora_config is not None:
                 self.lora_manager.remove_req_id(req_id)
-
-            # Clean up Voxtral per-request state (encoder cache, etc.)
-            if hasattr(self, "_voxtral_request_state"):
-                self._voxtral_request_state.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -1121,145 +1083,6 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         hidden_states = self.model.execute_model(model_input)
         return hidden_states
 
-    def _execute_model_for_voxtral(
-        self,
-        scheduler_output: "SchedulerOutput",
-    ) -> ModelRunnerOutput:
-        """Self-contained Voxtral execution that bypasses standard batch management.
-
-        Voxtral uses NeuronApplicationVoxtral which runs full generation
-        internally via HuggingFaceGenerationAdapter. This method handles the
-        full pipeline: scheduling -> model forward -> output construction.
-
-        For new requests (prefill): runs full generation (audio + text or text-only)
-        For cached requests (decode): continues generation token by token
-        """
-        if not hasattr(self, "_voxtral_request_state"):
-            self._voxtral_request_state = {}
-
-        voxtral_app = self.model.voxtral_app
-
-        # Clean up finished requests
-        for req_id in scheduler_output.finished_req_ids:
-            self._voxtral_request_state.pop(req_id, None)
-
-        if not scheduler_output.total_num_scheduled_tokens:
-            return EMPTY_MODEL_RUNNER_OUTPUT
-
-        # Collect request info
-        new_reqs = scheduler_output.scheduled_new_reqs
-        cached_req_ids = list(scheduler_output.scheduled_cached_reqs.req_ids)
-
-        req_ids = []
-        sampled_tokens = []
-
-        # Process new requests (full generation)
-        for new_req in new_reqs:
-            req_id = new_req.req_id
-            req_ids.append(req_id)
-
-            # Extract token IDs
-            token_ids = new_req.prompt_token_ids
-            if hasattr(new_req, "output_token_ids") and new_req.output_token_ids:
-                token_ids = list(token_ids) + list(new_req.output_token_ids)
-
-            input_ids = torch.tensor([token_ids], dtype=torch.long)
-            attention_mask = torch.ones_like(input_ids)
-            seq_len_actual = input_ids.shape[1]
-
-            # Check for audio features in multimodal data
-            mm_data = new_req.mm_features
-            input_features = None
-            if mm_data:
-                for mm_spec in mm_data:
-                    kwargs_item = getattr(mm_spec, "data", None)
-                    if kwargs_item is None:
-                        continue
-                    try:
-                        field_elem = kwargs_item["input_features"]
-                        input_features = getattr(field_elem, "data", field_elem)
-                        if isinstance(input_features, list) and len(input_features) > 0:
-                            input_features = input_features[0]
-                        break
-                    except (KeyError, TypeError):
-                        pass
-                    try:
-                        for key, field_elem in kwargs_item.items():
-                            if "input_features" in str(key):
-                                input_features = getattr(field_elem, "data", field_elem)
-                                if (
-                                    isinstance(input_features, list)
-                                    and len(input_features) > 0
-                                ):
-                                    input_features = input_features[0]
-                                break
-                    except (TypeError, AttributeError):
-                        pass
-                    if input_features is not None:
-                        break
-
-            # Run generation
-            if input_features is not None:
-                # Audio + text generation
-                output_ids = voxtral_app.generate_with_audio(
-                    input_ids, attention_mask, input_features, max_new_tokens=500
-                )
-            else:
-                # Text-only generation
-                output_ids = voxtral_app.generate_text_only(
-                    input_ids, attention_mask, max_new_tokens=500
-                )
-
-            # Extract generated tokens
-            new_tokens = output_ids[0, seq_len_actual:].tolist()
-
-            # For vLLM: return first token now, cache rest for decode steps
-            if len(new_tokens) > 0:
-                sampled_tokens.append([new_tokens[0]])
-                self._voxtral_request_state[req_id] = {
-                    "generated_tokens": new_tokens,
-                    "current_idx": 1,  # next token to return
-                }
-            else:
-                # EOS immediately
-                sampled_tokens.append([voxtral_app.tokenizer.eos_token_id or 2])
-                self._voxtral_request_state[req_id] = {
-                    "generated_tokens": [],
-                    "current_idx": 0,
-                }
-
-        # Process cached requests (return next pre-generated token)
-        for req_id in cached_req_ids:
-            req_ids.append(req_id)
-            state = self._voxtral_request_state.get(req_id)
-            if state is None:
-                # Should not happen, but handle gracefully
-                sampled_tokens.append([2])  # EOS
-                continue
-
-            idx = state["current_idx"]
-            tokens = state["generated_tokens"]
-            if idx < len(tokens):
-                sampled_tokens.append([tokens[idx]])
-                state["current_idx"] = idx + 1
-            else:
-                # All tokens returned, signal EOS
-                eos_id = voxtral_app.tokenizer.eos_token_id or 2
-                sampled_tokens.append([eos_id])
-
-        # Build ModelRunnerOutput
-        req_id_to_index = {rid: idx for idx, rid in enumerate(req_ids)}
-
-        return ModelRunnerOutput(
-            req_ids=req_ids,
-            req_id_to_index=req_id_to_index,
-            sampled_token_ids=sampled_tokens,
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[],
-            kv_connector_output=None,
-        )
-
     def _process_multi_modal_data_neuron(
         self, mm_data: list[MultiModalFeatureSpec]
     ) -> BatchedTensorInputs:
@@ -1280,11 +1103,11 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
 
         logger.debug("mm_data in _process_multi_modal_data_neuron: %s", mm_kwargs)
 
-        # Voxtral audio data: input_features (mel spectrogram) passes through directly
-        if self.model.architecture in NEURON_VOXTRAL_MODELS:
-            return mm_kwargs
-
-        if self.model.model.config.model_type == "llava":
+        # Check architecture-based models first (their NxDI configs may not
+        # have a model_type attribute, so we must guard before accessing it).
+        if self.model.architecture == "VoxtralForConditionalGeneration":
+            pass  # Voxtral audio data (input_features) passes through directly
+        elif self.model.model.config.model_type == "llava":
             mm_kwargs = self._process_multi_modal_data_neuron_llava(mm_kwargs)
         elif self.model.model.config.model_type == "qwen2_vl":
             mm_kwargs = self._process_multi_modal_data_neuron_qwen2_vl(mm_kwargs)
@@ -1945,12 +1768,6 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         """Execute a dummy forward pass for engine initialization and warmup."""
         if self.model is None:
             logger.warning("Model is not loaded, skipping dummy run")
-            return
-
-        # Voxtral compiles encoder + decoder NEFFs during load_weights().
-        # No dummy forward pass is needed (or possible -- would require audio input).
-        if self.model.architecture in NEURON_VOXTRAL_MODELS:
-            logger.info("Skipping dummy run for Voxtral model (compiled at load time)")
             return
 
         try:

@@ -7,9 +7,6 @@ NEURON_MULTI_MODAL_MODELS = [
     "Llama4ForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
-]
-
-NEURON_VOXTRAL_MODELS = [
     "VoxtralForConditionalGeneration",
 ]
 

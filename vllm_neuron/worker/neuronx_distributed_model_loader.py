@@ -55,7 +55,6 @@ from vllm.v1.sample import sampler as Sampler
 
 from vllm_neuron.worker.constants import (
     NEURON_MULTI_MODAL_MODELS,
-    NEURON_VOXTRAL_MODELS,
     TORCH_DTYPE_TO_NEURON_AMP,
 )
 
@@ -829,55 +828,79 @@ class NeuronQwen3VLForCausalLM(NeuronQwen2VLForCausalLM):
         return saved_path
 
 
-class NeuronVoxtralModel(NeuronModelBase):
-    """
-    Voxtral audio-language model for speech-to-text and audio understanding
-    on Neuron.
+class NeuronVoxtralForCausalLM(NeuronMultiModalCausalLM):
+    """Voxtral audio-language model using the standard multimodal pattern.
 
-    Wraps NeuronApplicationVoxtral from the NxDI contrib model. The application
-    manages three components internally:
-    - Audio encoder: torch_neuronx traced NEFF
-    - Projector: CPU nn.Module
-    - Text decoder: NxDI ImageToTextModelWrapper (Llama backbone)
+    Uses VoxtralForCausalLM from the NxDI contrib for the text decoder
+    (NeuronBaseForImageToText with Llama backbone). The audio encoder
+    (torch_neuronx traced NEFF) and projector (CPU nn.Module) are managed
+    here on the vLLM side.
 
-    The model uses NxDI's HuggingFaceGenerationAdapter for autoregressive
-    decoding, managing its own KV cache via compiled NEFFs. vLLM uses the
-    "attention-free" scheduling path (empty KV cache spec).
+    This follows the same pattern as NeuronPixtralForCausalLM:
+    - execute_model() extracts multimodal data and runs audio pipeline
+    - forward() passes vision_embeddings and vision_mask to the NxDI model
+    - NxDI routes to CTE (prefill) or TKG (decode) internally
     """
+
+    AUDIO_TOKEN_ID = 24
+    AUDIO_INTERMEDIATE_SIZE = 5120
 
     def __init__(self, config: PretrainedConfig) -> None:
         super().__init__(config)
-        self.voxtral_app = None  # NeuronApplicationVoxtral instance
+        self.audio_encoder = None  # torch_neuronx traced NEFF
+        self.projector = None  # CPU nn.Module
 
-    def forward(self, input_ids, input_block_ids, **kwargs):
-        """Not used directly -- the model runner calls the Voxtral execution path."""
-        raise NotImplementedError(
-            "NeuronVoxtralModel.forward() should not be called directly. "
-            "Use _execute_model_for_voxtral() in the model runner instead."
-        )
+    def _save_pretrained_model(self, model_name: str):
+        """Save full Voxtral model (needed for weight extraction)."""
+        from transformers import VoxtralForConditionalGeneration
 
-    def sample(self, logits: torch.Tensor) -> SamplerOutput | None:
-        raise RuntimeError(
-            "CPU sampling should be handled by the model runner, not the model."
-        )
+        hf_model = VoxtralForConditionalGeneration.from_pretrained(model_name)
+        saved_path = os.path.join("local-models", model_name)
+        hf_model.save_pretrained(saved_path)
+        return saved_path
 
     def load_weights(self, model_name_or_path: str, architecture: str, **kwargs):
+        """Load Voxtral model using NxDI contrib VoxtralForCausalLM.
+
+        This handles:
+        1. Text weight extraction (Llama backbone from full model)
+        2. NxDI text decoder compile/load via VoxtralForCausalLM
+        3. Audio encoder tracing via torch_neuronx
+        4. Projector loading on CPU
+
+        The NxDI contrib classes (VoxtralForCausalLM, VoxtralInferenceConfig,
+        NeuronApplicationVoxtral) must be importable (add contrib src/ to
+        sys.path at runtime).
         """
-        Load and compile Voxtral model using NeuronApplicationVoxtral from
-        the NxDI contrib.
-        """
-        from modeling_voxtral import NeuronApplicationVoxtral
+        from modeling_voxtral import (
+            NeuronApplicationVoxtral,
+            VoxtralForCausalLM as NxDIVoxtralForCausalLM,
+        )
 
         neuron_config_dict = kwargs.get("neuron_config", {})
+        override_neuron_config = kwargs.get("override_neuron_config", {})
         tp_degree = neuron_config_dict.get("tp_degree", 1)
         seq_len = neuron_config_dict.get("seq_len", 2048)
-        n_positions = neuron_config_dict.get("n_positions", 4096)
+        n_positions = neuron_config_dict.get(
+            "n_positions", neuron_config_dict.get("seq_len", 4096)
+        )
         dtype = neuron_config_dict.get("torch_dtype", torch.bfloat16)
+        # Map string dtype to torch dtype if needed
+        if isinstance(dtype, str):
+            dtype_map = {
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+                "float32": torch.float32,
+            }
+            dtype = dtype_map.get(dtype, torch.bfloat16)
 
-        self.voxtral_app = NeuronApplicationVoxtral(
+        # Use NeuronApplicationVoxtral to manage the full compile/load pipeline.
+        # It handles text weight extraction, audio encoder tracing, projector
+        # loading, and NxDI text decoder compile/load internally.
+        app = NeuronApplicationVoxtral(
             model_path=model_name_or_path,
             tp_degree=tp_degree,
-            seq_len=seq_len,
+            seq_len=min(seq_len, 2048),  # Voxtral seq_len cap
             n_positions=n_positions,
             dtype=dtype,
         )
@@ -888,7 +911,7 @@ class NeuronVoxtralModel(NeuronModelBase):
             os.path.join(compiled_path, "text_decoder", "text_model", "model.pt")
         ):
             logger.info("Loading pre-compiled Voxtral from %s", compiled_path)
-            self.voxtral_app.load(compiled_path)
+            app.load(compiled_path)
         else:
             # Compile from scratch
             if not compiled_path:
@@ -902,20 +925,150 @@ class NeuronVoxtralModel(NeuronModelBase):
                     config_hash,
                 )
             os.makedirs(compiled_path, exist_ok=True)
-
             logger.info("Compiling Voxtral model to %s", compiled_path)
-            self.voxtral_app.compile(compiled_path)
-            self.voxtral_app.load(compiled_path)
+            app.compile(compiled_path)
+            app.load(compiled_path)
 
-        # Store reference for downstream access
-        self.model = self.voxtral_app
-        logger.info("Voxtral model loaded successfully")
+        # Store the NxDI VoxtralForCausalLM (NeuronBaseForImageToText) as
+        # self.model — this is what NeuronMultiModalCausalLM.forward() calls.
+        self.model = app.vl_model
+
+        # Store audio encoder and projector on this vLLM model class
+        self.audio_encoder = app.audio_encoder
+        self.projector = app.projector
+        self._dtype = dtype
+
+        # Store text config info for vision arg construction
+        text_config = app.full_config.get("text_config", app.full_config)
+        self._text_hidden_size = text_config.get("hidden_size", 3072)
+        self._seq_len = app.seq_len
+        self._audio_token_id = app.audio_token_id
+
+        logger.info(
+            "Voxtral model loaded successfully via NeuronMultiModalCausalLM pattern"
+        )
         return True, compiled_path
 
-    def get_kv_caches(self):
-        # Voxtral manages its own KV cache via NxDI's compiled NEFFs.
-        # Return empty list since vLLM's KV cache management does not apply.
-        return []
+    def _run_audio_pipeline(self, input_features: torch.Tensor) -> torch.Tensor:
+        """Run audio through encoder -> reshape -> projector.
+
+        Args:
+            input_features: Mel spectrogram [1, 128, 3000] or [128, 3000].
+
+        Returns:
+            Projected embeddings [1, 375, hidden_size].
+        """
+        if input_features.dim() == 2:
+            input_features = input_features.unsqueeze(0)
+
+        with torch.no_grad():
+            enc_output = self.audio_encoder(input_features.to(self._dtype))
+
+        if isinstance(enc_output, dict):
+            audio_hidden = enc_output.get(
+                "last_hidden_state", list(enc_output.values())[0]
+            )
+        elif isinstance(enc_output, tuple):
+            audio_hidden = enc_output[0]
+        else:
+            audio_hidden = enc_output
+
+        # Reshape: [1, 1500, 1280] -> [375, 5120]
+        audio_hidden_flat = audio_hidden.reshape(-1, self.AUDIO_INTERMEDIATE_SIZE)
+
+        # Projector on CPU
+        with torch.no_grad():
+            audio_embeds = self.projector(audio_hidden_flat)
+
+        return audio_embeds
+
+    def execute_model(self, model_input):
+        """Extract audio features and run the audio pipeline during prefill.
+
+        For prefill with audio: runs encoder + projector, constructs
+        vision_embeddings and vision_mask, passes to NxDI model.
+        For decode or text-only: passes dummy vision args.
+        """
+        from neuronx_distributed_inference.models.llama4.utils.encoder_utils import (
+            generate_positions_from_mask,
+            pad_positions,
+            pad_vision_embeddings,
+        )
+
+        input_features = None
+        if (
+            model_input.multi_modal_kwargs is not None
+            and model_input.multi_modal_kwargs.get("input_features") is not None
+        ):
+            input_features = model_input.multi_modal_kwargs["input_features"]
+            if isinstance(input_features, list) and len(input_features) > 0:
+                input_features = input_features[0]
+
+        is_prefill = model_input.input_tokens.shape[-1] > 1
+        vision_embeddings = None
+        vision_mask = None
+
+        if input_features is not None and is_prefill:
+            # Run audio pipeline: encoder -> reshape -> projector
+            audio_embeds = self._run_audio_pipeline(input_features)
+            audio_embeds_3d = audio_embeds.unsqueeze(0).to(self._dtype)
+
+            # Construct vision_mask from audio token positions in input_ids
+            audio_positions = (
+                model_input.input_tokens == self._audio_token_id
+            ).squeeze(0)
+            vision_mask = generate_positions_from_mask(audio_positions)
+
+            # Pad to text bucket size
+            pad_limit = model_input.input_tokens.shape[-1]
+            vision_mask = pad_positions(vision_mask, pad_limit, pad_limit - 1)
+            vision_embeddings = pad_vision_embeddings(audio_embeds_3d, pad_limit)
+
+        hidden_states = self.forward(
+            input_ids=model_input.input_tokens,
+            positions=model_input.position_ids,
+            input_block_ids=model_input.input_block_ids,
+            sampling_params=model_input.sampling_params,
+            vision_embeddings=vision_embeddings,
+            vision_mask=vision_mask,
+        )
+        return hidden_states
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_block_ids: torch.Tensor,
+        sampling_params: torch.Tensor,
+        vision_embeddings: torch.Tensor | None = None,
+        vision_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Forward pass routing to NxDI's CTE (prefill) or TKG (decode)."""
+        with self._reordered(
+            input_block_ids,
+            input_ids=input_ids,
+            positions=positions,
+            sampling_params=sampling_params,
+            vision_embeddings=vision_embeddings,
+            vision_mask=vision_mask,
+        ) as (sorted_ids, inputs, restore):
+            output = self.model(
+                inputs["input_ids"].to(torch.int32),
+                attention_mask=None,
+                position_ids=inputs["positions"].to(torch.int32),
+                seq_ids=sorted_ids.flatten().to(torch.int32),
+                sampling_params=inputs["sampling_params"],
+                vision_embeddings=inputs.get("vision_embeddings"),
+                vision_mask=inputs.get("vision_mask"),
+            )
+
+            if self.model.config.neuron_config.on_device_sampling_config:
+                output = output.hidden_states
+            else:
+                output = output.logits[:, -1, :]
+
+            return restore(output)
 
 
 class NeuronLlama4ForCausalLM(NeuronMultiModalCausalLM):
@@ -989,23 +1142,6 @@ def _get_model_configs(config: PretrainedConfig) -> str:
     if not archs:
         raise ValueError("No architectures specified in the pretrained config.")
     architecture = archs[0]
-
-    # Voxtral has a nested config: text_config contains the Llama backbone config
-    if architecture in NEURON_VOXTRAL_MODELS:
-        text_config = getattr(config, "text_config", None)
-        if text_config is not None:
-            num_kv_heads = getattr(text_config, "num_key_value_heads", None)
-            h_dim = getattr(text_config, "head_dim", None)
-            if not h_dim:
-                n_heads = getattr(text_config, "num_attention_heads", None)
-                h_size = getattr(text_config, "hidden_size", None)
-                if n_heads and h_size:
-                    h_dim = h_size // n_heads
-            if num_kv_heads and h_dim:
-                return architecture, int(num_kv_heads), int(h_dim)
-        raise ValueError(
-            "Voxtral config missing text_config with num_key_value_heads or hidden_size."
-        )
 
     if architecture in NEURON_MULTI_MODAL_MODELS:
         config = getattr(config, "text_config", None)
@@ -1103,27 +1239,6 @@ def get_neuron_model(
         model_config.hf_config
     )
 
-    # Voxtral uses a completely different model architecture (encoder + projector + decoder)
-    # with its own compilation and loading pipeline via NeuronApplicationVoxtral.
-    if architecture in NEURON_VOXTRAL_MODELS:
-        model = NeuronVoxtralModel(model_config.hf_config)
-        neuron_config_dict = {
-            "tp_degree": parallel_config.tensor_parallel_size,
-            "torch_dtype": model_config.dtype,
-            "seq_len": min(model_config.max_model_len, 2048),
-            "n_positions": model_config.max_model_len,
-        }
-        model.load_weights(
-            model_name_or_path=model_config.model,
-            architecture=architecture,
-            neuron_config=neuron_config_dict,
-        )
-        model.neuron_config = None  # Voxtral manages its own config
-        model.architecture = architecture
-        model.num_key_value_heads = num_key_value_heads
-        model.head_dim = head_dim
-        return model.eval()
-
     if architecture == "LlavaForConditionalGeneration":
         model = NeuronPixtralForCausalLM(model_config.hf_config)
     elif architecture == "Llama4ForConditionalGeneration":
@@ -1132,6 +1247,8 @@ def get_neuron_model(
         model = NeuronQwen2VLForCausalLM(model_config.hf_config)
     elif architecture == "Qwen3VLForConditionalGeneration":
         model = NeuronQwen3VLForCausalLM(model_config.hf_config)
+    elif architecture == "VoxtralForConditionalGeneration":
+        model = NeuronVoxtralForCausalLM(model_config.hf_config)
     else:
         model = NeuronCausalLM(model_config.hf_config)
 
