@@ -42,6 +42,20 @@ from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
 from neuronx_distributed_inference.utils.constants import MODEL_TYPES
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 from transformers import AutoModelForCausalLM, PretrainedConfig
+
+# Register Nemotron contrib model if available on sys.path
+if "nemotron_h" not in MODEL_TYPES:
+    try:
+        from modeling_nemotron_h import NeuronNemotronForCausalLM
+
+        MODEL_TYPES["nemotron_h"] = {"causal-lm": NeuronNemotronForCausalLM}
+        logging.getLogger(__name__).info(
+            "Registered Nemotron-3-Nano contrib model in MODEL_TYPES"
+        )
+    except ImportError:
+        logging.getLogger(__name__).debug(
+            "Nemotron contrib model not found on sys.path, skipping registration"
+        )
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -969,6 +983,9 @@ def _get_neuron_model_cls(architecture: str):
 
             if model == "qwen3vl":
                 model = "qwen3_vl"
+
+            if model == "nemotronh":
+                model = "nemotron_h"
 
             if architecture == "LlavaForConditionalGeneration":
                 model = "pixtral"
