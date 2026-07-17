@@ -209,9 +209,15 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         sample_start = time.perf_counter()
 
         if self._cached_logits is None:
-            raise RuntimeError(
-                "sample_tokens() called without prior execute_model(). Logits must be cached first."
+            # execute_model returned EMPTY_MODEL_RUNNER_OUTPUT because there
+            # were no scheduled tokens on the previous step (e.g., an empty
+            # scheduler step during batch bucket transitions). Return an empty
+            # output rather than crashing the engine.
+            logger.debug(
+                "sample_tokens() called without cached logits; "
+                "returning EMPTY_MODEL_RUNNER_OUTPUT"
             )
+            return EMPTY_MODEL_RUNNER_OUTPUT
 
         hidden_states = self._cached_logits
         model_input = self._cached_model_input
