@@ -894,6 +894,18 @@ class NeuronVoxtralForCausalLM(NeuronMultiModalCausalLM):
             }
             dtype = dtype_map.get(dtype, torch.bfloat16)
 
+        # Voxtral optimisations discovered post-initial-onboarding.  Both
+        # are safe defaults on trn2.3xlarge; a caller can opt out via
+        # override_neuron_config if needed for A/B testing.
+        on_device_sampling = bool(override_neuron_config.get(
+            "on_device_sampling",
+            neuron_config_dict.get("on_device_sampling", True),
+        ))
+        move_trace_to_device = bool(override_neuron_config.get(
+            "move_trace_to_device",
+            neuron_config_dict.get("move_trace_to_device", True),
+        ))
+
         # Use NeuronApplicationVoxtral to manage the full compile/load pipeline.
         # It handles text weight extraction, audio encoder tracing, projector
         # loading, and NxDI text decoder compile/load internally.
@@ -903,6 +915,8 @@ class NeuronVoxtralForCausalLM(NeuronMultiModalCausalLM):
             seq_len=min(seq_len, 2048),  # Voxtral seq_len cap
             n_positions=n_positions,
             dtype=dtype,
+            on_device_sampling=on_device_sampling,
+            move_trace_to_device=move_trace_to_device,
         )
 
         # Check for pre-compiled artifacts
@@ -916,7 +930,9 @@ class NeuronVoxtralForCausalLM(NeuronMultiModalCausalLM):
             # Compile from scratch
             if not compiled_path:
                 config_hash = hashlib.md5(
-                    f"{tp_degree}_{seq_len}_{n_positions}_{dtype}".encode()
+                    f"{tp_degree}_{seq_len}_{n_positions}_{dtype}_"
+                    f"ods{int(on_device_sampling)}_"
+                    f"mtd{int(move_trace_to_device)}".encode()
                 ).hexdigest()[:12]
                 compiled_path = os.path.join(
                     "local-models",
