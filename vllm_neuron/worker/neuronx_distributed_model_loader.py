@@ -952,6 +952,10 @@ class NeuronVoxtralForCausalLM(NeuronMultiModalCausalLM):
         # Store audio encoder and projector on this vLLM model class
         self.audio_encoder = app.audio_encoder
         self.projector = app.projector
+        # Store the HF checkpoint path so execute_model can lazily load an
+        # `AutoFeatureExtractor` from it when vLLM 0.16+ passes raw waveforms
+        # (audio_arrays) instead of pre-computed input_features.
+        self._model_path = model_name_or_path
         self._dtype = dtype
 
         # Store text config info for vision arg construction
@@ -1004,6 +1008,12 @@ class NeuronVoxtralForCausalLM(NeuronMultiModalCausalLM):
         For prefill with audio: runs encoder + projector, constructs
         vision_embeddings and vision_mask, passes to NxDI model.
         For decode or text-only: passes dummy vision args.
+
+        The multi_modal_kwargs dict is expected to contain either
+        `input_features` (pre-computed log-mel spectrograms; older
+        vLLM API) or `audio_arrays` (raw 16 kHz mono float waveforms;
+        vLLM 0.16.0+).  In the latter case we lazily attach a HF
+        `WhisperFeatureExtractor` and convert on the CPU per request.
         """
         from neuronx_distributed_inference.models.llama4.utils.encoder_utils import (
             generate_positions_from_mask,
@@ -1012,31 +1022,71 @@ class NeuronVoxtralForCausalLM(NeuronMultiModalCausalLM):
         )
 
         input_features = None
-        if (
-            model_input.multi_modal_kwargs is not None
-            and model_input.multi_modal_kwargs.get("input_features") is not None
-        ):
-            input_features = model_input.multi_modal_kwargs["input_features"]
-            if isinstance(input_features, list) and len(input_features) > 0:
-                input_features = input_features[0]
+        if model_input.multi_modal_kwargs is not None:
+            mm = model_input.multi_modal_kwargs
+            if mm.get("input_features") is not None:
+                input_features = mm["input_features"]
+                if isinstance(input_features, list) and len(input_features) > 0:
+                    input_features = input_features[0]
+            elif mm.get("audio_arrays") is not None:
+                if not hasattr(self, "_feature_extractor"):
+                    from transformers import AutoFeatureExtractor
+                    self._feature_extractor = AutoFeatureExtractor.from_pretrained(
+                        self._model_path
+                    )
+                audio_arrays = mm["audio_arrays"]
+                # Normalise nesting: BatchedTensorInputs may deliver either a
+                # list of 1D tensors or a single stacked tensor.
+                if isinstance(audio_arrays, list) and len(audio_arrays) > 0:
+                    audio_arrays = audio_arrays[0]
+                if isinstance(audio_arrays, list):
+                    features_list = []
+                    for wave in audio_arrays:
+                        wave_np = (wave.detach().cpu().float().numpy()
+                                   if hasattr(wave, "detach") else wave)
+                        feats = self._feature_extractor(
+                            wave_np, sampling_rate=16000, return_tensors="pt",
+                        )
+                        features_list.append(feats["input_features"])
+                    input_features = torch.cat(features_list, dim=0)
+                else:
+                    wave = audio_arrays
+                    wave_np = (wave.detach().cpu().float().numpy()
+                               if hasattr(wave, "detach") else wave)
+                    if wave_np.ndim == 2:
+                        features_list = []
+                        for i in range(wave_np.shape[0]):
+                            feats = self._feature_extractor(
+                                wave_np[i], sampling_rate=16000, return_tensors="pt",
+                            )
+                            features_list.append(feats["input_features"])
+                        input_features = torch.cat(features_list, dim=0)
+                    else:
+                        feats = self._feature_extractor(
+                            wave_np, sampling_rate=16000, return_tensors="pt",
+                        )
+                        input_features = feats["input_features"]
 
         is_prefill = model_input.input_tokens.shape[-1] > 1
         vision_embeddings = None
         vision_mask = None
 
         if input_features is not None and is_prefill:
-            # Run audio pipeline: encoder -> reshape -> projector
+            # Run audio pipeline: encoder -> reshape -> projector.
             audio_embeds = self._run_audio_pipeline(input_features)
             audio_embeds_3d = audio_embeds.unsqueeze(0).to(self._dtype)
 
-            # Construct vision_mask from audio token positions in input_ids
+            # Construct vision_mask from audio token positions in input_ids.
             audio_positions = (
                 model_input.input_tokens == self._audio_token_id
             ).squeeze(0)
             vision_mask = generate_positions_from_mask(audio_positions)
 
-            # Pad to text bucket size
-            pad_limit = model_input.input_tokens.shape[-1]
+            # Pad to the compiled CTE bucket size (self._seq_len), not the
+            # runtime input_tokens length -- the NxDI text decoder was traced
+            # with a fixed seq_len and expects vision_mask / vision_embeddings
+            # of that exact shape even when the actual prompt is shorter.
+            pad_limit = self._seq_len
             vision_mask = pad_positions(vision_mask, pad_limit, pad_limit - 1)
             vision_embeddings = pad_vision_embeddings(audio_embeds_3d, pad_limit)
 
