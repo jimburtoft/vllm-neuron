@@ -60,11 +60,9 @@ Single 30-s clip, whisper-large-v3, greedy (decode-to-EOS), warm:
 | PyTorch-Native | trn2.3xlarge | TP=4 | 540.6 ms |
 | A100 CT2 reference | 1× A100 | bf16 | ~573–600 ms (~parity) |
 
-On an **18-clip TED-LIUM-derived evaluation set (0–30 s clips)**, mean per-file
-**end-to-end latency (greedy, decode-to-EOS) = 406.6 ms** — beating stock NxDI TP=4
-(785 ms) and PyTorch-Native TP=4 (540.6 ms), and roughly at parity with / faster
-than an A100 CT2 reference (~573–600 ms). TED-LIUM is a public dataset; the metric
-is generic mean per-file wall-clock.
+Per-file latency scales with decoded-token count (decode is ~94% of the wall), so
+shorter clips are proportionally faster; the 30-s clip above is the worst case within
+Whisper's native window.
 
 **TP=4 is the architectural maximum** for whisper-large-v3: it has 20 attention
 heads, and `20 % 8 != 0`, so TP=8 is not expressible (`assert num_heads % tp == 0`).
