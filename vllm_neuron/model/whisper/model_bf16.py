@@ -174,6 +174,62 @@ class EncoderLayer(nn.Module):
         return x
 
 
+class WhisperCrossKVEncoder(nn.Module):
+    """whisper enc-dec: the compiled ``.visual`` NEFF.
+
+    Wraps the audio encoder AND the per-layer cross-attention K/V projections so
+    that "run encoder once + project cross-KV + write the cross-KV buffers"
+    happens INSIDE a single compiled graph. This is the robust alternative to
+    running ``precompute_cross_kv`` eagerly on the Neuron device (eager
+    transpose/matmul/.contiguous() on device tensors raise
+    is_contiguous/dtype errors).
+
+    The cross-KV register_buffers are OWNED here (on the compiled module) so the
+    plugin's ``aliasing_output_rewrite`` FX pass creates the input_output alias
+    for each in-place ``.copy_()`` -- exactly the M0.5-de-risked persistence
+    pattern (write in a compiled NEFF, read in the decode NEFF). The decoder
+    layers hold references to these SAME tensor objects (set in
+    ``WhisperDecoder.bind_cross_kv``) and read them read-only every decode step.
+
+    forward(mel) writes the buffers in place and returns encoder_hidden (so the
+    runner's warmup ``visual(**inputs)`` call has a tensor output to trace).
+    """
+
+    def __init__(self, encoder: "WhisperEncoder", cross_attns: nn.ModuleList,
+                 n_layers: int, n_heads_local: int, head_dim: int, n_ctx: int,
+                 dtype):
+        super().__init__()
+        self.encoder = encoder
+        # The cross-attention projection modules live on the decoder layers; we
+        # keep a ModuleList reference so their weights load normally under the
+        # decoder namespace (weight loader unchanged) -- this ModuleList holds
+        # the SAME module objects, so no parameter duplication.
+        self.cross_attns = cross_attns
+        self.n_layers = n_layers
+        for i in range(n_layers):
+            self.register_buffer(
+                f"cross_k_{i}",
+                torch.zeros(1, n_heads_local, n_ctx, head_dim, dtype=dtype),
+                persistent=False,
+            )
+            self.register_buffer(
+                f"cross_v_{i}",
+                torch.zeros(1, n_heads_local, n_ctx, head_dim, dtype=dtype),
+                persistent=False,
+            )
+
+    def forward(self, input_features, encoder_cache_buffer=None,
+                write_block_ids=None, **kwargs):
+        # (a) encoder: mel [b,128,3000] -> encoder_hidden [b,1500,d].
+        encoder_hidden = self.encoder(input_features)
+        # (b) project + write cross-KV buffers in place (compiled -> aliased).
+        for i in range(self.n_layers):
+            k, v = self.cross_attns[i].project_kv(encoder_hidden)
+            getattr(self, f"cross_k_{i}").copy_(k)
+            getattr(self, f"cross_v_{i}").copy_(v)
+        return encoder_hidden
+
+
 class WhisperEncoder(nn.Module):
     """Audio encoder. mel[b,128,3000] -> [b,1500,d]. Ported from contrib.
 
@@ -201,7 +257,18 @@ class WhisperEncoder(nn.Module):
         )
         self.layer_norm = nn.LayerNorm(d, dtype=dtype)
 
-    def forward(self, input_features):
+    def forward(self, input_features, encoder_cache_buffer=None,
+                write_block_ids=None, **kwargs):
+        # input_features: [b, num_mel_bins=128, 3000] -> encoder_hidden [b, 1500, d]
+        #
+        # whisper enc-dec: the runner's vision-warmup path calls this as
+        # ``visual(input_features=..., encoder_cache_buffer=..., write_block_ids=...)``
+        # (neuron_worker.py:1622-1630) -- the vision models scatter-write their
+        # output into that block buffer. Whisper does NOT: its encoder output is
+        # projected into the decoder cross-KV register_buffers by
+        # precompute_cross_kv() instead, so encoder_cache_buffer/write_block_ids
+        # are accepted for warmup-signature parity and IGNORED. The encoder just
+        # returns encoder_hidden; embed_multimodal() consumes the return value.
         x = gelu(self.conv1(input_features))
         x = gelu(self.conv2(x))
         x = x.transpose(1, 2)  # [b, 1500, d]
@@ -445,40 +512,33 @@ class WhisperDecoder(nn.Module):
         )
         self.layer_norm = nn.LayerNorm(d, dtype=dtype)
 
-        # ---- Option A: model-owned cross-KV register_buffers (persistent=False)
-        # NOT listed in get_kv_spec -> invisible to the block manager.
-        # Shape [1, n_heads_local, 1500, head_dim] per layer (contrib :559-583).
-        # M1: allocated + zeroed. M2: precompute_cross_kv fills them from the
-        # encoder output via in-place .copy_() (the aliasing pass persists them
-        # across NEFF calls -- proven in M0.5 de-risk).
-        n_ctx = cfg.max_source_positions  # 1500
-        for i in range(cfg.decoder_layers):
-            self.register_buffer(
-                f"cross_k_{i}",
-                torch.zeros(1, self.n_heads_local, n_ctx, self.head_dim, dtype=dtype),
-                persistent=False,
-            )
-            self.register_buffer(
-                f"cross_v_{i}",
-                torch.zeros(1, self.n_heads_local, n_ctx, self.head_dim, dtype=dtype),
-                persistent=False,
-            )
+        # ---- Option A: cross-KV register_buffers (persistent=False). These are
+        # OWNED by the compiled WhisperCrossKVEncoder (.visual) so its NEFF's
+        # in-place .copy_() writes go through aliasing_output_rewrite (M0.5).
+        # The decoder reads them read-only each decode step by fetching them
+        # LIVE from .visual (getattr each forward) rather than caching a tensor
+        # reference -- because .to(device)/to_empty replace the buffer storage,
+        # a cached reference would go stale. NOT listed in get_kv_spec ->
+        # invisible to the block manager.
+        self._visual: "WhisperCrossKVEncoder | None" = None
 
-    # M2: called from embed_multimodal after the encoder runs (M3). Fills the
-    # cross-KV register_buffers in-place; the plugin aliasing pass makes them
-    # HBM-persistent across decode NEFF calls.
-    def precompute_cross_kv(self, encoder_hidden_states):
-        for i, layer in enumerate(self.layers):
-            k, v = layer.encoder_attn.project_kv(encoder_hidden_states)
-            getattr(self, f"cross_k_{i}").copy_(k)
-            getattr(self, f"cross_v_{i}").copy_(v)
+    def bind_cross_kv(self, visual: "WhisperCrossKVEncoder") -> None:
+        """whisper enc-dec: point the decoder's cross-KV reads at the compiled
+        ``.visual`` module that OWNS the cross-KV buffers. forward() fetches the
+        buffers live (getattr) so the same tensor the .visual NEFF writes is the
+        one the decode NEFF reads, even after .to(device) swaps storage.
+
+        Stored via object.__setattr__ so nn.Module does NOT register .visual as
+        a decoder child (that would create a module-tree cycle decoder ->
+        visual -> cross_attns -> decoder layers)."""
+        object.__setattr__(self, "_visual", visual)
 
     def forward(self, input_ids, positions, attn_metadata, is_prefill):
         # input_ids/positions: [T] token-flat. embed + learned position.
         x = self.embed_tokens(input_ids) + self.embed_positions(positions)
         for i, layer in enumerate(self.layers):
-            cross_k = getattr(self, f"cross_k_{i}")
-            cross_v = getattr(self, f"cross_v_{i}")
+            cross_k = getattr(self._visual, f"cross_k_{i}")
+            cross_v = getattr(self._visual, f"cross_v_{i}")
             x = layer(x, cross_k, cross_v, attn_metadata, is_prefill)
         return self.layer_norm(x)
 
@@ -507,6 +567,33 @@ class WhisperForConditionalGeneration(nn.Module):
         self.encoder = WhisperEncoder(config, self.dtype)
         self.decoder = WhisperDecoder(config, self.dtype)
 
+        # whisper enc-dec: expose the audio encoder under the ``.visual`` attr
+        # so the runner's separate-vision-encoder compile path
+        # (neuron_model_runner.py:1398 `hasattr(self.model, "visual")`) picks it
+        # up and compiles it as its own NEFF, exactly like qwen3_vl's vision
+        # tower. ``.visual`` is a WhisperCrossKVEncoder that runs the encoder AND
+        # projects+writes the decoder cross-KV register_buffers IN-GRAPH (one
+        # compiled NEFF). It owns the cross-KV buffers; the decoder reads the
+        # same tensor objects (bound below). This keeps the cross-KV populate on
+        # the compiled path (aliasing-persisted, M0.5) rather than eager-on-device.
+        tp = self.world_size
+        n_heads_local = config.decoder_attention_heads // tp
+        head_dim = config.d_model // config.decoder_attention_heads
+        cross_attns = nn.ModuleList(
+            [layer.encoder_attn for layer in self.decoder.layers]
+        )
+        self.visual = WhisperCrossKVEncoder(
+            self.encoder,
+            cross_attns,
+            n_layers=config.decoder_layers,
+            n_heads_local=n_heads_local,
+            head_dim=head_dim,
+            n_ctx=config.max_source_positions,
+            dtype=self.dtype,
+        )
+        # decoder reads the SAME cross-KV tensors the .visual NEFF writes.
+        self.decoder.bind_cross_kv(self.visual)
+
         # LM head is tied to decoder.embed_tokens (Whisper proj_out). Full-vocab
         # F.linear against the tied embedding weight. (A vocab-sharded head is a
         # later perf lever; M1 uses the simple tied path.)
@@ -518,6 +605,74 @@ class WhisperForConditionalGeneration(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # tied LM head
         return F.linear(hidden_states, self.decoder.embed_tokens.weight)
+
+    # ── M2/M3: encoder-run-once + cross-KV populate (audio-mm trigger) ──────
+    def embed_multimodal(
+        self,
+        input_features: torch.Tensor | None = None,
+        encoder_cache=None,
+        mm_hashes: list[str] | None = None,
+        **kwargs,
+    ) -> None:
+        """whisper enc-dec: run the audio encoder ONCE and populate the decoder
+        cross-attention K/V register_buffers.
+
+        Driven by the runner's existing MM-encoder trigger
+        (``_execute_mm_encoder`` -> this method, neuron_model_runner.py:2265),
+        which fires prefill-only, exactly once per request. Unlike the vision
+        models this does NOT write into ``encoder_cache`` (EncoderCacheBlocks):
+        Whisper's cross-attention needs projected per-layer K/V read on EVERY
+        decode step, so the encoder output is projected once (``project_kv``)
+        and written into model-owned ``cross_k_{i}``/``cross_v_{i}``
+        register_buffers (Option A; M0.5-de-risked HBM persistence). The
+        ``encoder_cache`` arg is accepted for interface parity but ignored.
+
+        Args:
+            input_features: mel features [b, 128, 3000] (b==1). Supplied by the
+                runner's grouped/batched mm_kwargs (audio modality).
+            encoder_cache: EncoderCacheBlocks (ignored -- see above).
+            mm_hashes: per-item identifiers (unused for cross-KV storage).
+        """
+        if input_features is None:
+            raise ValueError(
+                "whisper embed_multimodal requires `input_features` (mel "
+                "[b,128,3000]); none supplied by the mm-encoder trigger."
+            )
+        device = next(self.encoder.parameters()).device
+        # Cast dtype on the source device first, THEN move to the Neuron device.
+        # A combined device+dtype .to() on Neuron raises
+        # "Expected self.dtype() == dst.dtype()".
+        mel = input_features.to(dtype=self.dtype).to(device=device)
+        if mel.dim() == 2:
+            mel = mel.unsqueeze(0)  # [128,3000] -> [1,128,3000]
+
+        # Run the compiled .visual NEFF: encoder(mel) -> project cross-KV ->
+        # in-place write the cross_k_{i}/cross_v_{i} register_buffers. The
+        # aliasing_output_rewrite FX pass keeps them HBM-resident across the
+        # subsequent decode NEFF calls (M0.5 de-risk verdict: GO). The decoder
+        # reads the same tensor objects (bound via decoder.bind_cross_kv).
+        self.visual(mel)
+
+    def build_vision_synthetic_inputs(
+        self,
+        bucket: int,
+        vision_neuron_config,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """whisper enc-dec: warmup shape for the encoder NEFF. Whisper's encoder
+        input is a fixed mel [1, num_mel_bins, 3000]; there is exactly one shape
+        (no bucketing), so ``bucket`` is ignored. Matches ``WhisperEncoder.forward``
+        signature (single positional ``input_features``).
+        """
+        return {
+            "input_features": torch.zeros(
+                1,
+                self.config.num_mel_bins,
+                self.config.max_source_positions * 2,  # 1500*2 = 3000 mel frames
+                dtype=self.dtype,
+                device=device,
+            )
+        }
 
     # ── from_configs ──────────────────────────────────────────────────────
     @classmethod
@@ -587,12 +742,15 @@ class WhisperForConditionalGeneration(nn.Module):
         # 1) materialize meta tensors to empty CPU storage.
         self.to_empty(device="cpu")
 
-        # 2) zero the cross-KV buffers + encoder sinusoidal positions (real HF
-        #    checkpoint provides encoder.embed_positions.weight, but zero first).
+        # to_empty replaces buffer/param tensors with fresh storage, which
+        # (a) invalidates the decoder's cross-KV references and (b) may have
+        # split the .encoder / .visual.encoder shared-module tensors. Re-point
+        # the decoder cross-KV reads at .visual's (now materialized) buffers.
         with torch.no_grad():
             for i in range(self.config.decoder_layers):
-                getattr(self.decoder, f"cross_k_{i}").zero_()
-                getattr(self.decoder, f"cross_v_{i}").zero_()
+                getattr(self.visual, f"cross_k_{i}").zero_()
+                getattr(self.visual, f"cross_v_{i}").zero_()
+        self.decoder.bind_cross_kv(self.visual)
 
         # 3) resolve checkpoint dir + load HF state.
         model_dir = resolve_checkpoint_dir(checkpoint_path, cache_dir)
