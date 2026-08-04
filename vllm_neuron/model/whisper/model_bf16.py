@@ -46,6 +46,7 @@ import vllm_neuron.functional as NF
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn import ColumnParallelLinear, RowParallelLinear
+from vllm_neuron.nn.sampler import Sampler
 from transformers import PretrainedConfig
 
 from .config import WhisperConfig
@@ -605,6 +606,21 @@ class WhisperForConditionalGeneration(nn.Module):
 
     is_text_generation_model = True
 
+    # ── M4: transcription markers on the INSTANCE ────────────────────────────
+    # ``from_configs`` returns THIS inner model (factory.py:157 returns the
+    # concrete model, not a factory wrapper), so the runner's ``self.model`` is
+    # an instance of this class. The Neuron runner's ``get_supported_tasks``
+    # inspects ``supports_transcription(model)`` -> ``getattr(model,
+    # "supports_transcription", False)`` on that INSTANCE to decide whether to
+    # report the "transcription" task. The full serving classmethods
+    # (get_generation_prompt, validate_language, ...) live on the REGISTERED
+    # factory class (factory.py) which the serving layer resolves via
+    # get_model_cls; here we only need the boolean flag + supports_transcription_only
+    # so the runner emits ("transcription",). See task016_m4 for the split.
+    supports_transcription = True
+    supports_transcription_only = True
+    supports_multimodal = True
+
     def __init__(self, config: WhisperConfig):
         super().__init__()
         self.config = config
@@ -645,6 +661,32 @@ class WhisperForConditionalGeneration(nn.Module):
         # LM head is tied to decoder.embed_tokens (Whisper proj_out). Full-vocab
         # F.linear against the tied embedding weight. (A vocab-sharded head is a
         # later perf lever; M1 uses the simple tied path.)
+
+        # ── M4: on-device sampling ────────────────────────────────────────────
+        # The vllm-neuron SERVING path drives the model through the runner's
+        # async/MP executor, which REQUIRES the model's forward to return sampled
+        # TOKEN IDS (shape [num_reqs]) -- NOT raw logits -- when on-device
+        # sampling is enabled. The runner's _sample() on-device branch does
+        # ``[[x] for x in model_output_tensor.tolist()]`` expecting one token id
+        # per request; if we return full-vocab logits it tries to write 51866
+        # ids into a length-1 slot (the M4 "expanded size (1) must match (51866)"
+        # error). So, exactly like llama3/model.py:1486-1614, we own an on-device
+        # Sampler and apply it inside forward when configured. The LM head here is
+        # the FULL-vocab tied fp32 matmul (compute_logits), identical on every TP
+        # rank, so the sampler needs no cross-rank gather -> process_group=None
+        # and greedy argmax is rank-consistent. When on-device sampling is off
+        # (the M3 offline byte-identical driver path), forward still returns
+        # logits and the host samples -- unchanged.
+        nc = config.neuron_config
+        self.on_device_sampling_config = (
+            nc.on_device_sampling_config if nc is not None else None
+        )
+        self.sampler = None
+        if self.on_device_sampling_config is not None:
+            self.sampler = Sampler(
+                self.on_device_sampling_config,
+                process_group=None,
+            )
 
     # ── generative-model detection (vLLM) ────────────────────────────────
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -877,6 +919,8 @@ class WhisperForConditionalGeneration(nn.Module):
         attn_metadata: object | None = None,
         sampling_positions: torch.Tensor | None = None,
         sampling_params: torch.Tensor | None = None,
+        logit_mask: torch.Tensor | None = None,
+        rank: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         positions = positions.to(torch.int32)
@@ -902,4 +946,18 @@ class WhisperForConditionalGeneration(nn.Module):
                 hidden_states, dim=0, index=sampling_positions
             )
         logits = self.compute_logits(hidden_states)
+
+        # ── M4: on-device sampling for the serving/async runner path ──────────
+        # When on-device sampling is configured, the runner expects TOKEN IDS
+        # (shape [num_reqs]) back from forward (llama3 parity). We apply the
+        # greedy argmax on-device over the FULL-vocab fp32 logits computed above.
+        # The logits are identical on every TP rank (tied full-vocab matmul), so
+        # argmax is rank-consistent with process_group=None. When on-device
+        # sampling is OFF (offline byte-identical driver), return logits and let
+        # the host sample -- unchanged M3 behaviour.
+        if self.sampler is not None:
+            sampled_tokens = self.sampler(
+                logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
+            )
+            return sampled_tokens
         return logits

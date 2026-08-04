@@ -19,13 +19,88 @@ from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig
 
+# M4 serving: the OpenAI /v1/audio/transcriptions route is wired only when the
+# REGISTERED model class (this factory -- registry.py:25 registers THIS class,
+# which the plugin's ModelRegistry.register_model override installs under the
+# "WhisperForConditionalGeneration" arch) satisfies vLLM-core's
+# SupportsTranscription + SupportsMultiModal interfaces. The serving layer
+# (vllm/entrypoints/openai/speech_to_text/speech_to_text.py) resolves the class
+# via get_model_cls(model_config) -> get_model_architecture(...) -> THIS factory
+# class, then calls the transcription classmethods on it
+# (get_speech_to_text_config, get_generation_prompt, validate_language,
+# post_process_output, get_num_audio_tokens, supports_segment_timestamp,
+# no_space_languages). The Neuron runner's get_supported_tasks() must ALSO
+# report "transcription" (it inspects supports_transcription(model) on the
+# constructed model instance -- so the marker must travel with BOTH the
+# registered class AND the instance, which subclassing the interface provides).
+#
+# We inherit the concrete transcription/multimodal behaviour directly from
+# vLLM-core's upstream Whisper class (the language table, prompt construction,
+# audio mm processor) rather than re-implementing it: those classmethods only
+# touch cls.supported_languages + the tokenizer/processor and are independent of
+# the modeling body, so reusing them keeps us byte-identical to how core routes
+# audio and avoids drift.
+from vllm.model_executor.models.interfaces import (
+    SupportsMultiModal,
+    SupportsTranscription,
+)
+from vllm.model_executor.models.whisper import (
+    WhisperDummyInputsBuilder,
+    WhisperMultiModalProcessor,
+    WhisperProcessingInfo,
+)
+from vllm.model_executor.models.whisper import (
+    WhisperForConditionalGeneration as _CoreWhisper,
+)
+from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
+from vllm.multimodal import MULTIMODAL_REGISTRY
 
-class WhisperForConditionalGeneration(nn.Module):
+
+@MULTIMODAL_REGISTRY.register_processor(
+    WhisperMultiModalProcessor,
+    info=WhisperProcessingInfo,
+    dummy_inputs=WhisperDummyInputsBuilder,
+)
+class WhisperForConditionalGeneration(
+    nn.Module,
+    SupportsTranscription,
+    SupportsMultiModal,
+):
     """Factory that validates config and selects the Whisper implementation.
 
     Extends nn.Module to satisfy vLLM's ModelRegistry requirements; delegates
     forward() to the selected implementation.
+
+    Carries the transcription/multimodal interface markers (M4) so
+    ``vllm serve`` routes ``/v1/audio/transcriptions`` here. The concrete
+    transcription classmethods are inherited from vLLM-core's upstream Whisper
+    class (see the note above); only the audio-mm processor is (re-)registered
+    on THIS class because ``register_processor`` stores ``_processor_factory``
+    on the decorated class object and the multimodal registry resolves it from
+    the *registered* (plugin) class, not core's.
     """
+
+    # ── M4: transcription/multimodal interface markers ──────────────────────
+    # SupportsTranscription requires supported_languages; the rest of the
+    # transcription classmethods (get_generation_prompt, validate_language,
+    # get_speech_to_text_config, get_num_audio_tokens, post_process_output,
+    # language-detection helpers) are inherited verbatim from _CoreWhisper below.
+    supported_languages = ISO639_1_SUPPORTED_LANGS
+    supports_transcription_only = True
+    supports_segment_timestamp = True
+    supports_explicit_language_detection = True
+
+    # Inherit the concrete transcription classmethods from core Whisper. These
+    # are class-body-independent (they only use cls.supported_languages + the
+    # tokenizer/processor), so binding them here gives byte-identical routing.
+    validate_language = _CoreWhisper.validate_language
+    get_generation_prompt = _CoreWhisper.get_generation_prompt
+    get_speech_to_text_config = _CoreWhisper.get_speech_to_text_config
+    get_num_audio_tokens = _CoreWhisper.get_num_audio_tokens
+    get_language_token_ids = _CoreWhisper.get_language_token_ids
+    get_language_detection_prompt = _CoreWhisper.get_language_detection_prompt
+    parse_language_detection_output = _CoreWhisper.parse_language_detection_output
+    get_placeholder_str = _CoreWhisper.get_placeholder_str
 
     def __init__(
         self,

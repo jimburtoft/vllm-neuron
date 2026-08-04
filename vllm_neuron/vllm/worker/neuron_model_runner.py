@@ -22,7 +22,10 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
-from vllm.model_executor.models.interfaces import supports_eagle3
+from vllm.model_executor.models.interfaces import (
+    supports_eagle3,
+    supports_transcription,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
@@ -8246,6 +8249,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         Returns:
             Tuple of supported tasks
         """
+        # M4 (whisper native serving): mirror vLLM-core's
+        # gpu_model_runner.get_supported_generation_tasks -- if the constructed
+        # model carries the SupportsTranscription marker, report "transcription"
+        # so the OpenAI API server registers /v1/audio/transcriptions. Whisper
+        # sets supports_transcription_only=True (audio-conditioned only), so it
+        # reports ONLY "transcription"; every other Neuron model keeps the
+        # historical ("generate",) behaviour unchanged.
+        model = getattr(self, "model", None)
+        if model is not None and supports_transcription(model):
+            if getattr(model, "supports_transcription_only", False):
+                return ("transcription",)
+            return ("generate", "transcription")
         return ("generate",)
 
     def ensure_kv_transfer_shutdown(self) -> None:
