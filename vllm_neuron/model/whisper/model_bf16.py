@@ -106,11 +106,19 @@ class RowParallelLinearFP32Bias(nn.Module):
 
     def forward(self, x):
         y = self.rpl(x)
-        # Add the fp32 bias in fp32, then cast back to the activation dtype.
-        # Neuron rejects a mixed fp32+bf16/fp16 add (NCC_IVRF100); doing the add
-        # in a single dtype keeps the compiler happy.
-        out = y.to(torch.float32) + self.bias
-        return out.to(self._out_dtype)
+        # M3 FIX (byte-identical): match the contrib reference EXACTLY. Contrib
+        # casts the fp32 bias down to the activation dtype and adds in bf16
+        # (whisper_neuron.py:131 ``y = y + self.bias.to(y.dtype)``). The previous
+        # plugin path promoted y to fp32, added the fp32 bias, then cast back --
+        # a different bf16 rounding that, accumulated across 32 layers x 4 RPLs
+        # (self/cross out_proj + mlp fc2), shifted the final hidden state enough
+        # to flip a NEAR-TIE at the very first predicted token (503 ' "' at
+        # logprob -0.71 vs the reference 2221 ' Mr' at -0.835). Adding in bf16 to
+        # mirror contrib removes that drift. This compiles cleanly on device (the
+        # contrib model uses this exact add), so the NCC_IVRF100 concern that
+        # motivated the fp32 add does not apply here.
+        y = y + self.bias.to(y.dtype)
+        return y
 
 
 # --------------------------------------------------------------------------- #
@@ -143,7 +151,7 @@ class EncoderSelfAttention(nn.Module):
         k = self._shape(self.k_proj(hidden_states), seqlen, bsz)
         v = self._shape(self.v_proj(hidden_states), seqlen, bsz)
         attn = torch.matmul(q, k.transpose(-1, -2))
-        attn = F.softmax(attn, dim=-1)
+        attn = F.softmax(attn.to(torch.float32), dim=-1).to(v.dtype)  # M3: fp32 softmax
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).reshape(bsz, seqlen, self.num_heads * self.head_dim)
         return self.out_proj(out)
@@ -316,8 +324,10 @@ class CrossAttention(nn.Module):
         """Q from decoder tokens; K/V read from the cached buffers (contrib)."""
         bsz, tgt_len, _ = hidden_states.shape
         q = self._shape(self.q_proj(hidden_states) * self.scaling, tgt_len, bsz)
+        # M3: fp32 softmax (device bf16 softmax accumulation contributes to the
+        # first-token near-tie drift vs the OpenAI/HF reference).
         attn = torch.matmul(q, cross_k.transpose(-1, -2))
-        attn = F.softmax(attn, dim=-1)
+        attn = F.softmax(attn.to(torch.float32), dim=-1).to(cross_v.dtype)
         ctx = torch.matmul(attn, cross_v)  # [b,h,tgt,d]
         out = ctx.transpose(1, 2).reshape(bsz, tgt_len, self.num_heads * self.head_dim)
         return self.out_proj(out)
@@ -400,30 +410,51 @@ class DecoderSelfAttention(nn.Module):
         )
 
     def forward_prefill(self, hidden_states, attn_metadata):
-        """Full-sequence causal self-attention over the prompt (flash)."""
+        """Full-sequence causal self-attention over the prompt.
+
+        M3: uses the SAME plain SDPA math as the byte-identical contrib reference
+        (matmul + explicit upper-triangular causal mask + softmax), NOT the flash
+        kernel. The SOT prompt is only ~4 tokens, so there is no perf reason to
+        use flash here, and the flash kernel's bf16 numerics diverged from the
+        reference just enough to flip the FIRST predicted token (spurious leading
+        token, then re-sync). Matching the reference math exactly makes token 0
+        byte-identical. q is pre-scaled in ``_project`` (scale applied once).
+        """
         layer_name = f"decoder.layers.{self.layer_idx}.self_attn"
         meta = attn_metadata[layer_name]
         slot_mapping = meta["slot_mapping"]
         block_size = meta["block_size"]
 
-        q, k, v = self._project(hidden_states)
+        q, k, v = self._project(hidden_states)  # [Nh, T, d]; q pre-scaled
         self._write_kv_cache(k, v, slot_mapping, block_size)
 
-        q_flash = q.transpose(1, 2)  # [Nh, Dh, T]
-        k_flash = k.transpose(1, 2)  # [Nh, Dh, T]
-        v_flash = v  # [Nh, T, Dh]
-        attn_output = NF.flash_attention(
-            q_flash, k_flash, v_flash, scale=self.scaling, tp_q=False, tp_out=True
-        )  # [Nh, Dh, T]
-        # [Nh, Dh, T] -> [T, Nh*Dh]
         tokens = hidden_states.shape[0]
-        attn_output = attn_output.permute(2, 0, 1).reshape(tokens, self.num_heads * self.head_dim)
+        # causal SDPA (contrib forward_prefill math): attn = softmax(q@k^T + mask)@v
+        attn = torch.matmul(q, k.transpose(-1, -2))  # [Nh, T, T]; q pre-scaled
+        mask = torch.triu(
+            torch.full((tokens, tokens), float("-inf"),
+                       dtype=attn.dtype, device=attn.device),
+            diagonal=1,
+        )
+        attn = attn + mask
+        attn = F.softmax(attn.to(torch.float32), dim=-1).to(v.dtype)  # M3: fp32 softmax
+        ctx = torch.matmul(attn, v)  # [Nh, T, d]
+        # [Nh, T, d] -> [T, Nh*d]
+        attn_output = ctx.transpose(0, 1).reshape(tokens, self.num_heads * self.head_dim)
         return self.out_proj(attn_output)
 
-    def forward_decode(self, hidden_states, attn_metadata):
+    def forward_decode(self, hidden_states, attn_metadata, positions):
         """Single-token decode: append new K/V to the paged cache and attend over
         the gathered per-sequence cache. Plain (non-fused) for M1 correctness of
         structure; reads the block table to gather the sequence's cache.
+
+        M3: ``positions`` [tokens] carries the absolute target position of each
+        decode token. It is required to mask out cache slots the sequence has not
+        yet written (the gathered cache spans the FULL block range S_ctx =
+        max_blocks * block_size, most of which is still zero). Without this mask
+        softmax attends over ~all-zero future slots, corrupting the output
+        (the M2 "jumbles token order" symptom). Contrib reference: decode_step
+        masks ``arange(S_ctx) <= cur_pos``.
         """
         layer_name = f"decoder.layers.{self.layer_idx}.self_attn"
         meta = attn_metadata[layer_name]
@@ -452,7 +483,24 @@ class DecoderSelfAttention(nn.Module):
         # q: [Nh, tokens, d] -> [B_local, nkh, S_decode, d]
         qd = q.transpose(0, 1).reshape(B_local, S_decode, nkh, self.head_dim).transpose(1, 2)
         attn = torch.matmul(qd, kc.transpose(-1, -2))  # already scaled q
-        attn = F.softmax(attn, dim=-1)
+        # M3 FIX (missing decode mask): the gathered cache spans the FULL block
+        # range S_ctx = max_blocks * block_size; only slots [0..cur_pos] have been
+        # written for this sequence, the rest are still zero. Softmax over the
+        # unwritten zero slots pulls attention mass onto garbage and corrupts the
+        # output (M2 "jumbles token order"). Mask slot s for query j to be valid
+        # iff s <= absolute_position(j). Gathered slot index == logical sequence
+        # position (block_table maps logical block i -> positions i*block_size..),
+        # so a flat ``arange(S_ctx) <= pos`` mask is exact. Matches contrib
+        # decode_step ``allowed = ar <= cur_pos``.
+        pos = positions.to(torch.int32).view(B_local, S_decode)  # [B_local, S_decode]
+        ar = torch.arange(S_ctx, device=attn.device, dtype=torch.int32)  # [S_ctx]
+        # valid[b, j, s] = s <= pos[b, j]
+        valid = ar.view(1, 1, S_ctx) <= pos.view(B_local, S_decode, 1)  # [B,S_decode,S_ctx]
+        neg = torch.full((), float("-inf"), dtype=attn.dtype, device=attn.device)
+        zero = torch.zeros((), dtype=attn.dtype, device=attn.device)
+        add_mask = torch.where(valid, zero, neg)  # [B, S_decode, S_ctx]
+        attn = attn + add_mask.unsqueeze(1)  # broadcast over nkh: [B,1,S_decode,S_ctx]
+        attn = F.softmax(attn.to(torch.float32), dim=-1).to(vc.dtype)  # M3: fp32 softmax
         ctx = torch.matmul(attn, vc)  # [B_local, nkh, S_decode, d]
         ctx = ctx.transpose(1, 2).reshape(tokens, self.num_heads * self.head_dim)
         return self.out_proj(ctx)
@@ -472,14 +520,14 @@ class DecoderLayer(nn.Module):
         self.mlp = MLP(d, cfg.decoder_ffn_dim, dtype)
         self.final_layer_norm = nn.LayerNorm(d, dtype=dtype)
 
-    def forward(self, x, cross_k, cross_v, attn_metadata, is_prefill):
+    def forward(self, x, cross_k, cross_v, attn_metadata, is_prefill, positions):
         # x is [T, H] (token-flat, plugin SP layout).
         residual = x
         h = self.self_attn_layer_norm(x)
         if is_prefill:
             sa = self.self_attn.forward_prefill(h, attn_metadata)
         else:
-            sa = self.self_attn.forward_decode(h, attn_metadata)
+            sa = self.self_attn.forward_decode(h, attn_metadata, positions)
         x = residual + sa
 
         # cross-attention reads cached cross-K/V (zeroed for M1; M2 populates).
@@ -539,7 +587,7 @@ class WhisperDecoder(nn.Module):
         for i, layer in enumerate(self.layers):
             cross_k = getattr(self._visual, f"cross_k_{i}")
             cross_v = getattr(self._visual, f"cross_v_{i}")
-            x = layer(x, cross_k, cross_v, attn_metadata, is_prefill)
+            x = layer(x, cross_k, cross_v, attn_metadata, is_prefill, positions)
         return self.layer_norm(x)
 
 
@@ -603,8 +651,14 @@ class WhisperForConditionalGeneration(nn.Module):
         return self.decoder.embed_tokens(input_ids)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # tied LM head
-        return F.linear(hidden_states, self.decoder.embed_tokens.weight)
+        # tied LM head. M3: compute the tied-embedding matmul in fp32. The
+        # OpenAI/HF reference is produced in fp32; doing the final projection in
+        # fp32 (cheap, one matmul) matches the reference's logit precision at the
+        # LM head. The bf16 hidden state going in still carries the decoder's
+        # bf16 accumulation, but the fp32 projection removes the last rounding
+        # step before argmax.
+        w = self.decoder.embed_tokens.weight
+        return F.linear(hidden_states.to(torch.float32), w.to(torch.float32))
 
     # ── M2/M3: encoder-run-once + cross-KV populate (audio-mm trigger) ──────
     def embed_multimodal(
