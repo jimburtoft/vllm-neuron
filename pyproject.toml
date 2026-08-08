@@ -44,12 +44,12 @@ vllm_neuron = ["py.typed", "**/*.json", "model/llama3/LICENSE"]
 include = ["vllm_neuron", "vllm_neuron.*"]
 
 [tool.pytest.ini_options]
-testpaths = ["test/unit", "test/vllm_neuron", "vllm_neuron/model/whisper/tests"]
+testpaths = ["test/unit", "test/vllm_neuron", "vllm_neuron/model/whisper/tests", "vllm_neuron/model/voxtral/tests"]
 python_files = ["test_*.py", "*_test.py", "*_tests.py"]
 python_classes = "Test*"
 python_functions = "test_*"
 markers = [
-    "neuron_device: test requires a Neuron device (Trainium/Inferentia) and model weights; skipped when no device is present or WHISPER_NEURON_DEVICE_TESTS is unset",
+    "neuron_device: test requires a Neuron device (Trainium/Inferentia) and model weights; skipped when no device is present or WHISPER_NEURON_DEVICE_TESTS / VOXTRAL_NEURON_DEVICE_TESTS is unset",
 ]
 
 [tool.coverage.run]
