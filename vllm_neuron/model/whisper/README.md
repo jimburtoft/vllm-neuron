@@ -26,7 +26,7 @@ A registered plugin model package `vllm_neuron/model/whisper/`:
 |------|---------|
 | `config.py` | `WhisperConfig` — asserts large-v3 dims (`d_model==1280`, `vocab==51866`, 20 enc/dec heads), coerces fp16/fp32 → bf16. |
 | `factory.py` | Registered `WhisperForConditionalGeneration` — carries the `SupportsTranscription` + `SupportsMultiModal` interface markers and the audio-mm processor registration so `vllm serve` routes `/v1/audio/transcriptions` here. |
-| `model_bf16.py` | The concrete encoder + decoder: block-managed self-KV, model-owned cross-KV buffers, on-device greedy sampler, fp32 LM head. |
+| `model_bf16.py` | The concrete encoder + decoder: block-managed self-KV, model-owned cross-KV buffers, on-device greedy sampler, vocab-parallel (sharded) fp32 LM head. |
 | `weight_loaders.py` | HF `openai/whisper-large-v3` safetensors → module state-dict remap. |
 | `registry.py` (one-line edit) | registers `WhisperForConditionalGeneration` in `get_models()`. |
 
@@ -131,15 +131,22 @@ print(r.text)
   self-attn `LayerSpec`s (`head_size=64`, `num_kv_heads = 20 // tp`), paged writes
   via `index_put_`, an additive causal + position mask so unwritten cache slots
   are never attended.
-- **On-device greedy sampler.** The serving/async path requires `forward` to
-  return sampled **token ids**, not logits. The model owns a `Sampler`
-  (`on_device_sampling_config`, `all_greedy`) and applies it in `forward`. Because
-  the LM head is a full-vocab fp32 matmul that produces identical logits on every
-  TP rank, the greedy argmax is rank-consistent and needs no cross-rank gather
-  (`process_group=None`).
+- **On-device greedy sampler + vocab-parallel LM head.** The serving/async path
+  requires `forward` to return sampled **token ids**, not logits. The model owns a
+  `Sampler` (`on_device_sampling_config`, `all_greedy`) and applies it in
+  `forward`. The LM head is **vocab-parallel**: a `ColumnParallelLinear` shards the
+  (padded) vocab across TP ranks so each rank projects only its `1/TP` slice
+  (`gather_output=False`), instead of the older replicated full-vocab matmul.
+  vocab=51866 is padded to the next multiple of TP (51868 at TP=4); the padded
+  columns are masked to `-inf` so they can never win. The `Sampler` is constructed
+  with `process_group=<lm_head TP group>`, so its greedy argmax runs the plugin's
+  distributed global-argmax gather across ranks — lowest global index wins on ties,
+  byte-identical to argmax over the full-vocab head. When on-device sampling is off
+  (the offline byte-identical driver), `compute_logits` all-gathers the shards back
+  to full vocab for host sampling.
 - **fp32 at the precision-critical spots.** The attention softmaxes (encoder
   self-attn, decoder self-attn prefill + decode, cross-attn) and the tied LM-head
-  matmul run in fp32. This removes device-bf16 rounding at first-token near-ties
+  projection run in fp32. This removes device-bf16 rounding at first-token near-ties
   without altering the reference math.
 - **TP=4 is the maximum.** whisper-large-v3 has 20 attention heads and
   `20 % 8 != 0`, so TP=8 is not expressible. Valid TP ∩ power-of-2 on trn2 =

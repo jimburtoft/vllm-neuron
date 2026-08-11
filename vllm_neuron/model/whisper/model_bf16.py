@@ -658,9 +658,60 @@ class WhisperForConditionalGeneration(nn.Module):
         # decoder reads the SAME cross-KV tensors the .visual NEFF writes.
         self.decoder.bind_cross_kv(self.visual)
 
-        # LM head is tied to decoder.embed_tokens (Whisper proj_out). Full-vocab
-        # F.linear against the tied embedding weight. (A vocab-sharded head is a
-        # later perf lever; M1 uses the simple tied path.)
+        # ── Task 019: vocab-parallel (sharded) LM head ───────────────────────
+        # LM head is tied to decoder.embed_tokens (Whisper proj_out). The
+        # baseline did a FULL-vocab tied fp32 F.linear REPLICATED on every TP
+        # rank (each rank re-read the whole [vocab, d] weight and computed all
+        # 51866 logits). That does not scale with TP and re-reads the full weight
+        # every decode step. Task 007 (contrib) showed a vocab-parallel head +
+        # on-device global argmax recovers ~633->612 ms AND cuts P99-P50 variance
+        # (~39ms -> ~6ms). We port it here using the plugin's INTENDED mechanism
+        # (ColumnParallelLinear vocab shard + the plugin Sampler's built-in
+        # cross-rank global argmax), NOT the contrib hand-rolled all_gather.
+        #
+        # Each rank computes only its 1/TP vocab slice. vocab=51866 is not a
+        # multiple of TP=4, so we pad to the next multiple (51868) and mask the
+        # padded columns to -inf so they can never win the argmax. The weight is
+        # tied to embed_tokens (copied per-rank at the end of load_weights).
+        d_model = config.d_model
+        vocab = config.vocab_size
+        tp = self.world_size
+        pad = (-vocab) % tp
+        self.padded_vocab = vocab + pad
+        self.vocab_pad = pad
+        self.per_rank = self.padded_vocab // tp
+        self.vocab_start = self.rank * self.per_rank
+        # count of *valid* (unpadded) vocab logits this rank owns
+        self.n_valid = max(0, min(self.per_rank, vocab - self.vocab_start))
+
+        # The LM-head TP group. The plugin always initializes a lm_head TP group
+        # (defaults to the full TP group when lm_head_dp_size == 1), and the
+        # Sampler's distributed argmax must gather over the SAME group the
+        # ColumnParallelLinear shards the vocab across. Fall back to the default
+        # WORLD group if the neuron parallel state is not initialized (e.g. TP=1
+        # / CPU-mode unit tests), matching every other CPL in this model.
+        lm_head_device_group = None
+        try:
+            from vllm_neuron.parallel.neuron_parallel_state import (
+                get_neuron_lm_head_tp_group,
+            )
+
+            lm_head_device_group = get_neuron_lm_head_tp_group().device_group
+        except Exception:
+            lm_head_device_group = None
+        self._lm_head_tp_group = lm_head_device_group
+
+        # ColumnParallelLinear shards dim 0 (output = vocab). No bias (Whisper
+        # tie). gather_output=False so each rank returns ONLY its local
+        # [..., per_rank] logits slice; the sampler gathers across ranks.
+        self.lm_head = ColumnParallelLinear(
+            d_model,
+            self.padded_vocab,
+            bias=False,
+            gather_output=False,
+            dtype=torch.float32,
+            tp_group=lm_head_device_group,
+        )
 
         # ── M4: on-device sampling ────────────────────────────────────────────
         # The vllm-neuron SERVING path drives the model through the runner's
@@ -668,15 +719,19 @@ class WhisperForConditionalGeneration(nn.Module):
         # TOKEN IDS (shape [num_reqs]) -- NOT raw logits -- when on-device
         # sampling is enabled. The runner's _sample() on-device branch does
         # ``[[x] for x in model_output_tensor.tolist()]`` expecting one token id
-        # per request; if we return full-vocab logits it tries to write 51866
-        # ids into a length-1 slot (the M4 "expanded size (1) must match (51866)"
-        # error). So, exactly like llama3/model.py:1486-1614, we own an on-device
-        # Sampler and apply it inside forward when configured. The LM head here is
-        # the FULL-vocab tied fp32 matmul (compute_logits), identical on every TP
-        # rank, so the sampler needs no cross-rank gather -> process_group=None
-        # and greedy argmax is rank-consistent. When on-device sampling is off
-        # (the M3 offline byte-identical driver path), forward still returns
-        # logits and the host samples -- unchanged.
+        # per request. Exactly like llama3/model.py, we own an on-device Sampler
+        # and apply it inside forward when configured. Now that the LM head is
+        # vocab-SHARDED (each rank has only its slice), the Sampler is given
+        # ``process_group=<lm_head TP group>`` so its greedy argmax does the
+        # cross-rank global-argmax gather internally (functional/argmax.py). The
+        # distributed argmax picks the rank with the highest local max, and on a
+        # tie ``torch.argmax`` over the gathered maxes picks the LOWEST rank
+        # (which owns the lower vocab indices), and each rank's local argmax is
+        # itself lowest-index-on-tie -> byte-identical "lowest global index wins"
+        # semantics vs the full-vocab head. When on-device sampling is off (the
+        # M3 offline byte-identical driver path), forward all-gathers the sharded
+        # logits back to full vocab and returns them so the host can sample --
+        # see compute_logits / forward.
         nc = config.neuron_config
         self.on_device_sampling_config = (
             nc.on_device_sampling_config if nc is not None else None
@@ -685,7 +740,7 @@ class WhisperForConditionalGeneration(nn.Module):
         if self.on_device_sampling_config is not None:
             self.sampler = Sampler(
                 self.on_device_sampling_config,
-                process_group=None,
+                process_group=lm_head_device_group,
             )
 
     # ── generative-model detection (vLLM) ────────────────────────────────
@@ -693,14 +748,58 @@ class WhisperForConditionalGeneration(nn.Module):
         return self.decoder.embed_tokens(input_ids)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # tied LM head. M3: compute the tied-embedding matmul in fp32. The
-        # OpenAI/HF reference is produced in fp32; doing the final projection in
-        # fp32 (cheap, one matmul) matches the reference's logit precision at the
-        # LM head. The bf16 hidden state going in still carries the decoder's
-        # bf16 accumulation, but the fp32 projection removes the last rounding
-        # step before argmax.
-        w = self.decoder.embed_tokens.weight
-        return F.linear(hidden_states.to(torch.float32), w.to(torch.float32))
+        """FULL-vocab logits (used by the offline/host-sampling path).
+
+        The sharded head (self.lm_head) returns only this rank's [.., per_rank]
+        slice. For the M3 offline byte-identical driver -- which expects
+        full-vocab logits and samples on the host -- we all-gather the per-rank
+        slices back to the full padded vocab, mask the pad columns to -inf, and
+        slice off the padding so the returned width is exactly the real vocab.
+
+        The projection is kept in fp32 (M3 tie-stability: the OpenAI/HF
+        reference logits are produced in fp32; doing the final projection in
+        fp32 matches the reference's logit precision at the LM head). The
+        ColumnParallelLinear weight is fp32; we cast the hidden state to fp32
+        before the matmul.
+        """
+        local = self._logits_local(hidden_states)  # [.., per_rank] this rank
+        if self.world_size == 1:
+            full = local
+        else:
+            from torch.distributed._functional_collectives import all_gather_tensor
+
+            group = self._lm_head_tp_group
+            full = all_gather_tensor(local, -1, group)  # [.., padded_vocab]
+        full = self._mask_pad(full)
+        # drop the padded columns so the width matches the real vocab
+        return full[..., : self.config.vocab_size]
+
+    def _logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab-slice logits [.., per_rank], fp32 tied projection."""
+        return self.lm_head(hidden_states.to(torch.float32))
+
+    def _mask_pad(self, logits: torch.Tensor) -> torch.Tensor:
+        """Mask the padded (>= real vocab) columns of a FULL-vocab logits tensor
+        to -inf so they can never win the argmax. No-op when vocab is already a
+        multiple of TP (pad == 0)."""
+        if self.vocab_pad == 0:
+            return logits
+        vocab = self.config.vocab_size
+        width = logits.shape[-1]
+        ar = torch.arange(width, device=logits.device)
+        neg = torch.full((), float("-inf"), dtype=logits.dtype, device=logits.device)
+        return torch.where(ar < vocab, logits, neg)
+
+    def _mask_pad_local(self, local: torch.Tensor) -> torch.Tensor:
+        """Mask this rank's LOCAL [.., per_rank] slice: columns whose global
+        vocab index >= real vocab are set to -inf. Only the last rank owns any
+        padded columns (n_valid < per_rank)."""
+        if self.n_valid >= self.per_rank:
+            return local
+        per_rank = self.per_rank
+        ar = torch.arange(per_rank, device=local.device)
+        neg = torch.full((), float("-inf"), dtype=local.dtype, device=local.device)
+        return torch.where(ar < self.n_valid, local, neg)
 
     # ── M2/M3: encoder-run-once + cross-KV populate (audio-mm trigger) ──────
     def embed_multimodal(
@@ -886,6 +985,18 @@ class WhisperForConditionalGeneration(nn.Module):
             else:
                 enc_missing_real.append(m)
 
+        # ── Task 019: tie the sharded LM head to decoder.embed_tokens ────────
+        # Whisper's proj_out is tied to decoder.embed_tokens.weight [vocab, d].
+        # The vocab-parallel ColumnParallelLinear head (self.lm_head) has a
+        # separate [per_rank, d] weight per rank; copy this rank's vocab slice
+        # embed_tokens.weight[vocab_start : vocab_start+per_rank] into it, in
+        # fp32 (the head projects in fp32). Rows >= real vocab (padding) stay
+        # zero; the pad columns are masked to -inf at argmax time so the zero
+        # rows never win. Weights are frozen at inference, so copy (vs shared
+        # storage) is fine. embed_tokens is on CPU here (post to_empty / pre the
+        # runner's device move), so materialize the shard on CPU too.
+        self._tie_lm_head()
+
         n_missing = len(enc_missing_real) + len(dec_missing)
         n_unexpected = len(enc_unexpected) + len(dec_unexpected)
         logger.info(
@@ -908,6 +1019,26 @@ class WhisperForConditionalGeneration(nn.Module):
         # Expose counts for the loader verification harness.
         self._weight_load_missing = n_missing
         self._weight_load_unexpected = n_unexpected
+
+    def _tie_lm_head(self) -> None:
+        """Copy this rank's vocab slice of decoder.embed_tokens.weight into the
+        vocab-parallel ColumnParallelLinear LM head (fp32), padding rows beyond
+        the real vocab with zeros. Call after the decoder weights are loaded and
+        while tensors are still on CPU (pre device move)."""
+        vocab = self.config.vocab_size
+        per_rank = self.per_rank
+        s = self.vocab_start
+        e = s + per_rank
+        w_cpu = self.decoder.embed_tokens.weight.detach().to("cpu")  # [vocab, d]
+        d = w_cpu.shape[1]
+        target_dtype = self.lm_head.weight.dtype
+        shard = torch.zeros(per_rank, d, dtype=target_dtype)
+        # rows [s:e) mapped from the (unpadded) embed weight; rows >= vocab -> 0.
+        valid_e = min(e, vocab)
+        if valid_e > s:
+            shard[: valid_e - s] = w_cpu[s:valid_e].to(target_dtype)
+        with torch.no_grad():
+            self.lm_head.weight.copy_(shard.to(self.lm_head.weight.device))
 
     # ── forward (unified prefill/decode; block-managed self-KV) ────────────
     @torch.no_grad()
@@ -940,24 +1071,32 @@ class WhisperForConditionalGeneration(nn.Module):
             input_ids, positions, attn_metadata, is_prefill
         )
 
-        # logits for the sampling positions (tied LM head).
+        # logits for the sampling positions.
         if sampling_positions is not None:
             hidden_states = torch.index_select(
                 hidden_states, dim=0, index=sampling_positions
             )
-        logits = self.compute_logits(hidden_states)
 
-        # ── M4: on-device sampling for the serving/async runner path ──────────
+        # ── Task 019: on-device sampling for the serving/async runner path ────
         # When on-device sampling is configured, the runner expects TOKEN IDS
-        # (shape [num_reqs]) back from forward (llama3 parity). We apply the
-        # greedy argmax on-device over the FULL-vocab fp32 logits computed above.
-        # The logits are identical on every TP rank (tied full-vocab matmul), so
-        # argmax is rank-consistent with process_group=None. When on-device
-        # sampling is OFF (offline byte-identical driver), return logits and let
-        # the host sample -- unchanged M3 behaviour.
+        # (shape [num_reqs]) back from forward (llama3 parity). With the
+        # vocab-SHARDED head, each rank computes only its local [.., per_rank]
+        # slice; we pad-mask the local slice (only the last rank owns padded
+        # columns) and hand it to the Sampler, which -- constructed with
+        # process_group=<lm_head TP group> -- runs the plugin's distributed
+        # global argmax (functional/argmax.py): gather each rank's (max, argidx),
+        # pick the global winner with correct sharding offset, lowest-index-wins
+        # on ties. Byte-identical to argmax over the full-vocab head, but each
+        # rank only projects/reads 1/TP of the vocab (the perf win).
+        #
+        # When on-device sampling is OFF (M3 offline byte-identical driver),
+        # all-gather the sharded slices to full vocab (compute_logits) and return
+        # the full-vocab logits for the host to sample -- unchanged behaviour.
         if self.sampler is not None:
+            local_logits = self._mask_pad_local(self._logits_local(hidden_states))
             sampled_tokens = self.sampler(
-                logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
+                local_logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
             )
             return sampled_tokens
+        logits = self.compute_logits(hidden_states)
         return logits
