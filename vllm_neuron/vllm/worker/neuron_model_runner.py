@@ -72,6 +72,7 @@ from vllm_neuron.model.neuron_config import (
 from vllm_neuron.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
+from vllm_neuron.vllm.spec_decode.medusa import MedusaProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
     get_max_num_batched_tokens,
@@ -723,7 +724,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         # Set up speculative decoding.
         self.drafter = None
         self.is_eagle3_spec = False
+        self.is_medusa_spec = False
         self._draft_token_ids = None
+        # Task 020 (M2): Medusa verify-step scratch. The target NEFF stashes the
+        # last candidate hidden state + the next-K drafts here; consumed by the
+        # propose gate + _propose_draft_token_ids, then cleared.
+        self._medusa_last_hidden_states: torch.Tensor | None = None
+        self._medusa_drafts: torch.Tensor | None = None
         # Async EAGLE3 draft rows by req_id. Only used at batch-composition
         # changes (e.g. several prefills merging into the first bs-wide decode).
         # Steady-state decode goes through the cross-step future path in
@@ -735,6 +742,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             if self.speculative_config.method == "eagle3":
                 self.is_eagle3_spec = True
                 self.drafter = EagleProposer(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
+                self.rejection_sampler = RejectionSampler()
+            elif self.speculative_config.method == "medusa":
+                # Task 020 (M2): Medusa is a PARTIAL parallel to EAGLE. The
+                # accept/reject machinery (RejectionSampler,
+                # _parse_rejection_sampling_output, SpecDecodeMetadata) is
+                # method-agnostic and reused UNCHANGED; only the proposer +
+                # a few dispatch sites are Medusa-aware. The heads live in the
+                # target model (loaded at model load); the proposer is thin
+                # and has no separate draft model / draft KV.
+                self.is_medusa_spec = True
+                self.drafter = MedusaProposer(
                     self.vllm_config, self.device, self.on_device_sampling
                 )
                 self.rejection_sampler = RejectionSampler()
@@ -1451,12 +1471,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         logger.info("NeuronModel loading complete (moved to device and compiled)")
 
         if self.drafter is not None:
-            logger.info("Spec decode enabled. Loading draft model ...")
-            # TODO: model loading logic could be extracted
-            # Pass target model's padded hidden_size to draft model
-            target_hidden_size = self.model.config.hidden_size
-            self.drafter.load_model(target_hidden_size=target_hidden_size)
-            logger.info("Draft model loading complete (moved to device and compiled)")
+            if self.is_medusa_spec:
+                # Task 020 (M2): Medusa has no separate draft model. The heads
+                # live in the target model (loaded above); bind the target so
+                # the proposer can call its medusa_propose in the fallback path.
+                logger.info("Spec decode (medusa) enabled. Binding target model to proposer ...")
+                self.drafter.set_target_model(self.model)
+                self.drafter.load_model(target_model=self.model)
+            else:
+                logger.info("Spec decode enabled. Loading draft model ...")
+                # TODO: model loading logic could be extracted
+                # Pass target model's padded hidden_size to draft model
+                target_hidden_size = self.model.config.hidden_size
+                self.drafter.load_model(target_hidden_size=target_hidden_size)
+                logger.info("Draft model loading complete (moved to device and compiled)")
 
     def init_tensor_replacement(self) -> None:
         """Initialize tensor replacement from neuron_config."""
@@ -5515,7 +5543,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         # If spec decode enabled, log acceptance stats and propose draft tokens.
         # aux_hidden_states is None when eagle3 is not active.
-        if self.is_eagle3_spec and aux_hidden_states is not None:
+        # Task 020 (M2): Medusa fires the same propose block from the LAST
+        # hidden state (not aux_hidden_states) -- the target NEFF stashes
+        # self._medusa_last_hidden_states + self._medusa_drafts when a verify
+        # step ran, so gate on that instead of aux_hidden_states.
+        medusa_ready = (
+            self.is_medusa_spec
+            and getattr(self, "_medusa_last_hidden_states", None) is not None
+        )
+        if (self.is_eagle3_spec and aux_hidden_states is not None) or medusa_ready:
             max_position = positions.max().item() if positions.numel() > 0 else 0
             num_spec_tokens = self.drafter.num_speculative_tokens
             # Stop proposing early enough that the scheduler never trims
@@ -6477,7 +6513,27 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         last_accepted_token: torch.Tensor | None = None
 
         if self.on_device_sampling:
-            if self.is_eagle3_spec:
+            if self.is_medusa_spec and spec_decode_metadata is not None:
+                # Task 020 (M2): Medusa verify step. The target NEFF returns a
+                # 3-tuple (verify_logits [K+1, vocab], last_hidden_states,
+                # drafts [K]) -- NOT sampled token ids. verify_logits feed the
+                # HOST RejectionSampler (Lever B, _sample :7307). The heads run
+                # in-graph on the last candidate row and emit the next K drafts.
+                # last_hidden_states is stashed so the propose-block gate fires
+                # (it stands in for EAGLE's aux_hidden_states); medusa_drafts is
+                # consumed by _propose_draft_token_ids.
+                (
+                    model_output_tensor,
+                    self._medusa_last_hidden_states,
+                    self._medusa_drafts,
+                ) = model_output
+                # Medusa reads the target's LAST hidden state, not EAGLE's
+                # mid-network aux layers; expose it under both names so the
+                # existing propose gate / dispatch generalizes with minimal
+                # edits (aux_hidden_states stays None for the eagle3 checks).
+                aux_hidden_states = None
+                self._on_device_logits = model_output_tensor
+            elif self.is_eagle3_spec:
                 if spec_decode_metadata is not None:
                     # Eagle3 + spec decode: model returns 4-tuple
                     # (sampled_tokens, aux_hidden_states, gathered_logits,
@@ -7491,6 +7547,35 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
     ) -> list[list[int]] | torch.Tensor:
         # TODO: now only supports EAGLE speculative decoding
         # Add more when needed
+        # Task 020 (M2): Medusa dispatch. The Medusa target NEFF already ran the
+        # heads on the last candidate row and emitted the next K drafts (stashed
+        # as self._medusa_drafts by the output parser). The proposer is a thin
+        # reshape/return -- no shifted input_ids, no aux_hidden_states, no draft
+        # KV. Return drafts_only [num_reqs, K] on CPU (sync path, Lever A).
+        if self.is_medusa_spec:
+            assert isinstance(self.drafter, MedusaProposer)
+            num_reqs = self.input_batch.num_reqs
+            K = self.drafter.num_speculative_tokens
+            if num_reqs == 0:
+                return torch.empty((0, K), dtype=torch.int32)
+            drafts = getattr(self, "_medusa_drafts", None)
+            if drafts is None:
+                # Fallback: compute drafts from the stashed last hidden state via
+                # the proposer (calls model.medusa_propose). Rare -- the NEFF
+                # normally emits drafts directly.
+                last_hidden = self._medusa_last_hidden_states
+                last_token_indices = torch.arange(
+                    num_reqs, dtype=torch.long, device=last_hidden.device
+                )
+                drafts = self.drafter.propose(
+                    last_hidden_states=last_hidden,
+                    last_token_indices=last_token_indices,
+                )
+            drafts = drafts.reshape(num_reqs, K).to(torch.int32)
+            self._medusa_last_hidden_states = None
+            self._medusa_drafts = None
+            return drafts.cpu()
+
         assert isinstance(self.drafter, EagleProposer)
 
         num_reqs = self.input_batch.num_reqs

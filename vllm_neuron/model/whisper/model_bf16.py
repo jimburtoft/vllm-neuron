@@ -1164,6 +1164,7 @@ class WhisperForConditionalGeneration(nn.Module):
         sampling_params: torch.Tensor | None = None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
+        spec_decode_metadata: object | None = None,
         **kwargs,
     ) -> torch.Tensor:
         positions = positions.to(torch.int32)
@@ -1182,6 +1183,42 @@ class WhisperForConditionalGeneration(nn.Module):
         hidden_states = self.decoder(
             input_ids, positions, attn_metadata, is_prefill
         )
+
+        # ── Task 020 (M2): Medusa VERIFY-K path (host rejection, Lever B) ─────
+        # When a spec-decode verify step is active AND Medusa heads exist, the
+        # runner drives forward over input_ids [1, K+1] = [anchor, d0..d_{K-1}]
+        # (the scheduler placed the previous step's drafts into input_ids). The
+        # decoder above already wrote the K+1 self-KV slots at the trailing
+        # positions (forward_decode's per-position causal mask handles the
+        # multi-token window -- M0.5-de-risked). Here we must:
+        #   (a) return FULL-vocab logits at ALL K+1 candidate rows (NOT one
+        #       sampled token id) so the host RejectionSampler (runner :7307)
+        #       can index bonus_logits_indices / target_logits_indices;
+        #   (b) run the Medusa heads on the LAST candidate row's hidden state
+        #       to produce the next K drafts (heads compile INTO this NEFF).
+        # Return the runner-parser (:6479 medusa branch) 3-tuple
+        #   (verify_logits [K+1, vocab], last_hidden_states, drafts [K]).
+        is_medusa_verify = (
+            self.medusa_heads is not None
+            and spec_decode_metadata is not None
+            and not is_prefill
+        )
+        if is_medusa_verify:
+            # verify rows: the runner passes sampling_positions=logits_indices,
+            # which spans all K+1 candidate positions for a spec-decode step.
+            if sampling_positions is not None:
+                verify_hidden = torch.index_select(
+                    hidden_states, dim=0, index=sampling_positions
+                )  # [K+1, d_model]
+            else:
+                verify_hidden = hidden_states
+            verify_logits = self.compute_logits(verify_hidden)  # [K+1, vocab]
+            # next-K drafts from the LAST candidate position's hidden state.
+            last_hidden = verify_hidden[-1:].contiguous()  # [1, d_model]
+            drafts = self.medusa_heads.propose_from_hidden(
+                last_hidden, project_fn=self.compute_logits
+            )  # [K] int32
+            return verify_logits, verify_hidden, drafts
 
         # logits for the sampling positions.
         if sampling_positions is not None:
