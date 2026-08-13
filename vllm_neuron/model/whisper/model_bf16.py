@@ -920,6 +920,38 @@ class WhisperForConditionalGeneration(nn.Module):
         # text_neuron_config is the 3-arg name for neuron_config.
         nc = neuron_config if neuron_config is not None else text_neuron_config
         config = WhisperConfig.from_configs(hf_config, nc)
+
+        # Task 020 (M4): surface the Medusa heads config for the SERVED path.
+        # The runner constructs the model via the generic from_configs(hf_config,
+        # neuron_config) call (neuron_model_runner.py:1190/1210) and never passes
+        # a medusa_config -- so we pull it from the active vLLM config's
+        # additional_config here. Customer enables Medusa with:
+        #   --speculative-config '{"method":"medusa","num_speculative_tokens":5}'
+        #   --additional-config  '{"medusa_config":{"init":"zero"}}'
+        # (num_speculative_tokens=K is handled by the spec-config shim + runner;
+        # medusa_config carries only the heads SOURCE: init=zero|random|load +
+        # heads_path when init=load, num_heads defaults to K.) An explicit
+        # medusa_config kwarg (e.g. from a test) takes precedence.
+        medusa_config = kwargs.get("medusa_config")
+        if medusa_config is None:
+            try:
+                from vllm.config import get_current_vllm_config
+
+                vcfg = get_current_vllm_config()
+                add_cfg = getattr(vcfg, "additional_config", None) or {}
+                medusa_config = add_cfg.get("medusa_config")
+                # Default num_heads (N) to K from the speculative config so the
+                # customer only has to set K in ONE place (--speculative-config).
+                if medusa_config is not None and "num_heads" not in medusa_config:
+                    spec = getattr(vcfg, "speculative_config", None)
+                    k = getattr(spec, "num_speculative_tokens", None)
+                    if k is not None:
+                        medusa_config = {**medusa_config, "num_heads": int(k)}
+            except Exception:
+                medusa_config = None
+        if medusa_config is not None:
+            config.medusa_config = medusa_config
+
         return cls(config)
 
     # ── KV cache: self-KV only (block-managed). cross-KV is register_buffer ──

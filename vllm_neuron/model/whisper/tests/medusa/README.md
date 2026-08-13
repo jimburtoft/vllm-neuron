@@ -20,6 +20,7 @@ This directory holds the M3 validation tooling.
 | `medusa_bench.py` | The **customer latency harness**. Measures per-clip end-to-end latency, mean per-iter latency, mean accepted tokens/iter, effective ms/token, and speedup vs greedy. Emits a clean table + the speedup-vs-acceptance model. This is the tool the customer runs once they load their TRAINED heads. |
 | `medusa_synth_heads.py` | Builds a SYNTHETIC partially-correct head checkpoint (crude fit to the greedy continuation) used by the gate to EXERCISE the accept path. Not a real trained model — only a device for driving multi-token accepts. |
 | `make_clip_mels.py` | Builds the 5-clip mel set (jfk + 4 LibriSpeech dummy utterances) the gate/harness consume. |
+| `serve_medusa_smoke_test.sh` | Brings up `vllm serve` with Medusa enabled at TP=4 and curls one clip through `/v1/audio/transcriptions` — the REAL served customer entry point. See **[../../MEDUSA.md](../../MEDUSA.md)** for the full serve command + config surface. |
 
 ## Correctness invariant (M0 spec §5)
 
@@ -78,3 +79,24 @@ speedup ≈ (mean tokens emitted per verify) / 1.116
 
 Heads must deliver > ~0.12 accepted drafts/verify just to break even; the win
 grows with acceptance. The customer's trained heads determine the real speedup.
+
+## Serving with Medusa (the real customer entry point)
+
+The gate + harness above are the mechanism/measurement tools (the harness is
+host-transfer-bound; read its `accepted/iter`, not its wall-clock). The **served**
+path is what the customer actually runs and measures:
+
+```bash
+# launch vllm serve with Medusa at TP=4 (placeholder zero heads)
+./serve_medusa_smoke_test.sh
+# ... in another shell once "Application startup complete":
+CLIP=/large/work/ref/jfk.flac ./serve_medusa_smoke_test.sh --curl-only
+
+# with YOUR trained heads:
+MEDUSA_HEADS_PATH=/path/to/heads.pt ./serve_medusa_smoke_test.sh
+```
+
+Enable knobs: `--speculative-config '{"method":"medusa","num_speculative_tokens":5}'`
+(K) + `--additional-config '{"medusa_config":{"init":"zero|random|load","heads_path":...}}'`
+(heads source). Full details, config surface, and the offline-vs-served latency
+framing: **[../../MEDUSA.md](../../MEDUSA.md)**.

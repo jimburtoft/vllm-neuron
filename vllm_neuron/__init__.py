@@ -197,6 +197,24 @@ from vllm_neuron.vllm.patches.port_hold_patch import apply_port_hold_patch
 
 apply_port_hold_patch()
 
+# Task 020 (M4): accept `--speculative-config '{"method":"medusa",...}'` in
+# `vllm serve` without demanding a separate draft model (the Medusa heads live
+# inside the native Whisper target). The actual patch (wrapping
+# EngineArgs.create_speculative_config) is applied in register() below -- NOT at
+# import time -- because `vllm_neuron` is imported WHILE vLLM itself is still
+# initializing (the plugin-discovery import happens mid `import vllm`), so any
+# `from vllm.engine.arg_utils import EngineArgs` here hits a circular import.
+# register() runs after vLLM's plugin system is up (arg_utils fully loaded) and
+# before the engine builds SpeculativeConfig.
+from vllm_neuron.vllm.patches.medusa_spec_config_patch import (
+    apply_medusa_spec_config_patch,
+)
+
+# Attempt once at import time too (harmless if it fails on the circular import;
+# register() retries). This covers spawn-mode re-imports where register() may
+# not run in a subprocess but arg_utils is already importable.
+apply_medusa_spec_config_patch()
+
 
 def register():
     """Register the Neuron platform if Neuron devices are present, else return None.
@@ -218,6 +236,12 @@ def register():
     from vllm_neuron.vllm.platform import _patch_dcp_config_validation
 
     _patch_dcp_config_validation()
+
+    # Task 020 (M4): (re)apply the Medusa spec-config shim now that vLLM's
+    # plugin system is up and vllm.engine.arg_utils is fully importable (the
+    # import-time attempt in this module may have raced a circular import during
+    # `import vllm`). Idempotent -- a no-op if already armed.
+    apply_medusa_spec_config_patch()
 
     return get_platform_class()
 

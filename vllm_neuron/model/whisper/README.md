@@ -28,7 +28,14 @@ A registered plugin model package `vllm_neuron/model/whisper/`:
 | `factory.py` | Registered `WhisperForConditionalGeneration` — carries the `SupportsTranscription` + `SupportsMultiModal` interface markers and the audio-mm processor registration so `vllm serve` routes `/v1/audio/transcriptions` here. |
 | `model_bf16.py` | The concrete encoder + decoder: block-managed self-KV, model-owned cross-KV buffers, on-device greedy sampler, vocab-parallel (sharded) fp32 LM head. |
 | `weight_loaders.py` | HF `openai/whisper-large-v3` safetensors → module state-dict remap. |
+| `medusa_heads.py` | Medusa spec-decode heads (ResBlock MLPs on the decoder's last hidden state) + head loader (customer / placeholder weights). See **[MEDUSA.md](MEDUSA.md)**. |
 | `registry.py` (one-line edit) | registers `WhisperForConditionalGeneration` in `get_models()`. |
+
+> **Speculative decoding**: a Medusa spec-decode framework for BS=1 latency ships
+> alongside this model — enable it from `vllm serve` with
+> `--speculative-config '{"method":"medusa","num_speculative_tokens":5}'`. See
+> **[MEDUSA.md](MEDUSA.md)** for the serve command, config surface, head loader,
+> the speedup-vs-acceptance model, and the correctness guarantee.
 
 One runner edit is required (see [Known limitations](#known-limitations)):
 `neuron_model_runner.py get_supported_tasks()` now reports `("transcription",)`
