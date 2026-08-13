@@ -42,6 +42,17 @@ class WhisperConfig:
     # Framework config (self-KV block sizing, sampling, TP degree, etc.)
     neuron_config: NeuronConfig | None = None
 
+    # Task 020 Medusa: optional speculative-decoding heads config. None ->
+    # Medusa disabled (zero overhead, heads never constructed). When set (a
+    # dict, e.g. from additional_config['medusa_config']), the top-level model
+    # builds MedusaHeads. Recognized keys:
+    #   num_heads:         N = K lookahead heads (default 5)
+    #   medusa_num_layers: ResBlocks per head (default 1)
+    #   init:              "zero" | "random" | "load" (default "random")
+    #   heads_path:        checkpoint path when init == "load" (default None)
+    #   seed:              RNG seed for init == "random" (default 0)
+    medusa_config: dict | None = None
+
     def __post_init__(self):
         # Footgun 3 (contrib whisper_neuron.py:177-184): assert large-v3 dims so
         # a mis-sized config fails fast at construction rather than at a shape

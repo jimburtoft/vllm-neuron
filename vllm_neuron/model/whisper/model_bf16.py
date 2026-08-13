@@ -743,6 +743,36 @@ class WhisperForConditionalGeneration(nn.Module):
                 process_group=lm_head_device_group,
             )
 
+        # ── Task 020: optional Medusa speculative-decoding heads ──────────────
+        # Built ONLY when config.medusa_config is set (via additional_config /
+        # hf_config). When None, Medusa is disabled -> heads are never
+        # constructed -> zero overhead + the existing non-Medusa serving path is
+        # untouched. Heads are children of this module (compile INTO the target
+        # decode/verify NEFF; their read of the last hidden state is an in-graph
+        # zero-copy op). The output projection is the sharded self.lm_head
+        # (Medusa-1 tie) -- heads own only the per-head ResBlock params, loaded
+        # in load_weights (after the base weights, on CPU). M2 wires the
+        # proposer/verify path; M1 only constructs + loads + runs the heads.
+        self.medusa_heads = None
+        self._medusa_cfg = None
+        mc = getattr(config, "medusa_config", None)
+        if mc is not None:
+            from .medusa_heads import MedusaHeads
+
+            self._medusa_cfg = {
+                "num_heads": int(mc.get("num_heads", 5)),
+                "medusa_num_layers": int(mc.get("medusa_num_layers", 1)),
+                "init": str(mc.get("init", "random")),
+                "heads_path": mc.get("heads_path", None),
+                "seed": int(mc.get("seed", 0)),
+            }
+            self.medusa_heads = MedusaHeads(
+                num_heads=self._medusa_cfg["num_heads"],
+                hidden_size=config.d_model,
+                medusa_num_layers=self._medusa_cfg["medusa_num_layers"],
+                dtype=self.dtype,
+            )
+
     # ── generative-model detection (vLLM) ────────────────────────────────
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.decoder.embed_tokens(input_ids)
@@ -997,6 +1027,60 @@ class WhisperForConditionalGeneration(nn.Module):
         # runner's device move), so materialize the shard on CPU too.
         self._tie_lm_head()
 
+        # ── Task 020: load Medusa head ResBlock params (if enabled) ───────────
+        # After the base weights + lm-head tie, while tensors are on CPU (pre
+        # device move). The heads' output projection is the sharded self.lm_head
+        # (tie) -- only the ResBlock params are synthesized/loaded here. init
+        # "zero"/"random" need NO checkpoint (framework runs untrained); "load"
+        # reads a customer checkpoint. MISSING/UNEXPECTED for the head params
+        # must be 0 (asserted by the M1 harness).
+        self._medusa_load_report = None
+        if self.medusa_heads is not None:
+            from .medusa_heads import (
+                _load_checkpoint_state,
+                _normalize_external_state,
+                _synthesize_state,
+            )
+
+            cfg = self._medusa_cfg
+            # materialize head storage on CPU (parity with to_empty above).
+            if any(p.is_meta for p in self.medusa_heads.parameters()):
+                self.medusa_heads.to_empty(device="cpu")
+            if cfg["init"] in ("zero", "random"):
+                head_state = _synthesize_state(
+                    self.medusa_heads, cfg["init"], seed=cfg["seed"]
+                )
+            elif cfg["init"] == "load":
+                if not cfg["heads_path"]:
+                    raise ValueError("medusa_config init='load' requires heads_path")
+                raw = _load_checkpoint_state(cfg["heads_path"])
+                head_state = _normalize_external_state(raw, self.medusa_heads)
+            else:
+                raise ValueError(
+                    f"medusa_config init must be zero|random|load, got {cfg['init']!r}"
+                )
+            m_missing, m_unexpected = self.medusa_heads.load_state_dict(
+                head_state, strict=False, assign=True
+            )
+            self._medusa_load_report = {
+                "missing": len(m_missing),
+                "unexpected": len(m_unexpected),
+            }
+            logger.info(
+                "Medusa heads load: N=%d L=%d init=%s missing=%d unexpected=%d",
+                cfg["num_heads"],
+                cfg["medusa_num_layers"],
+                cfg["init"],
+                len(m_missing),
+                len(m_unexpected),
+            )
+            if m_missing or m_unexpected:
+                logger.warning(
+                    "Medusa heads weight mismatch: missing=%s unexpected=%s",
+                    m_missing,
+                    m_unexpected,
+                )
+
         n_missing = len(enc_missing_real) + len(dec_missing)
         n_unexpected = len(enc_unexpected) + len(dec_unexpected)
         logger.info(
@@ -1039,6 +1123,34 @@ class WhisperForConditionalGeneration(nn.Module):
             shard[: valid_e - s] = w_cpu[s:valid_e].to(target_dtype)
         with torch.no_grad():
             self.lm_head.weight.copy_(shard.to(self.lm_head.weight.device))
+
+    # ── Task 020 (M1): Medusa draft proposal from a single anchor ──────────
+    @torch.no_grad()
+    def medusa_propose(self, last_hidden: torch.Tensor) -> torch.Tensor:
+        """Task 020 (M1): run the Medusa heads on a single anchor hidden state
+        and return the K greedy draft token ids [N] int32.
+
+        ``last_hidden`` is the decoder's LAST hidden state (post final LayerNorm)
+        at the anchor position -- the SAME tensor compute_logits / self.lm_head
+        consume (self.decoder returns self.layer_norm(x); forward computes
+        ``hidden_states`` from it). Head j predicts the token at anchor+1+j via
+        ResBlock_j(h) -> tied full-vocab lm_head -> argmax.
+
+        The projection uses ``compute_logits`` (all-gathers the sharded per-rank
+        vocab slices to full vocab, fp32) so the argmax is a real token id and is
+        byte-consistent across TP ranks (each rank's head output projection uses
+        its lm_head vocab shard; the all-gather stitches them). This is exactly
+        what M2's proposer/verify NEFF calls on the last candidate position to
+        produce the next K drafts.
+        """
+        if self.medusa_heads is None:
+            raise RuntimeError(
+                "medusa_propose called but Medusa heads are not constructed "
+                "(config.medusa_config is None)."
+            )
+        return self.medusa_heads.propose_from_hidden(
+            last_hidden, project_fn=self.compute_logits
+        )
 
     # ── forward (unified prefill/decode; block-managed self-KV) ────────────
     @torch.no_grad()
