@@ -29,9 +29,9 @@ graph call → fewer iterations → lower latency **when the heads are accurate*
   customer-trained heads (or placeholder heads), enabled from `vllm serve`, with a
   correctness gate + a latency harness the customer runs against their own heads.
 - **It is NOT**: a speedup by itself. Untrained / placeholder heads accept ~0 real
-  drafts → ~1 token/iter → **≈1.0× or slightly slower** than greedy (you pay a small
-  verify overhead for no accepted tokens). The win requires trained heads and scales
-  with their acceptance (see [Speedup model](#speedup--facceptance)).
+  drafts → ~1 token/iter → **slower than greedy** (you pay a small verify overhead for
+  no accepted tokens). The win requires trained heads and scales with their acceptance
+  (see [Speedup model](#speedup--fyour-heads-acceptance)).
 
 ### Correctness guarantee (holds at ANY acceptance rate)
 
@@ -123,29 +123,61 @@ variants (Medusa-2 / Hydra / EAGLE) are rejected with a clear error.
 
 ---
 
-## Speedup = f(acceptance)
+## Speedup = f(your head's acceptance)
 
-On device a `[1, K+1]` verify step costs `r ≈ 1.116×` a single-token `[1, 1]` decode
-step (decode is bandwidth-bound; the extra K positions are nearly free). If the heads
-let you emit `T` tokens per verify (accepted drafts + 1 bonus):
+The served speedup is set entirely by **how many tokens your head lets the target emit
+per verify step**. The framework's per-step cost is fixed and independent of the head:
 
 ```
-speedup ≈ T / 1.116
+served speedup ≈ (accepted tokens per verify) / R
 ```
 
-| tokens/verify T | speedup |
+where **`R` is the measured served verify-step / greedy-step cost ratio**. With
+on-device greedy rejection (accepted token ids returned from the verify NEFF; no
+per-step `[K+1, vocab]` logits→host copy), the measured **`R ≈ 1.31×`** at TP=4 LNC=2
+BS=1. If your heads let the target emit `T` tokens per verify (accepted drafts + 1
+bonus):
+
+| tokens/verify T | served speedup (R≈1.31) |
 |--:|--:|
-| **1** (placeholder / untrained heads land here) | **0.90× — slightly SLOWER than greedy** |
-| 1.116 | 1.00× (**breakeven**) |
-| 2 | 1.79× |
-| 3 | 2.69× |
-| 4 | 3.58× |
-| 5 | 4.48× |
-| 6 | 5.38× |
+| **1** (placeholder / untrained heads land here) | **0.76× — slower than greedy** |
+| **1.31** | **1.00× (breakeven)** |
+| 2 | 1.53× |
+| 3 | 2.29× |
+| 4 | 3.05× |
+| 5 | 3.82× |
+| 6 | 4.58× |
 
-**Breakeven: heads must deliver > 1.116 accepted tokens/verify** just to beat greedy.
-The framework measures *your* heads — it does not manufacture acceptance. Placeholder
-heads exist only to prove the plumbing runs and stays byte-identical.
+**Breakeven: your head must deliver > ~1.31 accepted tokens/verify** to beat greedy.
+Well-trained Medusa heads in the literature commonly reach 2–3+ accepted/verify, i.e.
+~1.5–2.3× here. The framework measures *your* heads — it does not manufacture
+acceptance; placeholder heads (`zero`/`random`) exist only to prove the plumbing runs
+and stays byte-identical (they land at T≈1 → slower, expected).
+
+> The bundled example head (`jburtoft/whisper-large-v3-medusa-heads`) is a lightly
+> trained *demonstration* head (~1.19 accepted/verify → ~0.92×, just below breakeven).
+> It exists to exercise the accept path end-to-end, not to show a speedup — bring your
+> own trained head.
+
+### Head compatibility contract (match these or acceptance silently collapses)
+
+Your trained head must match the framework's assumptions, or it will load but accept
+~nothing:
+
+- **Medusa-1 (tied output projection).** Each head's output projection is tied to the
+  target's `proj_out` (LM head). Per-head output-projection tensors in your checkpoint
+  are dropped on load. A Medusa-2 (untied) head will not use its own output projection.
+- **Head architecture:** `L` stacked ResBlocks per head, `ResBlock(x) = x + SiLU(Linear(d,d))`,
+  `d_model = 1280`. Set `medusa_config.medusa_num_layers = L` to match your `L`.
+- **Shift convention `i + 2`:** `head_i` must be trained to predict the token at position
+  `t + i + 2` from the decoder's last hidden state at `t` (the +1 slot is the target's own
+  next-token argmax; the heads cover +2 onward). A head trained with a different shift will
+  mispredict and be rejected.
+- **Dims:** `hidden_size == 1280`, `vocab_size == 51866`, `n_heads >= K`
+  (`num_speculative_tokens`).
+- **Train against the target's own greedy outputs (pseudo-labels), not ground-truth
+  transcripts** — acceptance measures agreement with what `whisper-large-v3` would greedily
+  emit. (See the example repo's training/harvest scripts.)
 
 ---
 
