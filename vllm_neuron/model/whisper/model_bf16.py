@@ -831,6 +831,76 @@ class WhisperForConditionalGeneration(nn.Module):
         neg = torch.full((), float("-inf"), dtype=local.dtype, device=local.device)
         return torch.where(ar < self.n_valid, local, neg)
 
+    def _medusa_ondevice_reject(
+        self,
+        target_argmax: torch.Tensor,
+        verify_input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Task 023: ON-DEVICE greedy rejection for the Medusa verify step.
+
+        Runs the exact ``RejectionSampler._rejection_greedy_sample`` logic in
+        the compiled graph (argmax + compare + cumulative-accept mask), so the
+        verify NEFF emits ACCEPTED token ids instead of ``[K+1, vocab]`` logits.
+        No ``.to("cpu")`` / ``.tolist()`` / Python loop -- pure on-device tensor
+        ops, byte-identical to plain greedy (each accepted position is set to
+        the target's own argmax; reject at the first draft != argmax mismatch).
+
+        BS=1 (the served target regime): verify_input_ids is
+        ``[anchor, d0..d_{K-1}]`` (K+1 tokens); the drafts being verified are
+        ``verify_input_ids[1:K+1]``. The greedy accept for draft ``d_p`` (which
+        follows position ``p``) is ``d_p == target_argmax[p]``.
+
+        Args:
+            target_argmax: [K+1] int32 target argmax token ids (distributed
+                argmax over the sharded LM head).
+            verify_input_ids: [K+1] int32 = [anchor, d0..d_{K-1}].
+
+        Returns:
+            [1, K+1] int32 accepted token ids, ``-1`` after the first reject --
+            the ``_parse_rejection_sampling_output`` contract.
+        """
+        Kp1 = target_argmax.shape[0]  # K + 1
+        K = Kp1 - 1
+        # Drafts d_p = verify_input_ids[1 .. K]; compare vs target_argmax[0..K-1].
+        # match[p] = (d_p == target_argmax[p]) for p in 0..K-1.
+        drafts = verify_input_ids[1:Kp1].to(torch.int32)  # [K]
+        tgt_k = target_argmax[:K]  # [K]
+        match = (drafts == tgt_k).to(torch.int32)  # [K], 1 = accept
+        # n_acc = number of LEADING accepts (== position of the first reject,
+        # == K if all K accepted). We compute the leading-accept count WITHOUT
+        # torch.cumprod/torch.cumsum -- those lower to a Neuron custom-call the
+        # compiler rejects ("Unknown custom-call API version"). Instead: build a
+        # lower-triangular ones matrix [K,K] (tri[p,j]=1 iff j<=p) and matmul it
+        # against the per-position mismatch vector to get the running mismatch
+        # count. accept_prefix[p] = (running_mismatch[p] == 0). This is pure
+        # elementwise + matmul, all natively supported.
+        mismatch = (1 - match).to(torch.float32)  # [K]
+        ar = torch.arange(K, device=target_argmax.device, dtype=torch.int32)
+        tri = (ar.unsqueeze(1) >= ar.unsqueeze(0)).to(torch.float32)  # [K,K]
+        cummis = torch.matmul(tri, mismatch)  # [K] running mismatch count
+        accept_prefix = (cummis == 0).to(torch.int32)  # [K], 1 while accepting
+        n_acc = accept_prefix.sum()  # scalar int32 in 0..K
+        # Keep positions 0..n_acc inclusive (the accepted prefix + the
+        # reject/bonus token at position n_acc); -1 after. keep[p] = p <= n_acc.
+        arp1 = torch.arange(Kp1, device=target_argmax.device, dtype=torch.int32)
+        keep = arp1 <= n_acc  # [K+1] bool
+        neg = torch.full_like(target_argmax, -1)
+        accepted = torch.where(keep, target_argmax.to(torch.int32), neg)  # [K+1]
+        return accepted.unsqueeze(0)  # [1, K+1]
+
+    def _sharded_argmax(self, head_hidden: torch.Tensor) -> torch.Tensor:
+        """Task 023: sharded distributed argmax over head hidden-states.
+
+        Maps [N, d] Medusa head hidden-states -> [N] int32 greedy token ids
+        using the model's vocab-sharded LM head + the plugin Sampler's
+        cross-rank global argmax (the SAME mechanism greedy decode uses). This
+        replaces N per-head full-vocab all-gathers (compute_logits) with a
+        single [N, per_rank] distributed argmax. Always greedy (drafts are
+        argmax), so sampling_params=None.
+        """
+        local = self._mask_pad_local(self._logits_local(head_hidden))  # [N, per_rank]
+        return self.sampler(local).to(torch.int32)  # [N]
+
     # ── M2/M3: encoder-run-once + cross-KV populate (audio-mm trigger) ──────
     def embed_multimodal(
         self,
@@ -1216,20 +1286,24 @@ class WhisperForConditionalGeneration(nn.Module):
             input_ids, positions, attn_metadata, is_prefill
         )
 
-        # ── Task 020 (M2): Medusa VERIFY-K path (host rejection, Lever B) ─────
+        # ── Task 020 (M2) / Task 023: Medusa VERIFY-K path ───────────────────
         # When a spec-decode verify step is active AND Medusa heads exist, the
         # runner drives forward over input_ids [1, K+1] = [anchor, d0..d_{K-1}]
         # (the scheduler placed the previous step's drafts into input_ids). The
         # decoder above already wrote the K+1 self-KV slots at the trailing
         # positions (forward_decode's per-position causal mask handles the
-        # multi-token window -- M0.5-de-risked). Here we must:
-        #   (a) return FULL-vocab logits at ALL K+1 candidate rows (NOT one
-        #       sampled token id) so the host RejectionSampler (runner :7307)
-        #       can index bonus_logits_indices / target_logits_indices;
-        #   (b) run the Medusa heads on the LAST candidate row's hidden state
-        #       to produce the next K drafts (heads compile INTO this NEFF).
-        # Return the runner-parser (:6479 medusa branch) 3-tuple
-        #   (verify_logits [K+1, vocab], last_hidden_states, drafts [K]).
+        # multi-token window -- M0.5-de-risked). Here we:
+        #   (a) run the Medusa heads on the LAST candidate row's hidden state
+        #       to produce the next K drafts (heads compile INTO this NEFF);
+        #   (b) EITHER
+        #       - ON-DEVICE rejection (Task 023, served path when self.sampler
+        #         is set): return [bs, K+1] int32 ACCEPTED token ids (-1 padded),
+        #         the EAGLE / _parse_rejection_sampling_output contract. This
+        #         removes the per-step [K+1, vocab] logits -> CPU copy that made
+        #         served Medusa 0.587x in Task 022; OR
+        #       - HOST rejection (Lever B, offline byte-identical driver when
+        #         self.sampler is None): return the [K+1, vocab] logits 3-tuple
+        #         so the host RejectionSampler can index bonus/target logits.
         is_medusa_verify = (
             self.medusa_heads is not None
             and spec_decode_metadata is not None
@@ -1242,14 +1316,46 @@ class WhisperForConditionalGeneration(nn.Module):
                 verify_hidden = torch.index_select(
                     hidden_states, dim=0, index=sampling_positions
                 )  # [K+1, d_model]
+                verify_input_ids = torch.index_select(
+                    input_ids, dim=0, index=sampling_positions
+                )  # [K+1] = [anchor, d0..d_{K-1}]
             else:
                 verify_hidden = hidden_states
-            verify_logits = self.compute_logits(verify_hidden)  # [K+1, vocab]
+                verify_input_ids = input_ids
             # next-K drafts from the LAST candidate position's hidden state.
             last_hidden = verify_hidden[-1:].contiguous()  # [1, d_model]
+
+            if self.sampler is not None:
+                # ── Task 023: ON-DEVICE greedy rejection + SHARDED propose ────
+                # Reuse the SAME sharded-LM-head distributed argmax already used
+                # for greedy decode: feed the local vocab-slice logits for all
+                # K+1 rows to self.sampler (all_greedy), which returns [K+1]
+                # int32 target argmax ids via the cross-rank global argmax --
+                # NO [K+1, vocab] host copy.
+                local_logits = self._mask_pad_local(
+                    self._logits_local(verify_hidden)
+                )  # [K+1, per_rank]
+                target_argmax = self.sampler(
+                    local_logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
+                ).to(torch.int32)  # [K+1]
+                accepted = self._medusa_ondevice_reject(
+                    target_argmax, verify_input_ids
+                )  # [1, K+1] int32, -1 padded
+                # Propose the next K drafts via the SHARDED distributed argmax
+                # (one [N, per_rank] argmax) instead of N full-vocab all-gathers
+                # (propose_from_hidden -> compute_logits per head). This removes
+                # N per-step vocab all-gathers from the verify NEFF.
+                drafts = self.medusa_heads.propose_from_hidden_sharded(
+                    last_hidden, argmax_fn=self._sharded_argmax
+                )  # [K] int32
+                return accepted, verify_hidden, drafts
+
+            # Offline / host-sampling path: return the [K+1, vocab] logits for
+            # the host RejectionSampler (Lever B, byte-identical driver).
             drafts = self.medusa_heads.propose_from_hidden(
                 last_hidden, project_fn=self.compute_logits
             )  # [K] int32
+            verify_logits = self.compute_logits(verify_hidden)  # [K+1, vocab]
             return verify_logits, verify_hidden, drafts
 
         # logits for the sampling positions.

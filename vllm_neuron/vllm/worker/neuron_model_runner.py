@@ -5551,6 +5551,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             self.is_medusa_spec
             and getattr(self, "_medusa_last_hidden_states", None) is not None
         )
+        # Task 022: on a standard single-node `vllm serve`, the first decode
+        # step runs plain single-token decode (spec_decode_metadata is None),
+        # so the verify NEFF never runs, _medusa_last_hidden_states stays None,
+        # medusa_ready never becomes True, and spec decode NEVER bootstraps
+        # (drafts_total stays 0 -> no speedup). Detect that state and inject
+        # placeholder drafts to kick off the verify->propose loop. Only fires
+        # when NOT already in a verify step and we are on a real decode step
+        # (positions advanced past the prefill prompt) so we don't disturb
+        # prefill or an already-running spec loop.
+        medusa_bootstrap = (
+            self.is_medusa_spec
+            and not medusa_ready
+            and self._is_decode()
+            and spec_decode_metadata is None
+            and positions.numel() > 0
+        )
         if (self.is_eagle3_spec and aux_hidden_states is not None) or medusa_ready:
             max_position = positions.max().item() if positions.numel() > 0 else 0
             num_spec_tokens = self.drafter.num_speculative_tokens
@@ -5659,8 +5675,39 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     logits_indices=logits_indices,
                     raw_sampled_token_ids=raw_sampled_token_ids,
                 )
-
-        # Trim sampler output back to real num_reqs before output generation.
+        elif medusa_bootstrap:
+            # Bootstrap the Medusa verify->propose loop on a standard serve.
+            # Inject placeholder drafts so the scheduler schedules spec tokens
+            # next step; the target then runs the verify-K NEFF (stashing
+            # _medusa_last_hidden_states), and the real MedusaProposer takes
+            # over from that point. Placeholder drafts are rejected by the
+            # greedy rejection sampler (they won't match the target's argmax),
+            # so correctness is preserved -- byte-identical to greedy. Guard on
+            # proximity to max_model_len so we never propose past the limit.
+            num_spec_tokens = self.drafter.num_speculative_tokens
+            spec_decode_limit = self.max_model_len - num_spec_tokens - 2
+            if self.use_async_scheduling:
+                spec_decode_limit -= 1 + num_spec_tokens
+            max_position = positions.max().item() if positions.numel() > 0 else 0
+            if max_position < spec_decode_limit:
+                pad_token_id = getattr(
+                    self.vllm_config.model_config.hf_config, "pad_token_id", None
+                )
+                if pad_token_id is None:
+                    pad_token_id = 0
+                num_reqs = self.input_batch.num_reqs
+                self._draft_token_ids = [
+                    [pad_token_id] * num_spec_tokens for _ in range(num_reqs)
+                ]
+                logger.debug(
+                    "Medusa bootstrap: injected %d placeholder drafts "
+                    "(max_position=%d, num_reqs=%d)",
+                    num_spec_tokens,
+                    max_position,
+                    num_reqs,
+                )
+            else:
+                self._draft_token_ids = None
         # With spec decode batch padding, the sampler runs at padded_num_reqs;
         # output/bookkeeping expect only real requests.
         #
@@ -7350,6 +7397,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         else:
             # On-device rejection sampling
             if self.on_device_sampling:
+                # Task 023: the Medusa verify NEFF now performs greedy rejection
+                # ON-DEVICE and returns [bs, K+1] int32 accepted token ids (-1
+                # padded) -- the same contract EAGLE uses. So the generic
+                # on-device branch below (_parse_rejection_sampling_output)
+                # handles it directly; the per-step [K+1, vocab] logits -> CPU
+                # copy + host Python rejection loop (_medusa_host_greedy_reject,
+                # Task 022) is GONE. This is what removes the 2.39x served
+                # verify-step overhead measured in Task 022.
+                #
+                # (The host-rejection fallback _medusa_host_greedy_reject is
+                # retained below for the OFFLINE byte-identical driver path,
+                # where the model returns [K+1, vocab] logits because
+                # self.sampler is None -- but that path does not reach _sample's
+                # on-device branch, so no dispatch is needed here.)
                 # Model already performed rejection sampling on-device
                 # model_output_tensor: [batch_size, max_spec_len+1] with -1 padding
                 # Parse to list[list[int]] format expected by vLLM
@@ -7392,6 +7453,83 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             sampler_output.sampled_token_ids = output_token_ids
 
         return sampler_output
+
+    def _medusa_host_greedy_reject(
+        self,
+        verify_logits: torch.Tensor,
+        spec_decode_metadata: "SpecDecodeMetadata | None",
+    ) -> list[list[int]]:
+        """Host greedy rejection for the Medusa verify step (Task 022).
+
+        The Medusa verify NEFF emits ``[bs*(K+1), vocab]`` logits (K draft
+        positions + 1 bonus position per request) plus the K draft ids that
+        were proposed last step (stashed as ``self._medusa_drafts`` -> [bs, K]).
+        Greedy rejection: for each request, walk the K draft positions; accept
+        position ``i`` iff ``argmax(verify_logits[i]) == draft[i]`` and set the
+        emitted token to the target's own argmax; stop at the first mismatch and
+        emit that argmax as the (rejection) token; if all K accept, append the
+        bonus ``argmax(verify_logits[K])``. This matches
+        ``RejectionSampler._rejection_greedy_sample`` and is byte-identical to
+        plain greedy (every emitted token is the target's own argmax).
+
+        Returns list[list[int]] (per request, variable length 1..K+1), the
+        format vLLM-core's scheduler consumes.
+        """
+        drafts = getattr(self, "_medusa_drafts", None)
+        K = self.drafter.num_speculative_tokens
+        # verify_logits is on CPU here (moved in _execute_model_forward when
+        # not async). argmax over the vocab axis -> [bs*(K+1)] target tokens.
+        vl = verify_logits
+        if vl.dim() == 1:
+            vl = vl.unsqueeze(0)
+        target_argmax = vl.float().argmax(dim=-1)  # [bs*(K+1)]
+        rows = target_argmax.shape[0]
+        # Infer bs from the row count (K+1 rows per request).
+        per_req = K + 1
+        bs = max(1, rows // per_req)
+
+        # The drafts being VERIFIED this step are the ones the scheduler
+        # scheduled (spec_decode_metadata.draft_token_ids), NOT the freshly
+        # proposed _medusa_drafts (those are for the NEXT step). Use the
+        # scheduled drafts for the accept/reject comparison.
+        drafts_list = None
+        if (
+            spec_decode_metadata is not None
+            and getattr(spec_decode_metadata, "draft_token_ids", None) is not None
+        ):
+            dtid = spec_decode_metadata.draft_token_ids
+            if isinstance(dtid, torch.Tensor):
+                flat = dtid.detach().cpu().view(-1).tolist()
+                # First bs*K entries are the real per-request drafts (K each).
+                if len(flat) >= bs * K:
+                    drafts_list = [flat[r * K : r * K + K] for r in range(bs)]
+        if drafts_list is None:
+            # Fallback to the stashed drafts (BS=1 steady state).
+            if drafts is None:
+                drafts_list = [[None] * K for _ in range(bs)]
+            else:
+                d = drafts
+                if isinstance(d, torch.Tensor):
+                    d = d.detach().cpu().view(bs, -1).tolist()
+                drafts_list = d
+
+        outputs: list[list[int]] = []
+        for r in range(bs):
+            base = r * per_req
+            emitted: list[int] = []
+            rejected = False
+            for pos in range(K):
+                tgt = int(target_argmax[base + pos].item())
+                emitted.append(tgt)  # accepted position = target's own argmax
+                drf = drafts_list[r][pos] if pos < len(drafts_list[r]) else None
+                if drf is None or int(drf) != tgt:
+                    rejected = True
+                    break
+            if not rejected:
+                # All K drafts accepted -> append the bonus token.
+                emitted.append(int(target_argmax[base + K].item()))
+            outputs.append(emitted)
+        return outputs
 
     def _parse_rejection_sampling_output(
         self,

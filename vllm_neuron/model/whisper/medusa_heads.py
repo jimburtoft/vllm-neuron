@@ -181,6 +181,36 @@ class MedusaHeads(nn.Module):
             ids.append(torch.argmax(logits, dim=-1).to(torch.int32))  # [1]
         return torch.cat(ids, dim=0)  # [N]
 
+    def propose_from_hidden_sharded(
+        self,
+        last_hidden: torch.Tensor,
+        argmax_fn: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Greedy draft proposal via the SHARDED distributed argmax (Task 023).
+
+        Unlike ``propose_from_hidden`` (which calls ``model.compute_logits`` ->
+        a full-vocab all-gather per head), this stacks all N head hidden-states
+        into one [N, d] tensor and runs a SINGLE sharded distributed argmax over
+        the local vocab slices -- avoiding N full-vocab all-gathers per verify
+        step. ``argmax_fn`` maps [N, d] head hidden-states -> [N] int32 token
+        ids (the model's sharded ``_logits_local`` + pad-mask + Sampler path).
+
+        Args:
+            last_hidden: [d_model] or [1, d_model] decoder last hidden state.
+            argmax_fn:   [N, d] -> [N] int32 sharded distributed argmax.
+
+        Returns:
+            drafts: [N] int32 -- the K greedy draft token ids, one per head.
+        """
+        if last_hidden.dim() == 1:
+            last_hidden = last_hidden.unsqueeze(0)  # [1, d]
+        head_hs = [
+            self._apply_head(i, last_hidden) for i in range(self.num_heads)
+        ]  # N x [1, d]
+        stacked = torch.cat(head_hs, dim=0)  # [N, d]
+        return argmax_fn(stacked).to(torch.int32)  # [N]
+
+
 
 # --------------------------------------------------------------------------- #
 # Loader
