@@ -197,6 +197,19 @@ from vllm_neuron.vllm.patches.port_hold_patch import apply_port_hold_patch
 
 apply_port_hold_patch()
 
+# Accept `--speculative-config '{"method":"medusa",...}'` in `vllm serve`
+# without demanding a separate draft model (the Medusa heads live inside the
+# native Voxtral target's Llama backbone). The patch wraps
+# SpeculativeConfig.__post_init__; it is applied here at import time (harmless
+# if it races the circular import during `import vllm`; register() retries) and
+# again in register() once vLLM's plugin system is fully up. Ported verbatim
+# from the whisper native-integration branch (Task 020 M4); it is model-agnostic.
+from vllm_neuron.vllm.patches.medusa_spec_config_patch import (
+    apply_medusa_spec_config_patch,
+)
+
+apply_medusa_spec_config_patch()
+
 
 def register():
     """Register the Neuron platform if Neuron devices are present, else return None.
@@ -218,6 +231,11 @@ def register():
     from vllm_neuron.vllm.platform import _patch_dcp_config_validation
 
     _patch_dcp_config_validation()
+
+    # (re)apply the Medusa spec-config shim now that vLLM's plugin system is up
+    # and vllm.engine.arg_utils is fully importable (the import-time attempt may
+    # have raced a circular import during `import vllm`). Idempotent.
+    apply_medusa_spec_config_patch()
 
     return get_platform_class()
 

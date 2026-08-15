@@ -304,6 +304,39 @@ class VoxtralForConditionalGeneration(nn.Module, SupportsVisionWarmup):
         # Captures for the runner's optional tensor-capture facility.
         self._vision_captures: tuple[torch.Tensor, ...] = ()
 
+        # Optional Medusa speculative-decoding heads (built only when
+        # config.medusa_config is set via additional_config). Heads read the
+        # Llama decoder's LAST hidden state and predict K future tokens; the
+        # output projection is tied to language_model.lm_head (Medusa-1).
+        self.medusa_heads = None
+        self._medusa_cfg = None
+        mc = getattr(config, "medusa_config", None)
+        if mc is not None:
+            from .medusa_heads import MedusaHeads
+            self._medusa_cfg = {
+                "num_heads": int(mc.get("num_heads", 5)),
+                "medusa_num_layers": int(mc.get("medusa_num_layers", 1)),
+                "init": str(mc.get("init", "random")),
+                "heads_path": mc.get("heads_path", None),
+                "seed": int(mc.get("seed", 0)),
+            }
+            self.medusa_heads = MedusaHeads(
+                num_heads=self._medusa_cfg["num_heads"],
+                hidden_size=config.text_config.hidden_size,
+                medusa_num_layers=self._medusa_cfg["medusa_num_layers"],
+                dtype=config.text_config.torch_dtype,
+            )
+            logger.info(
+                "Voxtral Medusa heads constructed: N=%d L=%d d=%d init=%s",
+                self._medusa_cfg["num_heads"], self._medusa_cfg["medusa_num_layers"],
+                config.text_config.hidden_size, self._medusa_cfg["init"],
+            )
+            # Attach heads + the tied-projection argmax onto the Llama model so
+            # its spec-decode verify branch runs the heads in-graph and returns
+            # the (accepted, last_hidden, drafts) 3-tuple.
+            self.language_model.medusa_heads = self.medusa_heads
+            self.language_model._medusa_project_argmax = self._medusa_project_argmax
+
     @classmethod
     def from_configs(
         cls,
@@ -316,6 +349,25 @@ class VoxtralForConditionalGeneration(nn.Module, SupportsVisionWarmup):
             text_neuron_config=text_neuron_config,
             vision_neuron_config=vision_neuron_config,
         )
+        # Surface the Medusa heads config for the SERVED path. The runner calls
+        # from_configs without a medusa_config, so pull it from the active vLLM
+        # config's additional_config. Customer enables Medusa with:
+        #   --speculative-config '{"method":"medusa","num_speculative_tokens":5}'
+        #   --additional-config  '{"medusa_config":{"init":"load","heads_path":"..."}}'
+        try:
+            from vllm.config import get_current_vllm_config
+            vcfg = get_current_vllm_config()
+            add_cfg = getattr(vcfg, "additional_config", None) or {}
+            medusa_config = add_cfg.get("medusa_config")
+            if medusa_config is not None and "num_heads" not in medusa_config:
+                spec = getattr(vcfg, "speculative_config", None)
+                k = getattr(spec, "num_speculative_tokens", None)
+                if k is not None:
+                    medusa_config = {**medusa_config, "num_heads": int(k)}
+            if medusa_config is not None:
+                config.medusa_config = medusa_config
+        except Exception:
+            pass
         return cls(config)
 
     # ── KV cache delegation ────────────────────────────────────────────
@@ -800,6 +852,46 @@ class VoxtralForConditionalGeneration(nn.Module, SupportsVisionWarmup):
                     owner = getattr(owner, p)
                 owner.register_buffer(parts[-1], new_buf.contiguous(), persistent=False)
                 logger.debug("Materialized buffer %s shape=%s", name, tuple(new_buf.shape))
+
+        # Load Medusa head ResBlock params (Medusa-1 tie: output projection is
+        # language_model.lm_head, so only per-head ResBlocks are loaded).
+        if self.medusa_heads is not None:
+            from .medusa_heads import load_medusa_heads
+            cfg = self._medusa_cfg
+            heads, report = load_medusa_heads(
+                num_heads=cfg["num_heads"],
+                hidden_size=self.config.text_config.hidden_size,
+                medusa_num_layers=cfg["medusa_num_layers"],
+                dtype=self.config.text_config.torch_dtype,
+                init=cfg["init"],
+                heads_path=cfg["heads_path"],
+                seed=cfg["seed"],
+            )
+            self.medusa_heads = heads
+            # Re-attach the loaded heads onto the Llama model (load replaced the
+            # object built in __init__).
+            self.language_model.medusa_heads = self.medusa_heads
+            self.language_model._medusa_project_argmax = self._medusa_project_argmax
+            logger.info("Voxtral Medusa heads loaded: %s", report)
+
+    def _medusa_project_argmax(self, head_hidden: torch.Tensor) -> torch.Tensor:
+        """[N, d] head hidden-states -> [N] int32 greedy token ids via the
+        language_model's vocab-sharded lm_head + Sampler distributed argmax
+        (the same mechanism greedy decode uses). Always greedy."""
+        lm = self.language_model
+        # Match the Llama forward's lm_head call convention (no fp32 pre-cast;
+        # lm_head + sampler handle the head dtype), avoiding a mixed-dtype op.
+        local = lm.lm_head(head_hidden.to(lm.lm_head.weight.dtype))
+        return lm.sampler(local).to(torch.int32)
+
+    def medusa_propose(self, last_hidden: torch.Tensor) -> torch.Tensor:
+        """Greedy draft proposal for a SINGLE anchor position. Returns [K] int32.
+        Runs the N Medusa heads on the Llama decoder's last hidden state and
+        argmaxes each through the tied sharded lm_head."""
+        assert self.medusa_heads is not None, "medusa_propose called without heads"
+        return self.medusa_heads.propose_from_hidden_sharded(
+            last_hidden, self._medusa_project_argmax
+        )
 
     @staticmethod
     def _remap_hf_key(k: str) -> str | None:

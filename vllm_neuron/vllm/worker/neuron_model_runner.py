@@ -72,6 +72,7 @@ from vllm_neuron.model.neuron_config import (
 from vllm_neuron.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
+from vllm_neuron.vllm.spec_decode.medusa import MedusaProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
     get_max_num_batched_tokens,
@@ -723,6 +724,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         # Set up speculative decoding.
         self.drafter = None
         self.is_eagle3_spec = False
+        self.is_medusa_spec = False
+        self._medusa_last_hidden_states = None
+        self._medusa_drafts = None
         self._draft_token_ids = None
         # Async EAGLE3 draft rows by req_id. Only used at batch-composition
         # changes (e.g. several prefills merging into the first bs-wide decode).
@@ -735,6 +739,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             if self.speculative_config.method == "eagle3":
                 self.is_eagle3_spec = True
                 self.drafter = EagleProposer(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
+                self.rejection_sampler = RejectionSampler()
+            elif self.speculative_config.method == "medusa":
+                self.is_medusa_spec = True
+                self.drafter = MedusaProposer(
                     self.vllm_config, self.device, self.on_device_sampling
                 )
                 self.rejection_sampler = RejectionSampler()
@@ -1149,6 +1159,43 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             self.vllm_config.model_config.architecture,
             model_config=self.vllm_config.model_config,
         )
+        # Under speculative decoding (e.g. medusa), vLLM-core may resolve the
+        # UPSTREAM model class (which lacks the plugin's from_configs) instead
+        # of the plugin factory. Fall back to the plugin registry by
+        # architecture, matching eagle.py's resolution. (No-op when core
+        # already returned the plugin class.)
+        # Under speculative decoding (e.g. medusa), vLLM-core may resolve the
+        # UPSTREAM model class (which lacks the plugin's from_configs) instead
+        # of the plugin's neuron model. Fall back to the plugin class by
+        # architecture name. (No-op when core already returned a from_configs
+        # class.)
+        if not hasattr(model_cls, "from_configs"):
+            arch = self.vllm_config.model_config.architecture
+            _plugin_cls = None
+            try:
+                from vllm_neuron.model.registry import get_models as _pg
+                _plugin_cls = dict(_pg()).get(arch)
+            except Exception:
+                _plugin_cls = None
+            if _plugin_cls is None or not hasattr(_plugin_cls, "from_configs"):
+                # get_models() can miss multimodal packages in some import
+                # orders; import the known plugin factory directly by arch.
+                _direct = {
+                    "VoxtralForConditionalGeneration":
+                        "vllm_neuron.model.voxtral",
+                    "WhisperForConditionalGeneration":
+                        "vllm_neuron.model.whisper",
+                }.get(arch)
+                if _direct is not None:
+                    import importlib
+                    _mod = importlib.import_module(_direct)
+                    _plugin_cls = getattr(_mod, arch, None)
+            if _plugin_cls is not None and hasattr(_plugin_cls, "from_configs"):
+                logger.info(
+                    "Resolved %s to plugin class %s (core returned %s w/o from_configs)",
+                    arch, _plugin_cls.__module__, getattr(model_cls, "__module__", "?"),
+                )
+                model_cls = _plugin_cls
 
         # TODO: validate and ensure all vLLM configs are complied to
 
@@ -1451,12 +1498,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         logger.info("NeuronModel loading complete (moved to device and compiled)")
 
         if self.drafter is not None:
-            logger.info("Spec decode enabled. Loading draft model ...")
-            # TODO: model loading logic could be extracted
-            # Pass target model's padded hidden_size to draft model
-            target_hidden_size = self.model.config.hidden_size
-            self.drafter.load_model(target_hidden_size=target_hidden_size)
-            logger.info("Draft model loading complete (moved to device and compiled)")
+            if self.is_medusa_spec:
+                logger.info("Spec decode (medusa) enabled. Binding target model to proposer ...")
+                self.drafter.set_target_model(self.model)
+                self.drafter.load_model(target_model=self.model)
+            else:
+                logger.info("Spec decode enabled. Loading draft model ...")
+                # TODO: model loading logic could be extracted
+                # Pass target model's padded hidden_size to draft model
+                target_hidden_size = self.model.config.hidden_size
+                self.drafter.load_model(target_hidden_size=target_hidden_size)
+                logger.info("Draft model loading complete (moved to device and compiled)")
 
     def init_tensor_replacement(self) -> None:
         """Initialize tensor replacement from neuron_config."""
@@ -5515,7 +5567,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         # If spec decode enabled, log acceptance stats and propose draft tokens.
         # aux_hidden_states is None when eagle3 is not active.
-        if self.is_eagle3_spec and aux_hidden_states is not None:
+        medusa_ready = (
+            self.is_medusa_spec
+            and getattr(self, "_medusa_last_hidden_states", None) is not None
+        )
+        medusa_bootstrap = (
+            self.is_medusa_spec
+            and not medusa_ready
+            and self._is_decode()
+            and spec_decode_metadata is None
+            and positions.numel() > 0
+        )
+        if (self.is_eagle3_spec and aux_hidden_states is not None) or medusa_ready:
             max_position = positions.max().item() if positions.numel() > 0 else 0
             num_spec_tokens = self.drafter.num_speculative_tokens
             # Stop proposing early enough that the scheduler never trims
@@ -5623,6 +5686,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     logits_indices=logits_indices,
                     raw_sampled_token_ids=raw_sampled_token_ids,
                 )
+        elif medusa_bootstrap:
+            num_spec_tokens = self.drafter.num_speculative_tokens
+            spec_decode_limit = self.max_model_len - num_spec_tokens - 2
+            if self.use_async_scheduling:
+                spec_decode_limit -= 1 + num_spec_tokens
+            max_position = positions.max().item() if positions.numel() > 0 else 0
+            if max_position < spec_decode_limit:
+                pad_token_id = getattr(
+                    self.vllm_config.model_config.hf_config, "pad_token_id", None
+                )
+                if pad_token_id is None:
+                    pad_token_id = 0
+                num_reqs = self.input_batch.num_reqs
+                self._draft_token_ids = [
+                    [pad_token_id] * num_spec_tokens for _ in range(num_reqs)
+                ]
+            else:
+                self._draft_token_ids = None
 
         # Trim sampler output back to real num_reqs before output generation.
         # With spec decode batch padding, the sampler runs at padded_num_reqs;
@@ -6477,7 +6558,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         last_accepted_token: torch.Tensor | None = None
 
         if self.on_device_sampling:
-            if self.is_eagle3_spec:
+            if self.is_medusa_spec and spec_decode_metadata is not None:
+                # Medusa verify step: the model returns
+                # (accepted_tokens, last_hidden, drafts) and the rejection
+                # sampler appends a 4th  [bs] (same as the
+                # eagle-spec 4-tuple contract).
+                (
+                    model_output_tensor,
+                    self._medusa_last_hidden_states,
+                    self._medusa_drafts,
+                    last_accepted_token,
+                ) = model_output
+                aux_hidden_states = None
+                self._on_device_logits = model_output_tensor
+            elif self.is_eagle3_spec:
                 if spec_decode_metadata is not None:
                     # Eagle3 + spec decode: model returns 4-tuple
                     # (sampled_tokens, aux_hidden_states, gathered_logits,
@@ -7489,6 +7583,31 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         logits_indices: torch.Tensor | None = None,
         raw_sampled_token_ids: torch.Tensor | None = None,
     ) -> list[list[int]] | torch.Tensor:
+        # Medusa: the target NEFF already ran the heads on the last candidate
+        # row and emitted the next K drafts (stashed as self._medusa_drafts by
+        # the output parser). Thin reshape/return -- no shifted input_ids, no
+        # aux_hidden_states, no draft KV.
+        if self.is_medusa_spec:
+            assert isinstance(self.drafter, MedusaProposer)
+            num_reqs = self.input_batch.num_reqs
+            K = self.drafter.num_speculative_tokens
+            if num_reqs == 0:
+                return torch.empty((0, K), dtype=torch.int32)
+            drafts = getattr(self, "_medusa_drafts", None)
+            if drafts is None:
+                last_hidden = self._medusa_last_hidden_states
+                last_token_indices = torch.arange(
+                    num_reqs, dtype=torch.long, device=last_hidden.device
+                )
+                drafts = self.drafter.propose(
+                    last_hidden_states=last_hidden,
+                    last_token_indices=last_token_indices,
+                )
+            drafts = drafts.reshape(num_reqs, K).to(torch.int32)
+            self._medusa_last_hidden_states = None
+            self._medusa_drafts = None
+            return drafts.cpu()
+
         # TODO: now only supports EAGLE speculative decoding
         # Add more when needed
         assert isinstance(self.drafter, EagleProposer)

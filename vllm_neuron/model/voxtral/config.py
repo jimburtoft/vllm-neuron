@@ -160,6 +160,9 @@ class VoxtralConfig:
     vocab_size: int = 131072  # Mirrors text_config.vocab_size
     hidden_size: int = 3072  # Mirrors text_config.hidden_size
     projector_hidden_act: str = "gelu"
+    # Optional Medusa speculative-decoding heads config (from
+    # additional_config["medusa_config"]). None -> Medusa disabled.
+    medusa_config: dict | None = None
 
     @classmethod
     def from_configs(

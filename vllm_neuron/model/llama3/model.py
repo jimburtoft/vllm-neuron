@@ -1597,6 +1597,25 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
                 spec_decode_metadata,
                 sampled_tokens,
             )
+            _medusa_heads = getattr(self, "medusa_heads", None)
+            if _medusa_heads is not None:
+                # Medusa verify step: run heads on the LAST candidate row's
+                # hidden state -> next-K drafts, and return the 3-tuple the
+                # runner's medusa output-parser consumes:
+                # (accepted_tokens, last_hidden, drafts).
+                # Keep the anchor in the head dtype (bf16) so the ResBlock
+                # residual add is same-dtype (mixed fp32+bf16 add is rejected
+                # by neuronx-cc, NCC_IVRF100). Cast to fp32 only at the tied
+                # lm_head projection inside _medusa_project_argmax.
+                anchor = hidden_states_for_logits[-1:].to(_medusa_heads.dtype)  # [1, d]
+                drafts = _medusa_heads.propose_from_hidden_sharded(
+                    anchor, self._medusa_project_argmax
+                )  # [K] int32
+                return (
+                    rejection_sampled_tokens,
+                    hidden_states_for_logits,
+                    drafts,
+                )
             if len(aux_hidden_states) > 0:
                 aux_hidden_states_concat = torch.cat(aux_hidden_states, dim=-1)
                 return (
