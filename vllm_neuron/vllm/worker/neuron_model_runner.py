@@ -5325,10 +5325,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         gather (``_compute_swa_decode_tensors``) only runs in that
         no-op-clip regime, so its P_MAX-aligned geometry is preserved.
         """
-        # Trimmed SWA kv block counts must produce S_ctx divisible by P_MAX.
+        # Trimmed SWA kv block counts must produce S_ctx divisible by P_MAX
+        # *per s_prior shard*. When attention_tkg does not batch-shard (see
+        # nkilib is_batch_sharded: it also needs bs * q_head * s_active >= P_MAX,
+        # so even batches with few query heads per rank still shard s_prior),
+        # it splits s_prior across the lnc programs and asserts each shard
+        # % P_MAX == 0 (NCC_INKI016 "Sharded s_prior must be divisible by
+        # p_max"). Aligning to P_MAX alone fails whenever the aligned window is
+        # an odd number of P_MAX tiles, e.g. sliding_window=1024, block_size=32
+        # -> 36 blocks -> s_prior 1152 -> 576 per shard. Align to lnc * P_MAX.
         P_MAX = 128
+        lnc = get_logical_nc_config()
         min_blocks = sliding_window // block_size + 1
-        blocks_per_pmax = P_MAX // block_size
+        blocks_per_pmax = max(1, (lnc * P_MAX) // block_size)
         num_swa_blocks = (
             (min_blocks + blocks_per_pmax - 1) // blocks_per_pmax * blocks_per_pmax
         )
@@ -5346,7 +5355,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # sliding_window outside [128, 255], which no current model has, and it
         # degrades to the un-swizzle fallback rather than to a wrong result. The
         # clip below still bounds the floor by the full-context width.
-        lnc = get_logical_nc_config()
         if bs % lnc != 0:
             min_viable_blocks = (2 * lnc * P_MAX) // block_size
             num_swa_blocks = max(num_swa_blocks, min_viable_blocks)
