@@ -468,25 +468,90 @@ def _torch_qkv_in_kernel_cache_write_impl(
         qk_norm_post_rope_k_beta=qk_norm_post_rope_k_beta,
     )  # [B, S, (num_q_heads + 2 * num_kv_heads) * d_head]
 
+    # Scatter into the 4D cache [num_blocks, num_kv_heads, block_size, d_head].
+    # Shared with the kernel path, which also writes the cache from the fused
+    # projection output rather than in the kernel.
+    q = _scatter_kv_into_paged_cache_4d(
+        qkv_out=qkv_out,
+        d_head=d_head,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        fp8_max=fp8_max,
+        fp8_min=fp8_min,
+        kv_dtype=kv_dtype,
+        block_size=block_size,
+        slot_mapping=slot_mapping,
+        output_layout=output_layout,
+    )
+    return q, k_cache, v_cache
+
+
+def _scatter_kv_into_paged_cache_4d(
+    qkv_out: Tensor,
+    d_head: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    k_scale: Optional[Tensor],
+    v_scale: Optional[Tensor],
+    fp8_max: Optional[float],
+    fp8_min: Optional[float],
+    kv_dtype: Optional[torch.dtype],
+    block_size: int,
+    slot_mapping: Tensor,
+    output_layout: QKVOutputLayout,
+) -> Tensor:
+    """Split a fused QKV tensor, scatter K/V into the 4D paged cache, return Q.
+
+    Writes only the ``n_tokens`` slots named by ``slot_mapping``, in place, so
+    the cost scales with the token count and not with the cache size. Shared by
+    the kernel path and the CPU fallback so the two cannot drift.
+
+    Args:
+        qkv_out: Fused projection output ``[B, S, (num_q_heads + 2 *
+            num_kv_heads) * d_head]`` in ``BSD`` layout, post-RoPE.
+        d_head: Head dimension.
+        num_q_heads: Q heads in ``qkv_out``.
+        num_kv_heads: K (and V) heads in ``qkv_out``.
+        k_cache: Paged K cache ``[num_blocks, num_kv_heads, block_size,
+            d_head]``, written in place.
+        v_cache: Paged V cache, same shape as ``k_cache``, written in place.
+        k_scale: Dequant scale for an FP8 K cache, or None for BF16.
+        v_scale: Dequant scale for an FP8 V cache, or None for BF16.
+        fp8_max: Upper clamp for the FP8 store.
+        fp8_min: Lower clamp for the FP8 store.
+        kv_dtype: Store dtype. Defaults to ``k_cache.dtype``.
+        block_size: Tokens per block, to split a slot into (block, position).
+        slot_mapping: Flat cache slot per token, ``n_tokens`` entries. Must
+            already be in range: callers sanitize sentinels to slot 0.
+        output_layout: Layout to apply to the returned Q.
+
+    Returns:
+        Q in ``output_layout``.
+    """
     q_dim = num_q_heads * d_head
     kv_dim = num_kv_heads * d_head
     q = qkv_out[:, :, :q_dim]
     k = qkv_out[:, :, q_dim : q_dim + kv_dim]
     v = qkv_out[:, :, q_dim + kv_dim :]
 
-    # FP8 KV cache stores quantized values: divide by the dequant scale then
-    # clamp (matches the qkv_cte kernel / qkv_cte_torch_ref convention). BF16
-    # caches store post-RoPE values directly.
+    # An FP8 cache stores quantized values: divide by the dequant scale, then
+    # clamp (the qkv_cte kernel / qkv_cte_torch_ref convention). A BF16 cache
+    # stores post-RoPE values directly.
     if k_scale is not None and v_scale is not None:
         k = (k.to(torch.float32) / k_scale.float().flatten()[0]).clamp(fp8_min, fp8_max)
         v = (v.to(torch.float32) / v_scale.float().flatten()[0]).clamp(fp8_min, fp8_max)
     store_dtype = kv_dtype if kv_dtype is not None else k_cache.dtype
 
-    # Scatter into the 4D cache [num_blocks, num_kv_heads, block_size, d_head].
     # k/v reshape to [n_tokens * num_kv_heads, d_head] in token-major,
-    # head-minor order; the (block, head, pos) index triple below is built in
-    # the same order so each row lands in its slot. (This differs from
-    # model.py's head-major scatter, whose source K is [num_kv_heads, S, d_head].)
+    # head-minor order; the (block, head, pos) index triple is built in the
+    # same order so each row lands in its slot. (This differs from model.py's
+    # head-major scatter, whose source K is [num_kv_heads, S, d_head].)
     n_tokens = k.shape[0] * k.shape[1]
     slot = slot_mapping.reshape(n_tokens).to(torch.long)
     block_of_token = slot // block_size
@@ -506,7 +571,7 @@ def _torch_qkv_in_kernel_cache_write_impl(
     k_cache.index_put_((block_index, head_index, pos_index), k_vals)
     v_cache.index_put_((block_index, head_index, pos_index), v_vals)
 
-    return q, k_cache, v_cache
+    return q
 
 
 def _torch_qkv_impl(
@@ -946,40 +1011,60 @@ def qkv_proj(
 
         wrapped_kernel = wrap_nki(_torch_compatible_qkv_kernel)
 
-        # Reshape vLLM-Neuron's 4D paged K/V cache to the kernel's documented
-        # 3D contract. The kernel internally does
+        # The in-kernel K/V write cannot target vLLM-Neuron's unpacked paged
+        # cache. The kernel internally does
         # ``cache_hbm.reshape((num_blocks*block_size, kv_dim))`` (see
-        # ``nkilib/core/qkv/qkv_cte.py:762``) which assumes the input is
-        # row-major-3D ``[num_blocks, block_size, num_kv_heads*d_head]``.
-        # vLLM-Neuron's canonical buffer is 4D
-        # ``[num_blocks, num_kv_heads, block_size, d_head]``; the strides
-        # only coincide when ``num_kv_heads == 1``. Without this reshape,
-        # ``num_kv_heads > 1`` configs (e.g. Llama-3.2-1B at TP=2) get K/V
-        # written at wrong slot offsets because the kernel walks the buffer
-        # with the wrong strides.
-        # contiguous() forces the row-major-3D copy so the kernel's DMA
-        # strides match; the writeback below mirrors the post-kernel state
-        # back into the original 4D buffers so downstream readers
-        # (segmented_attention, FX aliasing pass) see consistent updates.
+        # ``nkilib/core/qkv/qkv_cte.py:762``), which assumes a row-major-3D
+        # ``[num_blocks, block_size, num_kv_heads*d_head]`` buffer, while the
+        # canonical buffer is 4D ``[num_blocks, num_kv_heads, block_size,
+        # d_head]``. The strides only coincide when ``num_kv_heads == 1``, so
+        # for ``num_kv_heads > 1`` the kernel would write K/V at wrong slot
+        # offsets (e.g. Llama-3.2-1B at TP=2).
         # Packed-FP8 K cache is 5D per-head
         # ``[num_blocks, num_kv_heads, block_size//2, d_head, 2]`` — it already
         # matches the kernel's packed-write contract, so it must be passed
-        # through as-is (NOT reshaped). Only the bf16 unpacked 4D paged cache
-        # needs the 4D->3D bridge below.
-        _reshape_kv_4d_to_3d = (
+        # through as-is. Only the unpacked 4D paged cache has a layout the
+        # kernel cannot write, and it takes the slot-only scatter below.
+        #
+        # The 4D->3D bridge this replaces cost two FULL-CACHE copies per layer
+        # per prefill: ``permute(0, 2, 1, 3).reshape(...)`` is not a view for
+        # ``num_kv_heads > 1``, so it materialized a copy of the whole K and V
+        # caches, and the writeback copied the whole thing back. The traffic
+        # scaled with total cache size, not with the number of tokens written,
+        # so prefill got slower as the KV cache grew: measured on GPT-OSS 20B
+        # (trn2, TP=4, 2 KV heads/rank, BF16) at 94.5 ms + 174.7 ms per 1M KV
+        # tokens, i.e. 242.7 ms TTFT at a default-sized cache against 91.7 ms
+        # for the scatter, a 2.65x difference that grows with the cache.
+        #
+        # Writing only the ``n_tokens`` new slots gives up the in-kernel write's
+        # saved HBM round trip for Q/K/V, which is bounded by the token count,
+        # and removes a cost that scales with cache size. Measured TTFT is then
+        # flat in KV size (92.4 ms - 0.9 ms per 1M KV tokens).
+        _scatter_kv_4d = (
             use_block_kv
             and k_cache is not None
             and k_cache.dim() == 4
             and not transpose_k_cache
             and not fp8_packed
         )
-        if _reshape_kv_4d_to_3d:
-            nb_, nkh_, bs_, dh_ = k_cache.shape
-            k_cache_arg = k_cache.permute(0, 2, 1, 3).reshape(nb_, bs_, nkh_ * dh_)
-            v_cache_arg = v_cache.permute(0, 2, 1, 3).reshape(nb_, bs_, nkh_ * dh_)
+        if _scatter_kv_4d:
+            # Ask the kernel for the plain fused QKV projection: passing the
+            # caches is what triggers the in-kernel write.
+            k_cache_arg = None
+            v_cache_arg = None
+            use_block_kv_arg = False
+            slot_mapping_arg = None
+            block_size_arg = None
+            # The scatter needs the fused tensor, so request BSD and apply the
+            # caller's layout to Q afterwards.
+            output_layout_arg = QKVOutputLayout.BSD
         else:
             k_cache_arg = k_cache
             v_cache_arg = v_cache
+            use_block_kv_arg = use_block_kv
+            slot_mapping_arg = slot_mapping
+            block_size_arg = block_size
+            output_layout_arg = output_layout
 
         # Packed-FP8 qkv_cte loads the KV quant scales with a fixed
         # ``dma_copy(src=k_scale_hbm[0:pmax, 0:1])`` (qkv_cte.py), so the scale
@@ -1006,7 +1091,7 @@ def qkv_proj(
             mlp_prev=mlp_prev,
             attn_prev=attn_prev,
             d_head=d_head,
-            output_layout=output_layout,
+            output_layout=output_layout_arg,
             eps=eps,
             norm_type=norm_type,
             use_dma_transpose=use_dma_transpose,
@@ -1053,23 +1138,35 @@ def qkv_proj(
             fp8_max=fp8_max,
             fp8_min=fp8_min,
             kv_dtype=kv_dtype_arg,
-            use_block_kv=use_block_kv,
+            use_block_kv=use_block_kv_arg,
             transpose_k_cache=transpose_k_cache,
             fp8_packed=fp8_packed,
-            block_size=block_size,
-            slot_mapping=slot_mapping,
+            block_size=block_size_arg,
+            slot_mapping=slot_mapping_arg,
         )
 
-        # When we reshaped K/V into the kernel's 3D contract, the kernel
-        # wrote into the temporary 3D copy, NOT into the original 4D
-        # buffers. Mirror the writes back so downstream readers see the
-        # post-write state. Return the original 4D buffers so the FX
-        # aliasing pass rewires to the buffers segmented_attention reads.
-        if _reshape_kv_4d_to_3d:
-            q_out, k_3d_post, v_3d_post = result
-            k_cache.copy_(k_3d_post.reshape(nb_, bs_, nkh_, dh_).permute(0, 2, 1, 3))
-            v_cache.copy_(v_3d_post.reshape(nb_, bs_, nkh_, dh_).permute(0, 2, 1, 3))
-            return q_out, k_cache, v_cache
+        # The kernel returned the fused QKV tensor without touching the cache.
+        # Split it, scatter only the new slots, and return the original 4D
+        # buffers so the FX aliasing pass rewires to the buffers
+        # segmented_attention reads.
+        if _scatter_kv_4d:
+            q = _scatter_kv_into_paged_cache_4d(
+                qkv_out=result,
+                d_head=d_head,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                fp8_max=fp8_max,
+                fp8_min=fp8_min,
+                kv_dtype=kv_dtype,
+                block_size=block_size,
+                slot_mapping=slot_mapping,
+                output_layout=output_layout,
+            )
+            return q, k_cache, v_cache
         return result
     else:
         if quantization_type != QuantizationType.NONE:
