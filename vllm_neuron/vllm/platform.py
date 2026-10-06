@@ -162,7 +162,7 @@ def _apply_llm_init_patch(LLM):
     original `__init__` (no fork yet), so `apply_config_platform_defaults`
     can read the flag while it's still set.
     """
-    if getattr(LLM.__dict__.get("__init__"), "_neuron_optlevel_patched", False):
+    if getattr(LLM.__dict__.get("__init__"), "_neuron_llm_init_patched", False):
         return
 
     _orig_init = LLM.__init__
@@ -180,7 +180,7 @@ def _apply_llm_init_patch(LLM):
             _llm_init_explicit_optimization_level = prev
             _llm_init_explicit_prefix_caching = prev_apc
 
-    _patched_init._neuron_optlevel_patched = True
+    _patched_init._neuron_llm_init_patched = True
     LLM.__init__ = _patched_init
 
 
@@ -915,10 +915,16 @@ class NeuronPlatform(Platform):
             for a in sys.argv
         ):
             return
-        neuron_config = vllm_config.additional_config.get("neuron_config", {})
+        additional_config = vllm_config.additional_config
+        neuron_config = (
+            additional_config.get("neuron_config", {})
+            if isinstance(additional_config, dict)
+            else {}
+        )
         if "kv_segment_size_buckets" in neuron_config:
             return
-        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        if not isinstance(dcp_size, int) or dcp_size > 1:
             return
 
         from vllm_neuron.utils.bucket_utils import (
@@ -927,8 +933,20 @@ class NeuronPlatform(Platform):
         )
 
         max_model_len = vllm_config.model_config.max_model_len
+        scheduler_max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        # Both values are ints on any real config. Leave APC alone when they
+        # are not, so this fallback never turns a missing or stand-in config
+        # value into a startup failure: the model runner still reports the APC
+        # conflict, which is the pre-existing behavior.
+        if not isinstance(max_model_len, int) or not isinstance(
+            scheduler_max_num_batched_tokens, int
+        ):
+            return
+
         max_num_batched_tokens = get_max_num_batched_tokens(
-            vllm_config.scheduler_config.max_num_batched_tokens, max_model_len
+            scheduler_max_num_batched_tokens, max_model_len
         )
         if (
             get_default_kv_segment_size_buckets(max_num_batched_tokens, max_model_len)
