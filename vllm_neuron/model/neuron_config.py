@@ -144,6 +144,19 @@ class NeuronConfig:
     debug_logits_dir: str | None = None
     # Model quantization type (e.g., "bf16", "mxfp4", "mxfp8")
     quantization: str | None = None
+    # GPT-OSS quantization="fp8" only. Keep a BF16 copy of the expert weights so prefill
+    # can use it while decode uses FP8, at the cost of one extra BF16 copy of the expert
+    # weights in HBM.
+    #
+    # Worth it only where FP8 prefill is slower, and that is SHAPE-DEPENDENT. The cost
+    # comes from bwmm_shard_on_I upcasting each FP8 weight tile to BF16 before the
+    # matmul, so it scales with the per-rank intermediate size:
+    #   GPT-OSS 20B,  TP=4  (I_TP 768): FP8 prefill is ~34% SLOWER  -> keep the copy
+    #   GPT-OSS 120B, TP=64 (I_TP 48):  FP8 prefill is ~2% FASTER   -> set this False
+    # The default suits the first case. At high TP the copy buys nothing, so set False
+    # there and reclaim the memory. Only those two points have been measured, so there
+    # is no automatic threshold.
+    fp8_keep_bf16_for_prefill: bool = True
     # all2all communication backend when EP is enabled. vLLM's --all2all-backend
     # Literal does not include 'neuron'.
     all2all_backend: Literal[None, "neuron"] = None
@@ -264,6 +277,9 @@ class NeuronConfig:
             kv_segment_size_buckets=config_dict.get("kv_segment_size_buckets"),
             debug_logits_dir=config_dict.get("debug_logits_dir"),
             quantization=config_dict.get("quantization"),
+            fp8_keep_bf16_for_prefill=config_dict.get(
+                "fp8_keep_bf16_for_prefill", True
+            ),
             all2all_backend=config_dict.get("all2all_backend"),
             modules_to_not_convert=config_dict.get("modules_to_not_convert"),
             num_batched_tokens_buckets=config_dict.get("num_batched_tokens_buckets"),

@@ -103,8 +103,15 @@ _SHARD_ON_BLOCK_MIN_I_TP = 1024
 
 def _select_prefill_moe_implementation(
     intermediate_size_per_rank: int,
+    fp8_experts: bool = False,
 ) -> MoECTEImplementation:
     """Pick the prefill MoE kernel for this layer's intermediate-per-rank size.
+
+    FP8 expert weights always use shard_on_i, whatever the size: nkilib's
+    ``bwmm_shard_on_block`` accepts ``gate_up_proj_scale`` / ``down_proj_scale`` and
+    then discards them (``# Placeholder for FP8``), so FP8 weights would be multiplied
+    unscaled and the output would be silently wrong rather than an error.
+    ``bwmm_shard_on_I`` applies the per-channel scales correctly.
 
     ``bwmm_shard_on_block`` shards the token blocks and keeps the whole
     intermediate dimension on one core. Its docstring asks for ``I_TP >= 512``
@@ -137,10 +144,13 @@ def _select_prefill_moe_implementation(
     Args:
         intermediate_size_per_rank: ``intermediate_size // tp_degree``, using
             the padded ``intermediate_size``.
+        fp8_experts: Whether the expert weights are FP8.
 
     Returns:
         The ``MoECTEImplementation`` to use for prefill.
     """
+    if fp8_experts:
+        return MoECTEImplementation.shard_on_i
     if intermediate_size_per_rank >= _SHARD_ON_BLOCK_MIN_I_TP:
         return MoECTEImplementation.shard_on_block
     return MoECTEImplementation.shard_on_i
@@ -1149,8 +1159,25 @@ class GptOssExperts(nn.Module):
         # >>> PARALLELISM: Intermediate dim sharded across TP degree <<<
         self.intermediate_size_per_rank = self.intermediate_size // self.tp_degree
         self.block_size = 256
+        # FP8 expert weights are declared and loaded as BF16, then requantized in place
+        # after load (load_weights -> quantize_expert_state_dict). The scale parameters
+        # are registered there too, so their shapes always match the weight actually
+        # present at runtime. See quantization_fp8 for why the requantization is exact
+        # and why it has to happen on the loaded tensor.
+        self.fp8_experts = (
+            config.neuron_config is not None
+            and getattr(config.neuron_config, "quantization", None) == "fp8"
+        )
+        # FP8 only: keep a BF16 expert copy for prefill. See NeuronConfig for why.
+        self.fp8_keep_bf16_for_prefill = self.fp8_experts and bool(
+            getattr(config.neuron_config, "fp8_keep_bf16_for_prefill", True)
+        )
+
+        # Only FP8 *prefill* forces shard_on_i; with a BF16 copy kept, prefill reads
+        # BF16 and the size rule applies as usual.
         self.prefill_moe_implementation = _select_prefill_moe_implementation(
-            self.intermediate_size_per_rank
+            self.intermediate_size_per_rank,
+            fp8_experts=self.fp8_experts and not self.fp8_keep_bf16_for_prefill,
         )
 
         # <-- MODEL-SPECIFIC: SwiGLU activation parameters
@@ -1306,6 +1333,32 @@ class GptOssExperts(nn.Module):
 
         return get_neuron_ep_group().rank_in_group_tensor.reshape(1, 1).to(torch.int32)
 
+    def _prefill_uses_fp8(self) -> bool:
+        """True when prefill reads the FP8 weights, i.e. no BF16 copy was kept."""
+        return self.fp8_experts and not hasattr(self, "gate_up_proj_weight_bf16")
+
+    def _prefill_gate_up_weight(self) -> torch.Tensor:
+        """The gate_up weight prefill should use: the BF16 copy if one was kept."""
+        return getattr(self, "gate_up_proj_weight_bf16", self.gate_up_proj_weight)
+
+    def _prefill_down_weight(self) -> torch.Tensor:
+        """The down weight prefill should use: the BF16 copy if one was kept."""
+        return getattr(self, "down_proj_weight_bf16", self.down_proj_weight)
+
+    def _gate_up_scale_for_decode(self) -> torch.Tensor:
+        """Reshape the stored gate_up scale ``[E, 1, 2I]`` to moe_tkg's ``[E, 2, I]``.
+
+        Derived from the stored tensor rather than from a declared constant, so the
+        shape cannot drift from the weight the kernel receives.
+        """
+        scale = self.gate_up_proj_scale
+        return scale.reshape(scale.shape[0], 2, scale.shape[-1] // 2)
+
+    def _down_scale_for_decode(self) -> torch.Tensor:
+        """Reshape the stored down scale ``[E, 1, H]`` to moe_tkg's ``[E, H]``."""
+        scale = self.down_proj_scale
+        return scale.reshape(scale.shape[0], scale.shape[-1])
+
     def _run_moe_block_tkg(self, hidden_states: torch.Tensor, rank: torch.Tensor):
         """Run the fused MoE decode kernel on given hidden states.
 
@@ -1335,6 +1388,15 @@ class GptOssExperts(nn.Module):
                 self.intermediate_size_per_rank,
             ),
             expert_down_weights=self.down_proj_weight,
+            # FP8: the shapes come from the stored scale tensors, which were derived
+            # post-load from these exact weights. moe_tkg wants gate_up [E, 2, I] and
+            # down [E, H]; the stored layout is [E, 1, 2I] and [E, 1, H].
+            expert_gate_up_weights_scale=(
+                self._gate_up_scale_for_decode() if self.fp8_experts else None
+            ),
+            expert_down_weights_scale=(
+                self._down_scale_for_decode() if self.fp8_experts else None
+            ),
             rank_id=rank_id,
             top_k=self.num_experts_per_token,
             router_bias=self.router_bias.unsqueeze(0),
@@ -1493,19 +1555,28 @@ class GptOssExperts(nn.Module):
             conditions=conditions,
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
-            gate_up_proj_weight=self.gate_up_proj_weight.reshape(
+            gate_up_proj_weight=self._prefill_gate_up_weight().reshape(
                 self.num_local_experts,
                 self.hidden_size,
                 2,
                 self.intermediate_size_per_rank,
             ),
-            down_proj_weight=self.down_proj_weight,
+            down_proj_weight=self._prefill_down_weight(),
             gate_and_up_proj_bias=self.gate_up_proj_bias.reshape(
                 self.num_local_experts,
                 2,
                 self.intermediate_size_per_rank,
             ),
             down_proj_bias=self.down_proj_bias.unsqueeze(1),
+            # FP8: moe_cte takes the stored [E, 1, 2I] / [E, 1, H] layout directly.
+            # Only pass the scales when prefill is actually reading FP8 weights; with a
+            # BF16 copy kept, passing them would dequantize an already-BF16 tensor.
+            gate_up_proj_scale=(
+                self.gate_up_proj_scale if self._prefill_uses_fp8() else None
+            ),
+            down_proj_scale=(
+                self.down_proj_scale if self._prefill_uses_fp8() else None
+            ),
             # <-- MODEL-SPECIFIC: SwiGLU with clamping
             activation_function=ActFnType.Swish,
             block_size=self.block_size,
@@ -2544,7 +2615,35 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
 
         self._load_kv_cache_scales(checkpoint, device)
 
+        # Requantize the expert weights to FP8 while the state dict is still host-side.
+        # It has to happen here, not in __init__ or a weight loader: the scale must be
+        # derived from the tensor the kernel will use (the loaders emit a different
+        # geometry than the parameter declaration), and after load_state_dict the
+        # tensors are on the Neuron device, where both .to("cpu") on bf16 and a
+        # bf16 -> fp8 cast raise "Expected self.dtype() == dst.dtype()".
+        fp8_scales: dict[str, torch.Tensor] = {}
+        if getattr(self.model.layers[0].mlp.experts, "fp8_experts", False):
+            from vllm_neuron.model.gpt_oss.quantization_fp8 import (
+                quantize_expert_state_dict,
+            )
+
+            experts = self.model.layers[0].mlp.experts
+            rank_sharded_checkpoint, fp8_scales = quantize_expert_state_dict(
+                rank_sharded_checkpoint,
+                keep_bf16_for_prefill=experts.fp8_keep_bf16_for_prefill,
+            )
+
         self.load_state_dict(rank_sharded_checkpoint, strict=False, assign=True)
+
+        # Register the FP8 scales after load_state_dict. They cannot be declared in
+        # __init__ because load_sharded_pipelined walks every parameter and requires a
+        # checkpoint key for each, and the checkpoint has no FP8 scales.
+        for name, tensor in fp8_scales.items():
+            module = self
+            *path, leaf = name.split(".")
+            for part in path:
+                module = module[int(part)] if part.isdigit() else getattr(module, part)
+            module.register_parameter(leaf, nn.Parameter(tensor, requires_grad=False))
 
     def load_weights_lite(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None

@@ -126,6 +126,20 @@ class GptOssForCausalLM(nn.Module):
             _log_model_choice("model_bf16", quantization, platform, "quantization=bf16")
             return Model.from_configs(hf_config, neuron_config)
 
+        if quantization == "fp8":
+            # model_bf16 dequantizes the MXFP4 checkpoint to BF16, then requantizes the
+            # expert weights to FP8 after load. Trn2 only: Trn3 should use mxfp4, which
+            # keeps MX compute instead of dequantizing.
+            if not platform.startswith("trn2"):
+                raise ValueError(
+                    f"quantization='fp8' for GPT-OSS is supported on trn2, not "
+                    f"{platform!r}. Use quantization='mxfp4' there."
+                )
+            from .model_bf16 import GptOssForCausalLM as Model
+
+            _log_model_choice("model_bf16", quantization, platform, "quantization=fp8")
+            return Model.from_configs(hf_config, neuron_config)
+
         if platform.startswith("trn3"):
             from .model_mxfp4 import GptOssForCausalLM as Model
 
@@ -134,9 +148,16 @@ class GptOssForCausalLM(nn.Module):
             )
             return Model.from_configs(hf_config, neuron_config)
 
+        if quantization is not None:
+            raise ValueError(
+                f"Unsupported quantization {quantization!r} for GPT-OSS. Supported: "
+                f"'mxfp4', 'bf16', 'fp8' (trn2 only). Leave it unset to take the "
+                f"platform default."
+            )
+
         from .model_bf16 import GptOssForCausalLM as Model
 
-        _log_model_choice("model_bf16", quantization, platform, "fallback")
+        _log_model_choice("model_bf16", quantization, platform, "trn2 platform default")
         return Model.from_configs(hf_config, neuron_config)
 
     @classmethod

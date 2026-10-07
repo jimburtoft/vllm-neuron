@@ -59,6 +59,15 @@ def moe_block_tkg_wrapper(
 
     For STATIC_MX, ``expert_gate_up_input_scale`` and ``expert_down_input_scale``
     forward per-expert FP8 activation dequant scales (``[E_L, 1]`` fp32).
+
+    Only the MX-packed integer dtypes are reinterpreted here. **Plain (non-MX) FP8
+    weights, e.g. ``float8_e4m3fn``, pass through untouched and are treated as
+    non-MX by the kernel** -- which is correct, but it means their per-channel
+    dequant scales are applied only if the caller passes
+    ``expert_gate_up_weights_scale`` / ``expert_down_weights_scale``. Omitting
+    them does not raise: the kernel multiplies by the raw FP8 values and returns
+    silently wrong results. See ``model/gpt_oss/quantization_fp8.py`` for a caller
+    that passes them.
     """
     if expert_gate_up_weights.dtype == nl.uint16:
         expert_gate_up_weights = expert_gate_up_weights.view(nl.float4_e2m1fn_x4)
