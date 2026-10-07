@@ -96,6 +96,56 @@ DEFAULT_SELECTIVE_LOADING_THRESHOLD = 1.0
 logger = logging.getLogger(__name__)
 
 
+# Intermediate-per-rank size at or above which the prefill MoE keeps
+# shard_on_block. See _select_prefill_moe_implementation.
+_SHARD_ON_BLOCK_MIN_I_TP = 1024
+
+
+def _select_prefill_moe_implementation(
+    intermediate_size_per_rank: int,
+) -> MoECTEImplementation:
+    """Pick the prefill MoE kernel for this layer's intermediate-per-rank size.
+
+    ``bwmm_shard_on_block`` shards the token blocks and keeps the whole
+    intermediate dimension on one core. Its docstring asks for ``I_TP >= 512``
+    and is tuned for a large intermediate. ``bwmm_shard_on_I`` shards the
+    intermediate dimension instead, and documents an intended ``I_TP`` of
+    2048-16384.
+
+    GPT-OSS sits below both ranges. ``intermediate_size`` is padded to 3072
+    (``GptOssConfig.from_configs``), so ``I_TP`` is 768 at TP=4 and 384 at
+    TP=8. At that size shard_on_block leaves the tensor engine underfed, and
+    sharding the intermediate dimension wins despite being outside its
+    documented range. Measured on GPT-OSS 20B (trn2, TP=4, I_TP=768, BF16,
+    MoE block_size=256, KV block_size=128, max_num_batched_tokens=512,
+    default KV allocation): prefill TTFT 140.8 ms with shard_on_block against
+    92.4 ms with shard_on_i, a 1.52x difference.
+
+    Both kernels are numerically valid; they differ in reduction order, so
+    near-tie greedy tokens can flip between them. GSM8K (gsm8k_cot, 8-shot,
+    100 problems, greedy) is unchanged: 0.88 +/- 0.033 with shard_on_block
+    against 0.90 +/- 0.030 with shard_on_i.
+
+    The threshold is 1024: above every production GPT-OSS ``I_TP`` (768 at
+    TP=4, 384 at TP=8) and below the smallest configuration measured to still
+    prefer shard_on_block. The crossover has only been measured at
+    ``I_TP`` = 768, so the bound deliberately stays close to it rather than
+    extrapolating up to shard_on_I's documented range: anything at or above
+    1024 keeps today's kernel, so no other model or test configuration changes
+    behavior.
+
+    Args:
+        intermediate_size_per_rank: ``intermediate_size // tp_degree``, using
+            the padded ``intermediate_size``.
+
+    Returns:
+        The ``MoECTEImplementation`` to use for prefill.
+    """
+    if intermediate_size_per_rank >= _SHARD_ON_BLOCK_MIN_I_TP:
+        return MoECTEImplementation.shard_on_block
+    return MoECTEImplementation.shard_on_i
+
+
 # =============================================================================
 # Section 1: RMS Normalization
 # <-- MODEL-SPECIFIC: GPT-OSS uses RMSNorm with variance on unpadded portion
@@ -1099,6 +1149,9 @@ class GptOssExperts(nn.Module):
         # >>> PARALLELISM: Intermediate dim sharded across TP degree <<<
         self.intermediate_size_per_rank = self.intermediate_size // self.tp_degree
         self.block_size = 256
+        self.prefill_moe_implementation = _select_prefill_moe_implementation(
+            self.intermediate_size_per_rank
+        )
 
         # <-- MODEL-SPECIFIC: SwiGLU activation parameters
         self.alpha = config.swiglu_alpha
@@ -1436,7 +1489,7 @@ class GptOssExperts(nn.Module):
         )
 
         output = NF.moe_cte(
-            implementation=MoECTEImplementation.shard_on_block,
+            implementation=self.prefill_moe_implementation,
             conditions=conditions,
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
