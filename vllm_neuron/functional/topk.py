@@ -85,7 +85,7 @@ def _select_topk_method(tensor: Tensor, k: int, dim: int) -> TopkMethod | None:
         >>> import torch
         >>> t = torch.randn(16, 25136, dtype=torch.bfloat16, device="meta")
         >>> _select_topk_method(t, 256, -1)  # meta -> can_run_kernel False -> None
-        >>> # on gen3 hw prefers GPSIMD, else ROTATIONAL, else None (torch)
+        >>> # on trn3 prefers GPSIMD, else ROTATIONAL, else None (torch)
     """
     if _can_use_gpsimd_topk(tensor, k, dim):
         return TopkMethod.GPSIMD
@@ -382,6 +382,9 @@ _GPSIMD_TOPK_MAX_K = 32768  # exclusive: kernel requires k < 32768
 # (trn1/trn1n/trn2/inf2 are pre-gen3). get_platform_target() reports this
 # host-side (env override or NRT) without an active NKI backend. Matched by prefix
 # (startswith) so trn3 variants are all admitted.
+# Platform families allowed to use the GpSIMD top-k kernel. Narrower than the ISA
+# requirement on purpose: nisa.topk needs gen3 and Trn2 is also gen3, so this is a
+# qualification boundary rather than a hardware one.
 _GPSIMD_TOPK_PLATFORM_PREFIX = "trn3"
 
 
@@ -403,10 +406,17 @@ def _can_use_gpsimd_topk(tensor: Tensor, k: int, dim: int) -> bool:
 
     The GpSIMD kernel is the preferred NKI top-k path where it applies -- it maps
     each row onto the 16-partition ``nisa.topk`` snake -- but it is narrower than
-    the rotational kernel: it is gen3-only (the ``nisa.topk`` ISA op does not exist
-    on gen2), bf16-only, and bounded to ``8 <= vocab < 65536`` / ``1 <= k < 32768``
-    / ``k < vocab``. Anything outside that falls through to the rotational gate,
-    then torch. Reduces over the LAST dimension only.
+    the rotational kernel: bf16-only, and bounded to ``8 <= vocab < 65536`` /
+    ``1 <= k < 32768`` / ``k < vocab``. Anything outside that falls through to the
+    rotational gate, then torch. Reduces over the LAST dimension only.
+
+    The platform gate below admits ``trn3`` only. Note that this is NARROWER than
+    the ISA requirement: ``nisa.topk`` needs gen3, and **Trn2 is gen3**
+    (``nisa.get_nc_version()`` returns ``gen3`` from a kernel running on Trn2), so
+    the op exists there too and has been observed to compile and run on Trn2. The
+    gate is therefore a deliberate platform restriction, not an ISA limit. It is
+    left as-is here because the kernel has not been accuracy-qualified on Trn2;
+    widening it needs that qualification first, not just a prefix change.
 
     ``can_run_kernel`` is the first check (CLAUDE.md kernel-guard rule) so
     ``VLLM_NEURON_DISABLE_NKI_KERNELS`` disables this path too. The gen3 gate uses

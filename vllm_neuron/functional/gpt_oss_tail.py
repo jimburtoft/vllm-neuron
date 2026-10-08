@@ -74,8 +74,10 @@ except ImportError:  # pragma: no cover - depends on nki and the installed nkili
     _CHUNKED_AVAILABLE = False
 
 
-# The kernel's two selection stages are both nisa.topk, which is gen3-only, and trn3 is the only
-# gen3 platform-target family. Mirrors the gate in functional/topk.py.
+# The kernel's two selection stages are both nisa.topk, which needs gen3. Note that trn3 is NOT
+# the only gen3 family: Trn2 is also gen3 (nisa.get_nc_version() returns gen3 there), so this
+# prefix is a platform/qualification restriction rather than an ISA limit. Mirrors the gate in
+# functional/topk.py, including the reason it is not widened.
 _TAIL_PLATFORM_PREFIX = "trn3"
 
 # Supported GPT-OSS-120B decode geometry: TP8, lm_head DP16, LNC1 on trn3.
@@ -669,7 +671,7 @@ def _reject_reason(
         # _neuronx_cc_has_sorted_topk_bir(), so a compiler-only gap is refused before this point.
         return "hw-sorted-topk-unavailable"
     if not _is_tail_kernel_platform():
-        return "not-gen3"
+        return "not-trn3"
     if world > 0 and n_rows % world != 0:
         # The kernel shards ROWS, not vocab, across the group: it asserts gbs % vtp == 0 and takes
         # rows_per_rank = gbs // vtp. A non-multiple asserts inside the traced kernel, so refuse
