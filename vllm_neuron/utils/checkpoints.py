@@ -707,6 +707,28 @@ class SafetensorsCheckpoint:
         self._ensure_indexed()
         return set(self._tensor_name_to_file.keys())
 
+    def get_tensor(self, name: str) -> torch.Tensor | None:
+        """Return one full tensor from the checkpoint, or None if it is absent.
+
+        Use this method for a small tensor that the model does not shard, for
+        example a token id map. The tensor stays on the CPU.
+
+        Args:
+            name: The tensor name in the safetensors files.
+
+        Returns:
+            The tensor, or None if no file contains ``name``.
+
+        Examples:
+            >>> checkpoint = SafetensorsCheckpoint("/path/to/checkpoint")
+            >>> d2t = checkpoint.get_tensor("d2t")
+        """
+        self._ensure_indexed()
+        file_path = self._tensor_name_to_file.get(name)
+        if file_path is None:
+            return None
+        return self._open_safetensor_files[file_path].get_tensor(name)
+
     def get_num_files(self) -> int:
         """
         Returns the total number of safetensor files found in the checkpoint when initialized.
