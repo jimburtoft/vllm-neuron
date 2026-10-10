@@ -33,6 +33,7 @@ from vllm_neuron.functional.attention.attention_decode import (
     _unswizzle_packed_k,
 )
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
 from vllm_neuron.parallel.neuron_parallel_state import shard_select
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.dtype_utils import (
@@ -905,6 +906,18 @@ class LlamaAttention(nn.Module):
             attn_metadata[_DECODE_MASK_CACHE_KEY] = attention_mask
 
         active_blocks_table = block_table
+        kv_cache_update_idx = slot_mapping.view(B_local, S_decode).to(torch.uint32)
+        # With more than one KV head on this rank (TP < num_kv_heads), the fused decode
+        # kernel needs a per-head 3D block table and per-head cache slots. A 2D table
+        # sends attention to the torch fallback (see _can_use_attention_block_kernel).
+        # The slots index the flat num_blocks * kv_heads pool that the table targets.
+        if nkh > 1 and not self.fp8_packed and not dcp_decode_active:
+            active_blocks_table = build_per_head_block_table(block_table, nkh).to(
+                torch.int32
+            )
+            kv_cache_update_idx = _per_head_cache_slots(
+                slot_mapping, block_size, nkh, B_local
+            )
 
         # Packed FP8 is selected by server config (neuron_config.fp8_packed_kv):
         # when enabled, the runner allocates the swizzled K layout and
@@ -940,7 +953,7 @@ class LlamaAttention(nn.Module):
             softmax_scale=self.scaling / self.k_scale_float,
             sink=None,
             update_cache=True,
-            kv_cache_update_idx=slot_mapping.view(B_local, S_decode).to(torch.uint32),
+            kv_cache_update_idx=kv_cache_update_idx,
             fp8_packed=self.fp8_packed,
             # Kernel currently requires fusing the V scale dequantization into W_out for KV quantization
             W_out=self.o_proj_weight / self.v_scale_float,
@@ -972,6 +985,29 @@ class LlamaAttention(nn.Module):
         self.attn_tp_group.all_reduce(output)
 
         return output
+
+
+def _per_head_cache_slots(
+    slot_mapping: torch.Tensor, block_size: int, kv_heads: int, batch: int
+) -> torch.Tensor:
+    """Return the per-head ``kv_cache_update_idx`` ``[B, kv_heads, 1]`` (uint32).
+
+    The values are the same as ``build_per_head_slot_mapping`` for one decode token
+    per request. This function builds the head-major layout with a broadcast, not a
+    transpose. A transpose into a uint32 cast does not compile (NCC_IDDT901).
+
+    Example:
+        >>> import torch
+        >>> _per_head_cache_slots(torch.tensor([2 * 4 + 3]), 4, 2, 1).tolist()
+        [[[19], [23]]]
+    """
+    base_block = torch.div(slot_mapping, block_size, rounding_mode="floor")
+    position = slot_mapping - base_block * block_size
+    kv_h = torch.arange(kv_heads, dtype=slot_mapping.dtype, device=slot_mapping.device)
+    base_block = base_block.view(batch, 1, 1)
+    position = position.view(batch, 1, 1)
+    slots = (base_block * kv_heads + kv_h.view(1, kv_heads, 1)) * block_size + position
+    return slots.to(torch.uint32)
 
 
 # =============================================================================
