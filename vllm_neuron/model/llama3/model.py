@@ -913,12 +913,7 @@ class LlamaAttention(nn.Module):
         # The slots index the flat num_blocks * kv_heads pool that the table targets.
         # Only one token per request is measured on device. Multi-token decode
         # (speculative verify) keeps the 2D table and the path it used before.
-        if (
-            nkh > 1
-            and S_decode == 1
-            and not self.fp8_packed
-            and not dcp_decode_active
-        ):
+        if nkh > 1 and S_decode == 1 and not self.fp8_packed and not dcp_decode_active:
             active_blocks_table = build_per_head_block_table(block_table, nkh).to(
                 torch.int32
             )
