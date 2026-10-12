@@ -911,12 +911,19 @@ class LlamaAttention(nn.Module):
         # kernel needs a per-head 3D block table and per-head cache slots. A 2D table
         # sends attention to the torch fallback (see _can_use_attention_block_kernel).
         # The slots index the flat num_blocks * kv_heads pool that the table targets.
-        if nkh > 1 and not self.fp8_packed and not dcp_decode_active:
+        # Only one token per request is measured on device. Multi-token decode
+        # (speculative verify) keeps the 2D table and the path it used before.
+        if (
+            nkh > 1
+            and S_decode == 1
+            and not self.fp8_packed
+            and not dcp_decode_active
+        ):
             active_blocks_table = build_per_head_block_table(block_table, nkh).to(
                 torch.int32
             )
             kv_cache_update_idx = _per_head_cache_slots(
-                slot_mapping, block_size, nkh, B_local
+                slot_mapping, block_size, nkh, B_local, S_decode
             )
 
         # Packed FP8 is selected by server config (neuron_config.fp8_packed_kv):
@@ -988,13 +995,18 @@ class LlamaAttention(nn.Module):
 
 
 def _per_head_cache_slots(
-    slot_mapping: torch.Tensor, block_size: int, kv_heads: int, batch: int
+    slot_mapping: torch.Tensor,
+    block_size: int,
+    kv_heads: int,
+    batch: int,
+    tokens: int = 1,
 ) -> torch.Tensor:
-    """Return the per-head ``kv_cache_update_idx`` ``[B, kv_heads, 1]`` (uint32).
+    """Return the per-head ``kv_cache_update_idx`` ``[B, kv_heads, S]`` (uint32).
 
-    The values are the same as ``build_per_head_slot_mapping`` for one decode token
-    per request. This function builds the head-major layout with a broadcast, not a
-    transpose. A transpose into a uint32 cast does not compile (NCC_IDDT901).
+    ``S`` is the number of decode tokens per request (``tokens``; more than one for
+    speculative verify). The values are the same as ``build_per_head_slot_mapping``.
+    This function builds the head-major layout with a broadcast, not a transpose.
+    A transpose into a uint32 cast does not compile (NCC_IDDT901).
 
     Example:
         >>> import torch
@@ -1004,8 +1016,8 @@ def _per_head_cache_slots(
     base_block = torch.div(slot_mapping, block_size, rounding_mode="floor")
     position = slot_mapping - base_block * block_size
     kv_h = torch.arange(kv_heads, dtype=slot_mapping.dtype, device=slot_mapping.device)
-    base_block = base_block.view(batch, 1, 1)
-    position = position.view(batch, 1, 1)
+    base_block = base_block.view(batch, 1, tokens)
+    position = position.view(batch, 1, tokens)
     slots = (base_block * kv_heads + kv_h.view(1, kv_heads, 1)) * block_size + position
     return slots.to(torch.uint32)
 
