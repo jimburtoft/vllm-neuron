@@ -24,6 +24,10 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 cascaded_max_jit = nki.jit()(cascaded_max)
 
+# Maximum free elements per partition that nisa.nc_find_index8 accepts.
+# TODO: Import this limit from nkilib once it exports one.
+_NKI_MAX_STAGE_FREE_SIZE = 16384
+
 logger = logging.getLogger(__name__)
 
 
@@ -219,12 +223,17 @@ def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:
     return True
 
 
-# Maximum free elements per partition that nisa.nc_find_index8 accepts.
-_NKI_MAX_STAGE_FREE_SIZE = 16384
-
-
 def _nki_max_stage_free_size(bxs: int, vocab_size: int, grid: int) -> int:
     """Return the per-partition free size that cascaded_max uses for one stage.
+
+    This copies the stage math of nkilib ``CascadedMaxConfig.__init__``. That
+    constructor calls ``get_verified_program_sharding_info``, which works only
+    while a kernel is traced, so this host-side gate cannot construct it.
+
+    TODO: Call nkilib for this value once ``CascadedMaxConfig`` exposes the stage
+    math as a public static method (for example
+    ``stage_free_size(bxs, vocab_size, n_programs)``) that ``__init__`` also uses.
+    Then drop this copy.
 
     Args:
         bxs: Partition dimension of the input (rows).
