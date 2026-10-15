@@ -9,7 +9,7 @@ Task 020 Milestone 1. This module provides:
      the Whisper decoder's LAST hidden state and predict K future tokens.
   3. ``load_medusa_heads`` -- a loader that either synthesizes placeholder heads
      (``zero`` / ``random``) so the framework runs UNTRAINED, or loads
-     customer-supplied head weights (voxtral-medusa external formats +
+     user-supplied head weights (voxtral-medusa external formats +
      a generic ``medusa_heads.{i}.*`` scheme).
 
 Design (M0 spec Task 020 §2, §3)
@@ -50,7 +50,7 @@ Loader key layouts accepted
   rejects at the first divergence -> framework == greedy). NO checkpoint needed.
 * ``random`` -- synth: small random ResBlock init (garbage drafts, mostly
   rejected). NO checkpoint needed.
-* ``<path>`` -- load customer weights. Supported external schemes (delegated to
+* ``<path>`` -- load trained head weights. Supported external schemes (delegated to
   ``head_formats`` normalization; see that module's docstring):
     - upstream FasterDecoding : ``{i}.{j}.linear.weight`` (+ ``{i}.{L}.weight``)
     - vLLM speculators        : ``blocks.{i}.layers.{j}.weight`` (+ ``lm_heads.{i}.weight``)
@@ -264,7 +264,7 @@ def _load_checkpoint_state(path: str) -> dict[str, torch.Tensor]:
 def _normalize_external_state(
     raw: dict[str, torch.Tensor], heads: MedusaHeads
 ) -> dict[str, torch.Tensor]:
-    """Convert a customer/external head state dict to this module's internal
+    """Convert an external head state dict to this module's internal
     ResBlock layout ``medusa_head_{i}.{j}.linear.{weight,bias}``, DROPPING any
     per-head output-projection tensors (Medusa-1 tie uses the model's lm_head).
 

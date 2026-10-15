@@ -351,7 +351,7 @@ class VoxtralForConditionalGeneration(nn.Module, SupportsVisionWarmup):
         )
         # Surface the Medusa heads config for the SERVED path. The runner calls
         # from_configs without a medusa_config, so pull it from the active vLLM
-        # config's additional_config. Customer enables Medusa with:
+        # config's additional_config. Enable Medusa with:
         #   --speculative-config '{"method":"medusa","num_speculative_tokens":5}'
         #   --additional-config  '{"medusa_config":{"init":"load","heads_path":"..."}}'
         try:

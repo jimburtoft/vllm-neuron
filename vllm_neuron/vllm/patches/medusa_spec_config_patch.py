@@ -18,7 +18,7 @@ they read the decoder's last hidden state in-graph, and compile INTO the target
 verify-K NEFF). There is **no** separate draft model and **no** draft KV cache.
 
 Without this patch, ``SpeculativeConfig.__post_init__`` fails one of two ways
-when the customer runs ``--speculative-config '{"method":"medusa",
+when a user runs ``--speculative-config '{"method":"medusa",
 "num_speculative_tokens":5}'`` (no ``model`` field):
 
   1. ``model is None`` -> no ``elif`` matches ``medusa`` in the model-inference
