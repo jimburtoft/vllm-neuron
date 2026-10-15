@@ -13,16 +13,9 @@ backend (`torch.compile(backend="vllm_neuron")`), following the
 - **SDK**: 2.31 (DLAMI `Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`)
 - **Container**: `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.21.0.1.0.0-neuronx-py313-sdk2.31.0-ubuntu24.04`
 
-## Baseline numbers
+## Performance
 
-Customer 18-file TED benchmark (`voxtral-native` dataset), first-pass unoptimized:
-
-| Metric | Value | Reference |
-|---|---:|---:|
-| Mean per-file latency | **0.727 s** | NxDI TP=4 SDK 2.31: 0.656 s; L40S GPU vLLM: 0.670 s |
-| Median | 0.767 s | -- |
-| Real-time factor | 19.86x | -- |
-| Byte-identical greedy (26+65 tokens) | ✓ | vs CPU HF `VoxtralForConditionalGeneration.from_pretrained(..., torch_dtype=bfloat16)` |
+Results on public benchmarks to be added.
 
 ## Quick start
 
