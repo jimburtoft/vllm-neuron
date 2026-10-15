@@ -669,8 +669,13 @@ class NeuronModelRunnerV2:
 
             self._spmd_rank_tensors = stamp_spmd_rank_tensors(self.device)
 
-            hlo2tensorizer_opts = "--modular-flow-mac-threshold=10"
             from libtorch_neuronx_lite.compile.platform import get_platform_target
+
+            from vllm_neuron.vllm.worker.neuron_model_runner import (
+                modular_flow_mac_threshold_option,
+            )
+
+            hlo2tensorizer_opts = modular_flow_mac_threshold_option()
 
             has_fp8 = self.vllm_config.cache_config.cache_dtype in (
                 "fp8",

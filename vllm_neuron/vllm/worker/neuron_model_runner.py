@@ -122,6 +122,24 @@ NULL_BLOCK_ID = 0
 PAD_SLOT_ID = -1
 
 
+_DEFAULT_MODULAR_FLOW_MAC_THRESHOLD = 10
+
+
+def modular_flow_mac_threshold_option() -> str:
+    """Build the hlo2tensorizer ``--modular-flow-mac-threshold`` option.
+
+    Returns the platform value (10) unless ``VLLM_NEURON_MODULAR_FLOW_MAC_THRESHOLD`` is set to a
+    positive integer, which then replaces it.
+
+    Returns:
+        The option string, e.g. ``"--modular-flow-mac-threshold=10"``.
+    """
+    threshold = envs.VLLM_NEURON_MODULAR_FLOW_MAC_THRESHOLD
+    if threshold <= 0:
+        threshold = _DEFAULT_MODULAR_FLOW_MAC_THRESHOLD
+    return f"--modular-flow-mac-threshold={threshold}"
+
+
 def _segmented_prefill_required_msg(
     feature: str,
     disable_hint: str,
@@ -2022,7 +2040,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.compile_options = {"alias_meta_to_neuron": True}
 
         # FIXME: -O1 and mac-threshold are temporary until NKI adds MAC count estimates for kernels.
-        hlo2tensorizer_opts = "--modular-flow-mac-threshold=10"
+        hlo2tensorizer_opts = modular_flow_mac_threshold_option()
         # The unsafe fp8 cast flag is only needed on Trn2 where kernels use
         # legacy nl.float8_e4m3 (max=240). Trn3 supports OCP e4m3fn natively.
         from libtorch_neuronx_lite.compile.platform import get_platform_target

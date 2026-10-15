@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     VLLM_NEURON_SHM_READER_SPIN_PATCH: bool = True
     # sys.setswitchinterval for a worker process. 0 keeps CPython's default.
     VLLM_NEURON_GIL_SWITCH_INTERVAL_S: float = 0.0
+    VLLM_NEURON_MODULAR_FLOW_MAC_THRESHOLD: int = 0
     # Offset added to the MPExecutor collective and root-comm base ports.
     # `make test` sets a different offset per concurrent build-time pass so the
     # passes do not collide on a rendezvous port. Default 0 keeps the production
@@ -394,6 +395,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # leaving it alone.
     "VLLM_NEURON_GIL_SWITCH_INTERVAL_S": lambda: optional_perf_float(
         "VLLM_NEURON_GIL_SWITCH_INTERVAL_S"
+    ),
+    # neuronx-cc --modular-flow-mac-threshold for the compiled model graphs. 0 keeps the platform
+    # value (10), which forces the modular-flow partitioner on for every graph. That partitioner can
+    # place a boundary inside an in-place NKI write chain on a KV buffer shared by several layers,
+    # and the compiler then copies the whole buffer as a partition intermediate. Measured on a
+    # Gemma3-4B decode graph (b64, TP=4) with in-kernel KV writes: 69.1 ms per step at 10 and
+    # 17.9 ms at 1e15. Opt-in, because a different partitioning changes every graph it reaches.
+    "VLLM_NEURON_MODULAR_FLOW_MAC_THRESHOLD": lambda: optional_perf_int(
+        "VLLM_NEURON_MODULAR_FLOW_MAC_THRESHOLD"
     ),
     # Disable NKI kernels — forces can_run_kernel() to return False
     "VLLM_NEURON_DISABLE_NKI_KERNELS": lambda: (
