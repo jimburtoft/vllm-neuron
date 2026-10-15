@@ -378,13 +378,12 @@ def batch_sharded_topk(
 _GPSIMD_TOPK_MIN_VOCAB = 8
 _GPSIMD_TOPK_MAX_VOCAB = 65536  # exclusive: kernel requires vocab < 65536
 _GPSIMD_TOPK_MAX_K = 32768  # exclusive: kernel requires k < 32768
-# The nisa.topk ISA op is gen3-only; trn3 is the only gen3 platform-target family
-# (trn1/trn1n/trn2/inf2 are pre-gen3). get_platform_target() reports this
-# host-side (env override or NRT) without an active NKI backend. Matched by prefix
-# (startswith) so trn3 variants are all admitted.
-# Platform families allowed to use the GpSIMD top-k kernel. Narrower than the ISA
-# requirement on purpose: nisa.topk needs gen3 and Trn2 is also gen3, so this is a
-# qualification boundary rather than a hardware one.
+# Platform families allowed to use the GpSIMD top-k kernel. The nisa.topk ISA op
+# needs gen3, and Trn2 is also gen3, so this gate is a qualification boundary,
+# not an ISA limit. Widening it to Trn2 needs an accuracy run on Trn2 first.
+# get_platform_target() reports the family host-side (env override or NRT)
+# without an active NKI backend. The match is by prefix (startswith), so every
+# trn3 variant is admitted.
 _GPSIMD_TOPK_PLATFORM_PREFIX = "trn3"
 
 
@@ -440,8 +439,9 @@ def _can_use_gpsimd_topk(tensor: Tensor, k: int, dim: int) -> bool:
     # eligible on the sampling path; anything non-bf16 falls to the rotational gate.
     if tensor.dtype != torch.bfloat16:
         return False
-    # gen3-only: the nisa.topk ISA op does not exist pre-gen3. trn3 is the only
-    # gen3 platform target; anything else falls through to the rotational gate.
+    # Qualified on trn3 only (see _GPSIMD_TOPK_PLATFORM_PREFIX). Trn2 is also
+    # gen3, so this is not an ISA limit. Any other platform falls through to the
+    # rotational gate.
     # Via the assume_constant_result helper so the ScriptClass NRT lookup is folded
     # off-graph (see _is_gpsimd_topk_platform).
     if not _is_gpsimd_topk_platform():
