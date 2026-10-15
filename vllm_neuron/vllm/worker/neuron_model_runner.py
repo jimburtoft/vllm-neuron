@@ -5325,15 +5325,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         gather (``_compute_swa_decode_tensors``) only runs in that
         no-op-clip regime, so its P_MAX-aligned geometry is preserved.
         """
-        # Trimmed SWA kv block counts must produce S_ctx divisible by P_MAX
-        # *per s_prior shard*. When attention_tkg does not batch-shard (see
-        # nkilib is_batch_sharded: it also needs bs * q_head * s_active >= P_MAX,
-        # so even batches with few query heads per rank still shard s_prior),
-        # it splits s_prior across the lnc programs and asserts each shard
-        # % P_MAX == 0 (NCC_INKI016 "Sharded s_prior must be divisible by
-        # p_max"). Aligning to P_MAX alone fails whenever the aligned window is
-        # an odd number of P_MAX tiles, e.g. sliding_window=1024, block_size=32
-        # -> 36 blocks -> s_prior 1152 -> 576 per shard. Align to lnc * P_MAX.
+        # Each s_prior shard must be divisible by P_MAX (NCC_INKI016).
+        # attention_tkg shards s_prior across the lnc programs when it does not
+        # batch-shard. nkilib is_batch_sharded also requires
+        # bs * q_head * s_active >= P_MAX. A model with few query heads per
+        # rank therefore shards s_prior for every small batch, odd or even.
+        # Aligning to P_MAX alone is not enough. Example:
+        # sliding_window=1024, block_size=32 -> 36 blocks -> s_prior 1152 ->
+        # 576 per shard at lnc=2. Align to lnc * P_MAX instead.
         P_MAX = 128
         lnc = get_logical_nc_config()
         min_blocks = sliding_window // block_size + 1
