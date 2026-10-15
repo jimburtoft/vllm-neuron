@@ -995,7 +995,7 @@ class WhisperForConditionalGeneration(nn.Module):
         # The runner constructs the model via the generic from_configs(hf_config,
         # neuron_config) call (neuron_model_runner.py:1190/1210) and never passes
         # a medusa_config -- so we pull it from the active vLLM config's
-        # additional_config here. Customer enables Medusa with:
+        # additional_config here. Enable Medusa with:
         #   --speculative-config '{"method":"medusa","num_speculative_tokens":5}'
         #   --additional-config  '{"medusa_config":{"init":"zero"}}'
         # (num_speculative_tokens=K is handled by the spec-config shim + runner;
@@ -1011,7 +1011,7 @@ class WhisperForConditionalGeneration(nn.Module):
                 add_cfg = getattr(vcfg, "additional_config", None) or {}
                 medusa_config = add_cfg.get("medusa_config")
                 # Default num_heads (N) to K from the speculative config so the
-                # customer only has to set K in ONE place (--speculative-config).
+                # user only has to set K in ONE place (--speculative-config).
                 if medusa_config is not None and "num_heads" not in medusa_config:
                     spec = getattr(vcfg, "speculative_config", None)
                     k = getattr(spec, "num_speculative_tokens", None)
@@ -1134,7 +1134,7 @@ class WhisperForConditionalGeneration(nn.Module):
         # device move). The heads' output projection is the sharded self.lm_head
         # (tie) -- only the ResBlock params are synthesized/loaded here. init
         # "zero"/"random" need NO checkpoint (framework runs untrained); "load"
-        # reads a customer checkpoint. MISSING/UNEXPECTED for the head params
+        # reads a trained head checkpoint. MISSING/UNEXPECTED for the head params
         # must be 0 (asserted by the M1 harness).
         self._medusa_load_report = None
         if self.medusa_heads is not None:

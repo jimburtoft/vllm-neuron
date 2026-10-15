@@ -13,7 +13,7 @@ greedy even when tokens are ACTUALLY accepted (not just all-rejected).
 This is NOT training a real speculative model. It is a crude, fast fit designed
 only to raise acceptance above zero so the multi-token-accepted branch of the
 rejection sampler is driven. Acceptance rate here is meaningless for latency --
-that is the customer's job with real trained heads.
+that is measured with real trained heads.
 
 How the fit works
 -----------------

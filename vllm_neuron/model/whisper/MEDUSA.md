@@ -11,7 +11,7 @@ for `/v1/audio/transcriptions`, the regime where spec-decode helps Whisper.
   architectural max — 20 attention heads).
 - **Status**: **framework complete and correctness-proven end-to-end.** `vllm serve`
   starts with Medusa enabled at TP=4 and serves real transcriptions. The **speedup
-  is a property of the customer's TRAINED heads** — this framework is the plumbing +
+  is a property of the user's TRAINED heads** — this framework is the plumbing +
   measurement tooling, and the correctness guarantee holds at any acceptance rate.
 
 ---
@@ -26,8 +26,8 @@ target's own greedy tokens, plus one bonus token. Multiple tokens can be emitted
 graph call → fewer iterations → lower latency **when the heads are accurate**.
 
 - **It IS**: a correct, runnable spec-decode framework for Whisper that accepts
-  customer-trained heads (or placeholder heads), enabled from `vllm serve`, with a
-  correctness gate + a latency harness the customer runs against their own heads.
+  user-trained heads (or placeholder heads), enabled from `vllm serve`, with a
+  correctness gate + a latency harness to run against your own heads.
 - **It is NOT**: a speedup by itself. Untrained / placeholder heads accept ~0 real
   drafts → ~1 token/iter → **slower than greedy** (you pay a small verify overhead for
   no accepted tokens). The win requires trained heads and scales with their acceptance
@@ -45,7 +45,7 @@ the exercised multi-token accept path (Task 020 M3).
 
 ---
 
-## Enable Medusa in `vllm serve` (the customer entry point)
+## Enable Medusa in `vllm serve` (the serving entry point)
 
 Two config surfaces, one for K and one for the heads source:
 
@@ -102,16 +102,16 @@ logits→CPU copy; see [Latency framing](#offline-harness-vs-served-latency)).
 
 ## Supplying trained heads (the loader)
 
-The head loader (`medusa_heads.py`) accepts customer weights in several external
+The head loader (`medusa_heads.py`) accepts trained head weights in several external
 formats and normalizes them to the internal `medusa_head_{i}.{j}.linear.{weight,bias}`
 scheme. Medusa-1 ties each head's output projection to the model's (sharded) `lm_head`,
-so a customer checkpoint only needs to carry the per-head **ResBlock** weights.
+so a head checkpoint only needs to carry the per-head **ResBlock** weights.
 
 | `init` | Meaning | Checkpoint required |
 |---|---|---|
 | `zero` | ResBlocks zeroed (each head proposes `argmax(lm_head(h))` — the same token K×) | No |
 | `random` | ResBlocks randomly initialized (seeded) | No |
-| `load` | Load customer/trained heads from `heads_path` | Yes |
+| `load` | Load trained heads from `heads_path` | Yes |
 
 Supported external checkpoint schemes (auto-detected):
 - Generic / internal: `medusa_heads.{i}.{j}.linear.*` or `medusa_head_{i}.{j}.linear.*`
@@ -202,8 +202,8 @@ torchrun --nproc_per_node=4 tests/medusa/medusa_bench.py --medusa-heads /path/to
   which dominates wall-clock (~0.5× regardless of head quality). Use it to confirm the
   loop runs and to read `accepted-tokens/iter`; do **not** read its absolute wall-clock
   as the served latency. It prints this caveat in-line and uses the speedup **model**
-  (above) for the customer-facing projection.
-- **Served path (`vllm serve`)** is the **real latency** the customer measures. With
+  (above) for the expected served speedup.
+- **Served path (`vllm serve`)** is the **real latency** users see. With
   on-device greedy sampling (`all_greedy: true`) the runner keeps sampling on device
   and does **not** perform the per-iter full-logits CPU copy — so the served latency
   reflects the on-device verify/step ratio, not the harness's host-transfer bound.

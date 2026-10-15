@@ -4,7 +4,7 @@
 # Serve smoke-test for native-plugin Whisper large-v3 WITH Medusa spec-decode.
 #
 # This brings up `vllm serve` with Medusa enabled at TP=4 and curls one clip
-# through /v1/audio/transcriptions -- the REAL customer entry point (the offline
+# through /v1/audio/transcriptions -- the REAL serving entry point (the offline
 # medusa_bench.py / medusa_correctness_gate.py are the mechanism/measurement
 # tools; this is the served path). See ../../MEDUSA.md for the full config
 # surface and the speedup-vs-acceptance model.

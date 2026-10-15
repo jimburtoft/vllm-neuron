@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-whisper-xla Task 020 Milestone 3 -- Medusa CUSTOMER LATENCY HARNESS (BS=1, native).
+Medusa LATENCY HARNESS for native-backend Whisper (BS=1).
 
-This is the tool the CUSTOMER runs, once they load their TRAINED Medusa heads, to
+Run this tool after loading your TRAINED Medusa heads to
 measure the single-stream latency speedup the heads deliver. It drives the SAME
 BS=1 Medusa decode loop the framework ships (plugin verify-K NEFF + host rejection
 + block-managed self-KV), on a set of clips, and reports per clip:
@@ -13,7 +13,7 @@ BS=1 Medusa decode loop the framework ships (plugin verify-K NEFF + host rejecti
   * effective ms / token  (= e2e_latency / tokens_emitted)
   * speedup vs plain greedy on the SAME config
 
-PLUS the breakeven / speedup MODEL so the customer understands
+PLUS the breakeven / speedup MODEL that makes explicit
 "speedup = f(acceptance)": given the measured verify/step ratio r (~1.116x from
 M0.5), speedup ~= (mean_accepted + 1) / r. This makes explicit that
 placeholder/untrained heads (mean_accepted ~ 0) are SLOWER than greedy, and the
@@ -22,7 +22,7 @@ break even.
 
 HONEST framing: this harness does NOT itself produce a speedup with placeholder
 heads (~1.0x or slightly slower). It is the measurement TOOL; the speedup is a
-property of the customer's trained heads.
+property of the trained heads.
 
 Configurable:
   --medusa-heads  zero | random | <path-to-head-ckpt>   (default zero)
@@ -56,7 +56,7 @@ MAX_BLOCKS = 16
 # Measured verify/step latency ratio from the M0.5 de-risk (TP=4 LNC=2):
 # a [1,K+1] verify step costs ~1.116x a single-token [1,1] step (decode is
 # bandwidth-bound; the extra K positions are nearly free). Used for the
-# theoretical speedup model. Customers on a different config should re-measure
+# theoretical speedup model. Users on a different config should re-measure
 # with --verify-ratio.
 DEFAULT_VERIFY_RATIO = 1.116
 
@@ -385,7 +385,7 @@ def main():
         log("  logits copied to CPU for host rejection), so a placeholder-head run looks")
         log("  ~0.5x here regardless of the on-device NEFF ratio. The clean ON-DEVICE")
         log("  verify/step ratio is 1.116x (M0.5); use the model below for the real")
-        log("  customer-facing speedup projection. On-device rejection (an M4+ lever) drops")
+        log("  served speedup projection. On-device rejection (an M4+ lever) drops")
         log("  the host bounce and realizes the model's speedup.")
 
         # ---- speedup-vs-acceptance model ----

@@ -1,6 +1,6 @@
-# Medusa framework — correctness gate + customer latency harness (Task 020 M3)
+# Medusa framework — correctness gate + latency harness
 
-BS=1 customer-facing validation for the Whisper-native Medusa speculative-decoding
+BS=1 validation for the Whisper-native Medusa speculative-decoding
 framework (`method="medusa"`, vllm-neuron 0.21 native XLA backend, NO NxDI).
 
 The framework itself (the `MedusaProposer`, the four runner dispatch edits, the
@@ -17,10 +17,10 @@ This directory holds the M3 validation tooling.
 | File | Purpose |
 |---|---|
 | `medusa_correctness_gate.py` | The formal BS=1 correctness gate. Proves the Medusa accepted-token output is BYTE-IDENTICAL to plain greedy on the SAME served config across three head modes — including when tokens are genuinely accepted (the multi-token accept path). |
-| `medusa_bench.py` | The **customer latency harness**. Measures per-clip end-to-end latency, mean per-iter latency, mean accepted tokens/iter, effective ms/token, and speedup vs greedy. Emits a clean table + the speedup-vs-acceptance model. This is the tool the customer runs once they load their TRAINED heads. |
+| `medusa_bench.py` | The **latency harness**. Measures per-clip end-to-end latency, mean per-iter latency, mean accepted tokens/iter, effective ms/token, and speedup vs greedy. Emits a clean table + the speedup-vs-acceptance model. Run it after loading your TRAINED heads. |
 | `medusa_synth_heads.py` | Builds a SYNTHETIC partially-correct head checkpoint (crude fit to the greedy continuation) used by the gate to EXERCISE the accept path. Not a real trained model — only a device for driving multi-token accepts. |
 | `make_clip_mels.py` | Builds the 5-clip mel set (jfk + 4 LibriSpeech dummy utterances) the gate/harness consume. |
-| `serve_medusa_smoke_test.sh` | Brings up `vllm serve` with Medusa enabled at TP=4 and curls one clip through `/v1/audio/transcriptions` — the REAL served customer entry point. See **[../../MEDUSA.md](../../MEDUSA.md)** for the full serve command + config surface. |
+| `serve_medusa_smoke_test.sh` | Brings up `vllm serve` with Medusa enabled at TP=4 and curls one clip through `/v1/audio/transcriptions` — the REAL served entry point. See **[../../MEDUSA.md](../../MEDUSA.md)** for the full serve command + config surface. |
 
 ## Correctness invariant (M0 spec §5)
 
@@ -48,7 +48,7 @@ python medusa_synth_heads.py --clips jfk,ls1,ls2,ls3 --steps 400
 # 3. correctness gate: 5 clips x {zero, random, load-synthetic} head modes, TP=4
 torchrun --nproc_per_node=4 medusa_correctness_gate.py     # or: python ... for TP=1
 
-# 4. customer latency harness (load YOUR trained heads here)
+# 4. latency harness (load YOUR trained heads here)
 torchrun --nproc_per_node=4 medusa_bench.py --medusa-heads /path/to/your_heads.pt \
     --num-speculative-tokens 5 --clips jfk,ls1,ls2,ls3,ls4
 ```
@@ -58,7 +58,7 @@ FasterDecoding / vLLM speculators / internal `medusa_heads.{i}.{j}.linear.*`
 layouts — the ResBlock Linear tensors are loaded, per-head output projections are
 dropped under the Medusa-1 lm_head tie).
 
-## Speedup expectation (be honest with the customer)
+## Speedup expectation
 
 Placeholder/untrained heads (`zero`/`random`) accept ~0 real drafts → Medusa is
 ~1.0x or SLOWER than greedy (you pay the ~1.116x verify overhead for no accepted
@@ -78,13 +78,13 @@ speedup ≈ (mean tokens emitted per verify) / 1.116
 | 4 | 3.58x |
 
 Heads must deliver > ~0.12 accepted drafts/verify just to break even; the win
-grows with acceptance. The customer's trained heads determine the real speedup.
+grows with acceptance. Your trained heads determine the real speedup.
 
-## Serving with Medusa (the real customer entry point)
+## Serving with Medusa (the real serving entry point)
 
 The gate + harness above are the mechanism/measurement tools (the harness is
 host-transfer-bound; read its `accepted/iter`, not its wall-clock). The **served**
-path is what the customer actually runs and measures:
+path is what users actually run and measure:
 
 ```bash
 # launch vllm serve with Medusa at TP=4 (placeholder zero heads)
