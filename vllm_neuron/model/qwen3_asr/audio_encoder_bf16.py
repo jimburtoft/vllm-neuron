@@ -630,6 +630,13 @@ class Qwen3ASREncoder(nn.Module):
             num_blocks               = attention blocks, from the bounds (after the DP scatter: this rank)
             num_slots                = chunk slots that this rank runs  [num_blocks * slots_per_block]
 
+        ``num_chunks`` and ``num_slots`` are different counts. ``num_chunks`` is
+        the size of the gather source. ``num_slots`` is the size of this rank's
+        gather output, after the DP scatter. They are equal only at DP 1 when the
+        caller pads the mel to whole slots, as the top-level model does. A caller
+        can also pass the compact stream (``AudioBlockAssignment.feature_length``),
+        which has fewer chunks than slots.
+
         The input is one packed feature stream, so the leading batch dim is
         always 1. The code expresses batching across num_blocks.
         """
@@ -710,13 +717,12 @@ class Qwen3ASREncoder(nn.Module):
             bound_min = shard_select(bound_min, 0, self.dp_group)
             bound_max = shard_select(bound_max, 0, self.dp_group)
             num_blocks = num_blocks // self.dp_size
-        num_slots = num_blocks * slots_per_block
 
         # Step 3: Conv frontend (3x s2p1 -> 8x downsample): [num_slots, C, freq, time_steps].
         x = gelu(self._conv1_addmm(chunked))
         x = gelu(self.conv2d2(x))
         x = gelu(self.conv2d3(x))
-        _, conv_channels, freq_bins, time_steps = x.shape
+        num_slots, conv_channels, freq_bins, time_steps = x.shape
         x = self.conv_out(
             x.permute(0, 3, 1, 2)
             .contiguous()
