@@ -178,7 +178,8 @@ def get_efa_interface_from_bdf(bdf: str) -> str:
     except FileNotFoundError as e:
         raise RuntimeError(
             f"No EFA device found at {infiniband_path} for BDF {bdf}. "
-            f"This is expected on instances without EFA (e.g. trn3 3xlarge). "
+            f"This is expected on instances without EFA (e.g. trn2.3xlarge, "
+            f"trn3.3xlarge). "
             f"EFA affinity is a CPU performance optimization, not a "
             f"correctness requirement; set NEURON_SKIP_EFA_AFFINITY=1 to skip "
             f"it on instances without EFA. If you are using an instance that "

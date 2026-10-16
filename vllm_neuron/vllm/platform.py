@@ -129,6 +129,13 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        # The published GPT-OSS checkpoints carry quant_method "mxfp4", which
+        # vLLM renames to "gpt_oss_mxfp4" for the GptOss architecture. The
+        # GPT-OSS loaders read this checkpoint directly: they keep MXFP4 on
+        # Trn3 and dequantize to BF16 (or requantize to FP8) on Trn2. The model
+        # factory selects the path, so the checkpoint loads with no
+        # --hf-overrides.
+        "gpt_oss_mxfp4",
     ]
     # Neuron quantization paths that CPU-dequant compressed-tensors weights to
     # BF16 on the loader thread. On these paths the device only ever sees BF16
@@ -318,6 +325,8 @@ class NeuronPlatform(Platform):
         if model_config is None:
             return
 
+        cls._maybe_disable_default_prefix_caching(vllm_config)
+
         # Frontend multimodal patchify runs under vLLM's
         # set_default_torch_num_threads(), which pins torch to OMP_NUM_THREADS or
         # 1 when unset -- so patchify runs single-threaded by default. Default OMP
@@ -483,6 +492,74 @@ class NeuronPlatform(Platform):
                         f"mm_processor_kwargs) or increase "
                         f"num_vision_tokens_buckets in vision_neuron_config."
                     )
+
+    @classmethod
+    def _maybe_disable_default_prefix_caching(cls, vllm_config) -> None:
+        """Turn off default prefix caching when segmented prefill stays off.
+
+        Automatic Prefix Caching (APC) needs segmented prefill on Neuron, and
+        vLLM turns APC on by default. The model runner turns segmented prefill
+        on by default only for chunked prefill (max_num_batched_tokens smaller
+        than max_model_len). The LLM class default max_num_batched_tokens is
+        8192, so a model with max_model_len <= 8192 gets APC on and segmented
+        prefill off, and the model runner raises at startup.
+
+        APC is turned off, with a warning, only when the caller did not pass
+        --enable-prefix-caching / --no-enable-prefix-caching, did not set
+        kv_segment_size_buckets, and decode-context parallelism is off.
+        """
+        cache_config = vllm_config.cache_config
+        if cache_config is None or not getattr(
+            cache_config, "enable_prefix_caching", False
+        ):
+            return
+        if any(
+            a.startswith(("--enable-prefix-caching", "--no-enable-prefix-caching"))
+            for a in sys.argv
+        ):
+            return
+        additional_config = vllm_config.additional_config
+        neuron_config = (
+            additional_config.get("neuron_config", {})
+            if isinstance(additional_config, dict)
+            else {}
+        )
+        if "kv_segment_size_buckets" in neuron_config:
+            return
+        dcp_size = getattr(
+            vllm_config.parallel_config, "decode_context_parallel_size", 1
+        )
+        if not isinstance(dcp_size, int) or dcp_size > 1:
+            return
+        max_model_len = vllm_config.model_config.max_model_len
+        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        if not isinstance(max_model_len, int) or not isinstance(
+            max_num_batched_tokens, int
+        ):
+            return
+
+        from vllm_neuron.utils.bucket_utils import resolve_segmented_prefill_config
+
+        try:
+            segment_buckets, _ = resolve_segmented_prefill_config(
+                min(max_num_batched_tokens, max_model_len), max_model_len
+            )
+        except ValueError:
+            # Unsupported combination: the model runner reports it.
+            return
+        if segment_buckets is not None:
+            return
+
+        cache_config.enable_prefix_caching = False
+        logger.warning(
+            "Prefix caching is off. It needs segmented prefill, and segmented "
+            "prefill stays off for max_num_batched_tokens=%d and "
+            "max_model_len=%d. To use prefix caching, set "
+            "max_num_batched_tokens to a supported segment size that is less "
+            "than max_model_len, for example 512 or 2048.",
+            max_num_batched_tokens,
+            max_model_len,
+        )
 
     @classmethod
     def _validate_quantization_config(cls, vllm_config) -> None:

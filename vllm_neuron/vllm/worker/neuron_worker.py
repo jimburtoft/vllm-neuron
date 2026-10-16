@@ -390,7 +390,7 @@ class NeuronWorker(WorkerBase):
             "Initialized NeuronWorker with rank %s, local_rank %s", rank, local_rank
         )
 
-    def _set_efa_affinity(self, visible_devices) -> str:
+    def _set_efa_affinity(self, visible_devices) -> str | None:
         """
         Set EFA interface affinity for optimal network performance.
 
@@ -400,14 +400,37 @@ class NeuronWorker(WorkerBase):
         Args:
             visible_devices: List of visible Neuron device indices
 
+        EFA affinity is a CPU performance optimization, not a correctness
+        requirement. Some instances have no EFA device, for example
+        trn2.3xlarge and trn3.3xlarge. On these instances this method logs a
+        warning and returns None, and the worker continues. A worker that
+        needs EFA (kv_transfer_config is set) still raises.
+
         Returns:
-            str: Name of the EFA interface assigned to this host worker
+            str | None: Name of the EFA interface assigned to this host
+                worker, or None when the instance has no EFA device.
 
         Raises:
-            RuntimeError: If the Neuron device cannot be accessed or EFA interface not found
+            RuntimeError: If the Neuron device cannot be accessed, or the EFA
+                interface is not found and kv_transfer_config is set
             IndexError: If the computed device index is out of bounds
         """
-        efa = get_efa_interface(self.local_rank, visible_devices)
+        try:
+            efa = get_efa_interface(self.local_rank, visible_devices)
+        except RuntimeError as e:
+            if not isinstance(e.__cause__, FileNotFoundError):
+                raise
+            if getattr(self.vllm_config, "kv_transfer_config", None) is not None:
+                raise
+            logger.warning(
+                "No EFA device found for local_rank %s. Skip the EFA affinity "
+                "step, because this step is a performance optimization only. "
+                "Set NEURON_SKIP_EFA_AFFINITY=1 to remove this warning. "
+                "Cause: %s",
+                self.local_rank,
+                e,
+            )
+            return None
         os.environ["FI_EFA_IFACE"] = efa
         logger.debug(
             "Set EFA interface to %s for local_rank %s",

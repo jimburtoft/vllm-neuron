@@ -7,6 +7,7 @@ sharded tensors in a tensor-parallel setting.
 """
 
 import logging
+import math
 from typing import Optional
 
 import torch
@@ -165,7 +166,18 @@ def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:
         return False
 
     # Check minimum reduction size
-    return not shape[dim] < 128
+    if shape[dim] < 128:
+        return False
+
+    # The nkilib cascaded_max kernel splits each row across up to 128 partitions
+    # (rows are split across the 2 cores at LNC=2), and its nc_find_index8 step
+    # takes at most 16384 elements per partition. Large batches over a large
+    # per-rank vocabulary (for example batch >= 96 for GPT-OSS at TP=4, 50272
+    # per rank) exceed that and fail to compile, so use torch.max for them.
+    rows = math.prod(shape[:-1])
+    rows_per_core = math.ceil(rows / 2) if rows > 1 else 1
+    stages = min(128 // rows_per_core, shape[dim] // 128)
+    return stages >= 1 and math.ceil(shape[dim] / stages) <= 16384
 
 
 def _apply_sharding_offset(
