@@ -7,6 +7,7 @@ from torch import Tensor
 import nki
 import math
 
+from nkilib.core.attention.attention_tkg_utils import uses_flash_attention
 from nkilib.core.attention.gen_mask_tkg import gen_mask_tkg_hbm
 
 # QK-swap mask layout: newer nkilib ``attention_block_tkg`` selects a transposed,
@@ -318,6 +319,9 @@ def _resize_block_len(
 
     NOTE: the threshold must match the kernel's is_batch_sharded literal
     (currently ``s_prior <= lnc * P_MAX``); if it drifts the decode mask breaks.
+
+    The resize also applies the flash-attention tile rule of nkilib. See
+    ``_resize_cache_block_len_for_attention_tkg_kernel``.
     """
     if block_len <= 0:
         return block_len
@@ -355,7 +359,11 @@ def _resize_cache_block_len_for_attention_tkg_kernel(
       block_len: The size of each block.
       n_prgs: Sharding level.
       p_max: Maximum number of partitions.
-      full_sprior: Maximum KV cache capacity (bucket size). Used for warning suggestions.
+
+    When nkilib uses flash-attention tiles for the s_prior of one shard, each tile
+    must hold whole resized blocks. nkilib attention_block_tkg always enables this
+    tiling, and uses_flash_attention gives the tile size. Keep the gcd steps in sync
+    with resize_cache_block_len_for_attention_tkg_kernel in nkilib attention_tkg_utils.
 
     NOTE: This function is borrowed from NKI due to them having prints which aren't dynamo safe.
     """
@@ -364,7 +372,15 @@ def _resize_cache_block_len_for_attention_tkg_kernel(
     min_multiple = n_prgs * p_max
 
     # Find the greatest multiple of block_len that also divides the maximum block length.
-    reduced_blk_len = math.gcd(block_len, bucket_len // min_multiple)
+    divisor = bucket_len // min_multiple
+    s_prior_per_shard = bucket_len // n_prgs
+    use_fa, fa_tile_size = uses_flash_attention(True, s_prior_per_shard)
+    if use_fa:
+        divisor = math.gcd(divisor, fa_tile_size // p_max)
+        last_tile = s_prior_per_shard % fa_tile_size
+        if last_tile:
+            divisor = math.gcd(divisor, last_tile // p_max)
+    reduced_blk_len = math.gcd(block_len, divisor)
     resize_factor = block_len // reduced_blk_len
 
     return reduced_blk_len, resize_factor
