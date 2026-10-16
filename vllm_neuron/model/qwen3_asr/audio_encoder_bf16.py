@@ -586,6 +586,8 @@ class Qwen3ASREncoder(nn.Module):
         that at LNC=1. Each rank places its blocks in its own slot of a zeroed
         ``[dp_size, *x.shape]`` buffer, and the sum over ranks is the gather.
         Adding zeros is exact, so the result is bit-identical to all_gather.
+
+        TODO(V2413309353): return to all_gather at LNC=1 once it is fixed.
         """
         if get_logical_nc_config() != 1:
             return self.dp_group.all_gather(x, dim=0)
