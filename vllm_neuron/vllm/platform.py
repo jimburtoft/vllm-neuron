@@ -276,9 +276,21 @@ class NeuronPlatform(Platform):
         # the Neuron policy before ModelConfig validation constructs the config.
         patch_vllm_config_for_neuron()
 
-        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
-            from vllm.model_executor.models.registry import ModelRegistry
+        from vllm.model_executor.models.registry import ModelRegistry
 
+        # Architectures that vLLM itself does not implement. Without a
+        # front-end registration, ModelConfig resolves them to the generic
+        # Transformers backend (e.g. TransformersMultiModalForCausalLM), the
+        # worker then loads by that resolved name, and the plugin model is
+        # never selected. Lazy "module:Class" strings keep the import cheap.
+        if "MuseGlimmerForConditionalGeneration" not in ModelRegistry.models:
+            ModelRegistry.register_model(
+                "MuseGlimmerForConditionalGeneration",
+                "vllm_neuron.model.muse_glimmer.factory:"
+                "MuseGlimmerForConditionalGeneration",
+            )
+
+        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             ModelRegistry.register_model(
                 "SyntheticNeuronModel",
                 "vllm_neuron.model.synthetic:SyntheticNeuronModel",
