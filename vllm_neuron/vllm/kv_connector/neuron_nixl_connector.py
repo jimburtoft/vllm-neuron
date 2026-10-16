@@ -766,13 +766,32 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
         desc_len,
         offset,
     ):
-        """Register NIXL descriptors for a remote agent's blocks."""
+        """Register NIXL descriptors for a remote agent's blocks.
+
+        Block ``b`` of region ``r`` starts at ``base + b * block_strides[r]``. A
+        Neuron peer registers dense K/V slabs, so its stride equals its block
+        length. A peer whose K and V are two halves of one page (for example a
+        GPU engine with split K/V head slots) registers each half as its own
+        region with ``block_len = page // 2`` and ``block_stride = page``, so the
+        address must step by the advertised stride, not by the block length.
+        Metadata without strides (older peers) falls back to the block length.
+        """
         kv_addrs = nixl_agent_meta.kv_caches_base_addr
+        block_lens = nixl_agent_meta.block_lens
+        block_strides = getattr(nixl_agent_meta, "block_strides", None) or block_lens
+        assert len(block_strides) == len(kv_addrs), (
+            f"Remote advertised {len(block_strides)} block strides for "
+            f"{len(kv_addrs)} regions"
+        )
         blocks_data = []
         for kv_group_idx, base_addr in enumerate(kv_addrs):
-            page_size = nixl_agent_meta.block_lens[kv_group_idx]
+            block_stride = block_strides[kv_group_idx]
+            assert block_stride >= block_lens[kv_group_idx], (
+                f"Remote region {kv_group_idx}: block_stride {block_stride} < "
+                f"block_len {block_lens[kv_group_idx]}"
+            )
             for block_id in range(nixl_agent_meta.num_blocks):
-                addr = base_addr + block_id * page_size + offset
+                addr = base_addr + block_id * block_stride + offset
                 blocks_data.append((addr, desc_len, nixl_agent_meta.device_id))
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
         handle = self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
