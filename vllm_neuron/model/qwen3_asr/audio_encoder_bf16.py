@@ -36,7 +36,6 @@ from vllm_neuron.parallel.neuron_parallel_state import (
     get_neuron_encoder_tp_group,
     shard_select,
 )
-from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
 from vllm_neuron.utils.dynamo_graph import allow_in_graph_cacheable
 
@@ -576,28 +575,6 @@ class Qwen3ASREncoder(nn.Module):
         )
         return output.permute(0, 3, 1, 2)
 
-    def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
-        """Gather the per-rank encoder blocks from every DP rank on dim 0.
-
-        At LNC=1 the DP all_gather intermittently returns wrong blocks on some
-        ranks (seen at encoder DP 8 on trn2.3xlarge): ranks disagree, and
-        whole blocks, valid tokens included, hold another rank's or stale data.
-        The same gather built from an all_reduce is exact on every run, so use
-        that at LNC=1. Each rank places its blocks in its own slot of a zeroed
-        ``[dp_size, *x.shape]`` buffer, and the sum over ranks is the gather.
-        Adding zeros is exact, so the result is bit-identical to all_gather.
-
-        TODO(V2413309353): return to all_gather at LNC=1 once it is fixed.
-        """
-        if get_logical_nc_config() != 1:
-            return self.dp_group.all_gather(x, dim=0)
-        rank = self.dp_group.rank_in_group_tensor.to(torch.int64).reshape(1)
-        own_slot = torch.arange(self.dp_size, device=x.device) == rank
-        own_slot = own_slot.view(self.dp_size, *([1] * x.dim()))
-        slots = torch.where(own_slot, x.unsqueeze(0), torch.zeros_like(x).unsqueeze(0))
-        slots = self.dp_group.all_reduce(slots)
-        return slots.reshape(self.dp_size * x.shape[0], *x.shape[1:])
-
     def forward(
         self,
         input_features: torch.Tensor,
@@ -765,7 +742,7 @@ class Qwen3ASREncoder(nn.Module):
         # >>> PARALLELISM: DP gather — combine blocks from all DP ranks <<<
         # The cache write below needs all blocks on each rank.
         if self.dp_size > 1:
-            x = self._dp_gather(x)
+            x = self.dp_group.all_gather(x, dim=0)
 
         # Step 6:  Write to the encoder cache buffer.
         if encoder_cache_buffer is not None:
