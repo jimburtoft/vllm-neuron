@@ -906,7 +906,8 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
             "bound_max": z(nb, bs, 1, dtype=torch.int32),
             "window_bound_min": z(nb, bs, 1, dtype=torch.int32),
             "window_bound_max": z(nb, bs, 1, dtype=torch.int32),
-            "merged_order": torch.arange(bs // mu, dtype=torch.int64, device=device).repeat(nb, 1)
+            # Built on CPU then moved: aten::repeat (unfold) has no neuron impl.
+            "merged_order": torch.arange(bs // mu, dtype=torch.int64).repeat(nb, 1).to(device)
             if device != torch.device("meta")
             else z(nb, bs // mu, dtype=torch.int64),
         }
