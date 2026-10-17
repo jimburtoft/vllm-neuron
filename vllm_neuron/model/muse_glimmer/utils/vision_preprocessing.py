@@ -1,0 +1,268 @@
+# SPDX-License-Identifier: Apache-2.0
+"""CPU preprocessing for the MuseGlimmer perception encoder.
+
+Everything here is pure CPU tensor math on ``grid_thw``; the compiled vision
+graph only sees fixed-shape packed tensors. The functions are vendored (not
+imported from ``transformers.vision_utils``) because that module changed
+between transformers 5.15.0 (DLAMI) and 5.20 (the position-table helper only
+gained ``padding="zeros"`` after 5.15.0). The math below reproduces both HF
+versions:
+
+* position table: bilinear, ``align_corners=False``, zero padding
+  (``F.grid_sample`` semantics; 5.15.0 ``get_vision_bilinear_indices_and_weights``
+  == 5.20 ``get_vision_interpolation_indices_and_weights(..., "bilinear", False,
+  1, "zeros")``), fp32 weights.
+* 2D axial RoPE: positions ``(w + 1, h + 1)`` per un-merged patch, 24 inverse
+  frequencies ``theta ** -(2i / 48)``, angle layout ``[w, h, w, h]`` over the
+  96-dim head.
+* windows: 32x32-patch windows in un-merged patch space, row-major, partial
+  windows at the right / bottom edges, never crossing frames.
+
+Pack order
+----------
+Inside its block, each frame of an item is laid out
+``window (row-major) -> 2x2 merge block (row-major) -> in-block (row-major)``.
+Window edges are multiples of 32 (even), so every 2x2 block lies inside one
+window. Consequences (verified against the HF helpers in
+``harness/check_vision_ordering.py`` and the module tests):
+
+1. every HF attention window is a contiguous run -> window attention is a
+   plain ``[start, end)`` bound per token;
+2. the HF pixel shuffle becomes a reshape:
+   ``view(nb, bs/4, 4, D).transpose(-1, -2).reshape(nb, bs/4, 4D)``;
+3. the merged rows come out window-major; ``merged_order`` (a per-block gather
+   index) restores the HF order (2x2-block raster per frame) before the cache
+   write.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import torch
+
+from vllm_neuron.model.qwen3_vl.utils.vision_block_packing import BlockAssignment
+
+WINDOW_PATCHES = 32  # pos_emb_height * patch_size / patch_size (448 px)
+
+
+# ---------------------------------------------------------------------------
+# Per-frame helpers (one (h, w) patch grid)
+# ---------------------------------------------------------------------------
+
+
+def frame_pack_order(h: int, w: int, win: int = WINDOW_PATCHES, merge: int = 2) -> torch.Tensor:
+    """Raster indices of an ``h x w`` frame in pack order (window -> 2x2 block -> in-block)."""
+    if h % merge or w % merge:
+        raise ValueError(f"patch grid {h}x{w} must be divisible by merge size {merge}")
+    if win % merge:
+        raise ValueError(f"window {win} must be divisible by merge size {merge}")
+    r = torch.arange(h).view(h, 1).expand(h, w)
+    c = torch.arange(w).view(1, w).expand(h, w)
+    nwx = math.ceil(w / win)
+    bh, bw = h // merge, w // merge
+    key = (r // win) * nwx + (c // win)                 # window id (row-major)
+    key = key * bh + (r // merge)                        # block row
+    key = key * bw + (c // merge)                        # block col
+    key = key * merge + (r % merge)                      # in-block row
+    key = key * merge + (c % merge)                      # in-block col
+    return torch.argsort(key.reshape(-1))
+
+
+def frame_window_bounds(h: int, w: int, win: int = WINDOW_PATCHES) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token ``[start, end)`` of its window, in pack-order coordinates of one frame."""
+    starts, ends = [], []
+    off = 0
+    for wy in range(0, h, win):
+        for wx in range(0, w, win):
+            n = min(win, h - wy) * min(win, w - wx)
+            starts.append(torch.full((n,), off, dtype=torch.int32))
+            ends.append(torch.full((n,), off + n, dtype=torch.int32))
+            off += n
+    return torch.cat(starts), torch.cat(ends)
+
+
+def frame_merged_order(h: int, w: int, order: torch.Tensor, merge: int = 2) -> torch.Tensor:
+    """Gather index: ``hf_merged[j] = packed_merged[merged_order[j]]`` for one frame.
+
+    HF merged order is 2x2-block raster: rank ``(r // m) * (w // m) + (c // m)``.
+    """
+    top_left = order.view(-1, merge * merge)[:, 0]
+    r, c = top_left // w, top_left % w
+    hf_rank = (r // merge) * (w // merge) + (c // merge)
+    inv = torch.empty_like(hf_rank)
+    inv[hf_rank] = torch.arange(hf_rank.numel())
+    return inv
+
+
+def frame_rope_cos_sin(
+    h: int, w: int, head_dim: int, theta: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Axial 2D RoPE cos/sin ``[h*w, head_dim]`` (fp32) in raster order.
+
+    HF: ``position_ids = (h, w).flip(-1) + 1``; ``inv_freq`` over ``head_dim // 2``;
+    ``freq = cat([w*f, h*f, w*f, h*f])``.
+    """
+    spatial_dim = head_dim // 2
+    inv_freq = 1.0 / (theta ** (torch.arange(0, spatial_dim, 2, dtype=torch.float) / spatial_dim))
+    hh = torch.arange(h).view(h, 1).expand(h, w).reshape(-1)
+    ww = torch.arange(w).view(1, w).expand(h, w).reshape(-1)
+    fw = (ww + 1).float()[:, None] * inv_freq[None, :]
+    fh = (hh + 1).float()[:, None] * inv_freq[None, :]
+    freq = torch.cat([fw, fh, fw, fh], dim=-1)
+    return freq.cos(), freq.sin()
+
+
+def frame_bilinear_taps(h: int, w: int, side: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """4-tap bilinear indices / fp32 weights ``[4, h*w]`` into the ``side x side`` table.
+
+    ``align_corners=False`` and zero padding: out-of-range taps are clamped and
+    get weight 0. Tap order (floor,floor), (floor,ceil), (ceil,floor), (ceil,ceil),
+    as HF 5.15.0 ``get_vision_bilinear_indices_and_weights``.
+    """
+
+    def axis(n: int):
+        g = (torch.arange(n).float() + 0.5) * (side / n) - 0.5
+        lo = torch.floor(g).long()
+        hi = lo + 1
+        frac = g - lo.float()
+        lo_ok = (lo >= 0) & (lo <= side - 1)
+        hi_ok = (hi >= 0) & (hi <= side - 1)
+        return lo.clamp(0, side - 1), hi.clamp(0, side - 1), frac, lo_ok, hi_ok
+
+    hl, hc, hf, hl_ok, hc_ok = axis(h)
+    wl, wc, wf, wl_ok, wc_ok = axis(w)
+    idx = [
+        (hl[:, None] * side + wl[None, :]),
+        (hl[:, None] * side + wc[None, :]),
+        (hc[:, None] * side + wl[None, :]),
+        (hc[:, None] * side + wc[None, :]),
+    ]
+    wt = [
+        (1 - hf)[:, None] * (1 - wf)[None, :] * (hl_ok[:, None] & wl_ok[None, :]),
+        (1 - hf)[:, None] * wf[None, :] * (hl_ok[:, None] & wc_ok[None, :]),
+        hf[:, None] * (1 - wf)[None, :] * (hc_ok[:, None] & wl_ok[None, :]),
+        hf[:, None] * wf[None, :] * (hc_ok[:, None] & wc_ok[None, :]),
+    ]
+    return (
+        torch.stack([i.reshape(-1) for i in idx]).to(torch.int32),
+        torch.stack([x.reshape(-1) for x in wt]).float(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Block packing of a batch of items
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PackedVisionInputs:
+    pixel_values: torch.Tensor  # [nb, bs, patch_dim]
+    pos_emb_idx: torch.Tensor  # [4, nb, bs] int32
+    pos_emb_weight: torch.Tensor  # [4, nb, bs] fp32
+    cos: torch.Tensor  # [nb, bs, head_dim] fp32
+    sin: torch.Tensor  # [nb, bs, head_dim] fp32
+    bound_min: torch.Tensor  # [nb, bs, 1] int32 (full attention: per temporal group)
+    bound_max: torch.Tensor
+    window_bound_min: torch.Tensor  # [nb, bs, 1] int32 (window attention)
+    window_bound_max: torch.Tensor
+    merged_order: torch.Tensor  # [nb, bs // merge**2] int64, block-local gather index
+
+    def as_kwargs(self) -> dict[str, torch.Tensor]:
+        return dict(self.__dict__)
+
+
+def pack_vision_inputs(
+    pixel_values: torch.Tensor,
+    grid_thw: torch.Tensor,
+    assignment: BlockAssignment,
+    *,
+    head_dim: int,
+    rope_theta: float,
+    num_grid_per_side: int,
+    merge_size: int = 2,
+    window: int = WINDOW_PATCHES,
+    rope_dtype: torch.dtype | None = None,
+) -> PackedVisionInputs:
+    """Pack items (rows of ``grid_thw``, raster-ordered ``pixel_values``) into blocks.
+
+    Items go into their assigned blocks in item-index order (as
+    ``scatter_to_blocks``). Pad rows: zero pixels / taps / cos-sin, bounds
+    ``(0, 0)`` (attend to nothing), identity ``merged_order``.
+
+    ``rope_dtype``: round cos/sin through this dtype (HF casts them to the
+    hidden-state dtype before the fp32 rotation), then keep fp32.
+    """
+    nb, bs = assignment.num_blocks, assignment.block_size
+    mu = merge_size * merge_size
+    if bs % mu:
+        raise ValueError(f"block_size {bs} must be divisible by {mu}")
+    patch_dim = pixel_values.shape[-1]
+
+    pix = pixel_values.new_zeros(nb, bs, patch_dim)
+    tap_idx = torch.zeros(4, nb, bs, dtype=torch.int32)
+    tap_w = torch.zeros(4, nb, bs, dtype=torch.float32)
+    cos = torch.zeros(nb, bs, head_dim, dtype=torch.float32)
+    sin = torch.zeros(nb, bs, head_dim, dtype=torch.float32)
+    fmin = torch.zeros(nb, bs, 1, dtype=torch.int32)
+    fmax = torch.zeros(nb, bs, 1, dtype=torch.int32)
+    wmin = torch.zeros(nb, bs, 1, dtype=torch.int32)
+    wmax = torch.zeros(nb, bs, 1, dtype=torch.int32)
+    morder = torch.arange(bs // mu, dtype=torch.int64).repeat(nb, 1)
+
+    rows = [tuple(int(v) for v in r) for r in grid_thw.tolist()]
+    tokens = [t * h * w for t, h, w in rows]
+    src_off = [0]
+    for n in tokens:
+        src_off.append(src_off[-1] + n)
+
+    cache: dict[tuple[int, int], tuple] = {}
+
+    def frame_tables(h: int, w: int):
+        if (h, w) not in cache:
+            order = frame_pack_order(h, w, window, merge_size)
+            ws, we = frame_window_bounds(h, w, window)
+            mo = frame_merged_order(h, w, order, merge_size)
+            c, s = frame_rope_cos_sin(h, w, head_dim, rope_theta)
+            if rope_dtype is not None:
+                c, s = c.to(rope_dtype).float(), s.to(rope_dtype).float()
+            ti, tw = frame_bilinear_taps(h, w, num_grid_per_side)
+            cache[(h, w)] = (order, ws, we, mo, c[order], s[order], ti[:, order], tw[:, order])
+        return cache[(h, w)]
+
+    for b, items in enumerate(assignment.bins):
+        off = 0
+        for i in sorted(items):
+            t, h, w = rows[i]
+            order, ws, we, mo, c, s, ti, tw = frame_tables(h, w)
+            n = h * w
+            for f in range(t):
+                src = pixel_values[src_off[i] + f * n : src_off[i] + (f + 1) * n]
+                sl = slice(off, off + n)
+                pix[b, sl] = src[order]
+                tap_idx[:, b, sl] = ti
+                tap_w[:, b, sl] = tw
+                cos[b, sl] = c
+                sin[b, sl] = s
+                fmin[b, sl, 0] = off
+                fmax[b, sl, 0] = off + n
+                wmin[b, sl, 0] = ws + off
+                wmax[b, sl, 0] = we + off
+                morder[b, off // mu : (off + n) // mu] = mo + off // mu
+                off += n
+        if off > bs:
+            raise ValueError(f"block {b} overflows: {off} > {bs}")
+
+    return PackedVisionInputs(
+        pixel_values=pix,
+        pos_emb_idx=tap_idx,
+        pos_emb_weight=tap_w,
+        cos=cos,
+        sin=sin,
+        bound_min=fmin,
+        bound_max=fmax,
+        window_bound_min=wmin,
+        window_bound_max=wmax,
+        merged_order=morder,
+    )

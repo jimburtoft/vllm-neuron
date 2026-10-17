@@ -1,9 +1,9 @@
 # MuseGlimmer (vLLM-Neuron)
 
 Port of `MuseGlimmerForConditionalGeneration` (Muse-Glimmer-30B: image + video +
-text in, text out) to vLLM-Neuron 0.24 on trn2. **Status: text decoder only.**
-The perception encoder and multimodal inputs are the next step; until then
-`embed_multimodal` raises `NotImplementedError`.
+text in, text out) to vLLM-Neuron 0.24 on trn2. **Status: text decoder and the
+image path (perception encoder) implemented and verified in CPU mode; video is
+next** (`embed_multimodal` raises `NotImplementedError` for video).
 
 Files:
 
@@ -11,8 +11,11 @@ Files:
 |---|---|
 | `config.py` | Text/vision/top-level configs, plus load-time asserts for every special field |
 | `factory.py` | Registry class: `from_configs` for the worker, vLLM-model stubs and processor for the front-end |
-| `processing.py` | Front-end multimodal processing info and limits (image replacement only matters once the vision tower exists) |
-| `model_bf16.py` | Text decoder, LM head + softcap, KV spec, weight loading |
+| `processing.py` | Front-end vLLM multimodal processor (image prompt expansion identical to HF `MuseGlimmerProcessor`; video raises) |
+| `model_bf16.py` | Text decoder, LM head + softcap, KV spec, weight loading, `embed_multimodal`, `build_vision_synthetic_inputs` |
+| `vision_encoder_bf16.py` | Perception encoder + adapter + projection + weightless RMSNorm, encoder-cache write, vision DP/TP |
+| `weight_loaders.py` | 3-tensor (q/k/v) fused vision QKV loaders, transposed replicated loader |
+| `utils/vision_preprocessing.py` | CPU: pack order, window/full bounds, merged-order gather, axial RoPE, bilinear taps (vendored HF math, transformers 5.15/5.20 agnostic) |
 
 ## Architecture (text)
 
@@ -31,6 +34,34 @@ Files:
 | Embedding | lookup, then weightless RMSNorm (`embed_norm`); vision rows are scattered in after the norm |
 | Final norm | weighted RMSNorm, eps 1e-5 |
 | Logits | `20 * tanh(logits * 0.19611613513818404 / 20)`, in fp32, applied before sampling and on the gathered-logits (logprobs) path |
+
+## Architecture (perception encoder)
+
+| Parameter | Value (released checkpoint) |
+|---|---|
+| Layers / width / heads / head_dim / MLP | 50 / 1536 / 16 / 96 / 8960 (exact erf GELU) |
+| Patch embed | Linear 1176 -> 1536, no bias; patch flattened (temporal 2, RGB, 14, 14) |
+| Position table | learned 32x32, bilinear resample, `align_corners=False`, zero padding (4 taps, CPU indices/weights) |
+| Norms | `ln_pre`, `norm1`/`norm2` (eps 1e-5 hard-coded in HF), `ln_post`; all LayerNorm with bias |
+| Attention | q/k/v/proj with bias, non-causal; 2D axial RoPE (theta 1e4, positions `(w+1, h+1)`, layout `[w,h,w,h]`, fp32 rotation) |
+| Layer schedule | `full_attention` at 3,7,...,47 and 49; `window_attention` (32x32-patch windows) elsewhere |
+| Merge | 2x2 pixel shuffle, **channel-interleaved** (`out[c*4+j] = tok_j[c]`) -> 6144 |
+| Adapter / projection | fc1 6144->4096, GELU, fc2 4096->4096, GELU (no biases); projection 4096->6656 (no bias); weightless RMSNorm (eps 1e-5) |
+
+Window handling: the CPU packs each frame window-major, then 2x2-block-major,
+so every HF window is a contiguous run and window vs full layers differ only in
+their `[bound_min, bound_max)` tensors (selected per layer by the static
+`layer_types`). The pixel shuffle is then a reshape, and a per-block
+`merged_order` gather restores the HF merged-token order before the cache
+write. Bounds are a dynamic mask in `attention_cte` (no compute skip), so a
+window layer costs as much as a full layer over the block (perf item).
+
+Prompt format: the chat template renders one `<|patch|>` per image; the
+processor expands it to `<|image_start|>` + `<|patch|>` x (t*h*w/4) +
+`<|image_end|>`; only `<|patch|>` rows receive vision features. vLLM tokenizes
+multimodal prompts with special tokens; the processor collapses the resulting
+doubled BOS so prompt ids equal HF `apply_chat_template` (verified for
+`LLM.chat` and raw-text prompts with and without the leading BOS).
 
 ## Differences from the reference models
 
@@ -87,9 +118,11 @@ Truncated test checkpoints use the structural checks only.
 | Hybrid KV cache (SWA + full groups) | Yes | `LayerSpec.sliding_window_size` per layer |
 | On-device sampling / logprobs gather | Yes | Softcap applied before both |
 | `mm_language_model_only` (PD pool) | Yes | Text-only runs with and without it |
-| Vision encoder / images | No | Next step: `embed_multimodal` raises |
-| Video | No | Next step after images |
-| `mm_encoder_only` (VE pool) | No | Raises (needs the vision tower) |
+| Vision encoder / images | Yes (CPU) | fp32 module cos 1.000000 vs HF (1-, 4- and 3-window images); e2e greedy 8/8 at fp32 |
+| Vision DP (default) / vision TP | Yes (CPU) | DP=4 and `vision_neuron_config.tp_size=4` verified at text TP=4 |
+| Multiple images per request / per batch | Yes (CPU) | one image per block (on-device encoder cache rule) |
+| Video | No | Task 007: processor raises, `embed_multimodal` raises |
+| `mm_encoder_only` (VE pool) | No | Raises |
 | Prefix caching (APC) | Untested | Run with `enable_prefix_caching=False` |
 | DP / EP / attention-DP / DCP | N/A | Dense model, single node |
 | Eagle3 / speculative decoding | No | Not wired |
@@ -102,8 +135,19 @@ Truncated test checkpoints use the structural checks only.
 # trn2.3xlarge, TP=4, LNC=2 (text only)
 NEURON_SKIP_EFA_AFFINITY=1 python examples/vllm_neuron/models/muse_glimmer/run.py \
     --model /home/ubuntu/models/Muse-Glimmer-30B --tp 4 --max-model-len 8192
+# one image (vision DP; add --vision-tp 4 for vision TP). --vision-block = max patches per image
+NEURON_SKIP_EFA_AFFINITY=1 python examples/vllm_neuron/models/muse_glimmer/run.py \
+    --model /home/ubuntu/models/Muse-Glimmer-30B --tp 4 --max-model-len 8192 \
+    --image cat.jpg --vision-block 4096
 ```
+
+Vision config notes: `vision_attention_block_size` must be >= the patch count
+of the largest image (`max_image_tokens * 4`; the HF default 4096 merged tokens
+needs 16384). Pass `mm_processor_kwargs={"max_image_tokens": block // 4}` to
+cap images to the compiled block. Set `encoder_cache_num_blocks` explicitly
+(each image occupies whole cache blocks).
 
 CPU-mode tests on a truncated random checkpoint live in the project harness
 (`working/muse_glimmer/harness/`: `build_tiny_glimmer.py`,
-`run_tiny_glimmer.py`, `compare_tiny_glimmer.py`, `run_t003_matrix.sh`).
+`run_tiny_glimmer.py`, `compare_tiny_glimmer.py`, `run_t003_matrix.sh`; image path:
+`build_tiny_glimmer_vision.py`, `t005_module_test.py`, `t005_e2e.py`, `run_t005_matrix.sh`).

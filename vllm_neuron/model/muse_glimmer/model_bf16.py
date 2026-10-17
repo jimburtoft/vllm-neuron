@@ -30,14 +30,17 @@ Attention:
 Backbone: embed -> weightless RMSNorm (embed_norm) -> [vision scatter] ->
 layers -> weighted RMSNorm. Logits: ``cap * tanh(lm_head(x) * mult / cap)``.
 
-The vision tower (Task 005) is not built yet; ``embed_multimodal`` raises.
-Text-only runs work with and without ``mm_language_model_only``.
+The perception encoder lives in ``vision_encoder_bf16.py`` (``self.visual``);
+``embed_multimodal`` packs images on CPU and writes the projected features into
+the on-device encoder cache. ``mm_language_model_only`` skips the tower.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
+import time as _time
 
 import torch
 import torch.nn as nn
@@ -64,7 +67,14 @@ from vllm_neuron.utils.weight_loader import (
     sharding_weight_loader_with_padding,
 )
 
+from vllm_neuron.model.qwen3_vl.utils.vision_block_packing import (
+    ffd_pack_images,
+    select_vision_bucket,
+)
+
 from .config import MuseGlimmerConfig, MuseGlimmerTextConfig
+from .utils.vision_preprocessing import pack_vision_inputs
+from .vision_encoder_bf16 import MuseGlimmerVisionModel
 
 logger = logging.getLogger(__name__)
 
@@ -655,7 +665,7 @@ HF_TEXT_PREFIX = "model.language_model"
 
 
 class MuseGlimmerForConditionalGeneration(nn.Module):
-    """MuseGlimmer multimodal model; text decoder + (Task 005) vision tower."""
+    """MuseGlimmer multimodal model: text decoder + perception encoder."""
 
     def __init__(self, config: MuseGlimmerConfig):
         super().__init__()
@@ -664,16 +674,15 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         self.mm_language_model_only = bool(vnc and vnc.mm_language_model_only)
         if self.mm_encoder_only:
             raise NotImplementedError(
-                "MuseGlimmer: mm_encoder_only (vision-only pool) needs the vision "
-                "tower, which is not implemented yet (Task 005)."
+                "MuseGlimmer: mm_encoder_only (vision-only EPD pool) is not "
+                "supported yet; run the monolithic model."
             )
         self.config = config
         self.text_config = config.text_config
         tc = config.text_config
 
-        # Vision tower: Task 005. Kept as an attribute so the runner's EPD
-        # footprint check and vision-compile hooks see "no tower".
-        self.visual = None
+        # Vision tower (skipped on a language-only pool).
+        self.visual = None if self.mm_language_model_only else MuseGlimmerVisionModel(config)
 
         self.language_model = MuseGlimmerTextModel(tc)
 
@@ -769,14 +778,110 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
             return rejection_sampler(spec_decode_metadata, sampled)
         return sampled, gathered_logits
 
-    # ── multimodal (Task 005) ───────────────────────────────────────────
+    # ── multimodal ──────────────────────────────────────────────────────
 
-    def embed_multimodal(self, **kwargs) -> None:
-        raise NotImplementedError(
-            "MuseGlimmer vision/video encoding is not implemented yet (Task 005). "
-            "Run text-only (no images/videos), or set mm_language_model_only / "
-            "limit_mm_per_prompt={'image': 0, 'video': 0}."
+    # no_grad: the runner calls this outside a grad-free context; without it the
+    # encoder-cache index_put_ keeps every activation's autograd graph alive (CPU mode
+    # leaked ~9 GB per 4096-patch image).
+    @torch.no_grad()
+    def embed_multimodal(
+        self,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        encoder_cache=None,
+        mm_hashes: list[str] | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        **kwargs,
+    ) -> None:
+        """Encode images and write their features into the on-device encoder cache.
+
+        Flow (as qwen3_vl): allocate cache blocks per item -> pick a vision
+        bucket -> one-item-per-block packing -> CPU preprocessing in the
+        MuseGlimmer pack order -> VE graph scatter-writes into the cache.
+        """
+        if self.visual is None:
+            raise RuntimeError("MuseGlimmer: vision tower not built (mm_language_model_only)")
+        if pixel_values_videos is not None or video_grid_thw is not None:
+            raise NotImplementedError("MuseGlimmer video input is Task 007.")
+        if pixel_values is None or image_grid_thw is None:
+            raise ValueError("embed_multimodal requires pixel_values and image_grid_thw")
+
+        cache = encoder_cache
+        vc = self.config.vision_config
+        vnc = vc.neuron_config
+        t0 = _time.perf_counter()
+        mu = vc.merge_size**2
+        block_size = vnc.vision_attention_block_size
+        grid_thw = image_grid_thw.to(torch.int64).reshape(-1, 3)
+        rows = grid_thw.tolist()
+        for t, h, w in rows:
+            if t * h * w > block_size:
+                raise ValueError(
+                    f"vision_attention_block_size={block_size} < image patches {t * h * w}; "
+                    "an image must fit in one block. Increase the block size / bucket "
+                    "or lower mm_processor_kwargs max_image_tokens."
+                )
+        tokens = [t * h * w for t, h, w in rows]
+        if len(mm_hashes) != len(rows):
+            raise ValueError(f"{len(mm_hashes)} mm_hashes for {len(rows)} images")
+
+        block_map = [
+            cache.allocate(mm_hashes[i], cache.dense_tokens_per_block(n // mu, block_size // mu))
+            for i, n in enumerate(tokens)
+        ]
+        _bucket, num_blocks = select_vision_bucket(
+            sum(tokens), vnc.num_vision_tokens_buckets, block_size, dp_size=vnc.dp_size
         )
+        assignment = ffd_pack_images(tokens, block_size, num_blocks, one_item_per_block=True)
+        packed = pack_vision_inputs(
+            pixel_values.reshape(-1, vc.patch_dim),
+            grid_thw,
+            assignment,
+            head_dim=vc.head_dim,
+            rope_theta=vc.rope_theta,
+            num_grid_per_side=vc.pos_emb_height,
+            merge_size=vc.merge_size,
+            rope_dtype=self.visual.dtype,
+        )
+        flat = [b for blocks in block_map for b in blocks]
+        write_ids = torch.tensor(flat + [cache.scratch_block_id] * (num_blocks - len(flat)), dtype=torch.int64)
+        t1 = _time.perf_counter()
+
+        device = next(self.visual.parameters()).device
+        kw = packed.as_kwargs()
+        kw["pixel_values"] = kw["pixel_values"].to(self.visual.dtype)
+        kw = {k: v.to(device) for k, v in kw.items()}
+        self.visual(**kw, encoder_cache_buffer=cache.buffer, write_block_ids=write_ids.to(device))
+        logger.debug(
+            "[embed_multimodal] %d images, %d patches, %d blocks: cpu=%.1fms device=%.1fms",
+            len(rows), sum(tokens), num_blocks, (t1 - t0) * 1e3, (_time.perf_counter() - t1) * 1e3,
+        )
+
+    def build_vision_synthetic_inputs(
+        self, bucket: int, vision_neuron_config: VisionNeuronConfig, device: torch.device
+    ) -> dict[str, torch.Tensor]:
+        """Shape-only inputs for ``self.visual`` warmup / tracing (per bucket)."""
+        vc = self.config.vision_config
+        bs = vision_neuron_config.vision_attention_block_size
+        dp = vision_neuron_config.dp_size
+        nb = math.ceil(math.ceil(bucket / bs) / dp) * dp
+        mu = vc.merge_size**2
+        z = lambda *shape, dtype: torch.zeros(*shape, dtype=dtype, device=device)  # noqa: E731
+        return {
+            "pixel_values": z(nb, bs, vc.patch_dim, dtype=self.visual.dtype),
+            "pos_emb_idx": z(4, nb, bs, dtype=torch.int32),
+            "pos_emb_weight": z(4, nb, bs, dtype=torch.float32),
+            "cos": z(nb, bs, vc.head_dim, dtype=torch.float32),
+            "sin": z(nb, bs, vc.head_dim, dtype=torch.float32),
+            "bound_min": z(nb, bs, 1, dtype=torch.int32),
+            "bound_max": z(nb, bs, 1, dtype=torch.int32),
+            "window_bound_min": z(nb, bs, 1, dtype=torch.int32),
+            "window_bound_max": z(nb, bs, 1, dtype=torch.int32),
+            "merged_order": torch.arange(bs // mu, dtype=torch.int64, device=device).repeat(nb, 1)
+            if device != torch.device("meta")
+            else z(nb, bs // mu, dtype=torch.int64),
+        }
 
     # ── construction ────────────────────────────────────────────────────
 
@@ -851,15 +956,19 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
 
     def load_weights(self, checkpoint_path: str, device: torch.device, cache_dir: str | None) -> None:
         mappings = self.build_text_weight_mappings()
-        params = dict(self.named_parameters())
+        params = {n: p for n, p in self.named_parameters() if not n.startswith("visual.")}
         unmapped = sorted(set(params) - set(mappings))
         if unmapped:
             raise RuntimeError(f"MuseGlimmer: parameters without a checkpoint mapping: {unmapped}")
 
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
-        sd = checkpoint.load_sharded_pipelined(
-            self.rank, self.world_size, self, mappings, device, strict=True
-        ).state_dict
+        visual, self.visual = self.visual, None  # text-TP load must not see vision params
+        try:
+            sd = checkpoint.load_sharded_pipelined(
+                self.rank, self.world_size, self, mappings, device, strict=True
+            ).state_dict
+        finally:
+            self.visual = visual
         # Keep each parameter's own dtype: bf16 weights, fp32 centered-norm w.
         for name, tensor in sd.items():
             want = params[name].dtype
@@ -869,8 +978,10 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         if missing:
             raise RuntimeError(f"MuseGlimmer: checkpoint did not provide: {missing}")
         self.load_state_dict(sd, strict=False, assign=True)
-        # The vision tower (model.vision_tower.*, vision_adapter, vision_projection)
-        # is loaded in Task 005.
+        # Vision tower (model.vision_tower.*, vision_adapter, vision_projection) on the
+        # vision TP group (DP: full copy per rank).
+        if self.visual is not None:
+            self.visual.load_weights(checkpoint_path, device="cpu", cache_dir=cache_dir)
 
 
 def per_tower_param_bytes(model) -> dict[str, int]:

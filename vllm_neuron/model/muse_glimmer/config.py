@@ -290,13 +290,37 @@ class MuseGlimmerVisionConfig:
     def spatial_merge_size(self) -> int:
         return self.merge_size
 
+    @property
+    def rope_theta(self) -> float:
+        return float(self.rope_parameters.get("rope_theta", 10000.0))
+
+    @property
+    def patch_dim(self) -> int:
+        return self.patch_temporal * 3 * self.patch_size**2
+
     @classmethod
     def from_hf_config(cls, hf_vision_config, neuron_config: VisionNeuronConfig = None):
         config_dict = _to_dict(hf_vision_config)
         filtered = _filter_fields(cls, config_dict)
         if neuron_config is not None:
             filtered["neuron_config"] = neuron_config
+        if not filtered.get("layer_types"):
+            # HF MuseGlimmerVisionConfig.__post_init__ default (raw JSON may omit it).
+            n = int(filtered.get("num_hidden_layers", cls.num_hidden_layers))
+            filtered["layer_types"] = [
+                "full_attention" if (i + 1) % 4 == 0 or i == n - 1 else "window_attention"
+                for i in range(n)
+            ]
+        if filtered.get("rope_parameters") is None:
+            filtered.pop("rope_parameters", None)
         cfg = cls(**filtered)
+        bad = sorted(set(cfg.layer_types) - {"window_attention", "full_attention"})
+        if bad:
+            raise ValueError(f"unknown vision layer_types {bad}")
+        if cfg.pos_emb_height != cfg.pos_emb_width:
+            raise ValueError("non-square vision position table is not supported (HF assumes square)")
+        if cfg.hidden_act != "gelu":
+            raise ValueError(f"vision hidden_act must be gelu (erf), got {cfg.hidden_act!r}")
         # transformers remaps the raw "default" rope_type to "axial" for the
         # vision tower (MuseGlimmerVisionConfig.default_rope_type). A raw JSON
         # parse sees "default"; both mean the same 2D axial RoPE here.
