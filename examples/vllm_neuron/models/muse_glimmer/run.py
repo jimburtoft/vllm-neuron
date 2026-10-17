@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Offline text generation example for MuseGlimmer (Muse-Glimmer-30B) on Neuron.
 
-Text, or one image + text (``--image PATH``; video is Task 007). Runs on
+Text, one image + text (``--image PATH``), or one video + text
+(``--video PATH.npy``: uint8 frames [T,H,W,3], with ``--video-fps`` = source FPS). Runs on
 trn2.3xlarge at TP=4 / LNC=2, or in vllm-neuron CPU mode
 (VLLM_NEURON_CPU_MODE=1) on a truncated checkpoint.
 
@@ -68,6 +69,8 @@ def main():
     ap.add_argument("--language-model-only", dest="lm_only", action="store_true", default=True)
     ap.add_argument("--no-language-model-only", dest="lm_only", action="store_false")
     ap.add_argument("--image", default="", help="path to an image: one image + --question prompt")
+    ap.add_argument("--video", default="", help="path to a .npy uint8 [T,H,W,3] video: one video + --question")
+    ap.add_argument("--video-fps", type=float, default=2.0, help="source FPS of --video (processor samples at 2 FPS)")
     ap.add_argument("--question", default="Describe this image in detail.")
     ap.add_argument("--vision-block", type=int, default=4096,
                     help="vision_attention_block_size (patches); max_image_tokens = block / 4")
@@ -75,7 +78,7 @@ def main():
     ap.add_argument("--num-gpu-blocks-override", type=int, default=0,
                     help="CPU mode needs a small value (e.g. 256)")
     args = ap.parse_args()
-    if args.image:
+    if args.image or args.video:
         args.lm_only = False
 
     mnbt = args.max_num_batched_tokens or args.max_model_len
@@ -95,7 +98,9 @@ def main():
         "neuron_config": neuron_config,
         "vision_neuron_config": {
             "vision_attention_block_size": args.vision_block,
-            "num_vision_tokens_buckets": [args.vision_block],
+            # 96-frame 16:9 video = 48 groups of 576 patches -> ceil(48 / (block // 576)) blocks
+            "num_vision_tokens_buckets": sorted({args.vision_block,
+                                                 -(-48 // (args.vision_block // 576)) * args.vision_block}),
             "encoder_cache_num_blocks": 8,
         },
     }
@@ -115,7 +120,7 @@ def main():
         additional_config=additional_config,
     )
     if not args.lm_only:
-        kwargs["limit_mm_per_prompt"] = {"image": 1}
+        kwargs["limit_mm_per_prompt"] = {"image": 1, "video": 1}
         kwargs["mm_processor_kwargs"] = {"max_image_tokens": args.vision_block // 4}
     if os.environ.get("VLLM_NEURON_CPU_MODE") == "1":
         kwargs["enforce_eager"] = True
@@ -143,6 +148,22 @@ def main():
             {"type": "text", "text": args.question},
         ]}]
         out = llm.chat(msgs, sp, add_generation_prompt=True)
+        print(f"Prompt tokens: {len(out[0].prompt_token_ids)}")
+        print(f"Generated: {out[0].outputs[0].text!r}")
+        return
+
+    if args.video:
+        import numpy as np
+        from transformers import AutoTokenizer
+
+        frames = np.load(args.video)
+        meta = {"fps": args.video_fps, "total_num_frames": len(frames), "duration": len(frames) / args.video_fps}
+        tok = AutoTokenizer.from_pretrained(args.model)
+        text = tok.apply_chat_template(
+            [{"role": "user", "content": [{"type": "video"}, {"type": "text", "text": args.question}]}],
+            tokenize=False, add_generation_prompt=True)
+        text = text.removeprefix(tok.bos_token)  # vLLM tokenizes with special tokens
+        out = llm.generate([{"prompt": text, "multi_modal_data": {"video": (frames, meta)}}], sp)
         print(f"Prompt tokens: {len(out[0].prompt_token_ids)}")
         print(f"Generated: {out[0].outputs[0].text!r}")
         return

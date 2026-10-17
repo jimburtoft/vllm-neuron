@@ -266,3 +266,49 @@ def pack_vision_inputs(
         window_bound_max=wmax,
         merged_order=morder,
     )
+
+
+# ---------------------------------------------------------------------------
+# Video: one encoder item per temporal group
+# ---------------------------------------------------------------------------
+
+
+def plan_video_items(
+    grid_thw: torch.Tensor, block_size: int, merge_size: int = 2
+) -> tuple[torch.Tensor, list[int], list[list[int]]]:
+    """Split videos into per-temporal-group encoder items.
+
+    HF runs the ViT on a video with ``cu_seqlens`` = ``h*w`` repeated ``t`` times
+    (``merge_temporal=False``) and windows that never cross a group, so a
+    ``[t, h, w]`` video is exactly ``t`` independent ``[1, h, w]`` items with the
+    same position taps / RoPE / pack order, concatenated in time order.
+
+    Returns ``(grid_items [sum t, 3], group_ids, tokens_per_block)``:
+    ``group_ids`` keeps a video's groups in their own block run (``ffd_pack_images``
+    with ``one_item_per_block=True``), and ``tokens_per_block[v]`` lists the real
+    merged tokens per cache block of video ``v`` (whole groups per block; a non-last
+    block may end in a pad tail when groups do not tile the block).
+    """
+    grid_thw = grid_thw.to(torch.int64).reshape(-1, 3)
+    mu = merge_size * merge_size
+    tpb_all: list[list[int]] = []
+    for t, h, w in grid_thw.tolist():
+        per = h * w
+        if per > block_size:
+            raise ValueError(
+                f"vision_attention_block_size={block_size} < per-group patches {per} "
+                f"(video grid {t}x{h}x{w}); a temporal group must fit in one block. "
+                "Increase the block size or lower mm_processor_kwargs max_video_frame_tokens."
+            )
+        fpb = block_size // per
+        tpb, left = [], t
+        while left > 0:
+            k = min(fpb, left)
+            tpb.append(k * per // mu)
+            left -= k
+        tpb_all.append(tpb)
+    frames = grid_thw[:, 0]
+    grid_items = grid_thw.repeat_interleave(frames, dim=0)
+    grid_items[:, 0] = 1
+    group_ids = torch.repeat_interleave(torch.arange(grid_thw.shape[0]), frames).tolist()
+    return grid_items, group_ids, tpb_all

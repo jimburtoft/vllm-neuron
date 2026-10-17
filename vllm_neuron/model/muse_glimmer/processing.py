@@ -18,10 +18,27 @@ and for raw prompts holding the HF-rendered chat text (with or without the
 leading ``<|begin_of_text|>``: vLLM tokenizes with ``add_special_tokens=True``
 and a doubled leading BOS is collapsed, see ``_apply_hf_processor_tokens_only``).
 
-Video (timestamp interleave, ``<|vid_start|>`` / ``<|vid_frame_separator|>``
-/ ``<|vid_end|>``, ``is_embed`` only on ``<|video|>``) is Task 007: add
-``"video"`` to ``get_supported_mm_limits``, a ``video_replacement`` in
-``_get_prompt_updates`` and the video dummy data. Until then video raises.
+Video path (Task 007). Same split: the chat template renders one
+``<|video|>`` per video and HF ``MuseGlimmerProcessor.replace_video_token``
+expands it to
+
+    <|vid_start|> Time: t0s <|video|>*n <|vid_frame_separator|> Time: t1s ...
+    <|video|>*n <|vid_end|>
+
+with one ``Time: {:.1f}s`` per temporal group (``timestamps[::2]``) and
+``n = h*w/4`` (<= ``max_video_frame_tokens``). Only the ``<|video|>`` tokens
+are embeds (``is_embed``); the timestamp text and the markers are ordinary
+text tokens. vLLM hands each video over as ``(frames[T,H,W,3] uint8, metadata)``
+(``video_needs_metadata``); metadata follows HF ``VideoMetadata`` (``fps``,
+``total_num_frames``, optional ``frames_indices`` / ``duration``) plus vLLM's
+``do_sample_frames`` flag. Raw frames (``do_sample_frames`` absent / True) are
+sampled by the HF processor (``fps`` / ``num_frames`` kwargs, default 2 FPS and
+96 frames); frames already sampled by vLLM's video loader are passed with
+``do_sample_frames=False`` and their original ``frames_indices`` so the
+timestamps stay in source time. Each video is run through the HF processor on
+its own (prompt ``<|video|>``), so the expansion is produced by HF itself; the
+resulting token ids are kept per item (``video_prompt_ids``) so the vLLM
+processor cache can rebuild the prompt update without re-running HF.
 
 Budget / limits are computed from processor caps, without the HF processor,
 so text-only runs (including ``skip_tokenizer_init=True``) work.
@@ -32,10 +49,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import numpy as np
 import torch
 from transformers import BatchFeature
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
-from vllm.multimodal.parse import MultiModalDataItems
+from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -49,6 +67,9 @@ IMAGE_TOKEN = "<|patch|>"
 IMAGE_START_TOKEN = "<|image_start|>"
 IMAGE_END_TOKEN = "<|image_end|>"
 VIDEO_TOKEN = "<|video|>"
+VIDEO_START_TOKEN = "<|vid_start|>"
+VIDEO_END_TOKEN = "<|vid_end|>"
+VIDEO_SEP_TOKEN = "<|vid_frame_separator|>"
 
 # HF image/video processor defaults (image_processing_muse_glimmer.py,
 # video_processing_muse_glimmer.py).
@@ -56,6 +77,29 @@ DEFAULT_MAX_IMAGE_TOKENS = 4096
 DEFAULT_MAX_VIDEO_FRAME_TOKENS = 144
 DEFAULT_NUM_FRAMES = 96
 DEFAULT_TEMPORAL_PATCH = 2
+DEFAULT_VIDEO_FPS = 2.0
+
+# HF ``VideoMetadata`` fields; anything else (e.g. vLLM's ``do_sample_frames``) is
+# stripped before the metadata reaches ``VideoMetadata(**d)``.
+_HF_VIDEO_METADATA_KEYS = (
+    "total_num_frames", "fps", "width", "height", "duration", "video_backend", "frames_indices",
+)
+
+
+class MuseGlimmerDataParser(MultiModalDataParser):
+    """``video_needs_metadata`` parser that tolerates a bare frame array.
+
+    A video without metadata gets ``fps=None`` and all frames as
+    ``frames_indices``; the HF processor then assumes 24 FPS (with a warning),
+    exactly like HF ``apply_chat_template`` on a bare array.
+    """
+
+    def _get_video_with_metadata(self, video):
+        frames, metadata = super()._get_video_with_metadata(video)
+        if metadata is None:
+            metadata = {"total_num_frames": len(frames), "fps": None,
+                        "frames_indices": list(range(len(frames)))}
+        return frames, metadata
 
 
 class MuseGlimmerProcessingInfo(BaseProcessingInfo):
@@ -64,8 +108,13 @@ class MuseGlimmerProcessingInfo(BaseProcessingInfo):
         return (mm_config.mm_processor_kwargs or {}) if mm_config else {}
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        # Video is Task 007 (omitting a modality = unsupported in vLLM).
-        return {"image": None}
+        return {"image": None, "video": None}
+
+    def get_data_parser(self) -> MultiModalDataParser:
+        return MuseGlimmerDataParser(
+            video_needs_metadata=True,
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
 
     def get_max_image_tokens(self) -> int:
         return int(self._mm_kwargs().get("max_image_tokens", DEFAULT_MAX_IMAGE_TOKENS))
@@ -79,7 +128,7 @@ class MuseGlimmerProcessingInfo(BaseProcessingInfo):
 
     def get_mm_max_tokens_per_item(self, seq_len: int, mm_counts: Mapping[str, int]):
         # Computed from processor caps, so no tokenizer / HF processor needed.
-        return {"image": self.get_max_image_tokens()}
+        return {"image": self.get_max_image_tokens(), "video": self.get_max_video_tokens()}
 
 
 class MuseGlimmerDummyInputsBuilder(BaseDummyInputsBuilder[MuseGlimmerProcessingInfo]):
@@ -90,8 +139,9 @@ class MuseGlimmerDummyInputsBuilder(BaseDummyInputsBuilder[MuseGlimmerProcessing
 
     def get_dummy_mm_data(self, seq_len, mm_counts, mm_options):
         num_images = mm_counts.get("image", 0)
+        num_videos = mm_counts.get("video", 0)
         side = 14 * 2 * 32  # 896 px -> 64x64 patches -> 1024 merged tokens
-        return {
+        out = {
             "image": self._get_dummy_images(
                 width=side,
                 height=side,
@@ -99,6 +149,17 @@ class MuseGlimmerDummyInputsBuilder(BaseDummyInputsBuilder[MuseGlimmerProcessing
                 overrides=(mm_options or {}).get("image"),
             )
         }
+        if num_videos:
+            # 16:9 frames at the per-group cap (448x252 -> 18x32 patches -> 144 tokens),
+            # max frames at the sampling FPS (no resampling: do_sample_frames=False).
+            kw = self.info._mm_kwargs()
+            nf = int(kw.get("num_frames", DEFAULT_NUM_FRAMES))
+            fps = float(kw.get("fps", DEFAULT_VIDEO_FPS))
+            frames = np.full((nf, 252, 448, 3), 255, dtype=np.uint8)
+            meta = {"fps": fps, "total_num_frames": nf, "duration": nf / fps,
+                    "frames_indices": list(range(nf)), "do_sample_frames": False}
+            out["video"] = [(frames.copy(), dict(meta)) for _ in range(num_videos)]
+        return out
 
 
 class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessingInfo]):
@@ -114,7 +175,59 @@ class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessi
         bos = self.info.get_tokenizer().bos_token
         if bos and prompt.startswith(bos):
             tok_kwargs = {**tok_kwargs, "add_special_tokens": False}
-        return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+        mm_data = dict(mm_data)
+        videos = mm_data.pop("videos", None) or []
+        if not videos:
+            return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+
+        # Each video on its own through the HF processor (prompt = one <|video|>): HF
+        # itself samples the frames and builds the timestamp/marker expansion.
+        video_kwargs = dict(mm_kwargs)
+        video_repl, pv_list, grid_list = [], [], []
+        for frames, metadata in videos:
+            metadata = dict(metadata or {})
+            kw = dict(video_kwargs)
+            if "do_sample_frames" in metadata and "do_sample_frames" not in kw:
+                kw["do_sample_frames"] = bool(metadata["do_sample_frames"])
+            meta = {k: metadata[k] for k in _HF_VIDEO_METADATA_KEYS if metadata.get(k) is not None}
+            meta.setdefault("total_num_frames", len(frames))
+            meta.setdefault("fps", None)
+            if "frames_indices" not in meta:
+                meta["frames_indices"] = list(range(len(frames)))
+            out = super()._call_hf_processor(
+                VIDEO_TOKEN,
+                {"videos": [frames], "video_metadata": [meta]},
+                kw,
+                {**tok_kwargs, "add_special_tokens": False},
+            )
+            ids = out["input_ids"]
+            ids = ids.tolist() if hasattr(ids, "tolist") else ids
+            video_repl.append(torch.tensor(ids[0], dtype=torch.int64))
+            pv_list.append(out["pixel_values_videos"])
+            grid_list.append(out["video_grid_thw"])
+
+        # Text (+ images) without videos: each <|video|> stays a single token, then is
+        # replaced by its HF expansion, in order.
+        text_kwargs = {k: v for k, v in mm_kwargs.items() if k not in ("fps", "num_frames")}
+        processed = super()._call_hf_processor(prompt, mm_data, text_kwargs, tok_kwargs)
+        ids = processed.pop("input_ids")
+        ids = ids.tolist() if hasattr(ids, "tolist") else ids
+        (prompt_ids,) = ids
+        vid = self.info.get_tokenizer().convert_tokens_to_ids(VIDEO_TOKEN)
+        expanded, k = [], 0
+        for t in prompt_ids:
+            if t == vid and k < len(video_repl):
+                expanded.extend(video_repl[k].tolist())
+                k += 1
+            else:
+                expanded.append(t)
+        if k != len(video_repl):
+            raise ValueError(f"MuseGlimmer: {len(video_repl)} videos but {k} {VIDEO_TOKEN} placeholders in the prompt")
+        processed["input_ids"] = [expanded]
+        processed["pixel_values_videos"] = torch.cat(pv_list)
+        processed["video_grid_thw"] = torch.cat(grid_list)
+        processed["video_prompt_ids"] = video_repl
+        return processed
 
     def _apply_hf_processor_tokens_only(self, prompt_tokens: list[int]) -> list[int]:
         # vLLM 0.24 tokenizes multimodal prompts with add_special_tokens=True for BOTH the
@@ -143,6 +256,8 @@ class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessi
                 "video", video_grid_thw.prod(-1)
             ),
             video_grid_thw=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
+            # HF expansion of each <|video|> (timestamps + markers + embeds), front-end only.
+            video_prompt_ids=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
         )
 
     def _get_prompt_updates(
@@ -151,10 +266,6 @@ class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessi
         hf_processor_mm_kwargs: Mapping[str, Any],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
-        if "video" in mm_items:
-            raise NotImplementedError(
-                "MuseGlimmer video input is not implemented yet (Task 007)."
-            )
         vocab = self.info.get_tokenizer().get_vocab()
         patch_id = vocab[IMAGE_TOKEN]
         start_id = vocab[IMAGE_START_TOKEN]
@@ -168,8 +279,19 @@ class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessi
                 [start_id] + [patch_id] * n + [end_id], embed_token_id=patch_id
             )
 
+        video_id = vocab[VIDEO_TOKEN]
+
+        def video_replacement(item_idx: int):
+            ids = out_mm_kwargs["video"][item_idx]["video_prompt_ids"].data
+            return PromptUpdateDetails.select_token_id(
+                [int(t) for t in ids.tolist()], embed_token_id=video_id
+            )
+
         return [
             PromptReplacement(
                 modality="image", target=[patch_id], replacement=image_replacement
-            )
+            ),
+            PromptReplacement(
+                modality="video", target=[video_id], replacement=video_replacement
+            ),
         ]

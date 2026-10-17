@@ -1,9 +1,8 @@
 # MuseGlimmer (vLLM-Neuron)
 
 Port of `MuseGlimmerForConditionalGeneration` (Muse-Glimmer-30B: image + video +
-text in, text out) to vLLM-Neuron 0.24 on trn2. **Status: text decoder and the
-image path (perception encoder) implemented and verified in CPU mode; video is
-next** (`embed_multimodal` raises `NotImplementedError` for video).
+text in, text out) to vLLM-Neuron 0.24 on trn2. **Status: text decoder, image and
+video paths (perception encoder) implemented and verified in CPU mode.**
 
 Files:
 
@@ -11,7 +10,7 @@ Files:
 |---|---|
 | `config.py` | Text/vision/top-level configs, plus load-time asserts for every special field |
 | `factory.py` | Registry class: `from_configs` for the worker, vLLM-model stubs and processor for the front-end |
-| `processing.py` | Front-end vLLM multimodal processor (image prompt expansion identical to HF `MuseGlimmerProcessor`; video raises) |
+| `processing.py` | Front-end vLLM multimodal processor (image and video prompt expansion identical to HF `MuseGlimmerProcessor`) |
 | `model_bf16.py` | Text decoder, LM head + softcap, KV spec, weight loading, `embed_multimodal`, `build_vision_synthetic_inputs` |
 | `vision_encoder_bf16.py` | Perception encoder + adapter + projection + weightless RMSNorm, encoder-cache write, vision DP/TP |
 | `weight_loaders.py` | 3-tensor (q/k/v) fused vision QKV loaders, transposed replicated loader |
@@ -121,7 +120,7 @@ Truncated test checkpoints use the structural checks only.
 | Vision encoder / images | Yes (CPU) | fp32 module cos 1.000000 vs HF (1-, 4- and 3-window images); e2e greedy 8/8 at fp32 |
 | Vision DP (default) / vision TP | Yes (CPU) | DP=4 and `vision_neuron_config.tp_size=4` verified at text TP=4 |
 | Multiple images per request / per batch | Yes (CPU) | one image per block (on-device encoder cache rule) |
-| Video | No | Task 007: processor raises, `embed_multimodal` raises |
+| Video | Yes (CPU) | One ViT item per temporal group (HF `cu_seqlens`); fp32 module cos 1.000000 vs HF `get_video_features`; e2e greedy 8/8 at fp32, TP=1/4, vision DP/TP; mixed image + video prompts |
 | `mm_encoder_only` (VE pool) | No | Raises |
 | Prefix caching (APC) | Untested | Run with `enable_prefix_caching=False` |
 | DP / EP / attention-DP / DCP | N/A | Dense model, single node |
@@ -141,6 +140,19 @@ NEURON_SKIP_EFA_AFFINITY=1 python examples/vllm_neuron/models/muse_glimmer/run.p
     --image cat.jpg --vision-block 4096
 ```
 
+Video prompts: the chat template renders one `<|video|>`; the processor
+expands it to `<|vid_start|>Time: 0.0s<|video|>*n<|vid_frame_separator|>Time:
+1.0s ... <|vid_end|>` (one timestamp per temporal group of 2 frames, HF
+`replace_video_token`); only `<|video|>` rows get vision features. Pass
+`multi_modal_data={"video": (frames_uint8[T,H,W,3], {"fps": src_fps,
+"total_num_frames": T})}`: the HF processor samples it at `fps` (default 2) up
+to `num_frames` (default 96). Frames already sampled by vLLM's video loader
+(`do_sample_frames=False`, original `frames_indices`) keep source-time
+timestamps. A temporal group (`h*w` <= 576 patches at the default
+`max_video_frame_tokens=144`) must fit in one vision block; a block holds
+`block // (h*w)` groups, so a 96-frame 16:9 video (48 groups) needs 7 blocks at
+block 4096 (bucket 28672) or 2 blocks at block 16384 (bucket 32768).
+
 Vision config notes: `vision_attention_block_size` must be >= the patch count
 of the largest image (`max_image_tokens * 4`; the HF default 4096 merged tokens
 needs 16384). Pass `mm_processor_kwargs={"max_image_tokens": block // 4}` to
@@ -150,4 +162,6 @@ cap images to the compiled block. Set `encoder_cache_num_blocks` explicitly
 CPU-mode tests on a truncated random checkpoint live in the project harness
 (`working/muse_glimmer/harness/`: `build_tiny_glimmer.py`,
 `run_tiny_glimmer.py`, `compare_tiny_glimmer.py`, `run_t003_matrix.sh`; image path:
-`build_tiny_glimmer_vision.py`, `t005_module_test.py`, `t005_e2e.py`, `run_t005_matrix.sh`).
+`build_tiny_glimmer_vision.py`, `t005_module_test.py`, `t005_e2e.py`, `run_t005_matrix.sh`; video:
+`build_tiny_glimmer_video_goldens.py`, `t007_processor_test.py`, `t007_module_test.py`, `t007_e2e.py`,
+`run_t007_matrix.sh`).

@@ -73,7 +73,7 @@ from vllm_neuron.model.qwen3_vl.utils.vision_block_packing import (
 )
 
 from .config import MuseGlimmerConfig, MuseGlimmerTextConfig
-from .utils.vision_preprocessing import pack_vision_inputs
+from .utils.vision_preprocessing import pack_vision_inputs, plan_video_items
 from .vision_encoder_bf16 import MuseGlimmerVisionModel
 
 logger = logging.getLogger(__name__)
@@ -794,18 +794,35 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         video_grid_thw: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
-        """Encode images and write their features into the on-device encoder cache.
+        """Encode images or videos and write their features into the on-device encoder cache.
 
         Flow (as qwen3_vl): allocate cache blocks per item -> pick a vision
         bucket -> one-item-per-block packing -> CPU preprocessing in the
         MuseGlimmer pack order -> VE graph scatter-writes into the cache.
+
+        Video (``pixel_values_videos`` / ``video_grid_thw``) uses the image path
+        unchanged: HF ``get_video_features`` == ``get_image_features``, and the
+        HF ViT attends per temporal group (``cu_seqlens`` repeats ``h*w`` ``t``
+        times; windows never cross a group). Each ``[T, H, W]`` row therefore
+        becomes ``T`` items ``[1, H, W]`` that share the video's block run
+        (``group_ids``): a block holds whole temporal groups, each with its own
+        full/window bounds, RoPE and position taps, so the features equal HF's.
+        A group must fit in one block (``H*W <= vision_attention_block_size``);
+        a video spans ``ceil(T / (block // (H*W)))`` blocks, non-last blocks
+        may carry a pad tail recorded in ``tokens_per_block``.
         """
         if self.visual is None:
             raise RuntimeError("MuseGlimmer: vision tower not built (mm_language_model_only)")
-        if pixel_values_videos is not None or video_grid_thw is not None:
-            raise NotImplementedError("MuseGlimmer video input is Task 007.")
+        if pixel_values is not None and pixel_values_videos is not None:
+            raise ValueError("embed_multimodal: images and videos must come in separate calls")
+        is_video = pixel_values is None and pixel_values_videos is not None
+        if is_video:
+            pixel_values, image_grid_thw = pixel_values_videos, video_grid_thw
         if pixel_values is None or image_grid_thw is None:
-            raise ValueError("embed_multimodal requires pixel_values and image_grid_thw")
+            raise ValueError(
+                "embed_multimodal requires (pixel_values, image_grid_thw) or "
+                "(pixel_values_videos, video_grid_thw)"
+            )
 
         cache = encoder_cache
         vc = self.config.vision_config
@@ -815,28 +832,38 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         block_size = vnc.vision_attention_block_size
         grid_thw = image_grid_thw.to(torch.int64).reshape(-1, 3)
         rows = grid_thw.tolist()
-        for t, h, w in rows:
-            if t * h * w > block_size:
-                raise ValueError(
-                    f"vision_attention_block_size={block_size} < image patches {t * h * w}; "
-                    "an image must fit in one block. Increase the block size / bucket "
-                    "or lower mm_processor_kwargs max_image_tokens."
-                )
-        tokens = [t * h * w for t, h, w in rows]
         if len(mm_hashes) != len(rows):
-            raise ValueError(f"{len(mm_hashes)} mm_hashes for {len(rows)} images")
+            raise ValueError(f"{len(mm_hashes)} mm_hashes for {len(rows)} items")
 
-        block_map = [
-            cache.allocate(mm_hashes[i], cache.dense_tokens_per_block(n // mu, block_size // mu))
-            for i, n in enumerate(tokens)
-        ]
+        if is_video:
+            grid_ve, group_ids, tpb = plan_video_items(grid_thw, block_size, vc.merge_size)
+            block_map = [cache.allocate(mm_hashes[i], tpb[i]) for i in range(len(rows))]
+        else:
+            for t, h, w in rows:
+                if t * h * w > block_size:
+                    raise ValueError(
+                        f"vision_attention_block_size={block_size} < image patches {t * h * w}; "
+                        "an image must fit in one block. Increase the block size / bucket "
+                        "or lower mm_processor_kwargs max_image_tokens."
+                    )
+            grid_ve = grid_thw
+            group_ids = None
+            block_map = [
+                cache.allocate(mm_hashes[i], cache.dense_tokens_per_block(t * h * w // mu, block_size // mu))
+                for i, (t, h, w) in enumerate(rows)
+            ]
+        tokens = [int(t * h * w) for t, h, w in grid_ve.tolist()]
+        required_blocks = sum(len(b) for b in block_map)
         _bucket, num_blocks = select_vision_bucket(
-            sum(tokens), vnc.num_vision_tokens_buckets, block_size, dp_size=vnc.dp_size
+            max(sum(tokens), required_blocks * block_size),
+            vnc.num_vision_tokens_buckets, block_size, dp_size=vnc.dp_size,
         )
-        assignment = ffd_pack_images(tokens, block_size, num_blocks, one_item_per_block=True)
+        assignment = ffd_pack_images(
+            tokens, block_size, num_blocks, one_item_per_block=True, group_ids=group_ids
+        )
         packed = pack_vision_inputs(
             pixel_values.reshape(-1, vc.patch_dim),
-            grid_thw,
+            grid_ve,
             assignment,
             head_dim=vc.head_dim,
             rope_theta=vc.rope_theta,
@@ -854,8 +881,9 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         kw = {k: v.to(device) for k, v in kw.items()}
         self.visual(**kw, encoder_cache_buffer=cache.buffer, write_block_ids=write_ids.to(device))
         logger.debug(
-            "[embed_multimodal] %d images, %d patches, %d blocks: cpu=%.1fms device=%.1fms",
-            len(rows), sum(tokens), num_blocks, (t1 - t0) * 1e3, (_time.perf_counter() - t1) * 1e3,
+            "[embed_multimodal] %d %s, %d patches, %d blocks: cpu=%.1fms device=%.1fms",
+            len(rows), "videos" if is_video else "images", sum(tokens), num_blocks,
+            (t1 - t0) * 1e3, (_time.perf_counter() - t1) * 1e3,
         )
 
     def build_vision_synthetic_inputs(
