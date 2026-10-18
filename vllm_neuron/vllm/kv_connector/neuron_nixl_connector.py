@@ -770,26 +770,41 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
 
         Block ``b`` of region ``r`` starts at ``base + b * block_strides[r]``. A
         Neuron peer registers dense K/V slabs, so its stride equals its block
-        length. A peer whose K and V are two halves of one page (for example a
-        GPU engine with split K/V head slots) registers each half as its own
-        region with ``block_len = page // 2`` and ``block_stride = page``, so the
-        address must step by the advertised stride, not by the block length.
-        Metadata without strides (older peers) falls back to the block length.
+        length. A peer whose K and V are the two halves of one page (separate
+        K/V head slots per page) registers each half as its own region with
+        ``block_len = page // 2`` and ``block_stride = page``, so the address
+        must step by the advertised stride, not by the block length. Metadata
+        without a ``block_strides`` field (older peers) uses the block length.
         """
         kv_addrs = nixl_agent_meta.kv_caches_base_addr
         block_lens = nixl_agent_meta.block_lens
-        block_strides = getattr(nixl_agent_meta, "block_strides", None) or block_lens
-        assert len(block_strides) == len(kv_addrs), (
-            f"Remote advertised {len(block_strides)} block strides for "
-            f"{len(kv_addrs)} regions"
-        )
+        block_strides = getattr(nixl_agent_meta, "block_strides", None)
+        if block_strides is None:
+            block_strides = block_lens
+        # Remote metadata comes over the wire: validate with exceptions, not
+        # asserts, so a malformed peer fails the handshake even under -O.
+        if len(block_strides) != len(kv_addrs):
+            raise ValueError(
+                f"Remote engine {eid} advertised {len(block_strides)} block "
+                f"strides for {len(kv_addrs)} KV regions. Check that both "
+                "engines run compatible NIXL connector versions."
+            )
         blocks_data = []
         for kv_group_idx, base_addr in enumerate(kv_addrs):
+            block_len = block_lens[kv_group_idx]
             block_stride = block_strides[kv_group_idx]
-            assert block_stride >= block_lens[kv_group_idx], (
-                f"Remote region {kv_group_idx}: block_stride {block_stride} < "
-                f"block_len {block_lens[kv_group_idx]}"
-            )
+            if block_stride < block_len:
+                raise ValueError(
+                    f"Remote engine {eid} region {kv_group_idx}: block_stride "
+                    f"{block_stride} is smaller than block_len {block_len}. "
+                    "Check the remote KV cache registration."
+                )
+            if offset + desc_len > block_len:
+                raise ValueError(
+                    f"Remote engine {eid} region {kv_group_idx}: reading "
+                    f"{desc_len} bytes at offset {offset} overruns block_len "
+                    f"{block_len}. Check the local/remote KV head split."
+                )
             for block_id in range(nixl_agent_meta.num_blocks):
                 addr = base_addr + block_id * block_stride + offset
                 blocks_data.append((addr, desc_len, nixl_agent_meta.device_id))
