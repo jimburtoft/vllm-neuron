@@ -71,12 +71,17 @@ def hf_checkpoint(tmp_path_factory):
     return path, hf
 
 
-def _build_native(path, vocab_pad_world=None):
+def _build_native(path, max_num_seqs=1):
     from vllm_neuron.model.whisper.model_bf16 import WhisperForConditionalGeneration
 
     hf_cfg = transformers.WhisperConfig.from_pretrained(path)
     model = WhisperForConditionalGeneration.from_configs(
-        hf_cfg, None, None, check_dims=False, torch_dtype=torch.float32
+        hf_cfg,
+        None,
+        None,
+        check_dims=False,
+        torch_dtype=torch.float32,
+        max_num_seqs=max_num_seqs,
     )
     model.load_weights(str(path), torch.device("cpu"), None)
     model.eval()
@@ -90,7 +95,7 @@ def _build_native(path, vocab_pad_world=None):
     return model
 
 
-def _metadata(model, slot_mapping, block_table, max_query_len):
+def _metadata(model, slot_mapping, block_table, max_query_len, request_slots=None):
     meta = {
         "slot_mapping": slot_mapping,
         "block_size": BLOCK_SIZE,
@@ -98,6 +103,8 @@ def _metadata(model, slot_mapping, block_table, max_query_len):
         "max_query_len": max_query_len,
         "decode_token_threshold": 1,
     }
+    if request_slots is not None:
+        meta["request_slots"] = torch.tensor(request_slots, dtype=torch.int32)
     return {layer.self_attn.layer_name: meta for layer in model.decoder.layers}
 
 
@@ -179,10 +186,87 @@ def test_pad_mask_uses_runtime_rank(hf_checkpoint):
     assert mask.shape[-1] == 51868 and not mask[0, VOCAB:].any()
 
 
-def test_embed_multimodal_rejects_batch(hf_checkpoint):
+def _hf_greedy(hf, mel, steps):
+    with torch.no_grad():
+        enc = hf.model.encoder(mel).last_hidden_state
+        tokens = list(PROMPT)
+        for _ in range(steps):
+            logits = hf(encoder_outputs=(enc,), decoder_input_ids=torch.tensor([tokens])).logits
+            tokens.append(int(logits[0, -1].argmax()))
+    return tokens
+
+
+def test_batched_requests_use_own_cross_kv(hf_checkpoint):
+    """Two requests in their own slots: prefill one at a time, then decode as a batch.
+
+    The batch rows are in the reverse order of the slots, and a padded third
+    row reads the scratch slot. Each request must match its own HF greedy
+    decode.
+    """
+    path, hf = hf_checkpoint
+    model = _build_native(path, max_num_seqs=3)
+    assert getattr(model.audio_tower, "cross_k_0").shape[0] == 4
+
+    torch.manual_seed(2)
+    mels = [torch.randn(1, 128, 3000), torch.randn(1, 128, 3000)]
+    req_slots = [2, 0]
+    blocks = [[4], [7]]
+    cache = _FakeEncoderCache()
+    for r in range(2):
+        model.embed_multimodal(
+            input_features=mels[r], encoder_cache=cache, mm_hashes=[f"c{r}"],
+            request_slots=[req_slots[r]],
+        )
+
+    def slot(r, pos):
+        return blocks[r][pos // BLOCK_SIZE] * BLOCK_SIZE + pos % BLOCK_SIZE
+
+    tokens = [list(PROMPT), list(PROMPT)]
+    n = len(PROMPT)
+    for r in range(2):
+        table = torch.full((1, MAX_BLOCKS_PER_SEQ), -1, dtype=torch.int32)
+        table[0, 0] = blocks[r][0]
+        out = model(
+            input_ids=torch.tensor(PROMPT, dtype=torch.int32),
+            positions=torch.arange(n, dtype=torch.int32),
+            attn_metadata=_metadata(
+                model, torch.tensor([slot(r, p) for p in range(n)]), table, n,
+                request_slots=[req_slots[r]],
+            ),
+            sampling_positions=torch.tensor([n - 1]),
+        )
+        tokens[r].append(int(out[0].argmax()))
+
+    # Batch rows: row 0 = request 1, row 1 = request 0, row 2 = padding.
+    order = [1, 0]
+    table = torch.full((3, MAX_BLOCKS_PER_SEQ), -1, dtype=torch.int32)
+    for row, r in enumerate(order):
+        table[row, 0] = blocks[r][0]
+    for _ in range(4):
+        pos = [len(tokens[r]) - 1 for r in order]
+        out = model(
+            input_ids=torch.tensor([tokens[r][-1] for r in order] + [0], dtype=torch.int32),
+            positions=torch.tensor(pos + [0], dtype=torch.int32),
+            attn_metadata=_metadata(
+                model,
+                torch.tensor([slot(r, p) for r, p in zip(order, pos)] + [-1]),
+                table,
+                1,
+                request_slots=[req_slots[r] for r in order] + [3],
+            ),
+            sampling_positions=torch.arange(3),
+        )
+        for row, r in enumerate(order):
+            tokens[r].append(int(out[row].argmax()))
+
+    for r in range(2):
+        assert tokens[r] == _hf_greedy(hf, mels[r], len(tokens[r]) - n), r
+
+
+def test_embed_multimodal_needs_slots_for_batch(hf_checkpoint):
     path, _ = hf_checkpoint
     model = _build_native(path)
-    with pytest.raises(ValueError, match="max_num_seqs=1"):
+    with pytest.raises(ValueError, match="request_slots"):
         model.embed_multimodal(
             input_features=torch.zeros(2, 128, 3000),
             encoder_cache=_FakeEncoderCache(),

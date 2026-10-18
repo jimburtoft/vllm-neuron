@@ -1351,6 +1351,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if self.supports_mm_inputs and self.encoder_neuron_config is not None:
             self._init_encoder_cache(vllm_config)
 
+        # Stable request slots for model-owned per-request state (for example
+        # the Whisper cross-attention K/V). load_model makes the table when the
+        # model sets ``uses_request_slots``. None for all other models.
+        self.request_slots = None
+
         # EPD EC (encoder-cache) transfer connector, worker-role. Built from
         # ec_transfer_config; None on the default monolith path (no ec_role).
         # A consumer (PD) uses it to pull vision embeddings over NIXL; a producer
@@ -2227,6 +2232,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.encoder_capture_backend = None
             self._compiled_encoder_attr = None
 
+        unwrapped = getattr(self.model, "_orig_mod", self.model)
+        if getattr(unwrapped, "uses_request_slots", False):
+            from vllm_neuron.vllm.worker.request_slots import RequestSlotTable
+
+            self.request_slots = RequestSlotTable(unwrapped.num_request_slots)
+            logger.info(
+                "Request slots enabled: %d slots (1 scratch)",
+                unwrapped.num_request_slots,
+            )
+
         logger.info("NeuronModel loading complete (moved to device and compiled)")
 
         if self.drafter is not None:
@@ -2777,6 +2792,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        if self.request_slots is not None:
+            self.request_slots.release_all(scheduler_output.finished_req_ids)
+            # A preempted request runs its encoder again when it resumes.
+            self.request_slots.release_all(
+                getattr(scheduler_output, "preempted_req_ids", None) or ()
+            )
 
         # Free the cached encoder outputs.
         # NOTE: upstream GPUModelRunner stores encoder cache as a dict[str, torch.Tensor]
@@ -3313,6 +3334,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         mm_hashes: list[str] = []
         mm_kwargs: list[tuple] = []
+        # Request slot of each item, for a model with request slots.
+        mm_slots: list[int] = []
 
         for (
             req_id,
@@ -3325,6 +3348,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     continue
                 mm_hashes.append(mm_feature.identifier)
                 mm_kwargs.append((mm_feature.modality, mm_feature.data))
+                if self.request_slots is not None:
+                    # A request in self.requests is live, also when it is
+                    # not in this batch (a decode request on a prefill step).
+                    mm_slots.append(
+                        self.request_slots.assign(req_id, running=self.requests)
+                    )
 
         if not mm_kwargs:
             return
@@ -3354,11 +3383,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # before the early return so a fully-cached batch still records them.
         DEVICE_ENCODER_CACHE_QUERIES.inc(len(mm_hashes))
 
-        # Filter already-cached items
+        # Filter already-cached items. A model with request slots keeps its
+        # state per request, not per mm_hash, so it encodes every item.
         uncached = [
             (mm_hash, modality, data)
             for mm_hash, (modality, data) in zip(mm_hashes, mm_kwargs)
-            if not self.encoder_cache.contains(mm_hash)
+            if self.request_slots is not None
+            or not self.encoder_cache.contains(mm_hash)
         ]
         if not uncached:
             return
@@ -3377,11 +3408,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             uncached_kwargs
         ):
             batch_hashes = uncached_hashes[item_cursor : item_cursor + num_items]
+            slot_kwargs = (
+                {"request_slots": mm_slots[item_cursor : item_cursor + num_items]}
+                if self.request_slots is not None
+                else {}
+            )
             item_cursor += num_items
 
             self.model.embed_multimodal(
                 encoder_cache=self.encoder_cache,
                 mm_hashes=batch_hashes,
+                **slot_kwargs,
                 **mm_kwargs_batch,
             )
             for mm_hash in batch_hashes:
@@ -5694,11 +5731,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 attn_metadata_i["raw_block_table_tensor"] = raw_blk_table_tensor
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
+            if self.request_slots is not None:
+                attn_metadata_i["request_slots"] = self._request_slot_tensor(
+                    blk_table_tensor.shape[0]
+                )
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
 
         return attn_metadata
+
+    def _request_slot_tensor(self, padded_num_reqs: int) -> torch.Tensor:
+        """Return the request slot of each batch row as an int32 device tensor.
+
+        The rows follow ``input_batch.req_ids``, the order of the block table.
+        The padded rows get the scratch slot.
+        """
+        slots = self.request_slots.lookup(
+            self.input_batch.req_ids[: self.input_batch.num_reqs], padded_num_reqs
+        )
+        return torch.tensor(slots, dtype=torch.int32).to(self.device)
 
     def _build_warmup_attention_metadata(
         self,
@@ -5873,6 +5925,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             }
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
+            if self.request_slots is not None:
+                # Warmup rows read the scratch slot.
+                attn_metadata_i["request_slots"] = torch.full(
+                    (num_reqs,),
+                    self.request_slots.scratch_slot,
+                    dtype=torch.int32,
+                    device=device,
+                )
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i

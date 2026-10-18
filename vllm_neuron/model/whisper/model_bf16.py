@@ -16,8 +16,10 @@ Design (the same as the 0.21 port):
 * The LM head is tied to ``decoder.embed_tokens``. It is vocab-parallel and
   in fp32. The on-device sampler does a distributed greedy argmax.
 
-The cross-KV buffers have one slot, so this model supports one sequence at a
-time (``max_num_seqs=1``).
+The cross-KV buffers have one slot for each request (``max_num_seqs`` slots
+plus one scratch slot). The runner gives each request a stable slot
+(``RequestSlotTable``) and sends the slot of each batch row in
+``attn_metadata[layer]["request_slots"]``.
 
 ANNOTATION GUIDE:
   # >>> PARALLELISM: ...     TP-sharded.
@@ -208,8 +210,10 @@ class WhisperCrossKVEncoder(nn.Module):
     this module, so the aliasing FX pass adds an input-output alias for each
     write. The decode graph reads the same tensors.
 
-    ``encoder_cache_buffer`` and ``write_block_ids`` are accepted for the
-    warmup signature. Whisper does not use the encoder cache buffer.
+    Each buffer is ``[num_slots, heads_local, 1500, head_dim]``. Clip ``j``
+    goes to slot ``write_block_ids[j]``. The warmup of the worker sends
+    ``write_block_ids`` as zeros, so warmup writes slot 0. Whisper does not use
+    ``encoder_cache_buffer``.
     """
 
     def __init__(
@@ -221,8 +225,10 @@ class WhisperCrossKVEncoder(nn.Module):
         head_dim: int,
         n_ctx: int,
         dtype,
+        num_slots: int = 2,
     ):
         super().__init__()
+        self.num_slots = num_slots
         self.encoder = encoder
         # The same module objects as the decoder cross-attention layers. The
         # weights load under the decoder names. There is no copy.
@@ -232,16 +238,21 @@ class WhisperCrossKVEncoder(nn.Module):
             for kind in ("k", "v"):
                 self.register_buffer(
                     f"cross_{kind}_{i}",
-                    torch.zeros(1, n_heads_local, n_ctx, head_dim, dtype=dtype),
+                    torch.zeros(num_slots, n_heads_local, n_ctx, head_dim, dtype=dtype),
                     persistent=False,
                 )
 
     def forward(self, input_features, encoder_cache_buffer=None, write_block_ids=None):
         encoder_hidden = self.encoder(input_features)
+        if write_block_ids is None:
+            write_block_ids = torch.zeros(
+                input_features.shape[0], dtype=torch.int64, device=input_features.device
+            )
+        slots = write_block_ids.to(torch.int64)
         for i in range(self.n_layers):
             k, v = self.cross_attns[i].project_kv(encoder_hidden)
-            getattr(self, f"cross_k_{i}").copy_(k)
-            getattr(self, f"cross_v_{i}").copy_(v)
+            getattr(self, f"cross_k_{i}").index_put_((slots,), k)
+            getattr(self, f"cross_v_{i}").index_put_((slots,), v)
         # Return a tensor, so that the warmup trace has an output.
         return encoder_hidden
 
@@ -426,7 +437,8 @@ class DecoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(d, dtype=dtype)
 
     def forward(self, x, cross_k, cross_v, attn_metadata, is_prefill, positions):
-        # x is token-flat, [T, H].
+        # x is token-flat, [T, H]. cross_k and cross_v are [B, h, 1500, d], one
+        # row for each request in the batch.
         h = self.self_attn_layer_norm(x)
         if is_prefill:
             sa = self.self_attn.forward_prefill(h, attn_metadata)
@@ -434,8 +446,10 @@ class DecoderLayer(nn.Module):
             sa = self.self_attn.forward_decode(h, attn_metadata, positions)
         x = x + sa
 
-        hc = self.encoder_attn_layer_norm(x).unsqueeze(0)
-        x = x + self.encoder_attn.attn_cached(hc, cross_k, cross_v).squeeze(0)
+        tokens, hidden = x.shape
+        num_rows = cross_k.shape[0]
+        hc = self.encoder_attn_layer_norm(x).view(num_rows, tokens // num_rows, hidden)
+        x = x + self.encoder_attn.attn_cached(hc, cross_k, cross_v).reshape(tokens, hidden)
 
         x = x + self.mlp(self.final_layer_norm(x))
         return x
@@ -466,16 +480,31 @@ class WhisperDecoder(nn.Module):
     def forward(self, input_ids, positions, attn_metadata, is_prefill):
         x = self.embed_tokens(input_ids) + self.embed_positions(positions)
         owner = self._cross_kv_owner
+        slots = self._request_slots(attn_metadata, x.device)
         for i, layer in enumerate(self.layers):
             x = layer(
                 x,
-                getattr(owner, f"cross_k_{i}"),
-                getattr(owner, f"cross_v_{i}"),
+                getattr(owner, f"cross_k_{i}").index_select(0, slots),
+                getattr(owner, f"cross_v_{i}").index_select(0, slots),
                 attn_metadata,
                 is_prefill,
                 positions,
             )
         return self.layer_norm(x)
+
+    def _request_slots(self, attn_metadata, device) -> torch.Tensor:
+        """Return the cross-KV slot of each batch row, ``[num_rows]``.
+
+        The runner sends the slots in ``attn_metadata[layer]["request_slots"]``.
+        A runner that does not send them runs one request at a time, so use
+        slot 0.
+        """
+        meta = attn_metadata[self.layers[0].self_attn.layer_name]
+        slots = meta.get("request_slots")
+        if slots is None:
+            num_rows = meta["block_table_tensor"].shape[0]
+            slots = torch.zeros(num_rows, dtype=torch.int32, device=device)
+        return slots
 
 
 # --------------------------------------------------------------------------- #
@@ -494,6 +523,9 @@ class WhisperForConditionalGeneration(nn.Module):
     supports_transcription = True
     supports_transcription_only = True
     supports_multimodal = True
+    # The runner gives each request a stable cross-KV slot and sends it in
+    # attn_metadata["request_slots"] and embed_multimodal(request_slots=...).
+    uses_request_slots = True
 
     def __init__(self, config: WhisperConfig):
         super().__init__()
@@ -516,6 +548,8 @@ class WhisperForConditionalGeneration(nn.Module):
 
         # >>> PARALLELISM: the cross-KV heads have the decoder sharding.
         n_heads_local = config.decoder_attention_heads // world
+        # One cross-KV slot for each request, plus the scratch slot.
+        self.num_request_slots = config.max_num_seqs + 1
         self.audio_tower = WhisperCrossKVEncoder(
             self.encoder,
             nn.ModuleList([layer.encoder_attn for layer in self.decoder.layers]),
@@ -524,6 +558,7 @@ class WhisperForConditionalGeneration(nn.Module):
             head_dim=config.head_dim,
             n_ctx=config.max_source_positions,
             dtype=self.dtype,
+            num_slots=self.num_request_slots,
         )
         self.decoder.bind_cross_kv(self.audio_tower)
 
@@ -654,9 +689,10 @@ class WhisperForConditionalGeneration(nn.Module):
         input_features: torch.Tensor | None = None,
         encoder_cache=None,
         mm_hashes: list[str] | None = None,
+        request_slots: list[int] | None = None,
         **kwargs,
     ) -> None:
-        """Run the audio encoder one time and write the cross-KV buffers.
+        """Run the audio encoder and write the cross-KV slot of each clip.
 
         Whisper does not write the encoder cache buffer. The runner still reads
         the cache bookkeeping at prefill, so reserve one block (1500 tokens) for
@@ -667,6 +703,9 @@ class WhisperForConditionalGeneration(nn.Module):
             input_features: Mel features ``[b, 128, 3000]``.
             encoder_cache: The ``EncoderCacheBlocks`` of the runner.
             mm_hashes: One identifier for each clip.
+            request_slots: The cross-KV slot of each clip. When the runner
+                does not send slots, it runs one request at a time, so use
+                slot 0.
         """
         if input_features is None:
             raise ValueError(
@@ -679,10 +718,18 @@ class WhisperForConditionalGeneration(nn.Module):
         if mel.dim() == 2:
             mel = mel.unsqueeze(0)
         num_clips = mel.shape[0]
-        if num_clips != 1:
+        if request_slots is None:
+            if num_clips != 1 or self.config.max_num_seqs != 1:
+                raise ValueError(
+                    f"Whisper received {num_clips} clips without request slots "
+                    f"(max_num_seqs={self.config.max_num_seqs}). Use a runner that "
+                    "sends request_slots, or set max_num_seqs=1."
+                )
+            request_slots = [0]
+        if len(request_slots) != num_clips:
             raise ValueError(
-                f"Whisper received {num_clips} clips in one encoder step. "
-                "This model has one cross-KV slot. Set max_num_seqs=1."
+                f"Whisper received {num_clips} clips and {len(request_slots)} "
+                "request slots. Send one slot for each clip."
             )
         if mm_hashes is None or len(mm_hashes) != num_clips:
             raise ValueError(
@@ -697,7 +744,8 @@ class WhisperForConditionalGeneration(nn.Module):
         # Cast on the source device first. A combined device and dtype .to() on
         # Neuron raises "Expected self.dtype() == dst.dtype()".
         mel = mel.to(dtype=self.dtype).to(device=device)
-        self.audio_tower(mel)
+        slots = torch.tensor(request_slots, dtype=torch.int64).to(device=device)
+        self.audio_tower(mel, write_block_ids=slots)
 
     # ── KV cache ──────────────────────────────────────────────────────────
     def get_kv_spec(self) -> KVSpec:
