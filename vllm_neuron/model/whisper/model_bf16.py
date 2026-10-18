@@ -66,8 +66,27 @@ def encoder_flash_enabled() -> bool:
 
 
 def fused_decode_enabled() -> bool:
-    """Return True when ``WHISPER_FUSED_DECODE=1`` selects the NKI decode attention."""
-    return os.environ.get("WHISPER_FUSED_DECODE", "0") == "1"
+    """Return True when ``WHISPER_FUSED_DECODE=1`` selects the NKI decode attention.
+
+    Whisper is MHA, so the kernel folds several KV heads per rank into the
+    batch. The decode mask must have the folded layout. Without that fold the
+    kernel output is wrong, and nothing fails, so check that it is present.
+
+    Raises:
+        RuntimeError: If the fused decode is selected and the GQA mask fold is
+            not in ``attention_decode``.
+    """
+    if os.environ.get("WHISPER_FUSED_DECODE", "0") != "1":
+        return False
+    from vllm_neuron.functional.attention import attention_decode as _ad
+
+    if not hasattr(_ad, "_fold_gqa_block_kv_mask"):
+        raise RuntimeError(
+            "WHISPER_FUSED_DECODE=1 needs the GQA decode-mask fold in "
+            "attention_decode (_fold_gqa_block_kv_mask). This tree does not have "
+            "it. Unset WHISPER_FUSED_DECODE, or use a tree with the fold."
+        )
+    return True
 
 # Whisper always pads or cuts the audio to a 30 s window: 3000 mel frames, then
 # 1500 encoder positions after the stride-2 convolution.
