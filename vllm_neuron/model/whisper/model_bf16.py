@@ -324,6 +324,37 @@ class CrossAttention(nn.Module):
         v = self._shape(self.v_proj(encoder_hidden_states), src_len, bsz)
         return k, v
 
+    def attn_all_slots(self, hidden_states, cross_k, cross_v, slots):
+        """Cross-attention of each row over its own slot, without a gather.
+
+        ``cross_k`` and ``cross_v`` hold all slots, ``[S, h, src, d]``. The
+        scores of row ``b`` for every slot other than ``slots[b]`` get -inf,
+        so their softmax weights are exactly zero. A gather of the cross-KV
+        lowers to software-DGE indirect DMA, which is slow for large rows.
+
+        Args:
+            hidden_states: ``[B, tgt, H]``.
+            cross_k: ``[S, h, src, d]``.
+            cross_v: ``[S, h, src, d]``.
+            slots: ``[B]`` int32, the slot of each row.
+        """
+        bsz, tgt_len, _ = hidden_states.shape
+        num_slots, _, src_len, _ = cross_k.shape
+        q = self._shape(self.q_proj(hidden_states) * self.scaling, tgt_len, bsz)
+        scores = torch.einsum("bhqd,shtd->bhqst", q, cross_k)
+        own = torch.arange(num_slots, device=slots.device, dtype=slots.dtype).view(
+            1, num_slots
+        ) == slots.view(bsz, 1)
+        neg = torch.full((), float("-inf"), dtype=torch.float32, device=scores.device)
+        zero = torch.zeros((), dtype=torch.float32, device=scores.device)
+        bias = torch.where(own, zero, neg).view(bsz, 1, 1, num_slots, 1)
+        scores = scores.to(torch.float32) + bias
+        probs = F.softmax(scores.view(bsz, self.num_heads, tgt_len, num_slots * src_len), dim=-1)
+        probs = probs.view(bsz, self.num_heads, tgt_len, num_slots, src_len).to(cross_v.dtype)
+        ctx = torch.einsum("bhqst,shtd->bhqd", probs, cross_v)
+        out = ctx.transpose(1, 2).reshape(bsz, tgt_len, self.num_heads * self.head_dim)
+        return self.out_proj(out)
+
     def attn_cached(self, hidden_states, cross_k, cross_v):
         bsz, tgt_len, _ = hidden_states.shape
         q = self._shape(self.q_proj(hidden_states) * self.scaling, tgt_len, bsz)
@@ -578,9 +609,10 @@ class DecoderLayer(nn.Module):
         self.mlp = MLP(d, cfg.decoder_ffn_dim, dtype, tp_group)
         self.final_layer_norm = nn.LayerNorm(d, dtype=dtype)
 
-    def forward(self, x, cross_k, cross_v, meta, is_prefill, positions):
+    def forward(self, x, cross_k, cross_v, meta, is_prefill, positions, slots=None):
         # x is token-flat, [T, H]. cross_k and cross_v are [B, h, 1500, d], one
-        # row for each request in the batch.
+        # row for each request in the batch. When slots is set, they hold all
+        # slots, [S, h, 1500, d], and slots gives the slot of each row.
         h = self.self_attn_layer_norm(x)
         if is_prefill:
             sa = self.self_attn.forward_prefill(h, meta)
@@ -591,9 +623,15 @@ class DecoderLayer(nn.Module):
         x = x + sa
 
         tokens, hidden = x.shape
-        num_rows = cross_k.shape[0]
-        hc = self.encoder_attn_layer_norm(x).view(num_rows, tokens // num_rows, hidden)
-        x = x + self.encoder_attn.attn_cached(hc, cross_k, cross_v).reshape(tokens, hidden)
+        if slots is not None:
+            num_rows = slots.shape[0]
+            hc = self.encoder_attn_layer_norm(x).view(num_rows, tokens // num_rows, hidden)
+            ca = self.encoder_attn.attn_all_slots(hc, cross_k, cross_v, slots)
+        else:
+            num_rows = cross_k.shape[0]
+            hc = self.encoder_attn_layer_norm(x).view(num_rows, tokens // num_rows, hidden)
+            ca = self.encoder_attn.attn_cached(hc, cross_k, cross_v)
+        x = x + ca.reshape(tokens, hidden)
 
         x = x + self.mlp(self.final_layer_norm(x))
         return x
@@ -631,15 +669,44 @@ class WhisperDecoder(nn.Module):
         # With one request slot, read slot 0 directly. A gather of the cross-KV
         # becomes an indirect DMA that copies all of the cross-KV on each step.
         slots = None if owner.num_slots <= 2 else self._request_slots(attn_metadata, x.device)
+        # How a decode step with request slots reads the cross-KV of its rows
+        # (WHISPER_CROSS_MODE):
+        #   mask (default): attention over all slots with -inf for the other
+        #     slots. Measured fastest (TP4, 16 rows).
+        #   onehot: a one-hot matmul selects the slot of each row. It
+        #     is exact (1 * v + 0 * others) and runs as one dense matmul.
+        #   gather: index_select (software-DGE indirect DMA, slow).
+        # Prefill has one row, so it always uses the gather.
+        mode = os.environ.get("WHISPER_CROSS_MODE", "mask")
+        if slots is None or is_prefill:
+            mode = "gather"
+        all_slots = mode == "mask"
+        onehot = None
+        if mode == "onehot":
+            num_slots = owner.num_slots
+            onehot = (
+                torch.arange(num_slots, device=slots.device, dtype=slots.dtype).view(1, -1)
+                == slots.view(-1, 1)
+            ).to(self.embed_tokens.weight.dtype)
         for i, layer in enumerate(self.layers):
             cross_k = getattr(owner, f"cross_k_{i}")
             cross_v = getattr(owner, f"cross_v_{i}")
             if slots is None:
                 cross_k, cross_v = cross_k[:1], cross_v[:1]
-            else:
-                cross_k = cross_k.index_select(0, slots)
-                cross_v = cross_v.index_select(0, slots)
-            x = layer(x, cross_k, cross_v, meta, is_prefill, positions)
+            elif onehot is not None:
+                shape = (onehot.shape[0], *cross_k.shape[1:])
+                cross_k = torch.matmul(onehot, cross_k.view(cross_k.shape[0], -1)).view(shape)
+                cross_v = torch.matmul(onehot, cross_v.view(cross_v.shape[0], -1)).view(shape)
+            elif not all_slots:
+                # Gather whole flat rows, so that each DMA descriptor moves one
+                # slot of one layer (about 1 MB at TP4), not one 128-byte head row.
+                shape = (slots.shape[0], *cross_k.shape[1:])
+                cross_k = cross_k.view(cross_k.shape[0], -1).index_select(0, slots).view(shape)
+                cross_v = cross_v.view(cross_v.shape[0], -1).index_select(0, slots).view(shape)
+            x = layer(
+                x, cross_k, cross_v, meta, is_prefill, positions,
+                slots=slots if all_slots else None,
+            )
         return self.layer_norm(x)
 
     def _request_slots(self, attn_metadata, device) -> torch.Tensor:
