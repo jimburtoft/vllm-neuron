@@ -505,6 +505,15 @@ class DecoderSelfAttention(nn.Module):
         nkh = self.num_key_value_heads_per_rank
         S_ctx = block_table.shape[1] * block_size
 
+        # The mask, the slots and the table are the same for every layer.
+        # Build them one time for each step and keep them in the shared
+        # metadata dict (the llama3 decode-mask cache does the same).
+        cached = meta.get("_whisper_fused_decode_inputs")
+        if cached is not None:
+            attention_mask, update_idx, table = cached
+            return self._fused_decode_call(
+                hidden_states, attention_mask, update_idx, table, B, S, tokens, hidden
+            )
         attention_mask = NF.gen_attention_decode_mask(
             pos_ids=positions.view(1, B * S).to(torch.float32),
             bs=B,
@@ -527,6 +536,17 @@ class DecoderSelfAttention(nn.Module):
             table = build_per_head_block_table(block_table.to(torch.int32), nkh).to(
                 torch.int32
             )
+        meta["_whisper_fused_decode_inputs"] = (attention_mask, update_idx, table)
+        return self._fused_decode_call(
+            hidden_states, attention_mask, update_idx, table, B, S, tokens, hidden
+        )
+
+    def _fused_decode_call(
+        self, hidden_states, attention_mask, update_idx, table, B, S, tokens, hidden
+    ):
+        """Run the fused decode kernel, the TP all-reduce, and the out_proj bias."""
+        from vllm_neuron import functional as NF
+
         out = NF.attention_decode(
             X=hidden_states.view(B, S, hidden),
             X_hidden_dim_actual=hidden,
