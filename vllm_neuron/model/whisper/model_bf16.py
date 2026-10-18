@@ -37,13 +37,19 @@ Whisper properties that are different from llama3:
 
 import logging
 import math
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
-from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
+from vllm_neuron.model.kv_cache import (
+    KVSpec,
+    LayerSpec,
+    build_per_head_slot_mapping,
+    paged_slot_indices,
+)
 from vllm_neuron.model.neuron_config import EncoderNeuronConfig, NeuronConfig
 from vllm_neuron.nn import ColumnParallelLinear, RowParallelLinear
 from vllm_neuron.nn.sampler import Sampler
@@ -52,6 +58,16 @@ from .config import WhisperConfig
 from .weight_loaders import build_state, load_hf_state, resolve_checkpoint_dir
 
 logger = logging.getLogger(__name__)
+
+
+def encoder_flash_enabled() -> bool:
+    """Return True when ``WHISPER_ENCODER_FLASH=1`` selects NKI flash attention in the encoder."""
+    return os.environ.get("WHISPER_ENCODER_FLASH", "0") == "1"
+
+
+def fused_decode_enabled() -> bool:
+    """Return True when ``WHISPER_FUSED_DECODE=1`` selects the NKI decode attention."""
+    return os.environ.get("WHISPER_FUSED_DECODE", "0") == "1"
 
 # Whisper always pads or cuts the audio to a 30 s window: 3000 mel frames, then
 # 1500 encoder positions after the stride-2 convolution.
@@ -140,6 +156,8 @@ class EncoderSelfAttention(nn.Module):
 
     def forward(self, hidden_states):
         bsz, seqlen, _ = hidden_states.shape
+        if encoder_flash_enabled():
+            return self._forward_flash(hidden_states)
         q = self._shape(self.q_proj(hidden_states) * self.scaling, seqlen, bsz)
         k = self._shape(self.k_proj(hidden_states), seqlen, bsz)
         v = self._shape(self.v_proj(hidden_states), seqlen, bsz)
@@ -148,6 +166,29 @@ class EncoderSelfAttention(nn.Module):
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).reshape(bsz, seqlen, self.num_heads * self.head_dim)
         return self.out_proj(out)
+
+
+    def _forward_flash(self, hidden_states):
+        """Run the encoder attention with the NKI flash attention kernel (non-causal)."""
+        from vllm_neuron import functional as NF
+
+        bsz, seqlen, _ = hidden_states.shape
+        q = self._shape(self.q_proj(hidden_states) * self.scaling, seqlen, bsz)
+        k = self._shape(self.k_proj(hidden_states), seqlen, bsz)
+        v = self._shape(self.v_proj(hidden_states), seqlen, bsz)
+        bh = bsz * self.num_heads
+        out = NF.flash_attention(
+            q.reshape(bh, seqlen, self.head_dim),
+            k.reshape(bh, seqlen, self.head_dim),
+            v.reshape(bh, seqlen, self.head_dim),
+            scale=1.0,
+            causal_mask=False,
+            tp_q=True,
+            tp_k=True,
+            tp_out=False,
+        )
+        out = out.view(bsz, self.num_heads, seqlen, self.head_dim).transpose(1, 2)
+        return self.out_proj(out.reshape(bsz, seqlen, self.num_heads * self.head_dim))
 
 
 class MLP(nn.Module):
@@ -322,9 +363,47 @@ class DecoderSelfAttention(nn.Module):
         self.k_proj = _cpl(d, d, False, dtype, tp_group)
         self.v_proj = _cpl(d, d, True, dtype, tp_group)
         self.out_proj = RowParallelLinearFP32Bias(d, d, dtype, tp_group)
+        self.tp_group = tp_group
+        self.tp = tp
+
+        # Fused decode (NKI attention_decode): one [H, 3 * d_local] QKV weight
+        # and bias, and the [d_local, H] out_proj weight. finalize_weights
+        # fills them after weight loading. The k slice of the bias is zero.
+        self.fused = fused_decode_enabled()
+        if self.fused:
+            d_local = self.num_heads * self.head_dim
+            self.register_buffer(
+                "qkv_weight_fused", torch.zeros(d, 3 * d_local, dtype=dtype), persistent=False
+            )
+            self.register_buffer(
+                "qkv_bias_fused", torch.zeros(1, 3 * d_local, dtype=dtype), persistent=False
+            )
+            self.register_buffer(
+                "out_weight_fused", torch.zeros(d_local, d, dtype=dtype), persistent=False
+            )
 
         self.k_cache = None
         self.v_cache = None
+
+    @torch.no_grad()
+    def finalize_weights(self) -> None:
+        """Build the fused decode weights from the loaded q/k/v/out weights.
+
+        The q scale is folded into the q weight and the q bias, so the kernel
+        runs with ``softmax_scale=1``. This is the same math as ``_project``,
+        which scales q after the bias.
+        """
+        if not self.fused:
+            return
+        wq = self.q_proj.weight * self.scaling  # [d_local, H]
+        wk = self.k_proj.weight
+        wv = self.v_proj.weight
+        self.qkv_weight_fused.copy_(torch.cat([wq, wk, wv], dim=0).t().contiguous())
+        bq = self.q_proj.bias * self.scaling
+        bk = torch.zeros_like(bq)
+        bv = self.v_proj.bias
+        self.qkv_bias_fused.copy_(torch.cat([bq, bk, bv]).view(1, -1))
+        self.out_weight_fused.copy_(self.out_proj.rpl.weight.t().contiguous())
 
     def _project(self, hidden_states):
         """Project ``[T, H]`` to q, k, v, each ``[heads_local, T, head_dim]``."""
@@ -376,6 +455,71 @@ class DecoderSelfAttention(nn.Module):
         ctx = torch.matmul(attn, v)
         out = ctx.transpose(0, 1).reshape(tokens, self.num_heads * self.head_dim)
         return self.out_proj(out)
+
+    def forward_decode_fused(self, hidden_states, meta, positions):
+        """Decode with the NKI fused attention block (QKV, attention, KV write, out_proj).
+
+        The pre-attention LayerNorm stays outside the kernel (the kernel has
+        RMSNorm only). The kernel writes the new K/V into the paged cache. The
+        out_proj bias is added after the TP all-reduce, as in the torch path.
+        """
+        from vllm_neuron import functional as NF
+        from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
+
+        block_size = meta["block_size"]
+        block_table = meta["block_table_tensor"]
+        B = block_table.shape[0]
+        tokens, hidden = hidden_states.shape
+        S = tokens // B
+        nkh = self.num_key_value_heads_per_rank
+        S_ctx = block_table.shape[1] * block_size
+
+        attention_mask = NF.gen_attention_decode_mask(
+            pos_ids=positions.view(1, B * S).to(torch.float32),
+            bs=B,
+            q_head=self.num_heads,
+            s_active=S,
+            s_prior=S_ctx,
+            start_pos=None,
+            block_len=block_size,
+        )
+        # The NKI kernel needs per-head slots and a per-head [B, kv_heads, blocks]
+        # table for MHA. The CPU torch fallback takes the base [B, S] slots and
+        # the 2D table with the 4D cache.
+        if hidden_states.device.type == "cpu":
+            update_idx = meta["slot_mapping"].view(B, S)
+            table = block_table.to(torch.int32)
+        else:
+            update_idx = build_per_head_slot_mapping(
+                meta["slot_mapping"], block_size, nkh, B
+            ).to(torch.uint32)
+            table = build_per_head_block_table(block_table.to(torch.int32), nkh).to(
+                torch.int32
+            )
+        out = NF.attention_decode(
+            X=hidden_states.view(B, S, hidden),
+            X_hidden_dim_actual=hidden,
+            rmsnorm_X_enabled=False,
+            W_qkv=self.qkv_weight_fused,
+            bias_qkv=self.qkv_bias_fused,
+            K_cache_transposed=False,
+            active_blocks_table=table,
+            K_cache=self.k_cache,
+            V_cache=self.v_cache,
+            attention_mask=attention_mask,
+            softmax_scale=1.0,
+            update_cache=True,
+            kv_cache_update_idx=update_idx,
+            W_out=self.out_weight_fused,
+            bias_out=None,
+            transposed_out=False,
+        )
+        out = out.reshape(tokens, hidden)
+        if self.tp > 1:
+            from torch.distributed._functional_collectives import all_reduce
+
+            out = all_reduce(out, reduceOp="sum", group=self.tp_group)
+        return out + self.out_proj.bias.to(out.dtype)
 
     def forward_decode(self, hidden_states, meta, positions):
         """Decode: write the new K/V, gather the sequence cache, and attend.
@@ -440,6 +584,8 @@ class DecoderLayer(nn.Module):
         h = self.self_attn_layer_norm(x)
         if is_prefill:
             sa = self.self_attn.forward_prefill(h, meta)
+        elif self.self_attn.fused:
+            sa = self.self_attn.forward_decode_fused(h, meta, positions)
         else:
             sa = self.self_attn.forward_decode(h, meta, positions)
         x = x + sa
@@ -830,6 +976,8 @@ class WhisperForConditionalGeneration(nn.Module):
                     )
                 )
         self._tie_lm_head()
+        for layer in self.decoder.layers:
+            layer.self_attn.finalize_weights()
 
         problems = enc_missing + enc_unexpected + dec_missing + dec_unexpected
         logger.info(

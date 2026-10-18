@@ -27,7 +27,7 @@ HEADS = 4
 LAYERS = 2
 VOCAB = 51866
 BLOCK_SIZE = 8
-NUM_BLOCKS = 16
+NUM_BLOCKS = 20
 MAX_BLOCKS_PER_SEQ = 6
 PROMPT = [50258, 50259, 50360, 50364]  # <|sot|><|en|><|transcribe|><|notimestamps|>
 
@@ -288,3 +288,40 @@ def test_warmup_inputs(hf_checkpoint):
     assert [s.name for s in spec.layers] == [
         f"decoder.layers.{i}.self_attn" for i in range(LAYERS)
     ]
+
+
+def test_fused_decode_matches_torch_path(hf_checkpoint, monkeypatch):
+    """WHISPER_FUSED_DECODE=1 (attention_decode, torch fallback on CPU) gives the HF greedy tokens."""
+    path, hf = hf_checkpoint
+    monkeypatch.setenv("WHISPER_FUSED_DECODE", "1")
+    model = _build_native(path)
+    assert model.decoder.layers[0].self_attn.fused
+    torch.manual_seed(1)
+    mel = torch.randn(1, 128, 3000)
+    model.embed_multimodal(input_features=mel, encoder_cache=_FakeEncoderCache(), mm_hashes=["c"])
+    blocks = [3, 5]
+    # The NKI decode mask needs a context of a multiple of 128 positions.
+    table = torch.full((1, 128 // BLOCK_SIZE), -1, dtype=torch.int32)
+    table[0, :2] = torch.tensor(blocks, dtype=torch.int32)
+
+    def slot(pos):
+        return blocks[pos // BLOCK_SIZE] * BLOCK_SIZE + pos % BLOCK_SIZE
+
+    n = len(PROMPT)
+    out = model(
+        input_ids=torch.tensor(PROMPT, dtype=torch.int32),
+        positions=torch.arange(n, dtype=torch.int32),
+        attn_metadata=_metadata(model, torch.tensor([slot(p) for p in range(n)]), table, n),
+        sampling_positions=torch.tensor([n - 1]),
+    )
+    tokens = list(PROMPT) + [int(out[0].argmax())]
+    for _ in range(9):
+        pos = len(tokens) - 1
+        out = model(
+            input_ids=torch.tensor([tokens[-1]], dtype=torch.int32),
+            positions=torch.tensor([pos], dtype=torch.int32),
+            attn_metadata=_metadata(model, torch.tensor([slot(pos)]), table, 1),
+            sampling_positions=torch.tensor([0]),
+        )
+        tokens.append(int(out[0].argmax()))
+    assert tokens == _hf_greedy(hf, mel, len(tokens) - n)
