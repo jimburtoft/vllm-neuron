@@ -356,14 +356,13 @@ class DecoderSelfAttention(nn.Module):
         self.k_cache.index_put_(index, k_f)
         self.v_cache.index_put_(index, v_f)
 
-    def forward_prefill(self, hidden_states, attn_metadata):
+    def forward_prefill(self, hidden_states, meta):
         """Causal attention over the prompt, with the reference SDPA math.
 
         The decoder prompt has about 4 tokens, so a flash kernel gives no gain.
         The plain math keeps the first token byte-identical to the reference.
         The pad tokens are after the real tokens, so the causal mask hides them.
         """
-        meta = attn_metadata[self.layer_name]
         q, k, v = self._project(hidden_states)
         self._write_kv_cache(k, v, meta["slot_mapping"], meta["block_size"])
 
@@ -378,14 +377,13 @@ class DecoderSelfAttention(nn.Module):
         out = ctx.transpose(0, 1).reshape(tokens, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
-    def forward_decode(self, hidden_states, attn_metadata, positions):
+    def forward_decode(self, hidden_states, meta, positions):
         """Decode: write the new K/V, gather the sequence cache, and attend.
 
         The runner sets an unused block-table entry to -1. Change it to the
         null block (0) before the gather. The position mask hides each slot
         after the position of the query, which includes the null-block slots.
         """
-        meta = attn_metadata[self.layer_name]
         block_size = meta["block_size"]
         block_table = meta["block_table_tensor"]
         block_table = torch.where(
@@ -436,14 +434,14 @@ class DecoderLayer(nn.Module):
         self.mlp = MLP(d, cfg.decoder_ffn_dim, dtype, tp_group)
         self.final_layer_norm = nn.LayerNorm(d, dtype=dtype)
 
-    def forward(self, x, cross_k, cross_v, attn_metadata, is_prefill, positions):
+    def forward(self, x, cross_k, cross_v, meta, is_prefill, positions):
         # x is token-flat, [T, H]. cross_k and cross_v are [B, h, 1500, d], one
         # row for each request in the batch.
         h = self.self_attn_layer_norm(x)
         if is_prefill:
-            sa = self.self_attn.forward_prefill(h, attn_metadata)
+            sa = self.self_attn.forward_prefill(h, meta)
         else:
-            sa = self.self_attn.forward_decode(h, attn_metadata, positions)
+            sa = self.self_attn.forward_decode(h, meta, positions)
         x = x + sa
 
         tokens, hidden = x.shape
@@ -480,16 +478,22 @@ class WhisperDecoder(nn.Module):
     def forward(self, input_ids, positions, attn_metadata, is_prefill):
         x = self.embed_tokens(input_ids) + self.embed_positions(positions)
         owner = self._cross_kv_owner
-        slots = self._request_slots(attn_metadata, x.device)
+        # All decoder layers are in one KV-cache group, so they share one
+        # metadata dict. Read it one time: a lookup for each layer adds a
+        # Dynamo guard for each layer key on every step.
+        meta = attn_metadata[self.layers[0].self_attn.layer_name]
+        # With one request slot, read slot 0 directly. A gather of the cross-KV
+        # becomes an indirect DMA that copies all of the cross-KV on each step.
+        slots = None if owner.num_slots <= 2 else self._request_slots(attn_metadata, x.device)
         for i, layer in enumerate(self.layers):
-            x = layer(
-                x,
-                getattr(owner, f"cross_k_{i}").index_select(0, slots),
-                getattr(owner, f"cross_v_{i}").index_select(0, slots),
-                attn_metadata,
-                is_prefill,
-                positions,
-            )
+            cross_k = getattr(owner, f"cross_k_{i}")
+            cross_v = getattr(owner, f"cross_v_{i}")
+            if slots is None:
+                cross_k, cross_v = cross_k[:1], cross_v[:1]
+            else:
+                cross_k = cross_k.index_select(0, slots)
+                cross_v = cross_v.index_select(0, slots)
+            x = layer(x, cross_k, cross_v, meta, is_prefill, positions)
         return self.layer_norm(x)
 
     def _request_slots(self, attn_metadata, device) -> torch.Tensor:
@@ -587,6 +591,28 @@ class WhisperForConditionalGeneration(nn.Module):
             # that shards the vocab. On a tie, the lowest global index wins,
             # the same as an argmax over the full vocab.
             self.sampler = Sampler(self.on_device_sampling_config, process_group=tp_group)
+
+    def compiler_args_for(self, graph_type, example_inputs, base):
+        """Give each graph its own neuronx-cc arguments.
+
+        ``WHISPER_DECODE_OPT_LEVEL`` sets the ``-O`` level of the plain decode
+        graph. ``WHISPER_ENCODER_OPT_LEVEL`` sets it for the encoder graph. When
+        a variable is not set, the graph keeps the base arguments.
+
+        Example:
+            >>> model.compiler_args_for("prefill", None, ["-O2"])  # doctest: +SKIP
+            ['-O2']
+        """
+        import os
+
+        from vllm_neuron.utils.compiler_args_ctx import with_optimization_level
+
+        base = list(base or [])
+        level = {
+            "decode": os.environ.get("WHISPER_DECODE_OPT_LEVEL"),
+            "encoder": os.environ.get("WHISPER_ENCODER_OPT_LEVEL"),
+        }.get(graph_type)
+        return with_optimization_level(base, int(level)) if level else base
 
     @property
     def dtype(self) -> torch.dtype:
