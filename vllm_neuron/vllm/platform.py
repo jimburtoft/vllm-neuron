@@ -651,12 +651,15 @@ class NeuronPlatform(Platform):
                 )
                 os.environ["NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP"] = "0"
 
-        # Qwen3-ASR runs the Whisper mel/fbank extractor (torch.stft, OpenMP)
-        # during multimodal encoder-budget profiling in scheduler init. Under
-        # the default fork start method, the threaded STFT deadlocks in the
+        # Qwen3-ASR and Whisper run the Whisper mel/fbank extractor (torch.stft,
+        # OpenMP) during multimodal encoder-budget profiling in scheduler init.
+        # Under the default fork start method, the threaded STFT deadlocks in the
         # forked EngineCore. Force spawn so this profiling runs in a clean
-        # process. Scope this to Qwen3-ASR; other models keep fork.
-        if "Qwen3ASRForConditionalGeneration" in architectures:
+        # process. Scope this to the audio models; other models keep fork.
+        if (
+            "Qwen3ASRForConditionalGeneration" in architectures
+            or "WhisperForConditionalGeneration" in architectures
+        ):
             os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
         # vLLM-Neuron owns the decode-only weight decision; the customer does not
