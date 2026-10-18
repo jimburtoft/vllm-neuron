@@ -372,8 +372,7 @@ class MuseGlimmerAttention(nn.Module):
                 tp_out=True,
             )  # [N, D, T]
         else:
-            k = k.repeat_interleave(self.num_key_value_groups, dim=0)
-            v = v.repeat_interleave(self.num_key_value_groups, dim=0)
+            # attention_cte handles GQA natively (q batch N, kv batch N/groups): no K/V replication.
             attn_output = NF.flash_attention(
                 q.transpose(1, 2),  # [N, D, T]
                 k.transpose(1, 2),  # [N, D, T]
