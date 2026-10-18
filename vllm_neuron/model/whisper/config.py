@@ -39,6 +39,11 @@ class WhisperConfig:
     # config is set.
     encoder_neuron_config: EncoderNeuronConfig | None = None
 
+    # The largest number of requests in one batch. The model keeps one
+    # cross-KV slot for each request. from_configs reads the value from the
+    # vLLM scheduler config.
+    max_num_seqs: int = 1
+
     # Set to False only in unit tests that use small dimensions.
     check_dims: bool = True
 
@@ -103,7 +108,20 @@ class WhisperConfig:
         if filtered.get("torch_dtype") in (None, torch.float16, torch.float32):
             filtered["torch_dtype"] = torch.bfloat16
 
+        if "max_num_seqs" not in overrides:
+            filtered["max_num_seqs"] = _current_max_num_seqs()
         filtered.update(overrides)
         filtered["neuron_config"] = neuron_config
         filtered["encoder_neuron_config"] = encoder_neuron_config
         return cls(**filtered)
+
+
+def _current_max_num_seqs() -> int:
+    """Return ``max_num_seqs`` of the current vLLM config, or 1 if no config is set."""
+    try:
+        from vllm.config import get_current_vllm_config
+
+        value = get_current_vllm_config().scheduler_config.max_num_seqs
+    except (AssertionError, AttributeError, RuntimeError, ImportError):
+        return 1
+    return int(value) if value else 1
