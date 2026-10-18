@@ -1,8 +1,18 @@
 # MuseGlimmer (vLLM-Neuron)
 
 Port of `MuseGlimmerForConditionalGeneration` (Muse-Glimmer-30B: image + video +
-text in, text out) to vLLM-Neuron 0.24 on trn2. **Status: text decoder, image and
-video paths (perception encoder) implemented and verified in CPU mode.**
+text in, text out) to vLLM-Neuron 0.24 on trn2.
+
+**Status (2026-10-18): text, image, video and mixed image+video verified on trn2.**
+Setup: trn2.3xlarge, LNC=2, SDK 2.32 (DLAMI 20260818), vllm 0.24.0 + vllm-neuron
+0.24.0.1.1.0 + this branch, text TP=4, BF16, against HF BF16 (transformers 5.15.0):
+- prompt ids equal HF on all 10 golden prompts; prefill logit cos 0.99999-1.00000;
+- text greedy 32/32 on 3 prompts, including 5246 tokens (past the 2048 window);
+- image / video / mixed greedy 24-32/32, every divergence a near-tie (HF top-2 margin 0.19-0.31);
+- vision DP=4 and vision TP=4 both verified.
+
+Perf, same setup, `vllm serve`: text BS=1 TPOT 31.9 ms, TTFT 320 ms at 1k input;
+216 output tok/s at concurrency 16; image (896x672) TTFT 479 ms with vision TP=4.
 
 Files:
 
@@ -107,35 +117,64 @@ Truncated test checkpoints use the structural checks only.
 
 ## Feature status
 
+"trn2" = verified on trn2.3xlarge against HF BF16 (2026-10-17/18). "CPU" = verified only
+in `VLLM_NEURON_CPU_MODE=1` on a truncated checkpoint against HF fp32.
+
 | Feature | Status | Notes |
 |---|---|---|
-| TP (text) | Yes | TP=1 and TP=4 verified in CPU mode. TP=4 uses KV replication x2 |
-| SP (prefill sequence parallel) | Yes | Embedding reduce-scatter; all-gather/reduce-scatter around attention and MLP |
-| Single-shot prefill (`flash_attention`) | Yes | sliding_window per layer |
-| Chunked/segmented prefill (`segmented_attention`) | Yes (CPU) | Verified at 512-token segments with SWA |
-| Decode megakernel (`attention_decode`) | Yes (CPU and NKI simulator) | NoPE via `cos=None`, SWA via `swa_start_pos_ids`, weightless QK-norm |
-| Hybrid KV cache (SWA + full groups) | Yes | `LayerSpec.sliding_window_size` per layer |
-| On-device sampling / logprobs gather | Yes | Softcap applied before both |
-| `mm_language_model_only` (PD pool) | Yes | Text-only runs with and without it |
-| Vision encoder / images | Yes (CPU) | fp32 module cos 1.000000 vs HF (1-, 4- and 3-window images); e2e greedy 8/8 at fp32 |
-| Vision DP (default) / vision TP | Yes (CPU) | DP=4 and `vision_neuron_config.tp_size=4` verified at text TP=4 |
-| Multiple images per request / per batch | Yes (CPU) | one image per block (on-device encoder cache rule) |
-| Video | Yes (CPU) | One ViT item per temporal group (HF `cu_seqlens`); fp32 module cos 1.000000 vs HF `get_video_features`; e2e greedy 8/8 at fp32, TP=1/4, vision DP/TP; mixed image + video prompts |
+| TP (text) | trn2 (TP=4) | TP=4 uses KV replication x2. TP=1 CPU only (does not fit HBM for the 30B) |
+| SP (prefill sequence parallel) | trn2 | Embedding reduce-scatter; all-gather/reduce-scatter around attention and MLP |
+| Single-shot prefill (`flash_attention`) | trn2 | sliding_window per layer |
+| Chunked/segmented prefill (`segmented_attention`) | CPU | 512-token segments with SWA, fp32 exact |
+| Decode megakernel (`attention_decode`) | trn2 | NoPE via `cos=None`, SWA via `swa_start_pos_ids`, weightless QK-norm |
+| Hybrid KV cache (SWA + full groups) | trn2 | `LayerSpec.sliding_window_size` per layer |
+| On-device sampling / logprobs gather | trn2 | Softcap applied before both |
+| `mm_language_model_only` (PD pool) | trn2 | Text-only serving without building the vision tower |
+| Images | trn2 | 1-window and multi-window; multi-image per request CPU only |
+| Vision DP (default) / vision TP | trn2 | DP=4 and `vision_neuron_config.tp_size=4` at text TP=4 |
+| Video | trn2 (16 frames) | One ViT item per temporal group. 96 frames: CPU only |
+| Mixed image + video | trn2 | |
+| `vllm serve` (text, image) | trn2 | `harness/perf_serve.sh` in the project |
 | `mm_encoder_only` (VE pool) | No | Raises |
 | Prefix caching (APC) | Untested | Run with `enable_prefix_caching=False` |
 | DP / EP / attention-DP / DCP | N/A | Dense model, single node |
-| Eagle3 / speculative decoding | No | Not wired |
+| Eagle3 / DFlash speculative decoding | No | 0.24 has EAGLE3 only; the DFlash drafter needs vllm-neuron 0.29+ |
 | FP8 KV cache, quantized weights | No | Only `quantization in (None, "bf16")` |
-| Prefill MLP NKI kernel | Partial | At TP=4, I/rank 4992 needs 10 PSUM banks and H=6656 < 7168 blocks I-sharding, so prefill MLP falls back to torch on trn2. Correctness is unaffected; this is a perf item |
+| Prefill MLP NKI kernel | No (torch fallback) | At TP=4, I/rank 4992 needs 10 PSUM banks and H=6656 < 7168 blocks I-sharding. Perf only |
+
+## Required and recommended config (trn2.3xlarge, TP=4)
+
+| Knob | Value | Why |
+|---|---|---|
+| `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (env) | `0.12` | The default 0.30 (266k KV tokens) leaves no HBM for the NEFFs: `Allocation Failure status=4` at decode warmup. 0.12 gives 106,543 tokens (13x at 8192) |
+| `NEURON_SKIP_EFA_AFFINITY` (env) | `1` | trn2.3xlarge topology |
+| `--max-model-len` | 8192 (tested) | 96-frame video needs >= 8192 |
+| `neuron_config.decode_context_length_buckets` | unset, or only values > 2560 (e.g. `[4096]`) | A bucket below the trimmed SWA window (80 blocks = 2560 tokens) is warmed with the wrong SWA shape and the first concurrent decode fails `fail_on_recompile` |
+| `--no-enable-prefix-caching` | set | APC untested |
+| `vision_neuron_config.tp_size` | `4` under concurrency | Saves 2.6 GiB/core vs DP and is 26 % faster at image BS=1. DP=4 with a 32-block encoder cache OOMed HBM at concurrency 4 |
+| `vision_neuron_config.vision_attention_block_size` | 4096 (tested); 16384 for HF-default max images | Must be >= patches of the largest image / temporal group |
+| `vision_neuron_config.num_vision_tokens_buckets` | `[4096]` images, `[4096, 8192]` short video | 96-frame video: 28672 at block 4096 (untested on trn2) |
+| `vision_neuron_config.encoder_cache_num_blocks` | 8 (single request), 16 (concurrency 4) | The derived default can be too small; each item takes whole blocks |
+| `mm_processor_kwargs.max_image_tokens` | `vision_block // 4` | Caps images to the compiled block |
+
+## Known limits
+
+- **Cold compile:** about 12 min for text at `max_num_seqs` 1, about 24 min at 16, plus about 5 min for the vision buckets. A warm restart takes about 9 min.
+- **Not run on trn2:** 96-frame video and the largest image bucket (block 16384).
+- **Window layers pay full-block attention.** Bounds are a mask with no compute skip.
+- The gate matmul runs outside the QKV kernel (an extra `[T, H] x [H, 1024]` per layer).
+- The bf16 encoder cache rounds vision features. This explains the residual cos gap vs HF fp32; it is the same rounding as the runner's other VLMs.
+- `LLM.chat` with a video content part needs a URL or data URI (vLLM's chat parser). Offline use goes through `prompt` + `multi_modal_data`.
+- This branch adds two runner/platform changes outside this directory: the `pre_register_and_update` registration and the SWA block alignment to 2 x 128 for LNC=2 (`_compute_swa_num_blocks`).
 
 ## Running
 
 ```bash
 # trn2.3xlarge, TP=4, LNC=2 (text only)
-NEURON_SKIP_EFA_AFFINITY=1 python examples/vllm_neuron/models/muse_glimmer/run.py \
+NEURON_SKIP_EFA_AFFINITY=1 VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.12 python examples/vllm_neuron/models/muse_glimmer/run.py \
     --model /home/ubuntu/models/Muse-Glimmer-30B --tp 4 --max-model-len 8192
 # one image (vision DP; add --vision-tp 4 for vision TP). --vision-block = max patches per image
-NEURON_SKIP_EFA_AFFINITY=1 python examples/vllm_neuron/models/muse_glimmer/run.py \
+NEURON_SKIP_EFA_AFFINITY=1 VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.12 python examples/vllm_neuron/models/muse_glimmer/run.py \
     --model /home/ubuntu/models/Muse-Glimmer-30B --tp 4 --max-model-len 8192 \
     --image cat.jpg --vision-block 4096
 ```
