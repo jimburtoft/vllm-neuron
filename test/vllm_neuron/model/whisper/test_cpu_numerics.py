@@ -292,6 +292,10 @@ def test_warmup_inputs(hf_checkpoint):
 
 def test_fused_decode_matches_torch_path(hf_checkpoint, monkeypatch):
     """WHISPER_FUSED_DECODE=1 (attention_decode, torch fallback on CPU) gives the HF greedy tokens."""
+    from vllm_neuron.functional.attention import attention_decode as _ad
+
+    if not hasattr(_ad, "_fold_gqa_block_kv_mask"):
+        pytest.skip("The fused decode needs the GQA decode-mask fold (#4817).")
     path, hf = hf_checkpoint
     monkeypatch.setenv("WHISPER_FUSED_DECODE", "1")
     model = _build_native(path)
