@@ -157,6 +157,20 @@ class NeuronConfig:
     # there and reclaim the memory. Only those two points have been measured, so there
     # is no automatic threshold.
     fp8_keep_bf16_for_prefill: bool = True
+    # GPT-OSS only. Number of statically scheduled MoE blocks for prefill, or None to
+    # keep the static kernel. Prefill MoE sizes its block list for the worst case, so
+    # 18-32% of the blocks of a full chunk hold only padding, and a partly filled chunk
+    # has more. With a value N >= 0 the shard_on_i prefill kernel becomes
+    # shard_on_i_hybrid: the first N blocks run in a static loop and the rest in a
+    # dynamic loop bounded by the non-empty block count, so empty blocks are skipped.
+    #
+    # Off by default because older neuronx-cc releases (seen on 2.27.5334) fail with
+    # NCC_IGCA024 compiling the hybrid kernel in graphs of 6 or more layers, i.e. on
+    # every GPT-OSS compile. neuronx-cc 2.0.415991 compiles it.
+    # Measured on GPT-OSS 20B (trn2.3xlarge, TP=4, BF16, that compiler), N=16: TTFT
+    # -24 to -38% at max_num_batched_tokens 512 and -11 to -46% at 2048, for prompts of
+    # 128 to 2048 tokens.
+    prefill_moe_num_static_block: int | None = None
     # all2all communication backend when EP is enabled. vLLM's --all2all-backend
     # Literal does not include 'neuron'.
     all2all_backend: Literal[None, "neuron"] = None
@@ -279,6 +293,9 @@ class NeuronConfig:
             quantization=config_dict.get("quantization"),
             fp8_keep_bf16_for_prefill=config_dict.get(
                 "fp8_keep_bf16_for_prefill", True
+            ),
+            prefill_moe_num_static_block=config_dict.get(
+                "prefill_moe_num_static_block"
             ),
             all2all_backend=config_dict.get("all2all_backend"),
             modules_to_not_convert=config_dict.get("modules_to_not_convert"),

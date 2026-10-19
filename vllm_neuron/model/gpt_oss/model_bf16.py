@@ -151,9 +151,37 @@ def _select_prefill_moe_implementation(
     """
     if fp8_experts:
         return MoECTEImplementation.shard_on_i
+
     if intermediate_size_per_rank >= _SHARD_ON_BLOCK_MIN_I_TP:
         return MoECTEImplementation.shard_on_block
     return MoECTEImplementation.shard_on_i
+
+
+def _apply_prefill_moe_num_static_block(
+    implementation: MoECTEImplementation,
+    num_static_block: int | None,
+) -> tuple[MoECTEImplementation, int | None]:
+    """Switch shard_on_i prefill to the hybrid kernel when a block count is set.
+
+    ``shard_on_i_hybrid`` runs the first ``num_static_block`` MoE blocks in a
+    static loop and the rest in a dynamic loop bounded by the number of
+    non-empty blocks, so empty blocks are skipped. See
+    ``NeuronConfig.prefill_moe_num_static_block`` for the compiler requirement.
+    ``shard_on_block`` has no hybrid variant, so the setting does not apply
+    there.
+
+    Args:
+        implementation: The implementation chosen by
+            ``_select_prefill_moe_implementation``.
+        num_static_block: The configured static block count, or ``None``.
+
+    Returns:
+        ``(implementation, num_static_block)`` to use. ``num_static_block`` is
+        ``None`` whenever the static kernel stays.
+    """
+    if num_static_block is None or implementation != MoECTEImplementation.shard_on_i:
+        return implementation, None
+    return MoECTEImplementation.shard_on_i_hybrid, num_static_block
 
 
 # =============================================================================
@@ -1179,6 +1207,13 @@ class GptOssExperts(nn.Module):
             self.intermediate_size_per_rank,
             fp8_experts=self.fp8_experts and not self.fp8_keep_bf16_for_prefill,
         )
+        (
+            self.prefill_moe_implementation,
+            self.prefill_moe_num_static_block,
+        ) = _apply_prefill_moe_num_static_block(
+            self.prefill_moe_implementation,
+            getattr(config.neuron_config, "prefill_moe_num_static_block", None),
+        )
 
         # <-- MODEL-SPECIFIC: SwiGLU activation parameters
         self.alpha = config.swiglu_alpha
@@ -1541,7 +1576,17 @@ class GptOssExperts(nn.Module):
             block_to_expert,
             conditions,
         ) = NF.build_blockwise_mapping(
-            expert_affinities=expert_affinities,
+            # build_blockwise_mapping builds the expert mask from the affinities before
+            # it applies padding_mask, so the padding tokens of a partly filled chunk
+            # are still routed and take real block slots. Zero their affinities first
+            # so they take none; the hybrid kernel then skips the freed blocks. The
+            # outputs of padding tokens are discarded either way.
+            expert_affinities=(
+                expert_affinities
+                * padding_mask.unsqueeze(1).to(expert_affinities.dtype)
+                if padding_mask is not None
+                else expert_affinities
+            ),
             num_local_experts=self.num_local_experts,
             num_experts_per_token=self.num_experts_per_token,
             block_size=self.block_size,
@@ -1552,6 +1597,11 @@ class GptOssExperts(nn.Module):
 
         output = NF.moe_cte(
             implementation=self.prefill_moe_implementation,
+            **(
+                {"num_static_block": self.prefill_moe_num_static_block}
+                if self.prefill_moe_num_static_block is not None
+                else {}
+            ),
             conditions=conditions,
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
