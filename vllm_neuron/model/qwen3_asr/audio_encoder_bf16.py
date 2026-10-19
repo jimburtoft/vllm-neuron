@@ -605,8 +605,9 @@ class Qwen3ASREncoder(nn.Module):
             chunk_slots: ``[num_blocks * slots_per_block]`` int64, the gather
                 index from ``AudioBlockAssignment.chunk_slots()`` used by the
                 ``index_select`` below. Entry ``s`` is the base chunk index that
-                fills block slot ``s``. The gather runs on the mel chunks, before
-                the conv frontend. A real slot points at its base chunk; a
+                fills block slot ``s``. At DP > 1 the gather runs on the mel
+                chunks, before the conv frontend; at DP 1 it runs on the conv
+                output. A real slot points at its base chunk; a
                 padding slot points at chunk 0 (a harmless duplicate),
                 and the bounds give it an empty span so it does not attend.
             encoder_cache_buffer: optional ``[num_cache_blocks, cache_block_size, output_dim]``.
@@ -695,39 +696,43 @@ class Qwen3ASREncoder(nn.Module):
             )  # moves num_chunks to the batch dim
         )  # this single permute is valid only because the batch dim is 1
 
-        # Step 2: Gather base chunks into their block slots BEFORE the conv frontend.
-        # The conv frontend runs on each base chunk independently (chunks are the
-        # batch dim), so conv(index_select(mel)) == index_select(conv(mel)). Gather
-        # first, so that the DP scatter below can also shard the conv work.
-        # [num_chunks, 1, mel, frames] -> [num_slots, 1, mel, frames]
-        chunked = chunked.index_select(0, chunk_slots)
-
-        # >>> PARALLELISM: DP scatter — each rank takes its slice of blocks <<<
-        # Blocks are independent, so each rank only needs its own. Shard the chunk
-        # slots before the conv frontend, so that each rank runs the conv on its
-        # own blocks only. shard_select keeps the offset a runtime graph input, so
-        # all ranks share one graph.
+        # Step 2: Gather base chunks into their block slots, and shard the slots
+        # across DP ranks. The conv frontend runs on each base chunk on its own
+        # (chunks are the batch dim), so conv(index_select(mel)) equals
+        # index_select(conv(mel)). The gather can run before or after the conv:
+        # - DP > 1: gather and shard BEFORE the conv, so that each rank runs the
+        #   conv on its own blocks only.
+        # - DP 1: gather AFTER the conv. Then the conv runs once per base chunk,
+        #   not once per slot (padding slots repeat chunk 0), which is less work
+        #   when a short clip is padded up to its block.
         if self.dp_size > 1:
+            # >>> PARALLELISM: DP scatter — each rank takes its slice of blocks <<<
+            # Blocks are independent, so each rank only needs its own.
+            # shard_select keeps the offset a runtime graph input, so all ranks
+            # share one graph.
             assert num_blocks % self.dp_size == 0, (
                 f"num_blocks ({num_blocks}) must be a multiple of dp_size "
                 f"({self.dp_size}). Fix the dp-aligned block padding in "
                 f"plan_audio_blocks."
             )
+            # [num_chunks, 1, mel, frames] -> [num_slots, 1, mel, frames]
+            chunked = chunked.index_select(0, chunk_slots)
             chunked = shard_select(chunked, 0, self.dp_group)
             bound_min = shard_select(bound_min, 0, self.dp_group)
             bound_max = shard_select(bound_max, 0, self.dp_group)
             num_blocks = num_blocks // self.dp_size
 
-        # Step 3: Conv frontend (3x s2p1 -> 8x downsample): [num_slots, C, freq, time_steps].
+        # Step 3: Conv frontend (3x s2p1 -> 8x downsample): [n, C, freq, time_steps],
+        # where n is this rank's slots (DP > 1) or the base chunks (DP 1).
         x = gelu(self._conv1_addmm(chunked))
         x = gelu(self.conv2d2(x))
         x = gelu(self.conv2d3(x))
-        num_slots, conv_channels, freq_bins, time_steps = x.shape
+        n, conv_channels, freq_bins, time_steps = x.shape
         x = self.conv_out(
             x.permute(0, 3, 1, 2)
             .contiguous()
-            .view(num_slots, time_steps, conv_channels * freq_bins)
-        )  # [num_slots, time_steps, d_model]
+            .view(n, time_steps, conv_channels * freq_bins)
+        )  # [n, time_steps, d_model]
         # Sinusoidal position embedding, added per base chunk (no RoPE).
         x = x + self.positional_embedding(time_steps).to(x.dtype)
 
@@ -736,6 +741,10 @@ class Qwen3ASREncoder(nn.Module):
             f"config.max_position_embeddings is "
             f"{self.config.max_position_embeddings}."
         )
+
+        if self.dp_size == 1:
+            # [num_chunks, t, H] -> [num_slots, t, H]
+            x = x.index_select(0, chunk_slots)
 
         # Pack the chunk slots into blocks.
         # -> [num_blocks, slots_per_block * t, H]
