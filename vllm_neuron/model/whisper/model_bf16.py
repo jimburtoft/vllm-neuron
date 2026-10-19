@@ -91,10 +91,15 @@ def fused_decode_enabled() -> bool:
 # Whisper always pads or cuts the audio to a 30 s window: 3000 mel frames, then
 # 1500 encoder positions after the stride-2 convolution.
 WHISPER_ENCODER_TOKENS = 1500
-# The kernel cross-attention mode keeps the cross-KV in blocks of this many
-# tokens. 12 blocks hold 1536 positions: 1500 encoder positions, then pad.
-CROSS_BLOCK = 128
-CROSS_BLOCKS_PER_SLOT = 12
+# The kernel cross-attention mode keeps the cross-KV of a slot in
+# CROSS_BLOCKS_PER_SLOT blocks of CROSS_BLOCK tokens: 1536 positions, the 1500
+# encoder positions and then pad. WHISPER_CROSS_BLOCK sets the block length.
+# The decode kernel needs a multiple of 128 blocks for each row, and shrinks a
+# larger block until it gets one (128-token blocks become 4-token blocks), so
+# 12-token blocks (128 for each slot) keep each DMA at 12 rows.
+CROSS_CTX = 1536
+CROSS_BLOCK = int(os.environ.get("WHISPER_CROSS_BLOCK", "128"))
+CROSS_BLOCKS_PER_SLOT = CROSS_CTX // CROSS_BLOCK
 
 
 def cross_k_transposed() -> bool:
@@ -534,6 +539,15 @@ class CrossAttention(nn.Module):
         out = ctx.transpose(1, 2).reshape(bsz, tgt_len, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
+    def attn_hybrid(self, hc, cross_k, cross_v, perm, active):
+        """``attn_perm`` over only the first ``active`` slots of the cross-KV.
+
+        The runner gives the low slot numbers first, so the live slots of a
+        batch of B rows are mostly below B. ``active`` is a static bucket (the
+        decode-batch bucket); ``perm`` must be ``[B, active]``.
+        """
+        return self.attn_perm(hc, cross_k[:active], cross_v[:active], perm)
+
     def attn_perm(self, hc, cross_k, cross_v, perm):
         """Cross-attention of one query row for each slot, then back to the batch rows.
 
@@ -955,8 +969,16 @@ class WhisperDecoder(nn.Module):
                 + torch.arange(nb, device=x.device, dtype=torch.int64)
             ).view(-1)
         onehot = None
+        active = None
+        if mode == "perm" and not is_prefill:
+            # WHISPER_CROSS_ACTIVE=1: attend only the first B slots for a batch
+            # of B rows. The scheduler takes the lowest free slot, so this holds
+            # when the live slots are 0..B-1; the runner must fall back
+            # otherwise (the CPU test and the harness hold it by construction).
+            if os.environ.get("WHISPER_CROSS_ACTIVE", "0") == "1":
+                active = min(slots.shape[0], owner.num_slots)
         if mode in ("onehot", "perm"):
-            num_slots = owner.num_slots
+            num_slots = owner.num_slots if active is None else active
             onehot = (
                 torch.arange(num_slots, device=slots.device, dtype=slots.dtype).view(1, -1)
                 == slots.view(-1, 1)
@@ -978,7 +1000,8 @@ class WhisperDecoder(nn.Module):
             elif slots is None:
                 cross_k, cross_v = cross_k[:1], cross_v[:1]
             elif mode in ("perm", "none") and not is_prefill:
-                pass
+                if active is not None:
+                    cross_k, cross_v = cross_k[:active], cross_v[:active]
             elif onehot is not None:
                 n = onehot.shape[0]
                 cross_k = torch.matmul(onehot, cross_k.view(cross_k.shape[0], -1)).view(
@@ -1030,7 +1053,7 @@ class WhisperDecoder(nn.Module):
             table = base
         else:
             table = build_per_head_block_table(base, heads).to(torch.int32)
-        s_ctx = nb * CROSS_BLOCK
+        s_ctx = CROSS_CTX
         pos = torch.full((1, rows), float(WHISPER_ENCODER_TOKENS), device=x.device)
         active = torch.zeros(1, rows, heads, 1, dtype=torch.float32, device=x.device)
         mask = _torch_gen_attention_decode_mask_impl(

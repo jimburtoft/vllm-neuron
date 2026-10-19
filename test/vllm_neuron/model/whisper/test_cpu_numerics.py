@@ -365,7 +365,7 @@ def test_fused_decode_matches_torch_path(hf_checkpoint, monkeypatch):
 @pytest.mark.parametrize(
     "mode,fused,kt",
     [("kernel", "0", "0"), ("kernel", "1", "0"), ("perm", "1", "0"), ("perm", "1", "1"),
-     ("mask", "1", "1")],
+     ("mask", "1", "1"), ("perm-active", "1", "1")],
 )
 def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
     """WHISPER_CROSS_MODE=kernel (blocked cross-KV, attention_decode) and perm give the HF tokens.
@@ -378,12 +378,21 @@ def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
     if not hasattr(_ad, "_fold_gqa_block_kv_mask"):
         pytest.skip("The kernel cross mode needs the GQA decode-mask fold (#4817).")
     path, hf = hf_checkpoint
+    if mode == "perm-active":
+        # The batch has 3 rows and the slots are 2, 0 and 3 (scratch): every
+        # slot is below the first 4, so the active window covers them.
+        mode = "perm"
+        monkeypatch.setenv("WHISPER_CROSS_ACTIVE", "1")
     monkeypatch.setenv("WHISPER_CROSS_MODE", mode)
     monkeypatch.setenv("WHISPER_FUSED_DECODE", fused)
     monkeypatch.setenv("WHISPER_CROSS_KT", kt)
     model = _build_native(path, max_num_seqs=3)
     assert model.audio_tower.blocked == (mode == "kernel")
-    assert model.audio_tower.cross_k_0.shape[0] == (4 * 12 if mode == "kernel" else 4)
+    from vllm_neuron.model.whisper.model_bf16 import CROSS_BLOCKS_PER_SLOT
+
+    assert model.audio_tower.cross_k_0.shape[0] == (
+        4 * CROSS_BLOCKS_PER_SLOT if mode == "kernel" else 4
+    )
 
     torch.manual_seed(2)
     mels = [torch.randn(1, 128, 3000), torch.randn(1, 128, 3000)]
