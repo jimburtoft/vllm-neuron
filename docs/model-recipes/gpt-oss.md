@@ -71,6 +71,52 @@ deploying gpt-oss 20B and 120B on Trn3 (MXFP4) or Trn2 (BF16) via two paths: a
 single-instance server and a disaggregated-inference (separate prefill and
 decode) deployment.
 
+## Trn2 performance options
+
+On Trn2 the published checkpoints load with no `--hf-overrides`. Instances without
+EFA (for example trn2.3xlarge) log a warning and continue. If `max_num_batched_tokens`
+does not enable segmented prefill, default prefix caching is turned off with a warning.
+
+| `neuron_config` option | Effect on Trn2 |
+|---|---|
+| `"quantization": "fp8"` | Requantizes the MXFP4 expert weights to FP8 E4M3 (row scales, power-of-two, exact). Decode reads half the expert bytes. By default a BF16 copy of the experts is kept for prefill, and `gpu_memory_utilization` is capped at 0.80 so compiled graphs still fit (`GPTOSS_HYBRID_PREFILL=0` drops the copy and the cap). |
+| `"quantization": "bf16"` (default) | MXFP4 dequantized to BF16 |
+| `"decode_context_length_buckets": [1024, 2048, 4096, 7168]` | Compiles decode at several context lengths, so short requests do not pay for `max_model_len` on every step |
+| `"on_device_sampling_config": {"all_greedy": true}` | Greedy-only serving skips the general sampler |
+
+The defaults also:
+- write only the new token slots into the paged KV cache during prefill, so TTFT does
+  not grow with the KV cache size;
+- use the `shard_on_i` prefill MoE kernel;
+- run decode attention for both full and sliding-window layers on the NKI
+  `attention_block_tkg` kernel (per-KV-head block table);
+- give prefill padding tokens no MoE routing.
+
+With the companion NKI Library branch
+(`pip install "git+https://github.com/jimburtoft/nki-library.git@gptoss-trn2-perf-2.33"`,
+then `rm -rf ~/.cache/neuron_libtorch`), the model also uses a gate/up-major FP8 decode
+weight layout and the hybrid static/dynamic prefill MoE kernel, which skips empty blocks.
+The model detects the installed kernels, and works unchanged with the bundled NKI Library.
+
+Recommended starting point on trn2.3xlarge:
+
+```python
+LLM(model="openai/gpt-oss-20b", tensor_parallel_size=4, max_model_len=8192,
+    block_size=128, max_num_batched_tokens=512, enable_prefix_caching=False,
+    additional_config={"neuron_config": {
+        "quantization": "fp8",
+        "decode_context_length_buckets": [1024, 2048, 4096, 7168],
+        "on_device_sampling_config": {"all_greedy": True}}})
+```
+
+Use `max_num_batched_tokens=2048` when most prompts are longer than about 500 tokens.
+Every component can be switched back to the original path with an environment
+variable (`GPTOSS_KV_WRITE=kernel`, `GPTOSS_PREFILL_IMPL=shard_on_block`,
+`GPTOSS_DECODE_ATTN=torch`, `GPTOSS_PREFILL_NSB=-1`, `GPTOSS_MASK_PAD_ROUTE=0`,
+`GPTOSS_GU_MAJOR=0`, `GPTOSS_DECODE_OPT=base`); see the top of
+`vllm_neuron/model/gpt_oss/model_bf16.py`. Decode graphs compile at `-O3` by default
+(`GPTOSS_DECODE_OPT`).
+
 ## Known issues
 
 - **Intermittent HTTP 500 errors with an FP8 KV cache on Trn3.** A race

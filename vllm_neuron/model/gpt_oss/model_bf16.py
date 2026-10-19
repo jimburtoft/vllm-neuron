@@ -24,6 +24,7 @@ PARALLELISM SHARDING:
 
 import logging
 import math
+import os
 
 import nki.language as nl
 import torch
@@ -73,9 +74,109 @@ from .config import GptOssConfig
 DECODE_RSAG_TOKEN_THRESHOLD = 128
 
 
+# ── Environment overrides ─────────────────────────────────────────────────────
+# All defaults are the recommended configuration; the variables exist to A/B a
+# component or to fall back to the stock kernel path.
+#
+# GPTOSS_KV_WRITE        "scatter" (default) | "kernel"
+#     bf16 segmented-prefill KV write. "scatter" writes only the new slots;
+#     "kernel" uses the qkv kernel's in-kernel write (see forward_prefill).
+# GPTOSS_PREFILL_IMPL    "shard_on_i" (default) | "shard_on_block"
+#     Prefill MoE kernel for the BF16 path when GPTOSS_PREFILL_NSB resolves to -1.
+#     shard_on_i gives ~1.2-1.5x lower TTFT than shard_on_block. FP8 prefill
+#     never uses shard_on_block (it discards the FP8 dequant scales).
+# GPTOSS_HYBRID_PREFILL  "1" (default) | "0"
+#     FP8 only: keep a BF16 copy of the expert weights for prefill and use FP8
+#     for decode. Prefill is compute-bound and bwmm_shard_on_I upcasts every FP8
+#     weight tile to bf16, which adds TTFT; decode is DMA-bound and keeps the FP8
+#     win. Costs extra HBM for the BF16 copy (smaller KV cache).
+# GPTOSS_DECODE_ATTN     "kernel" (default) | "torch"
+#     GQA decode attention via the NKI attention_block_tkg kernel, or the
+#     PyTorch fallback.
+# GPTOSS_GQA_LAYERS      "all" (default) | "full"
+#     Layers that use the GQA decode kernel. "full" keeps sliding-window layers
+#     on the PyTorch fallback.
+# GPTOSS_PREFILL_NSB     "auto" (default) | integer
+#     Number of static blocks for the shard_on_i_hybrid prefill MoE kernel,
+#     used for BF16 and FP8 when >= 0. The first NSB blocks run in a static
+#     loop, the rest in a dynamic loop bounded by the number of non-empty
+#     blocks, so padding blocks are skipped. "auto" selects 16 if the installed
+#     nkilib attention_segmented_cte advertises SWA_SINK_STATIC (without it,
+#     neuronx-cc fails with NCC_IGCA024 on graphs with >= 6 layers), else -1.
+#     -1 disables the hybrid kernel (FP8: shard_on_i; BF16: GPTOSS_PREFILL_IMPL).
+# GPTOSS_MASK_PAD_ROUTE  "1" (default) | "0"
+#     Zero the routing affinities of prefill padding tokens so they get no MoE
+#     blocks.
+# GPTOSS_GU_MAJOR        "auto" (default) | "1" | "0"
+#     FP8 hybrid only: store the decode gate/up weight as [E, 2, H, I] so each
+#     moe_tkg weight DMA moves contiguous rows. Requires an nkilib moe_tkg that
+#     understands this layout (SUPPORTS_GATE_UP_MAJOR); stock nkilib would read
+#     it as [E, H, 2, I] and produce wrong output. "auto" enables it only if the
+#     installed nkilib advertises support.
+# GPTOSS_DECODE_OPT      "3" (default) | integer | "base"
+#     neuronx-cc optimization level for the decode graph (see
+#     GptOssForCausalLM.compiler_args_for). -O3 disables the modular flow, which
+#     removes the function-return / semaphore wrapper around every collective.
+#     "base" keeps the level the runner passes in. Prefill is unaffected.
+_GPTOSS_KV_SCATTER = os.environ.get("GPTOSS_KV_WRITE", "scatter") != "kernel"
+
+_GPTOSS_PREFILL_IMPL = (
+    MoECTEImplementation.shard_on_block
+    if os.environ.get("GPTOSS_PREFILL_IMPL", "shard_on_i") == "shard_on_block"
+    else MoECTEImplementation.shard_on_i
+)
+
+_GPTOSS_HYBRID_PREFILL = os.environ.get("GPTOSS_HYBRID_PREFILL", "1") == "1"
+
+_GPTOSS_GQA_DECODE_KERNEL = os.environ.get("GPTOSS_DECODE_ATTN", "kernel") != "torch"
+
+_GPTOSS_GQA_LAYERS = os.environ.get("GPTOSS_GQA_LAYERS", "all")
+
+
+def _gptoss_prefill_nsb_default() -> int:
+    _v = os.environ.get("GPTOSS_PREFILL_NSB", "auto")
+    if _v != "auto":
+        return int(_v)
+    try:
+        from nkilib.core.attention import attention_segmented_cte as _asc
+
+        return 16 if getattr(_asc, "SWA_SINK_STATIC", False) else -1
+    except Exception:
+        return -1
+
+
+_GPTOSS_PREFILL_NSB = _gptoss_prefill_nsb_default()
+
+_GPTOSS_MASK_PAD_ROUTE = os.environ.get("GPTOSS_MASK_PAD_ROUTE", "1") == "1"
+
+
+def _gptoss_gu_major_default() -> bool:
+    _v = os.environ.get("GPTOSS_GU_MAJOR", "auto")
+    if _v in ("0", "1"):
+        return _v == "1"
+    try:
+        from nkilib.core.moe.moe_tkg import (
+            all_expert_impl as _aei,
+            selective_expert_impl as _sei,
+        )
+
+        return bool(
+            getattr(_sei, "SUPPORTS_GATE_UP_MAJOR", False)
+            and getattr(_aei, "SUPPORTS_GATE_UP_MAJOR", False)
+        )
+    except Exception:
+        return False
+
+
+_GPTOSS_GU_MAJOR = _gptoss_gu_major_default()
+
 # ── Weight Loaders ────────────────────────────────────────────────────────────
 # Reuse existing weight loaders. These handle checkpoint format transformations
 # (MXFP4 dequantization, TP sharding, hidden dim padding).
+from vllm_neuron.model.gpt_oss.quantization_fp8 import (
+    FP8_TRN2_DTYPE,
+    quantize_expert_state_dict,
+)
 from vllm_neuron.model.gpt_oss.weight_loaders_bf16 import (
     fused_qkv_weight_loader,
     fused_qkv_bias_loader,
@@ -635,7 +736,14 @@ class GptOssAttention(nn.Module):
             # segmented_attention). The qkv kernel cannot emit the swizzled
             # packed-FP8 K layout, so packed FP8 falls back to a plain projection
             # + explicit (un)swizzled scatter.
-            if not self.fp8_packed:
+            # By default the bf16 paged cache is written with the explicit scatter
+            # below instead of the in-kernel write. When num_kv_heads_per_rank > 1
+            # the qkv wrapper bridges the 4D paged cache to the kernel's 3D layout
+            # by copying the entire K and V cache out and back every prefill layer
+            # (qkv.py `_reshape_kv_4d_to_3d`), so TTFT grows with KV cache size.
+            # The scatter writes only the new slots. GPTOSS_KV_WRITE=kernel selects
+            # the in-kernel write.
+            if not self.fp8_packed and not _GPTOSS_KV_SCATTER:
                 # Sanitize slot_mapping for the in-kernel scatter: the qkv NKI
                 # kernel uses slot_mapping values as direct DMA offsets into the
                 # cache, with no oob_mode.skip on this path — out-of-range slots
@@ -790,6 +898,28 @@ class GptOssAttention(nn.Module):
 
     # ── Decode path ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _gqa_slots(slot_mapping, B_local, S_decode, nkh, block_size):
+        """Per-(batch, head) physical slots for the GQA kernel's head-inner pool view.
+
+        [B*S] token slots -> [B, nkh, S] uint32. For a valid slot s and head h the pool slot is
+        ((s // bs) * nkh + h) * bs + s % bs  ==  s + (s // bs) * bs * (nkh - 1) + h * bs.
+
+        Lowering constraints (each of these fails compilation otherwise):
+          - no compare / where and no int64: XLA lowers them through s64 and neuronx-cc rejects the
+            resulting out-of-int32 constant (NCC_ESFH001);
+          - no arithmetic in uint32: torch OpMathType has no UInt32 ("Unrecognized ScalarType");
+        so compute in int32 with add/mul/floordiv only, then cast to uint32 once, matching the
+        non-GQA path's `slot_mapping.to(torch.uint32)`. Padding slots are -1: in int32 the formula
+        maps them to a small negative, which the final cast turns into a value near uint32 max, far
+        beyond the pool; the kernel's block-KV write uses oob_mode.skip, so they are dropped.
+        """
+        s = slot_mapping.view(B_local, 1, S_decode).to(torch.int32)
+        bs = block_size
+        h = (torch.arange(nkh, device=s.device, dtype=torch.int32) * bs).view(1, nkh, 1)
+        pool = s + (s // bs) * (bs * (nkh - 1)) + h
+        return pool.to(torch.uint32)
+
     def forward_decode(
         self,
         hidden_states: torch.Tensor,
@@ -887,6 +1017,21 @@ class GptOssAttention(nn.Module):
             )
 
         active_blocks_table = block_table
+        # GQA (kv_heads_per_rank > 1, e.g. 8 KV heads at TP=4 -> 2) reaches the NKI
+        # attention_block_tkg kernel only with a per-head 3D block table
+        # (attention_decode.py `_can_use_attention_block_kernel`); with the 2D table every
+        # layer takes the PyTorch fallback (repeat_interleave of K/V, transposes, torch
+        # softmax). Same approach as qwen3_vl/model_bf16.py.
+        # Pool addressing: block b, head h -> pool block b*nkh + h; token slot s -> pool slot
+        # (s // bs * nkh + h) * bs + s % bs. -1 (inactive) is preserved.
+        _gqa_kernel = _GPTOSS_GQA_DECODE_KERNEL and nkh > 1 and not self.fp8_packed
+        # GPTOSS_GQA_LAYERS=full: kernel only on full-attention layers (no SWA).
+        if _gqa_kernel and _GPTOSS_GQA_LAYERS == "full" and self.sliding_window is not None:
+            _gqa_kernel = False
+        if _gqa_kernel:
+            _kvh = torch.arange(nkh, dtype=block_table.dtype, device=block_table.device).view(1, nkh, 1)
+            _bt = block_table.unsqueeze(1)
+            active_blocks_table = torch.where(_bt < 0, _bt, _bt * nkh + _kvh).contiguous()
 
         # Packed FP8 is decided per decode bucket. The cache is *stored* packed
         # (self.fp8_packed), but the packed decode kernel requires the resized
@@ -943,7 +1088,11 @@ class GptOssAttention(nn.Module):
             # <-- MODEL-SPECIFIC: Sink tokens
             sink=self.sinks.unsqueeze(1),
             update_cache=True,
-            kv_cache_update_idx=slot_mapping.view(B_local, S_decode).to(torch.uint32),
+            kv_cache_update_idx=(
+                self._gqa_slots(slot_mapping, B_local, S_decode, nkh, block_size)
+                if _gqa_kernel
+                else slot_mapping.view(B_local, S_decode).to(torch.uint32)
+            ),
             fp8_packed=use_packed_kernel,
             # Kernel currently requires fusing the V scale dequantization into W_out for KV quantization
             W_out=self.o_proj_weight / self.v_scale_float,
@@ -1117,6 +1266,16 @@ class GptOssExperts(nn.Module):
 
         # >>> PARALLELISM: Expert weights sharded on intermediate dim <<<
         # gate_up_proj: [E, H, I_per_rank*2] (gate and up interleaved)
+        # FP8 (quantization="fp8"): expert weights are declared and loaded as BF16 by the
+        # standard loaders, then quantized to FP8 ROW after loading (see load_weights).
+        # The loaders return a different geometry than this declaration and
+        # `load_state_dict(assign=True)` replaces the parameter without a shape check, so
+        # the scale must be computed from the loaded tensor, not derived from this shape.
+        self.fp8_experts = bool(
+            config.neuron_config is not None
+            and getattr(config.neuron_config, "quantization", None) == "fp8"
+        )
+
         self.gate_up_proj_weight = nn.Parameter(
             torch.empty(
                 self.num_local_experts,
@@ -1231,6 +1390,28 @@ class GptOssExperts(nn.Module):
         else:
             return self.forward_prefill(hidden_states, positions, rank)
 
+    def _prefill_uses_fp8(self) -> bool:
+        """Prefill runs FP8 only when FP8 is on AND no BF16 copy was retained."""
+        return self.fp8_experts and not hasattr(self, "gate_up_proj_weight_bf16")
+
+    def _prefill_gate_up_weight(self) -> torch.Tensor:
+        return getattr(self, "gate_up_proj_weight_bf16", self.gate_up_proj_weight)
+
+    def _prefill_down_weight(self) -> torch.Tensor:
+        return getattr(self, "down_proj_weight_bf16", self.down_proj_weight)
+
+    def _gate_up_scale_tkg(self) -> torch.Tensor:
+        """[E,1,2I] -> [E,2,I] for moe_tkg. Derived from the stored tensor, not a constant."""
+        s = self.gate_up_proj_scale
+        E = s.shape[0]
+        two_i = s.shape[-1]
+        return s.reshape(E, 2, two_i // 2)
+
+    def _down_scale_tkg(self) -> torch.Tensor:
+        """[E,1,H] -> [E,H] for moe_tkg."""
+        s = self.down_proj_scale
+        return s.reshape(s.shape[0], s.shape[-1])
+
     def _ep_rank_id(self, rank: torch.Tensor):
         """Return the ``[[ep_rank]]`` int32 kernel input as a runtime tensor.
 
@@ -1275,13 +1456,31 @@ class GptOssExperts(nn.Module):
             inp=hidden_states.unsqueeze(0),
             gamma=self.post_attention_layernorm.weight.unsqueeze(0).to(torch.float32),
             router_weights=self.router_weight.T,
-            expert_gate_up_weights=self.gate_up_proj_weight.reshape(
-                self.num_local_experts,
-                self.hidden_size,
-                2,
-                self.intermediate_size_per_rank,
+            # [E, 2, H, I] when stored gate/up-major at load (GPTOSS_GU_MAJOR), else [E, H, 2, I].
+            expert_gate_up_weights=(
+                self.gate_up_proj_weight.reshape(
+                    self.num_local_experts,
+                    2,
+                    self.hidden_size,
+                    self.intermediate_size_per_rank,
+                )
+                if (_GPTOSS_GU_MAJOR and self.fp8_experts and hasattr(self, "gate_up_proj_weight_bf16"))
+                else self.gate_up_proj_weight.reshape(
+                    self.num_local_experts,
+                    self.hidden_size,
+                    2,
+                    self.intermediate_size_per_rank,
+                )
             ),
             expert_down_weights=self.down_proj_weight,
+            # FP8: scales are stored as [E,1,2I] / [E,1,H]; moe_tkg takes gate_up [E,2,I]
+            # and down [E,H]. Shapes are derived from the stored scale tensors.
+            expert_gate_up_weights_scale=(
+                self._gate_up_scale_tkg() if self.fp8_experts else None
+            ),
+            expert_down_weights_scale=(
+                self._down_scale_tkg() if self.fp8_experts else None
+            ),
             rank_id=rank_id,
             top_k=self.num_experts_per_token,
             router_bias=self.router_bias.unsqueeze(0),
@@ -1426,7 +1625,15 @@ class GptOssExperts(nn.Module):
             block_to_expert,
             conditions,
         ) = NF.build_blockwise_mapping(
-            expert_affinities=expert_affinities,
+            # Padding tokens of a partly filled chunk are still routed (build_blockwise_mapping
+            # builds expert_mask from the affinities before applying padding_mask), so they occupy
+            # real block slots. Zeroing their affinities gives them no blocks; the hybrid kernel
+            # then skips the empty blocks. Padding outputs are discarded either way.
+            expert_affinities=(
+                expert_affinities * padding_mask.unsqueeze(1).to(expert_affinities.dtype)
+                if (_GPTOSS_MASK_PAD_ROUTE and padding_mask is not None)
+                else expert_affinities
+            ),
             num_local_experts=self.num_local_experts,
             num_experts_per_token=self.num_experts_per_token,
             block_size=self.block_size,
@@ -1436,23 +1643,41 @@ class GptOssExperts(nn.Module):
         )
 
         output = NF.moe_cte(
-            implementation=MoECTEImplementation.shard_on_block,
+            # FP8 must use shard_on_i (or shard_on_i_hybrid): bwmm_shard_on_block discards
+            # the FP8 dequant scales (`# Placeholder for FP8: gup_scale = None;
+            # down_scale = None`), while bwmm_shard_on_I applies them (scale -> bias -> clamp).
+            implementation=(
+                MoECTEImplementation.shard_on_i_hybrid
+                if _GPTOSS_PREFILL_NSB >= 0
+                else MoECTEImplementation.shard_on_i
+                if self.fp8_experts
+                else _GPTOSS_PREFILL_IMPL
+            ),
+            **({"num_static_block": _GPTOSS_PREFILL_NSB} if _GPTOSS_PREFILL_NSB >= 0 else {}),
             conditions=conditions,
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
-            gate_up_proj_weight=self.gate_up_proj_weight.reshape(
+            gate_up_proj_weight=self._prefill_gate_up_weight().reshape(
                 self.num_local_experts,
                 self.hidden_size,
                 2,
                 self.intermediate_size_per_rank,
             ),
-            down_proj_weight=self.down_proj_weight,
+            down_proj_weight=self._prefill_down_weight(),
             gate_and_up_proj_bias=self.gate_up_proj_bias.reshape(
                 self.num_local_experts,
                 2,
                 self.intermediate_size_per_rank,
             ),
             down_proj_bias=self.down_proj_bias.unsqueeze(1),
+            # FP8 prefill (no BF16 copy retained): moe_cte takes the [E,1,2I] / [E,1,H]
+            # scales directly; non-MX FP8 has no gen4 requirement.
+            gate_up_proj_scale=(
+                self.gate_up_proj_scale if self._prefill_uses_fp8() else None
+            ),
+            down_proj_scale=(
+                self.down_proj_scale if self._prefill_uses_fp8() else None
+            ),
             # <-- MODEL-SPECIFIC: SwiGLU with clamping
             activation_function=ActFnType.Swish,
             block_size=self.block_size,
@@ -1571,6 +1796,8 @@ def _precompute_decode_attn_masks(
     attn_metadata: dict,
     positions: torch.Tensor,
     num_q_heads_after_a2a: int,
+    kv_fold_swa: int = 1,
+    kv_fold_full: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pre-compute the shared decode attention masks for one decode step.
 
@@ -1639,16 +1866,9 @@ def _precompute_decode_attn_masks(
             swa_pos_ids = torch.clamp(swa_pos_ids, min=0)
         swa_start_pos_ids = torch.clamp(swa_pos_ids - sliding_window + 1, min=0)
 
-    swa_mask = NF.gen_attention_decode_mask(
-        pos_ids=swa_pos_ids.to(torch.float32),
-        bs=B_local,
-        q_head=num_q_heads_after_a2a,
-        s_active=S_decode,
-        s_prior=S_ctx_swa,
-        start_pos=swa_start_pos_ids.to(torch.float32)
-        if swa_start_pos_ids is not None
-        else None,
-        block_len=block_size,
+    swa_mask = _gen_mask_folded(
+        swa_pos_ids, swa_start_pos_ids, B_local, num_q_heads_after_a2a, S_decode, S_ctx_swa,
+        block_size, kv_fold_swa,
     )
 
     # --- Full causal mask (odd layers) ---
@@ -1660,17 +1880,52 @@ def _precompute_decode_attn_masks(
     full_max_blocks = attn_metadata[non_swa_layer_name]["max_blocks_per_seq"]
     S_ctx_full = full_max_blocks * block_size
 
-    full_mask = NF.gen_attention_decode_mask(
-        pos_ids=pos_ids_flat.to(torch.float32),
-        bs=B_local,
-        q_head=num_q_heads_after_a2a,
-        s_active=S_decode,
-        s_prior=S_ctx_full,
-        start_pos=None,
-        block_len=block_size,
+    full_mask = _gen_mask_folded(
+        pos_ids_flat, None, B_local, num_q_heads_after_a2a, S_decode, S_ctx_full,
+        block_size, kv_fold_full,
     )
 
     return swa_mask, full_mask
+
+
+def _gen_mask_folded(pos_ids_flat, start_pos_flat, B_local, q_heads, S_decode, S_ctx, block_size, kv_fold):
+    """Generate the decode mask in the geometry the GQA attention kernel uses.
+
+    attention_block_tkg folds kv_heads into the batch dim (bs = B * kv_heads, q_head = q_heads / kv_heads)
+    and reads the precomputed mask as [S_ctx, B*kv_heads, q_heads/kv_heads, S]. The block-KV mask's s_prior
+    layout depends on the LNC sharding (batch vs s_prior) and block_len resize, which are chosen from
+    (bs, q_head, s_prior). The unfolded (B, q_heads) geometry can pick a different sharding than the
+    folded one (e.g. the 256-token SWA context at odd B picks s_prior sharding unfolded and batch
+    sharding folded), so the mask must be built in the folded geometry. kv_fold=1 keeps the
+    unfolded geometry used by the PyTorch fallback.
+    """
+    if kv_fold > 1:
+        pos_f = pos_ids_flat.reshape(B_local, S_decode).repeat_interleave(kv_fold, dim=0).reshape(1, -1)
+        st_f = (
+            start_pos_flat.reshape(B_local, S_decode).repeat_interleave(kv_fold, dim=0).reshape(1, -1)
+            if start_pos_flat is not None
+            else None
+        )
+        m = NF.gen_attention_decode_mask(
+            pos_ids=pos_f.to(torch.float32),
+            bs=B_local * kv_fold,
+            q_head=q_heads // kv_fold,
+            s_active=S_decode,
+            s_prior=S_ctx,
+            start_pos=st_f.to(torch.float32) if st_f is not None else None,
+            block_len=block_size,
+        )
+        # [S_ctx, B*kv, q/kv, S] -> [S_ctx, B, q, S]; the kernel re-folds with the same (b, h) order.
+        return m.reshape(m.shape[0], B_local, q_heads, S_decode)
+    return NF.gen_attention_decode_mask(
+        pos_ids=pos_ids_flat.to(torch.float32),
+        bs=B_local,
+        q_head=q_heads,
+        s_active=S_decode,
+        s_prior=S_ctx,
+        start_pos=start_pos_flat.to(torch.float32) if start_pos_flat is not None else None,
+        block_len=block_size,
+    )
 
 
 class GptOssDecoderLayer(nn.Module):
@@ -2030,11 +2285,18 @@ class GptOssModel(nn.Module):
         swa_mask = None
         full_mask = None
         if not is_prefill:
+            _a0 = self.layers[0].self_attn
+            _nkh = _a0.num_key_value_heads_per_rank
+            _gqa = _GPTOSS_GQA_DECODE_KERNEL and _nkh > 1 and not _a0.fp8_packed
             swa_mask, full_mask = _precompute_decode_attn_masks(
                 sliding_window=self.config.sliding_window,
                 attn_metadata=attn_metadata,
                 positions=positions,
-                num_q_heads_after_a2a=self.layers[0].self_attn.num_q_heads_after_a2a,
+                num_q_heads_after_a2a=_a0.num_q_heads_after_a2a,
+                # fold only for the layer types that run the GQA kernel (the torch fallback
+                # consumes the stock-geometry mask)
+                kv_fold_swa=_nkh if (_gqa and _GPTOSS_GQA_LAYERS == "all") else 1,
+                kv_fold_full=_nkh if _gqa else 1,
             )
 
         # Run through decoder layers, collecting Eagle3 auxiliary hidden states
@@ -2083,6 +2345,22 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
     - Gathered for full logits (when not using on-device sampling)
     - Kept sharded for on-device sampling (sampler handles TP internally)
     """
+
+    def compiler_args_for(self, graph_type, example_inputs, base):
+        """Per-graph neuronx-cc args (runner hook; same policy as Qwen3-VL/ASR).
+
+        Compile the decode graph at -O3, which disables the modular flow and removes the
+        PSEUDO_FUNCTION_RETURN / EVENT_SEMAPHORE wrapper around every collective. Prefill
+        keeps the caller's level. GPTOSS_DECODE_OPT=<n> overrides the decode level; "base"
+        keeps the caller's level.
+        """
+        from vllm_neuron.utils.compiler_args_ctx import with_optimization_level
+
+        base = list(base or [])
+        lvl = os.environ.get("GPTOSS_DECODE_OPT", "3")
+        if graph_type == "decode" and lvl != "base":
+            return with_optimization_level(base, int(lvl))
+        return base
 
     def __init__(self, config: GptOssConfig, batch_size: int):
         super().__init__()
@@ -2485,13 +2763,45 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
                 mappings[f"{layer_prefix}.mlp.experts.down_proj_weight"] = (
                     f"{layer_prefix}.mlp.experts.down_proj"
                 )
+        # Single source of truth: read the flag off the constructed MoE block, so the
+        # parameter declarations and this quantization decision cannot disagree.
+        _fp8_experts = bool(
+            getattr(self.model.layers[0].mlp.experts, "fp8_experts", False)
+        )
+
         rank_sharded_checkpoint = checkpoint.load_sharded_pipelined(
             tp_rank, tp_size, self, mappings, device
         ).state_dict
 
         self._load_kv_cache_scales(checkpoint, device)
 
+        # Quantize expert weights to FP8 in the state dict, before load_state_dict:
+        #   1. After the loaders run, because their output geometry differs from the
+        #      parameter declaration and `assign=True` accepts the mismatch; the scale
+        #      must be computed from the actual loaded tensor.
+        #   2. Before load_state_dict, because a bf16->fp8 cast on the Neuron device
+        #      raises "Expected self.dtype() == dst.dtype()". The quantizer copies each
+        #      tensor to host and does the arithmetic in CPU torch.
+        _fp8_scales = {}
+        if _fp8_experts:
+            rank_sharded_checkpoint, _fp8_scales = quantize_expert_state_dict(
+                rank_sharded_checkpoint, self, keep_bf16=_GPTOSS_HYBRID_PREFILL,
+                gate_up_major=_GPTOSS_GU_MAJOR,
+            )
+
         self.load_state_dict(rank_sharded_checkpoint, strict=False, assign=True)
+        # Register the FP8 dequant scales (and optional BF16 prefill copies) after
+        # load_state_dict. They cannot be declared in __init__ because
+        # `load_sharded_pipelined(self, ...)` requires a checkpoint key for every
+        # parameter, and the checkpoint has no FP8 scales.
+        for _pname, _tensor in _fp8_scales.items():
+            _mod = self
+            *_path, _leaf = _pname.split(".")
+            for _p in _path:
+                _mod = getattr(_mod, _p) if not _p.isdigit() else _mod[int(_p)]
+            _mod.register_parameter(
+                _leaf, nn.Parameter(_tensor, requires_grad=False)
+            )
 
     def load_weights_lite(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None

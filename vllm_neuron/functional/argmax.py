@@ -7,6 +7,7 @@ sharded tensors in a tensor-parallel setting.
 """
 
 import logging
+import math
 from typing import Optional
 
 import torch
@@ -199,6 +200,17 @@ def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:
     # across `grid` programs. Each program gets a maximum of pmax rows.
     grid = 1 if envs.VLLM_NEURON_CPU_MODE else get_logical_nc_config()
     if shape[-2] > nl.tile_size.pmax * grid:
+        return False
+
+    # The cascaded_max kernel splits each row across up to 128 partitions
+    # (rows are split across the `grid` programs), and its nc_find_index8 step
+    # takes at most 16384 elements per partition. Large batches over a large
+    # per-rank vocabulary (for example batch > 64 for GPT-OSS at TP=4, 50272
+    # per rank) exceed that and fail to compile, so use torch.max for them.
+    rows = math.prod(shape[:-1])
+    rows_per_program = math.ceil(rows / grid) if rows > 1 else 1
+    stages = min(nl.tile_size.pmax // rows_per_program, shape[dim] // 128)
+    if stages < 1 or math.ceil(shape[dim] / stages) > 16384:
         return False
 
     return True

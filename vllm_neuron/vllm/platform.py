@@ -106,6 +106,10 @@ def _patch_dcp_config_validation():
 # still carries that information. Mirrors the CLI-side `sys.argv` check in
 # `apply_config_platform_defaults` below for the offline API.
 _llm_init_explicit_optimization_level = False
+# True while LLM.__init__ runs with an explicit `enable_prefix_caching` kwarg.
+# NeuronPlatform._maybe_disable_default_prefix_caching reads it, for the same
+# reason as the optimization-level flag above.
+_llm_init_explicit_prefix_caching = False
 _llm_init_patched = False
 
 
@@ -158,21 +162,25 @@ def _apply_llm_init_patch(LLM):
     original `__init__` (no fork yet), so `apply_config_platform_defaults`
     can read the flag while it's still set.
     """
-    if getattr(LLM.__dict__.get("__init__"), "_neuron_optlevel_patched", False):
+    if getattr(LLM.__dict__.get("__init__"), "_neuron_llm_init_patched", False):
         return
 
     _orig_init = LLM.__init__
 
     def _patched_init(self, *args, **kwargs):
         global _llm_init_explicit_optimization_level
+        global _llm_init_explicit_prefix_caching
         prev = _llm_init_explicit_optimization_level
+        prev_apc = _llm_init_explicit_prefix_caching
         _llm_init_explicit_optimization_level = "optimization_level" in kwargs
+        _llm_init_explicit_prefix_caching = "enable_prefix_caching" in kwargs
         try:
             _orig_init(self, *args, **kwargs)
         finally:
             _llm_init_explicit_optimization_level = prev
+            _llm_init_explicit_prefix_caching = prev_apc
 
-    _patched_init._neuron_optlevel_patched = True
+    _patched_init._neuron_llm_init_patched = True
     LLM.__init__ = _patched_init
 
 
@@ -215,6 +223,13 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        # The published GPT-OSS checkpoints carry quant_method "mxfp4". vLLM
+        # renames it to "gpt_oss_mxfp4" for the GptOss architecture. The
+        # vLLM Neuron GPT-OSS loaders read this MXFP4 checkpoint directly.
+        # They keep MXFP4 on Trn3, and they dequantize to BF16 on Trn2. The
+        # model factory selects the path, so the checkpoint loads with no
+        # --hf-overrides.
+        "gpt_oss_mxfp4",
     ]
     # Neuron quantization paths that CPU-dequant compressed-tensors weights to
     # BF16 on the loader thread. On these paths the device only ever sees BF16
@@ -600,6 +615,8 @@ class NeuronPlatform(Platform):
         if model_config is None:
             return
 
+        cls._maybe_disable_default_prefix_caching(vllm_config)
+
         # Frontend multimodal patchify runs under vLLM's
         # set_default_torch_num_threads(), which pins torch to OMP_NUM_THREADS or
         # 1 when unset -- so patchify runs single-threaded by default. Default OMP
@@ -630,6 +647,7 @@ class NeuronPlatform(Platform):
             neuron_config["gk_decode"] = should_use_gk_decode(
                 neuron_config.get("quantization"), get_platform_target(), kv_role
             )
+            cls._cap_memory_for_gpt_oss_fp8(vllm_config, neuron_config)
             if neuron_config["gk_decode"]:
                 # envs.py forces NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP=1 on
                 # every process as the Qwen3-MoE packed-KV workaround.
@@ -866,6 +884,126 @@ class NeuronPlatform(Platform):
                         f"encoder_neuron_config. For an image, you can also "
                         f"set max_pixels in mm_processor_kwargs."
                     )
+
+    # GPT-OSS quantization="fp8" keeps a BF16 copy of the expert weights for
+    # prefill by default, so its weights are ~16 GiB per logical core instead of
+    # ~11 GiB. At the vLLM default gpu_memory_utilization (0.92) the KV cache then
+    # leaves ~2 GiB of the 24 GiB HBM for NEFFs and scratch, and decode warmup at
+    # large batch x long context fails with "Allocation Failure". 0.80 leaves
+    # ~5 GiB and is the measured working value.
+    _GPT_OSS_FP8_MAX_GPU_MEMORY_UTILIZATION = 0.80
+
+    @classmethod
+    def _cap_memory_for_gpt_oss_fp8(cls, vllm_config, neuron_config) -> None:
+        """Cap gpu_memory_utilization for GPT-OSS FP8 with the BF16 prefill copy.
+
+        Applies only with the default fractional KV sizing (no explicit KV
+        headroom) and only when the BF16 prefill copy is kept
+        (GPTOSS_HYBRID_PREFILL is not "0"). Set GPTOSS_HYBRID_PREFILL=0 to drop
+        the copy and keep the full memory budget, or set
+        VLLM_NEURON_RESERVED_HEADROOM_GIB to size the KV cache explicitly.
+        """
+        if neuron_config.get("quantization") != "fp8":
+            return
+        if os.environ.get("GPTOSS_HYBRID_PREFILL", "1") == "0":
+            return
+        if envs.get_kv_headroom_env() is not None:
+            return
+        cache_config = vllm_config.cache_config
+        cap = cls._GPT_OSS_FP8_MAX_GPU_MEMORY_UTILIZATION
+        if cache_config is None or cache_config.gpu_memory_utilization <= cap:
+            return
+        logger.warning(
+            "GPT-OSS quantization=fp8 keeps a BF16 copy of the expert weights "
+            "for prefill. gpu_memory_utilization is reduced from %.2f to %.2f "
+            "so the device keeps room for compiled graphs. Set "
+            "GPTOSS_HYBRID_PREFILL=0 to drop the copy, or set "
+            "VLLM_NEURON_RESERVED_HEADROOM_GIB to size the KV cache explicitly.",
+            cache_config.gpu_memory_utilization,
+            cap,
+        )
+        cache_config.gpu_memory_utilization = cap
+
+    @classmethod
+    def _maybe_disable_default_prefix_caching(cls, vllm_config) -> None:
+        """Turn off default prefix caching when segmented prefill stays off.
+
+        Automatic Prefix Caching (APC) needs segmented prefill on Neuron. vLLM
+        turns APC on by default. The model runner defaults segmented prefill
+        on only when max_num_batched_tokens is a supported segment size and is
+        smaller than max_model_len. The default max_num_batched_tokens of the
+        LLM class is 8192, so a model with max_model_len <= 8192 gets APC on
+        and segmented prefill off. The model runner then raises at startup.
+
+        This method turns APC off when all of these conditions are true:
+
+        - APC is on, and the caller did not request APC.
+        - The caller did not set kv_segment_size_buckets.
+        - The default segment buckets are empty for this configuration.
+        - Decode-context parallelism is off. DCP keeps its own check.
+
+        An explicit APC request keeps the model runner error, so the caller
+        sees why APC cannot run.
+        """
+        cache_config = vllm_config.cache_config
+        if cache_config is None or not getattr(
+            cache_config, "enable_prefix_caching", False
+        ):
+            return
+        if _llm_init_explicit_prefix_caching or any(
+            a.startswith(("--enable-prefix-caching", "--no-enable-prefix-caching"))
+            for a in sys.argv
+        ):
+            return
+        additional_config = vllm_config.additional_config
+        neuron_config = (
+            additional_config.get("neuron_config", {})
+            if isinstance(additional_config, dict)
+            else {}
+        )
+        if "kv_segment_size_buckets" in neuron_config:
+            return
+        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        if not isinstance(dcp_size, int) or dcp_size > 1:
+            return
+
+        from vllm_neuron.utils.bucket_utils import (
+            get_default_kv_segment_size_buckets,
+            get_max_num_batched_tokens,
+        )
+
+        max_model_len = vllm_config.model_config.max_model_len
+        scheduler_max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        # Both values are ints on any real config. Leave APC alone when they
+        # are not, so this fallback never turns a missing or stand-in config
+        # value into a startup failure: the model runner still reports the APC
+        # conflict, which is the pre-existing behavior.
+        if not isinstance(max_model_len, int) or not isinstance(
+            scheduler_max_num_batched_tokens, int
+        ):
+            return
+
+        max_num_batched_tokens = get_max_num_batched_tokens(
+            scheduler_max_num_batched_tokens, max_model_len
+        )
+        if (
+            get_default_kv_segment_size_buckets(max_num_batched_tokens, max_model_len)
+            is not None
+        ):
+            return
+
+        cache_config.enable_prefix_caching = False
+        logger.warning(
+            "Prefix caching is off. It needs segmented prefill, and segmented "
+            "prefill stays off for max_num_batched_tokens=%d and "
+            "max_model_len=%d. To use prefix caching, set "
+            "max_num_batched_tokens to a supported segment size that is less "
+            "than max_model_len, for example 512 or 2048.",
+            max_num_batched_tokens,
+            max_model_len,
+        )
 
     @classmethod
     def _validate_quantization_config(cls, vllm_config) -> None:

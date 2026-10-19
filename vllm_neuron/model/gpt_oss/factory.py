@@ -126,6 +126,17 @@ class GptOssForCausalLM(nn.Module):
             _log_model_choice("model_bf16", quantization, platform, "quantization=bf16")
             return Model.from_configs(hf_config, neuron_config)
 
+        # FP8 expert weights (model_bf16 path). TRN2 has no MX matmul
+        # (nki.isa.nc_matmul_mx is NeuronCore-v4 only) but accepts non-MX
+        # float8_e4m3 nc_matmul operands, and the nkilib MoE kernels' gen4 check
+        # applies only to MX dtypes. The MXFP4 checkpoint is requantized to FP8 ROW
+        # with power-of-two scales, which is exact, halving expert-weight HBM and DMA.
+        if quantization == "fp8":
+            from .model_bf16 import GptOssForCausalLM as Model
+
+            _log_model_choice("model_bf16", quantization, platform, "quantization=fp8 (FP8 ROW experts)")
+            return Model.from_configs(hf_config, neuron_config)
+
         if platform.startswith("trn3"):
             from .model_mxfp4 import GptOssForCausalLM as Model
 
@@ -134,10 +145,18 @@ class GptOssForCausalLM(nn.Module):
             )
             return Model.from_configs(hf_config, neuron_config)
 
-        from .model_bf16 import GptOssForCausalLM as Model
+        if quantization is None:
+            from .model_bf16 import GptOssForCausalLM as Model
 
-        _log_model_choice("model_bf16", quantization, platform, "fallback")
-        return Model.from_configs(hf_config, neuron_config)
+            _log_model_choice("model_bf16", quantization, platform, "default")
+            return Model.from_configs(hf_config, neuron_config)
+
+        # Reject unrecognized values instead of silently falling back to BF16.
+        raise ValueError(
+            f"Unsupported neuron_config.quantization={quantization!r} for gpt_oss on "
+            f"platform={platform}. Supported: 'bf16', 'fp8' (TRN2/TRN3), "
+            f"'mxfp4' (TRN3 only). Omit the field for the default."
+        )
 
     @classmethod
     def _validate_config(
@@ -151,6 +170,8 @@ class GptOssForCausalLM(nn.Module):
 
         if quantization == "mxfp4" and platform == "trn2":
             raise ValueError(
-                "quantization='mxfp4' is not supported on TRN2. "
-                "Please use quantization='bf16'"
+                "quantization='mxfp4' is not supported on TRN2 (MX compute needs "
+                "nki.isa.nc_matmul_mx, a NeuronCore-v4 instruction). Use "
+                "quantization='fp8' (exact requantization, half the expert-weight "
+                "memory) or quantization='bf16'."
             )
