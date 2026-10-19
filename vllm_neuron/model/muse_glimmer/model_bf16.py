@@ -87,6 +87,116 @@ def _decode_torch_forced() -> bool:
     return os.environ.get(DECODE_TORCH_ENV, "0").strip().lower() in ("1", "true", "yes")
 
 
+# Task 023: decode KV-write mode.
+#   0 = per-layer index_put_ inside the layer loop (old behaviour);
+#   1 = defer: the same per-layer index_put_ calls, issued after the layer loop;
+#   2 = defer + coalesce: one index_put_ per physical (k, v) buffer (default).
+# Why: layers share hybrid KV buffers (``kv_cache_tensors[*].shared_by``). The
+# FX pass rewrites in-place index_put_ to functional form, and with N layers on
+# one buffer only the last result of the chain is aliasable, so the N-1
+# intermediates become full-buffer HBM copies when other ops sit between the
+# writes (Task 014: 1.31 GB per step). See OpencodeDocs/steering/kv-write-coalescing.md.
+KV_DEFER_ENV = "MUSE_GLIMMER_KV_DEFER"
+
+
+def _kv_defer_mode() -> int:
+    v = os.environ.get(KV_DEFER_ENV, "2").strip()
+    if v not in ("0", "1", "2"):
+        raise ValueError(f"{KV_DEFER_ENV}={v!r} not in (0, 1, 2)")
+    return int(v)
+
+
+def _resolve_kv_ptr_groups(layers) -> list[int] | None:
+    """``layer_idx -> group id`` keyed on the (k, v) ``data_ptr()`` pair.
+
+    NOT traced: called from ``bind_kv_cache`` only. ``.data_ptr()`` inside the
+    trace aborts Dynamo, and the per-layer cache attributes are distinct view
+    objects over shared storage, so ``is`` cannot group them. Returns None
+    (-> per-layer deferred writes) if a pointer cannot be read.
+    """
+    try:
+        ptr_to_gid: dict[tuple, int] = {}
+        group_of: list[int] = []
+        for layer in layers:
+            attn = layer.self_attn
+            if attn.k_cache is None or attn.v_cache is None:
+                return None
+            # Shapes are in the key too: the coalesced write indexes the first
+            # member's view, so all members must view the buffer identically.
+            key = (int(attn.k_cache.data_ptr()), int(attn.v_cache.data_ptr()),
+                   tuple(attn.k_cache.shape), tuple(attn.v_cache.shape))
+            group_of.append(ptr_to_gid.setdefault(key, len(ptr_to_gid)))
+        return group_of
+    except Exception:  # pragma: no cover - defensive
+        logger.warning(
+            "MuseGlimmer: could not resolve KV data_ptr groups; using per-layer "
+            "deferred KV writes.", exc_info=True,
+        )
+        return None
+
+
+def _issue_decode_kv_writes(writeback: list, group_of: list[int] | None) -> None:
+    """Issue the deferred decode KV writes after the layer loop.
+
+    ``writeback`` entries: ``(layer_idx, attn, k_new, v_new, slot_mapping,
+    block_size)`` with ``k_new``/``v_new`` ``[nkh, B*S, d]``.
+
+    Byte-identity of the deferral: decode attention runs ``update_cache=False``.
+    The kernel (and the torch reference) attends over the PRIOR cache, with the
+    prior mask ``iota < pos`` excluding the token's own slot, plus the active
+    K/V it holds on chip (the torch reference overlays it into the last S_tkg
+    columns). No layer reads the slot written this step, and another layer on the
+    same buffer reads only its own KV group's blocks, so moving the writes after
+    the loop leaves every attention input unchanged.
+
+    ``group_of is None`` -> the same per-layer index_put_ calls (mode 1).
+    Otherwise -> one index_put_ per physical buffer (mode 2). Concatenation is
+    valid only for disjoint slots. The members of one buffer come from different
+    KV groups (``shared_by`` takes one layer per group), each with its own
+    ``slot_mapping`` and its own blocks, so real slots never collide. The
+    ``slot_mapping`` object-identity check below (free at trace time) keeps two
+    layers of one KV group out of the same concatenation. Decode padding rows
+    use NULL_BLOCK_ID (0) -> slot 0 in the reserved null block, which is never
+    attended unmasked; duplicate pad writes there are harmless, as they already
+    are within one layer in mode 0.
+    """
+    if group_of is None:
+        for _li, attn, k, v, slot, bsz in writeback:
+            attn._write_paged_kv(k, v, slot, bsz)
+        return
+
+    groups: dict = {}
+    order: list = []
+    for item in writeback:
+        li, attn, _k, _v, slot, _bsz = item
+        gid = group_of[li] if li < len(group_of) else ("solo", li)
+        g = groups.get(gid)
+        if g is not None and any(slot is s for s in g[1]):
+            gid = ("solo", li)  # same slot source: do not concatenate
+            g = None
+        if g is None:
+            g = groups[gid] = [[], []]
+            order.append(gid)
+        g[0].append(item)
+        g[1].append(slot)
+
+    for gid in order:
+        items = groups[gid][0]
+        if len(items) == 1:
+            _li, attn, k, v, slot, bsz = items[0]
+            attn._write_paged_kv(k, v, slot, bsz)
+            continue
+        attn0 = items[0][1]
+        idx = [attn._paged_kv_indices(slot, bsz, k.device) for _li, attn, k, _v, slot, bsz in items]
+        b = torch.cat([i[0] for i in idx])
+        h = torch.cat([i[1] for i in idx])
+        p = torch.cat([i[2] for i in idx])
+        d = attn0.head_dim
+        kc, vc = attn0.k_cache, attn0.v_cache
+        kc.index_put_((b, h, p), torch.cat([it[2].reshape(-1, d) for it in items]).to(kc.dtype))
+        vc.index_put_((b, h, p), torch.cat([it[3].reshape(-1, d) for it in items]).to(vc.dtype))
+
+
 # ---------------------------------------------------------------------------
 # Section 1: Normalization
 # ---------------------------------------------------------------------------
@@ -286,32 +396,32 @@ class MuseGlimmerAttention(nn.Module):
         positions: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
         attn_metadata: dict,
+        kv_writeback: list | None = None,
     ) -> torch.Tensor:
         meta = attn_metadata[self.layer_name]
         if meta["max_query_len"] <= meta["decode_token_threshold"]:
             return self.forward_decode(
-                hidden_states, positions, position_embeddings, attn_metadata
+                hidden_states, positions, position_embeddings, attn_metadata, kv_writeback
             )
         # >>> PARALLELISM: SP all-gather before attention <<<
         if self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
         return self.forward_prefill(hidden_states, position_embeddings, attn_metadata)
 
-    def _write_paged_kv(self, k, v, slot_mapping, block_size):
-        """k, v: [nkh, T, d] -> 4D paged cache [blocks, nkh, block, d]."""
+    def _paged_kv_indices(self, slot_mapping, block_size, device):
+        """(block_idx, head_idx, pos_idx) for ``[nkh, T, d]`` values flattened to ``[nkh*T, d]``."""
         nkh = self.num_key_value_heads_per_rank
         n = slot_mapping.shape[0]
         block_idx = (slot_mapping // block_size).repeat(nkh)
         pos_idx = (slot_mapping % block_size).repeat(nkh)
-        head_idx = torch.arange(nkh, dtype=torch.long, device=k.device).repeat_interleave(n)
-        self.k_cache.index_put_(
-            (block_idx, head_idx, pos_idx),
-            k.reshape(-1, self.head_dim).to(self.k_cache.dtype),
-        )
-        self.v_cache.index_put_(
-            (block_idx, head_idx, pos_idx),
-            v.reshape(-1, self.head_dim).to(self.v_cache.dtype),
-        )
+        head_idx = torch.arange(nkh, dtype=torch.long, device=device).repeat_interleave(n)
+        return block_idx, head_idx, pos_idx
+
+    def _write_paged_kv(self, k, v, slot_mapping, block_size):
+        """k, v: [nkh, T, d] -> 4D paged cache [blocks, nkh, block, d]."""
+        idx = self._paged_kv_indices(slot_mapping, block_size, k.device)
+        self.k_cache.index_put_(idx, k.reshape(-1, self.head_dim).to(self.k_cache.dtype))
+        self.v_cache.index_put_(idx, v.reshape(-1, self.head_dim).to(self.v_cache.dtype))
 
     # ── prefill ─────────────────────────────────────────────────────────
 
@@ -403,6 +513,7 @@ class MuseGlimmerAttention(nn.Module):
         positions: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
         attn_metadata: dict,
+        kv_writeback: list | None = None,
     ) -> torch.Tensor:
         meta = attn_metadata[self.layer_name]
         slot_mapping = meta["slot_mapping"]
@@ -503,7 +614,11 @@ class MuseGlimmerAttention(nn.Module):
         # [d, B, S] (kernel); V_new: [B, nkh, S, d].
         k_new = K_new.reshape(d, B, nkh, S).permute(2, 1, 3, 0).reshape(nkh, B * S, d)
         v_new = V_new.reshape(B, nkh, S, d).permute(1, 0, 2, 3).reshape(nkh, B * S, d)
-        self._write_paged_kv(k_new, v_new, slot_mapping, block_size)
+        if kv_writeback is not None:
+            # Task 023: defer the write past the layer loop (see _issue_decode_kv_writes).
+            kv_writeback.append((self.layer_idx, self, k_new, v_new, slot_mapping, block_size))
+        else:
+            self._write_paged_kv(k_new, v_new, slot_mapping, block_size)
 
         # >>> PARALLELISM: TP all-reduce of o_proj partials <<<
         if self.world_size > 1:
@@ -570,10 +685,11 @@ class MuseGlimmerDecoderLayer(nn.Module):
         self.self_attn = MuseGlimmerAttention(config, layer_idx)
         self.mlp = MuseGlimmerMLP(config)
 
-    def forward(self, hidden_states, positions, position_embeddings, attn_metadata, is_prefill):
+    def forward(self, hidden_states, positions, position_embeddings, attn_metadata, is_prefill,
+                kv_writeback=None):
         residual = hidden_states
         h = self.input_layernorm(hidden_states)
-        h = self.self_attn(h, positions, position_embeddings, attn_metadata)
+        h = self.self_attn(h, positions, position_embeddings, attn_metadata, kv_writeback)
         h = self.post_attention_layernorm(h)
         hidden_states = residual + h
 
@@ -624,6 +740,11 @@ class MuseGlimmerTextModel(nn.Module):
             config.hidden_size, config.rms_norm_eps, config.torch_dtype, with_scale=True
         )
         self.rotary_emb = MuseGlimmerRotaryEmbedding(config)
+        # Task 023: read once (static Python int; no env read inside the trace).
+        self.kv_defer_mode = _kv_defer_mode()
+        # layer_idx -> physical (k_ptr, v_ptr) group id, resolved in bind_kv_cache
+        # (outside the trace). None -> per-layer deferred writes.
+        self.kv_ptr_group_of: list[int] | None = None
 
     def forward(
         self,
@@ -647,8 +768,14 @@ class MuseGlimmerTextModel(nn.Module):
 
         position_embeddings = self.rotary_emb(positions)
 
+        # Task 023: decode KV writes are deferred past the layer loop (mode >= 1).
+        kv_writeback = [] if (not is_prefill and self.kv_defer_mode >= 1) else None
         for layer in self.layers:
-            h = layer(h, positions, position_embeddings, attn_metadata, is_prefill)
+            h = layer(h, positions, position_embeddings, attn_metadata, is_prefill, kv_writeback)
+        if kv_writeback:
+            _issue_decode_kv_writes(
+                kv_writeback, self.kv_ptr_group_of if self.kv_defer_mode >= 2 else None
+            )
 
         h = self.norm(h)
         if is_prefill and self.world_size > 1:
@@ -953,6 +1080,18 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
                 raise Exception(f"KV cache for layer {name} not initialized")
             layer.self_attn.k_cache = kv_caches[name][0]
             layer.self_attn.v_cache = kv_caches[name][1]
+        # Task 023: resolve physical-buffer groups here, never inside the trace.
+        lm = self.language_model
+        lm.kv_ptr_group_of = _resolve_kv_ptr_groups(lm.layers)
+        if lm.kv_ptr_group_of is not None:
+            groups: dict[int, list[int]] = {}
+            for i, g in enumerate(lm.kv_ptr_group_of):
+                groups.setdefault(g, []).append(i)
+            logger.info(
+                "MuseGlimmer KV: %s=%d, %d layers -> %d physical (k,v) buffers: %s",
+                KV_DEFER_ENV, lm.kv_defer_mode, len(lm.layers), len(groups),
+                list(groups.values()),
+            )
 
     # ── weights ─────────────────────────────────────────────────────────
 
