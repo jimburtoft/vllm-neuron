@@ -360,3 +360,81 @@ def test_fused_decode_matches_torch_path(hf_checkpoint, monkeypatch):
         )
         tokens.append(int(out[0].argmax()))
     assert tokens == _hf_greedy(hf, mel, len(tokens) - n)
+
+
+@pytest.mark.parametrize(
+    "mode,fused,kt",
+    [("kernel", "0", "0"), ("kernel", "1", "0"), ("perm", "1", "0"), ("perm", "1", "1"),
+     ("mask", "1", "1")],
+)
+def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
+    """WHISPER_CROSS_MODE=kernel (blocked cross-KV, attention_decode) and perm give the HF tokens.
+
+    Two requests in slots 2 and 0, decoded as one batch in reverse slot order
+    with a padded third row. On CPU the kernel call runs the torch fallback.
+    """
+    from vllm_neuron.functional.attention import attention_decode as _ad
+
+    if not hasattr(_ad, "_fold_gqa_block_kv_mask"):
+        pytest.skip("The kernel cross mode needs the GQA decode-mask fold (#4817).")
+    path, hf = hf_checkpoint
+    monkeypatch.setenv("WHISPER_CROSS_MODE", mode)
+    monkeypatch.setenv("WHISPER_FUSED_DECODE", fused)
+    monkeypatch.setenv("WHISPER_CROSS_KT", kt)
+    model = _build_native(path, max_num_seqs=3)
+    assert model.audio_tower.blocked == (mode == "kernel")
+    assert model.audio_tower.cross_k_0.shape[0] == (4 * 12 if mode == "kernel" else 4)
+
+    torch.manual_seed(2)
+    mels = [torch.randn(1, 128, 3000), torch.randn(1, 128, 3000)]
+    req_slots = [2, 0]
+    blocks = [[3, 4], [7, 8]]
+    width = 128 // BLOCK_SIZE
+    for r in range(2):
+        model.embed_multimodal(
+            input_features=mels[r], encoder_cache=_FakeEncoderCache(), mm_hashes=[f"c{r}"],
+            request_slots=[req_slots[r]],
+        )
+
+    def slot(r, pos):
+        return blocks[r][pos // BLOCK_SIZE] * BLOCK_SIZE + pos % BLOCK_SIZE
+
+    tokens = [list(PROMPT), list(PROMPT)]
+    n = len(PROMPT)
+    for r in range(2):
+        table = torch.full((1, width), -1, dtype=torch.int32)
+        table[0, :2] = torch.tensor(blocks[r], dtype=torch.int32)
+        out = model(
+            input_ids=torch.tensor(PROMPT, dtype=torch.int32),
+            positions=torch.arange(n, dtype=torch.int32),
+            attn_metadata=_metadata(
+                model, torch.tensor([slot(r, p) for p in range(n)]), table, n,
+                request_slots=[req_slots[r]],
+            ),
+            sampling_positions=torch.tensor([n - 1]),
+        )
+        tokens[r].append(int(out[0].argmax()))
+
+    order = [1, 0]
+    table = torch.full((3, width), -1, dtype=torch.int32)
+    for row, r in enumerate(order):
+        table[row, :2] = torch.tensor(blocks[r], dtype=torch.int32)
+    for _ in range(6):
+        pos = [len(tokens[r]) - 1 for r in order]
+        out = model(
+            input_ids=torch.tensor([tokens[r][-1] for r in order] + [0], dtype=torch.int32),
+            positions=torch.tensor(pos + [0], dtype=torch.int32),
+            attn_metadata=_metadata(
+                model,
+                torch.tensor([slot(r, p) for r, p in zip(order, pos)] + [-1]),
+                table,
+                1,
+                request_slots=[req_slots[r] for r in order] + [3],
+            ),
+            sampling_positions=torch.arange(3),
+        )
+        for row, r in enumerate(order):
+            tokens[r].append(int(out[row].argmax()))
+
+    for r in range(2):
+        assert tokens[r] == _hf_greedy(hf, mels[r], len(tokens[r]) - n), r
