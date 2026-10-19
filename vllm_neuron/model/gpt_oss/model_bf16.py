@@ -22,6 +22,7 @@ PARALLELISM SHARDING:
   TP+DP+EP: Cross-DP token exchange for MoE (dispatch/combine), attention is DP-local
 """
 
+import functools
 import logging
 import math
 
@@ -813,9 +814,13 @@ class GptOssAttention(nn.Module):
         table for GQA. ``can_run_kernel`` reads only the device and global
         flags, so the QKV weight, which lives on the same device as the decode
         input, gives the same answer as the input itself.
+
+        Trn2 only for now. This path is measured on Trn2; on Trn3 the GPT-OSS
+        BF16 attention module test does not yet match the reference with it,
+        so Trn3 keeps the shared-table path until that is resolved.
         """
         kv = self.num_key_value_heads_per_rank
-        if kv <= 1 or self.fp8_packed:
+        if kv <= 1 or self.fp8_packed or not _platform_is_trn2():
             return 1
         return kv if can_run_kernel(self.qkv_proj_weight) else 1
 
@@ -1718,6 +1723,22 @@ def _precompute_decode_attn_masks(
     )
 
     return swa_mask, full_mask
+
+
+@functools.cache
+def _platform_is_trn2() -> bool:
+    """Whether the compile target is Trn2 (``get_platform_target`` starts "trn2").
+
+    Cached: the target cannot change within a process, and decode reads this on
+    every layer.
+
+    Read through libtorch_neuronx_lite, the same source dtype_utils uses for the
+    Trn2/Trn3 FP8 range. CPU mode sets NEURON_PLATFORM_TARGET_OVERRIDE, so it is
+    defined there too.
+    """
+    from libtorch_neuronx_lite.compile.platform import get_platform_target
+
+    return get_platform_target().startswith("trn2")
 
 
 def _gen_decode_mask_for_kernel(
