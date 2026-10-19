@@ -38,7 +38,12 @@ from vllm_neuron.functional.attention.attention_decode import (
     packed_fp8_viable_for_bucket as _packed_fp8_viable_for_bucket,
 )
 
-from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.model.kv_cache import (
+    KVSpec,
+    LayerSpec,
+    build_per_head_block_table,
+    build_per_head_slot_mapping,
+)
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.dtype_utils import (
     FP8_CLAMP_MAX,
@@ -790,6 +795,19 @@ class GptOssAttention(nn.Module):
 
     # ── Decode path ──────────────────────────────────────────────────────
 
+    @property
+    def decode_kv_fold(self) -> int:
+        """KV heads the decode kernel folds into the batch dim, or 1 for none.
+
+        GQA (more than one KV head per rank) runs the NKI attention_block_tkg
+        kernel with per-head block tables; that kernel folds KV heads into the
+        batch dim, so the precomputed decode masks must use the same fold. The
+        packed-FP8 cache keeps the shared-table path. ``forward_decode`` and
+        ``_precompute_decode_attn_masks`` both read this, so they cannot disagree.
+        """
+        kv = self.num_key_value_heads_per_rank
+        return kv if kv > 1 and not self.fp8_packed else 1
+
     def forward_decode(
         self,
         hidden_states: torch.Tensor,
@@ -886,7 +904,21 @@ class GptOssAttention(nn.Module):
                 else None
             )
 
-        active_blocks_table = block_table
+        # GQA decode reaches the NKI attention_block_tkg kernel only with a per-head
+        # 3D block table (see _can_use_attention_block_kernel in attention_decode.py).
+        # With the shared 2D table every GPT-OSS layer (8 KV heads, 2 per rank at TP=4)
+        # ran the torch fallback, which repeats K/V across query heads and was ~20% of
+        # the decode step. The packed-FP8 path keeps its own table handling.
+        if self.decode_kv_fold > 1:
+            active_blocks_table = build_per_head_block_table(
+                block_table, self.num_key_value_heads_per_rank
+            )
+            kv_cache_update_idx = build_per_head_slot_mapping(
+                slot_mapping, block_size, self.num_key_value_heads_per_rank, B_local
+            )
+        else:
+            active_blocks_table = block_table
+            kv_cache_update_idx = slot_mapping.view(B_local, S_decode).to(torch.uint32)
 
         # Packed FP8 is decided per decode bucket. The cache is *stored* packed
         # (self.fp8_packed), but the packed decode kernel requires the resized
@@ -943,7 +975,7 @@ class GptOssAttention(nn.Module):
             # <-- MODEL-SPECIFIC: Sink tokens
             sink=self.sinks.unsqueeze(1),
             update_cache=True,
-            kv_cache_update_idx=slot_mapping.view(B_local, S_decode).to(torch.uint32),
+            kv_cache_update_idx=kv_cache_update_idx,
             fp8_packed=use_packed_kernel,
             # Kernel currently requires fusing the V scale dequantization into W_out for KV quantization
             W_out=self.o_proj_weight / self.v_scale_float,
@@ -1571,6 +1603,7 @@ def _precompute_decode_attn_masks(
     attn_metadata: dict,
     positions: torch.Tensor,
     num_q_heads_after_a2a: int,
+    kv_heads_per_rank: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pre-compute the shared decode attention masks for one decode step.
 
@@ -1594,6 +1627,9 @@ def _precompute_decode_attn_masks(
         attn_metadata: Per-layer metadata dict from the model runner.
         positions: [B*S_decode] absolute position ids for the active tokens.
         num_q_heads_after_a2a: Query heads per rank after attention-DP A2A.
+        kv_heads_per_rank: KV heads per rank. Above 1 the decode kernel folds KV
+            heads into the batch dim, so the masks are built in that geometry
+            (see ``_gen_decode_mask_for_kernel``).
 
     Returns:
         Tuple of (swa_mask, full_mask), each
@@ -1639,16 +1675,15 @@ def _precompute_decode_attn_masks(
             swa_pos_ids = torch.clamp(swa_pos_ids, min=0)
         swa_start_pos_ids = torch.clamp(swa_pos_ids - sliding_window + 1, min=0)
 
-    swa_mask = NF.gen_attention_decode_mask(
-        pos_ids=swa_pos_ids.to(torch.float32),
-        bs=B_local,
-        q_head=num_q_heads_after_a2a,
-        s_active=S_decode,
-        s_prior=S_ctx_swa,
-        start_pos=swa_start_pos_ids.to(torch.float32)
-        if swa_start_pos_ids is not None
-        else None,
-        block_len=block_size,
+    swa_mask = _gen_decode_mask_for_kernel(
+        swa_pos_ids,
+        swa_start_pos_ids,
+        B_local,
+        num_q_heads_after_a2a,
+        S_decode,
+        S_ctx_swa,
+        block_size,
+        kv_heads_per_rank,
     )
 
     # --- Full causal mask (odd layers) ---
@@ -1660,17 +1695,80 @@ def _precompute_decode_attn_masks(
     full_max_blocks = attn_metadata[non_swa_layer_name]["max_blocks_per_seq"]
     S_ctx_full = full_max_blocks * block_size
 
-    full_mask = NF.gen_attention_decode_mask(
-        pos_ids=pos_ids_flat.to(torch.float32),
-        bs=B_local,
-        q_head=num_q_heads_after_a2a,
-        s_active=S_decode,
-        s_prior=S_ctx_full,
-        start_pos=None,
-        block_len=block_size,
+    full_mask = _gen_decode_mask_for_kernel(
+        pos_ids_flat,
+        None,
+        B_local,
+        num_q_heads_after_a2a,
+        S_decode,
+        S_ctx_full,
+        block_size,
+        kv_heads_per_rank,
     )
 
     return swa_mask, full_mask
+
+
+def _gen_decode_mask_for_kernel(
+    pos_ids_flat: torch.Tensor,
+    start_pos_flat: torch.Tensor | None,
+    B_local: int,
+    q_heads: int,
+    S_decode: int,
+    S_ctx: int,
+    block_size: int,
+    kv_heads: int,
+) -> torch.Tensor:
+    """Build a decode mask in the geometry the attention kernel reads it in.
+
+    For GQA, ``attention_block_tkg`` folds KV heads into the batch dim
+    (``bs = B * kv_heads``, ``q_head = q_heads / kv_heads``) and reads the
+    precomputed mask as ``[S_ctx, B * kv_heads, q_heads / kv_heads, S]``. The
+    block-KV mask layout depends on the LNC sharding (batch vs ``s_prior``) and
+    the ``block_len`` resize, both chosen from ``(bs, q_head, s_prior)``. Built in
+    the unfolded ``(B, q_heads)`` geometry, the mask can take a different layout
+    than the kernel: at the 256-token sliding-window context with odd ``B``
+    (e.g. ``B=1``), unfolded selects ``s_prior`` sharding while folded selects
+    batch sharding, and every sliding-window layer attends to the wrong slots.
+
+    Args:
+        pos_ids_flat: ``[1, B * S_decode]`` mask end positions.
+        start_pos_flat: ``[1, B * S_decode]`` window starts, or ``None``.
+        B_local: Requests in this decode step.
+        q_heads: Query heads per rank.
+        S_decode: Tokens per request in this step.
+        S_ctx: Context length the mask covers.
+        block_size: KV cache block size.
+        kv_heads: KV heads per rank. ``1`` keeps the unfolded geometry.
+
+    Returns:
+        ``[S_ctx, B_local, q_heads, S_decode]`` mask. The kernel re-folds it in
+        the same ``(b, h)`` order.
+    """
+    if kv_heads > 1:
+        pos_ids_flat = (
+            pos_ids_flat.reshape(B_local, S_decode)
+            .repeat_interleave(kv_heads, dim=0)
+            .reshape(1, -1)
+        )
+        if start_pos_flat is not None:
+            start_pos_flat = (
+                start_pos_flat.reshape(B_local, S_decode)
+                .repeat_interleave(kv_heads, dim=0)
+                .reshape(1, -1)
+            )
+    mask = NF.gen_attention_decode_mask(
+        pos_ids=pos_ids_flat.to(torch.float32),
+        bs=B_local * kv_heads,
+        q_head=q_heads // kv_heads,
+        s_active=S_decode,
+        s_prior=S_ctx,
+        start_pos=(
+            start_pos_flat.to(torch.float32) if start_pos_flat is not None else None
+        ),
+        block_len=block_size,
+    )
+    return mask.reshape(mask.shape[0], B_local, q_heads, S_decode)
 
 
 class GptOssDecoderLayer(nn.Module):
@@ -2030,11 +2128,13 @@ class GptOssModel(nn.Module):
         swa_mask = None
         full_mask = None
         if not is_prefill:
+            attn0 = self.layers[0].self_attn
             swa_mask, full_mask = _precompute_decode_attn_masks(
                 sliding_window=self.config.sliding_window,
                 attn_metadata=attn_metadata,
                 positions=positions,
-                num_q_heads_after_a2a=self.layers[0].self_attn.num_q_heads_after_a2a,
+                num_q_heads_after_a2a=attn0.num_q_heads_after_a2a,
+                kv_heads_per_rank=attn0.decode_kv_fold,
             )
 
         # Run through decoder layers, collecting Eagle3 auxiliary hidden states
