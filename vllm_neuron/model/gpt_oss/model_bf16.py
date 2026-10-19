@@ -53,6 +53,7 @@ from vllm_neuron.utils.weight_loader import set_weight_loader, with_rank_overrid
 
 from transformers import PretrainedConfig
 from vllm_neuron.model.neuron_config import NeuronConfig
+from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm_neuron.nn.sampler import Sampler
 from nkilib.core.utils.common_types import (
     ActFnType,
@@ -801,12 +802,22 @@ class GptOssAttention(nn.Module):
 
         GQA (more than one KV head per rank) runs the NKI attention_block_tkg
         kernel with per-head block tables; that kernel folds KV heads into the
-        batch dim, so the precomputed decode masks must use the same fold. The
-        packed-FP8 cache keeps the shared-table path. ``forward_decode`` and
-        ``_precompute_decode_attn_masks`` both read this, so they cannot disagree.
+        batch dim, so the precomputed decode masks must use the same fold.
+        ``forward_decode`` and ``_precompute_decode_attn_masks`` both read this,
+        so they cannot disagree.
+
+        Returns 1 (shared 2D table, unfolded masks) when the kernel will not run:
+        the packed-FP8 cache keeps the shared-table path, and when NKI kernels
+        cannot run (CPU mode without the simulator, or kernels disabled)
+        attention_decode takes its torch fallback, which rejects a per-head
+        table for GQA. ``can_run_kernel`` reads only the device and global
+        flags, so the QKV weight, which lives on the same device as the decode
+        input, gives the same answer as the input itself.
         """
         kv = self.num_key_value_heads_per_rank
-        return kv if kv > 1 and not self.fp8_packed else 1
+        if kv <= 1 or self.fp8_packed:
+            return 1
+        return kv if can_run_kernel(self.qkv_proj_weight) else 1
 
     def forward_decode(
         self,
