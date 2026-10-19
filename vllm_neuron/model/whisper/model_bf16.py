@@ -496,6 +496,9 @@ class DecoderSelfAttention(nn.Module):
         self._write_kv_cache(k, v, meta["slot_mapping"], meta["block_size"])
 
         tokens = hidden_states.shape[0]
+        rows = meta["block_table_tensor"].shape[0]
+        if rows > 1:
+            return self._prefill_rows(q, k, v, rows, tokens)
         attn = torch.matmul(q, k.transpose(-1, -2))
         mask = torch.triu(
             torch.full((tokens, tokens), float("-inf"), dtype=attn.dtype, device=attn.device),
@@ -504,6 +507,27 @@ class DecoderSelfAttention(nn.Module):
         attn = F.softmax((attn + mask).to(torch.float32), dim=-1).to(v.dtype)
         ctx = torch.matmul(attn, v)
         out = ctx.transpose(0, 1).reshape(tokens, self.num_heads * self.head_dim)
+        return self.out_proj(out)
+
+    def _prefill_rows(self, q, k, v, rows, tokens):
+        """Causal attention for ``rows`` prompts of ``tokens // rows`` tokens each.
+
+        Each row attends only to its own prompt. This is the per-row form of the
+        one-row math above, so each row gets the same values as a one-row call.
+        """
+        s = tokens // rows
+        h, d = self.num_heads, self.head_dim
+        qr = q.view(h, rows, s, d).transpose(0, 1)
+        kr = k.view(h, rows, s, d).transpose(0, 1)
+        vr = v.view(h, rows, s, d).transpose(0, 1)
+        attn = torch.matmul(qr, kr.transpose(-1, -2))
+        mask = torch.triu(
+            torch.full((s, s), float("-inf"), dtype=attn.dtype, device=attn.device),
+            diagonal=1,
+        )
+        attn = F.softmax((attn + mask).to(torch.float32), dim=-1).to(v.dtype)
+        ctx = torch.matmul(attn, vr)  # [rows, h, s, d]
+        out = ctx.permute(0, 2, 1, 3).reshape(tokens, h * d)
         return self.out_proj(out)
 
     def forward_decode_fused(self, hidden_states, meta, positions):

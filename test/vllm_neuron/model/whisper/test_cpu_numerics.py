@@ -263,6 +263,37 @@ def test_batched_requests_use_own_cross_kv(hf_checkpoint):
         assert tokens[r] == _hf_greedy(hf, mels[r], len(tokens[r]) - n), r
 
 
+def test_batched_prefill_matches_single(hf_checkpoint):
+    """One batched encoder call + one prefill of several rows equals the one-row path."""
+    path, hf = hf_checkpoint
+    model = _build_native(path, max_num_seqs=4)
+    torch.manual_seed(3)
+    mels = torch.randn(3, 128, 3000)
+    model.embed_multimodal(
+        input_features=mels, encoder_cache=_FakeEncoderCache(),
+        mm_hashes=["a", "b", "c"], request_slots=[2, 0, 1],
+    )
+    blocks = {2: 4, 0: 7, 1: 9}
+    n, S = len(PROMPT), 8
+    rows = [2, 0, 1]
+    table = torch.full((3, MAX_BLOCKS_PER_SEQ), -1, dtype=torch.int32)
+    ids, pos, sm = [], [], []
+    for r, s in enumerate(rows):
+        table[r, 0] = blocks[s]
+        ids += PROMPT + [0] * (S - n)
+        pos += list(range(n)) + [n - 1] * (S - n)
+        sm += [blocks[s] * BLOCK_SIZE + p for p in range(n)] + [-1] * (S - n)
+    out = model(
+        input_ids=torch.tensor(ids, dtype=torch.int32),
+        positions=torch.tensor(pos, dtype=torch.int32),
+        attn_metadata=_metadata(model, torch.tensor(sm), table, S, request_slots=rows),
+        sampling_positions=torch.tensor([r * S + n - 1 for r in range(3)]),
+    )
+    for r in range(3):
+        ref = _hf_greedy(hf, mels[r : r + 1], 1)[-1]
+        assert int(out[r].argmax()) == ref, r
+
+
 def test_embed_multimodal_needs_slots_for_batch(hf_checkpoint):
     path, _ = hf_checkpoint
     model = _build_native(path)
