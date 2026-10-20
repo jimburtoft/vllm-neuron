@@ -91,6 +91,7 @@ def _torch_rmsnorm_quant_static_impl(
     ln_w: Tensor,
     input_dequant_scale: Tensor,
     eps: float,
+    no_norm: bool = False,
 ) -> Tensor:
     """CPU reference for the STATIC quant path of ``rmsnorm_quant``.
 
@@ -110,9 +111,12 @@ def _torch_rmsnorm_quant_static_impl(
     scale = input_dequant_scale.to(torch.float32).flatten()[0]
 
     x = hidden.to(torch.float32)
-    var = x.pow(2).mean(dim=-1, keepdim=True)
-    x_norm = x * torch.rsqrt(var + eps)
-    x_norm = x_norm * ln_w.to(torch.float32).reshape(-1)
+    if no_norm:
+        x_norm = x
+    else:
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        x_norm = x * torch.rsqrt(var + eps)
+        x_norm = x_norm * ln_w.to(torch.float32).reshape(-1)
     q = (x_norm / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
     return q.to(torch.float8_e4m3fn)
 
@@ -125,6 +129,7 @@ def _torch_rmsnorm_quant_row_impl(
     hidden: Tensor,
     ln_w: Tensor,
     eps: float,
+    no_norm: bool = False,
 ) -> Tensor:
     """CPU reference for the ROW quant path of ``rmsnorm_quant``.
 
@@ -142,9 +147,12 @@ def _torch_rmsnorm_quant_row_impl(
         are the float32 dequant scale reinterpreted as 4 fp8 bytes.
     """
     x = hidden.to(torch.float32)
-    var = x.pow(2).mean(dim=-1, keepdim=True)
-    x_norm = x * torch.rsqrt(var + eps)
-    x_norm = x_norm * ln_w.to(torch.float32).reshape(-1)
+    if no_norm:
+        x_norm = x
+    else:
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        x_norm = x * torch.rsqrt(var + eps)
+        x_norm = x_norm * ln_w.to(torch.float32).reshape(-1)
 
     # Per-row absmax scaling
     row_absmax = x_norm.abs().amax(dim=-1, keepdim=True)
@@ -220,6 +228,7 @@ def rmsnorm_quant(
     input_dequant_scale: Optional[Tensor] = None,
     eps: float = 1e-6,
     quantization_type: QuantizationType = QuantizationType.STATIC,
+    norm_type: NormType = NormType.RMS_NORM,
 ) -> Tensor:
     """Fused RMSNorm + FP8 quantization.
 
@@ -247,6 +256,9 @@ def rmsnorm_quant(
         quantization_type: ``QuantizationType.STATIC`` or
             ``QuantizationType.ROW``. Other values raise
             ``NotImplementedError``.
+        norm_type: ``NormType.RMS_NORM`` (default) or ``NormType.NO_NORM``
+            (quantize only; ``ln_w`` is then ignored but must still have
+            shape ``[H]`` / ``[1, H]``).
 
     Returns:
         For STATIC: FP8 quantized tensor with the same shape as ``hidden``.
@@ -268,6 +280,8 @@ def rmsnorm_quant(
             ``ln_w`` is not ``[H]`` / ``[1, H]`` with last dim equal to
             ``hidden``'s last dim.
     """
+    if norm_type not in (NormType.RMS_NORM, NormType.NO_NORM):
+        raise NotImplementedError(f"rmsnorm_quant: unsupported norm_type {norm_type.name}")
     if quantization_type not in (QuantizationType.STATIC, QuantizationType.ROW):
         raise NotImplementedError(
             "rmsnorm_quant supports QuantizationType.STATIC and ROW; "
@@ -316,11 +330,12 @@ def rmsnorm_quant(
     hidden_in = hidden.unsqueeze(0) if squeeze_out else hidden
 
     if not _can_use_kernel(hidden_in):
+        no_norm = norm_type == NormType.NO_NORM
         if quantization_type == QuantizationType.ROW:
-            out = _torch_rmsnorm_quant_row_impl(hidden_in, ln_w, eps)
+            out = _torch_rmsnorm_quant_row_impl(hidden_in, ln_w, eps, no_norm=no_norm)
         else:
             out = _torch_rmsnorm_quant_static_impl(
-                hidden_in, ln_w, input_dequant_scale, eps
+                hidden_in, ln_w, input_dequant_scale, eps, no_norm=no_norm
             )
         return out.squeeze(0) if squeeze_out else out
 
@@ -331,7 +346,7 @@ def rmsnorm_quant(
         hidden=hidden_in,
         ln_w=ln_w,
         input_dequant_scale=input_dequant_scale,
-        norm_type=NormType.RMS_NORM,
+        norm_type=norm_type,
         quantization_type=quantization_type,
         eps=eps,
         lower_bound=0.0,

@@ -49,7 +49,7 @@ from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
-from nkilib.core.utils.common_types import NormType
+from nkilib.core.utils.common_types import NormType, QuantizationType
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
 from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
@@ -72,6 +72,7 @@ from vllm_neuron.model.qwen3_vl.utils.vision_block_packing import (
     select_vision_bucket,
 )
 
+from . import fp8 as _fp8
 from .config import MuseGlimmerConfig, MuseGlimmerTextConfig
 from .utils.vision_preprocessing import pack_vision_inputs, plan_video_items
 from .vision_encoder_bf16 import MuseGlimmerVisionModel
@@ -353,14 +354,24 @@ class MuseGlimmerAttention(nn.Module):
             torch.empty(q_size, self.hidden_size, dtype=self.dtype)
         )
 
+        # Task 021: FP8 ROW (per-output-channel weight scales, dynamic per-token activations).
+        self.fp8 = "attn" in _fp8.fp8_modules()
+        if self.fp8:
+            f8 = _fp8.FP8_DTYPE
+            for name, (k, n) in (("qkv_proj", (self.hidden_size, q_size + 2 * kv_size)),
+                                 ("gate_proj", (self.hidden_size, q_size)),
+                                 ("o_proj", (q_size, self.hidden_size))):
+                setattr(self, f"{name}_weight", nn.Parameter(torch.empty(k, n, dtype=f8), requires_grad=False))
+                setattr(self, f"{name}_w_scale",
+                        nn.Parameter(torch.empty(_fp8.PMAX, n, dtype=torch.float32), requires_grad=False))
+
         self.k_cache = None
         self.v_cache = None
         self._setup_weight_loaders()
 
     def _setup_weight_loaders(self):
-        set_weight_loader(
-            self.qkv_proj_weight,
-            fused_qkv_weight_loader(
+        loaders = {
+            "qkv_proj": fused_qkv_weight_loader(
                 q_size=self.q_size,
                 kv_size=self.kv_size,
                 shard_dim=1,
@@ -368,25 +379,62 @@ class MuseGlimmerAttention(nn.Module):
                 is_storage_transposed=True,
                 num_kv_replicas=self.num_kv_replicas,
             ),
-        )
-        set_weight_loader(
-            self.gate_proj_weight,
-            sharding_weight_loader(
+            "gate_proj": sharding_weight_loader(
                 shard_dim=1,
                 shard_size=self.q_size,
                 num_shards=self.world_size,
                 is_storage_transposed=True,
             ),
-        )
-        set_weight_loader(
-            self.o_proj_weight,
-            sharding_weight_loader(
+            "o_proj": sharding_weight_loader(
                 shard_dim=0,
                 shard_size=self.q_size,
                 num_shards=self.world_size,
                 is_storage_transposed=True,
             ),
+        }
+        for name, ld in loaders.items():
+            if self.fp8:
+                set_weight_loader(getattr(self, f"{name}_weight"), _fp8.wrap_fp8(ld, "q"))
+                set_weight_loader(getattr(self, f"{name}_w_scale"), _fp8.wrap_fp8(ld, "s"))
+            else:
+                set_weight_loader(getattr(self, f"{name}_weight"), ld)
+
+    # ── FP8 helpers (Task 021) ──────────────────────────────────────────
+
+    def _qkv_args(self, on_kernel: bool) -> tuple[torch.Tensor, dict]:
+        """QKV weight + quant kwargs for NF.qkv_proj (CPU: dequantized BF16 weight)."""
+        if not self.fp8:
+            return self.qkv_proj_weight, {}
+        if not on_kernel:
+            return _fp8.dequant(self.qkv_proj_weight, self.qkv_proj_w_scale, self.dtype), {}
+        return self.qkv_proj_weight, dict(
+            quantization_type=QuantizationType.ROW, qkv_w_scale=self.qkv_proj_w_scale
         )
+
+    def _gate(self, x: torch.Tensor) -> torch.Tensor:
+        """sigmoid(x @ Wgate), x [T, H] -> [T, q_size]."""
+        if not self.fp8:
+            return torch.sigmoid(x @ self.gate_proj_weight)
+        if not can_run_kernel(x):
+            return torch.sigmoid(x @ _fp8.dequant(self.gate_proj_weight, self.gate_proj_w_scale, self.dtype))
+        g = NF.qkv_proj(
+            hidden=x.unsqueeze(0), qkv_weights=self.gate_proj_weight,
+            quantization_type=QuantizationType.ROW, qkv_w_scale=self.gate_proj_w_scale,
+        ).squeeze(0)
+        return torch.sigmoid(g)
+
+    def _o_proj_tokens(self, attn: torch.Tensor) -> torch.Tensor:
+        """attn [T, Nq*d] (gated) -> [T, H]."""
+        if not self.fp8:
+            return attn @ self.o_proj_weight
+        if not can_run_kernel(attn):
+            return attn @ _fp8.dequant(self.o_proj_weight, self.o_proj_w_scale, self.dtype)
+        T = attn.shape[0]
+        active = attn.view(1, T, self.num_attention_heads_per_rank, self.head_dim)  # [B, S, N, D]
+        return NF.o_proj(
+            active, self.o_proj_weight, quantization_type=QuantizationType.ROW,
+            weight_scales=self.o_proj_w_scale,
+        ).squeeze(0)
 
     # ── dispatch ────────────────────────────────────────────────────────
 
@@ -443,9 +491,11 @@ class MuseGlimmerAttention(nn.Module):
             sin_cache = torch.cat((sin, sin), dim=-1).unsqueeze(0).to(self.dtype)
 
         # <-- MODEL-SPECIFIC: weightless QK RMSNorm (gamma=None) before RoPE.
+        qkv_w, qkv_q = self._qkv_args(can_run_kernel(hidden_states))
         qkv = NF.qkv_proj(
             hidden=hidden_states.unsqueeze(0),
-            qkv_weights=self.qkv_proj_weight,
+            qkv_weights=qkv_w,
+            **qkv_q,
             d_head=self.head_dim,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
@@ -494,11 +544,15 @@ class MuseGlimmerAttention(nn.Module):
             )  # [N, D, T]
 
         # <-- MODEL-SPECIFIC: sigmoid output gate before o_proj.
-        gate = torch.sigmoid(hidden_states @ self.gate_proj_weight)  # [T, N*D]
-        gate = gate.view(tokens, self.num_attention_heads_per_rank, self.head_dim).permute(1, 2, 0)
-        attn_output = (attn_output * gate).to(self.dtype)
-
-        out = NF.o_proj(attn_output.unsqueeze(0), self.o_proj_weight).squeeze(0)  # [T, H]
+        gate = self._gate(hidden_states)  # [T, N*D]
+        if self.fp8:
+            # ROW o_proj takes [B, S, N, D]: gate in token-major layout.
+            attn_tok = attn_output.permute(2, 0, 1).reshape(tokens, self.q_size)  # [T, N*D]
+            out = self._o_proj_tokens((attn_tok * gate).to(self.dtype))  # [T, H]
+        else:
+            gate = gate.view(tokens, self.num_attention_heads_per_rank, self.head_dim).permute(1, 2, 0)
+            attn_output = (attn_output * gate).to(self.dtype)
+            out = NF.o_proj(attn_output.unsqueeze(0), self.o_proj_weight).squeeze(0)  # [T, H]
 
         # >>> PARALLELISM: reduce-scatter back to SP layout <<<
         if self.world_size > 1:
@@ -558,9 +612,11 @@ class MuseGlimmerAttention(nn.Module):
             # GQA reaches the kernel only with a per-head 3D table.
             table = build_per_head_block_table(block_table, nkh)
 
+        on_kernel = can_run_kernel(X) and not _decode_torch_forced()
+        qkv_w, qkv_q = self._qkv_args(on_kernel)
         decode_kwargs = dict(
             X=X,
-            W_qkv=self.qkv_proj_weight,
+            W_qkv=qkv_w,
             rmsnorm_X_enabled=False,  # input norm applied by the decoder layer
             rmsnorm_QK_pre_rope_enabled=True,
             rmsnorm_QK_pre_rope_eps=self.qk_norm_eps,
@@ -595,7 +651,11 @@ class MuseGlimmerAttention(nn.Module):
                 attention_mask=mask, **decode_kwargs
             )
         else:
+            if qkv_q:
+                qkv_q = dict(quantization_type_qkv=qkv_q["quantization_type"],
+                             weight_dequant_scale_qkv=qkv_q["qkv_w_scale"])
             output, K_new, V_new = NF.attention_decode(
+                **qkv_q,
                 K_cache_transposed=False,
                 pos_ids=pos,
                 swa_start_pos_ids=swa_start,
@@ -606,9 +666,9 @@ class MuseGlimmerAttention(nn.Module):
 
         # output: [B, Nq, d, S] -> [B*S, Nq*d]
         attn = output.permute(0, 3, 1, 2).reshape(B * S, self.q_size)
-        gate = torch.sigmoid(hidden_states @ self.gate_proj_weight)
+        gate = self._gate(hidden_states)
         attn = (attn * gate).to(self.dtype)
-        out = attn @ self.o_proj_weight  # [B*S, H]
+        out = self._o_proj_tokens(attn)  # [B*S, H]
 
         # Manual KV scatter. K_new: [d, B*nkh, S] (torch) / [d, B, nkh, S] or
         # [d, B, S] (kernel); V_new: [B, nkh, S, d].
@@ -630,6 +690,9 @@ class MuseGlimmerAttention(nn.Module):
 # Section 4: MLP (SwiGLU)
 # ---------------------------------------------------------------------------
 
+# nkilib mlp picks TKG for B*S <= 96 (TKG_BS_SEQLEN_THRESHOLD); TKG ROW takes bf16 input.
+_MLP_TKG_MAX_T = 96
+
 
 class MuseGlimmerMLP(nn.Module):
     def __init__(self, config: MuseGlimmerTextConfig):
@@ -641,6 +704,27 @@ class MuseGlimmerMLP(nn.Module):
         inter = config.intermediate_size // self.world_size
         H = config.hidden_size
         dt = config.torch_dtype
+        # A str, not a torch.dtype attribute (Dynamo warm restore); wrap_nki takes it as is.
+        self.out_dtype_name = str(dt).removeprefix("torch.")
+        # Task 021: FP8 (ROW: per-output-channel weight scales, dynamic per-token activations).
+        self.fp8 = "mlp" in _fp8.fp8_modules()
+        if self.fp8:
+            ip = _fp8.round_up(inter, _fp8.FP8_I_ALIGN)  # zero-padded intermediate (see fp8.py)
+            f8 = _fp8.FP8_DTYPE
+            self.gate_proj_weight = nn.Parameter(torch.empty(H, ip, dtype=f8), requires_grad=False)
+            self.up_proj_weight = nn.Parameter(torch.empty(H, ip, dtype=f8), requires_grad=False)
+            self.down_proj_weight = nn.Parameter(torch.empty(ip, H, dtype=f8), requires_grad=False)
+            self.gate_w_scale = nn.Parameter(torch.empty(_fp8.PMAX, ip, dtype=torch.float32), requires_grad=False)
+            self.up_w_scale = nn.Parameter(torch.empty(_fp8.PMAX, ip, dtype=torch.float32), requires_grad=False)
+            self.down_w_scale = nn.Parameter(torch.empty(_fp8.PMAX, H, dtype=torch.float32), requires_grad=False)
+            kw = dict(num_shards=self.world_size, shard_size=inter, pad_to=ip)
+            for name in ("gate_proj_weight", "up_proj_weight"):
+                set_weight_loader(getattr(self, name), _fp8.fp8_weight_loader(shard_out=True, **kw))
+            for name in ("gate_w_scale", "up_w_scale"):
+                set_weight_loader(getattr(self, name), _fp8.fp8_scale_loader(shard_out=True, **kw))
+            set_weight_loader(self.down_proj_weight, _fp8.fp8_weight_loader(shard_out=False, **kw))
+            set_weight_loader(self.down_w_scale, _fp8.fp8_scale_loader(shard_out=False, **kw))
+            return
         self.gate_proj_weight = nn.Parameter(torch.empty(H, inter, dtype=dt))
         self.up_proj_weight = nn.Parameter(torch.empty(H, inter, dtype=dt))
         self.down_proj_weight = nn.Parameter(torch.empty(inter, H, dtype=dt))
@@ -654,12 +738,32 @@ class MuseGlimmerMLP(nn.Module):
         set_weight_loader(self.up_proj_weight, col)
         set_weight_loader(self.down_proj_weight, row)
 
+    def _mlp_fp8(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] > _MLP_TKG_MAX_T:
+            # CTE (prefill / large T): the ROW CTE kernel needs a pre-quantized input,
+            # [T, H+4] fp8 with the per-token fp32 dequant scale in the tail.
+            # ln_w is unused by NO_NORM; it is only shape-checked by the API.
+            ones = torch.ones((1, x.shape[-1]), dtype=x.dtype, device=x.device)
+            x = NF.rmsnorm_quant(
+                x, ones, None, quantization_type=QuantizationType.ROW,
+                norm_type=NormType.NO_NORM,
+            )
+        return NF.mlp(
+            x, self.gate_proj_weight, self.up_proj_weight, self.down_proj_weight,
+            quantization_type=QuantizationType.ROW,
+            gate_w_scale=self.gate_w_scale, up_w_scale=self.up_w_scale,
+            down_w_scale=self.down_w_scale, output_dtype=self.out_dtype_name,
+        )
+
     def forward(self, hidden_states: torch.Tensor, is_prefill: bool) -> torch.Tensor:
         if is_prefill and self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
-        out = NF.mlp(
-            hidden_states, self.gate_proj_weight, self.up_proj_weight, self.down_proj_weight
-        )
+        if self.fp8:
+            out = self._mlp_fp8(hidden_states)
+        else:
+            out = NF.mlp(
+                hidden_states, self.gate_proj_weight, self.up_proj_weight, self.down_proj_weight
+            )
         if self.world_size > 1:
             if is_prefill:
                 out = self.tp_group.reduce_scatter(out, dim=0)
@@ -1107,6 +1211,10 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
             ]
             m[f"{ours}.self_attn.gate_proj_weight"] = f"{hf}.self_attn.gate_proj.weight"
             m[f"{ours}.self_attn.o_proj_weight"] = f"{hf}.self_attn.o_proj.weight"
+            if self.language_model.layers[i].self_attn.fp8:
+                # Task 021: scales are derived from the same BF16 tensors at load time.
+                for p in ("qkv_proj", "gate_proj", "o_proj"):
+                    m[f"{ours}.self_attn.{p}_w_scale"] = m[f"{ours}.self_attn.{p}_weight"]
             for n in (
                 "input_layernorm",
                 "post_attention_layernorm",
@@ -1116,6 +1224,9 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
                 m[f"{ours}.{n}.weight"] = f"{hf}.{n}.weight"
             for p in ("gate_proj", "up_proj", "down_proj"):
                 m[f"{ours}.mlp.{p}_weight"] = f"{hf}.mlp.{p}.weight"
+                if self.language_model.layers[i].mlp.fp8:
+                    # Task 021: the scale is derived from the same BF16 tensor at load time.
+                    m[f"{ours}.mlp.{p.split('_')[0]}_w_scale"] = f"{hf}.mlp.{p}.weight"
         m["language_model.embed_tokens.weight"] = f"{HF_TEXT_PREFIX}.embed_tokens.weight"
         m["language_model.norm.weight"] = f"{HF_TEXT_PREFIX}.norm.weight"
         m["lm_head.weight"] = "lm_head.weight"
