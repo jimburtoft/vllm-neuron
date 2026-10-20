@@ -692,6 +692,12 @@ class MuseGlimmerAttention(nn.Module):
 
 # nkilib mlp picks TKG for B*S <= 96 (TKG_BS_SEQLEN_THRESHOLD); TKG ROW takes bf16 input.
 _MLP_TKG_MAX_T = 96
+# nkilib 2.33 (SDK 2.33) mlp CTE ROW fails kernel validation ("Stack out of memory",
+# NCC_INKI016, allocate_intermediate_tensor_tile in row quantization) for T >= 1024 at
+# H=6656 / I=5120 per rank; 512 passes. Rows are independent (per-row activation
+# scales), so prefill is split into row chunks; the result is bit-exact with the
+# un-chunked nkilib 2.32 kernel (simulator, T=1024). 0 disables chunking.
+_MLP_CTE_ROW_CHUNK = int(os.environ.get("MUSE_GLIMMER_FP8_CTE_CHUNK", "512") or 0)
 
 
 class MuseGlimmerMLP(nn.Module):
@@ -748,6 +754,12 @@ class MuseGlimmerMLP(nn.Module):
                 x, ones, None, quantization_type=QuantizationType.ROW,
                 norm_type=NormType.NO_NORM,
             )
+            C = _MLP_CTE_ROW_CHUNK
+            if C and x.shape[0] > C and x.shape[0] % C == 0:
+                return torch.cat([self._mlp_fp8_call(c) for c in torch.split(x, C)], dim=0)
+        return self._mlp_fp8_call(x)
+
+    def _mlp_fp8_call(self, x: torch.Tensor) -> torch.Tensor:
         return NF.mlp(
             x, self.gate_proj_weight, self.up_proj_weight, self.down_proj_weight,
             quantization_type=QuantizationType.ROW,
