@@ -5325,10 +5325,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         gather (``_compute_swa_decode_tensors``) only runs in that
         no-op-clip regime, so its P_MAX-aligned geometry is preserved.
         """
-        # Trimmed SWA kv block counts must produce S_ctx divisible by P_MAX.
+        # Trimmed SWA kv block counts must produce S_ctx divisible by P_MAX
+        # *per program*: on LNC=2 the decode kernel shards s_prior across 2
+        # programs (attention_tkg "Sharded s_prior must be divisible by p_max"),
+        # so align to 2 * 128. With sliding_window=2048 / block_size=32 a 128
+        # alignment gives 68 blocks = 2176 -> 1088 per program and fails.
         P_MAX = 128
+        align_tokens = 2 * P_MAX
+        # VLLM_NEURON_SWA_ALIGN_TOKENS pads the trimmed window to a larger token multiple.
+        # The decode kernel re-tiles the cache into gcd(block_size, s_prior / (n_prgs*128))
+        # token chunks, so s_prior with more factors of 2 gives larger KV DMAs
+        # (2560 -> 2-token, 4096 -> 16-token).
+        align_tokens = max(
+            align_tokens, int(os.environ.get("VLLM_NEURON_SWA_ALIGN_TOKENS", "0") or 0)
+        )
         min_blocks = sliding_window // block_size + 1
-        blocks_per_pmax = P_MAX // block_size
+        blocks_per_pmax = max(1, align_tokens // block_size)
         num_swa_blocks = (
             (min_blocks + blocks_per_pmax - 1) // blocks_per_pmax * blocks_per_pmax
         )
