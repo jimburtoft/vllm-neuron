@@ -365,7 +365,7 @@ def test_fused_decode_matches_torch_path(hf_checkpoint, monkeypatch):
 @pytest.mark.parametrize(
     "mode,fused,kt",
     [("kernel", "0", "0"), ("kernel", "1", "0"), ("perm", "1", "0"), ("perm", "1", "1"),
-     ("mask", "1", "1"), ("perm-active", "1", "1")],
+     ("mask", "1", "1"), ("perm-active", "1", "1"), ("mqa", "0", "0"), ("mqa", "1", "0")],
 )
 def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
     """WHISPER_CROSS_MODE=kernel (blocked cross-KV, attention_decode) and perm give the HF tokens.
@@ -387,12 +387,11 @@ def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
     monkeypatch.setenv("WHISPER_FUSED_DECODE", fused)
     monkeypatch.setenv("WHISPER_CROSS_KT", kt)
     model = _build_native(path, max_num_seqs=3)
-    assert model.audio_tower.blocked == (mode == "kernel")
+    assert model.audio_tower.blocked == (mode in ("kernel", "mqa"))
     from vllm_neuron.model.whisper.model_bf16 import CROSS_BLOCKS_PER_SLOT
 
-    assert model.audio_tower.cross_k_0.shape[0] == (
-        4 * CROSS_BLOCKS_PER_SLOT if mode == "kernel" else 4
-    )
+    expect = {"kernel": 4 * CROSS_BLOCKS_PER_SLOT, "mqa": 4 * 128}.get(mode, 4)
+    assert model.audio_tower.cross_k_0.shape[0] == expect
 
     torch.manual_seed(2)
     mels = [torch.randn(1, 128, 3000), torch.randn(1, 128, 3000)]

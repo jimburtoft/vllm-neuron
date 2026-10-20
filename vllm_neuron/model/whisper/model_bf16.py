@@ -129,7 +129,10 @@ def cross_mode() -> str:
       slot, attention runs once for each slot over its own cross-KV, and a
       second one-hot matmul moves the result back. Both moves are exact.
     * ``kernel``: the NKI ``attention_decode`` kernel over the cross-KV in
-      128-token blocks, with a block table for each row.
+      blocks, with a per-head block table for each row (MHA, heads folded).
+    * ``mqa``: the same kernel with one KV head: the heads of a slot are laid
+      end to end (head-major, 1536 positions each), and a per-head mask keeps
+      each q head on its own span. The kernel then runs B rows, not B * heads.
     * ``onehot`` / ``gather``: older modes, kept for comparison.
     """
     return os.environ.get("WHISPER_CROSS_MODE", "mask")
@@ -360,9 +363,15 @@ class WhisperCrossKVEncoder(nn.Module):
         self.n_layers = n_layers
         # The kernel mode stores each slot as CROSS_BLOCKS_PER_SLOT blocks of
         # [heads, CROSS_BLOCK, d], the same 4D layout as the paged self-KV.
-        self.blocked = cross_mode() == "kernel"
+        self.mqa = cross_mode() == "mqa"
+        self.blocked = cross_mode() in ("kernel", "mqa")
         self.kt = cross_k_transposed() and not self.blocked
-        if self.blocked:
+        self.n_heads_local = n_heads_local
+        if self.mqa:
+            # One KV head: each slot holds heads x 1536 positions in 128 blocks.
+            self.mqa_block = n_heads_local * CROSS_CTX // 128
+            shape = (num_slots * 128, 1, self.mqa_block, head_dim)
+        elif self.blocked:
             shape = (num_slots * CROSS_BLOCKS_PER_SLOT, n_heads_local, CROSS_BLOCK, head_dim)
         else:
             shape = (num_slots, n_heads_local, n_ctx, head_dim)
@@ -381,13 +390,17 @@ class WhisperCrossKVEncoder(nn.Module):
             )
         slots = write_block_ids.to(torch.int64)
         if self.blocked:
-            nb = CROSS_BLOCKS_PER_SLOT
+            nb = 128 if self.mqa else CROSS_BLOCKS_PER_SLOT
             rows = (
                 slots.view(-1, 1) * nb + torch.arange(nb, device=slots.device, dtype=slots.dtype)
             ).view(-1)
         for i in range(self.n_layers):
             k, v = self.cross_attns[i].project_kv(encoder_hidden)
-            if self.blocked:
+            if self.mqa:
+                k, v = self._to_mqa_blocks(k), self._to_mqa_blocks(v)
+                getattr(self, f"cross_k_{i}").index_put_((rows,), k)
+                getattr(self, f"cross_v_{i}").index_put_((rows,), v)
+            elif self.blocked:
                 k, v = self._to_blocks(k), self._to_blocks(v)
                 getattr(self, f"cross_k_{i}").index_put_((rows,), k)
                 getattr(self, f"cross_v_{i}").index_put_((rows,), v)
@@ -398,6 +411,12 @@ class WhisperCrossKVEncoder(nn.Module):
                 getattr(self, f"cross_v_{i}").index_put_((slots,), v)
         # Return a tensor, so that the warmup trace has an output.
         return encoder_hidden
+
+    def _to_mqa_blocks(self, x):
+        """``[n, h, 1500, d]`` to ``[n * 128, 1, h * 1536 / 128, d]``, head-major."""
+        n, h, t, d = x.shape
+        x = F.pad(x, (0, 0, 0, CROSS_CTX - t))  # [n, h, 1536, d]
+        return x.reshape(n * 128, 1, self.mqa_block, d)
 
     @staticmethod
     def _to_blocks(x):
@@ -429,15 +448,19 @@ class CrossAttention(nn.Module):
         self.kt = cross_k_transposed() and cross_mode() != "kernel"
         # Kernel mode: the kernel projects Q, K and V of the decoder token. Only
         # Q is used, so the K and V columns are zero. The active key is masked.
-        self.kernel = cross_mode() == "kernel"
+        self.kernel = cross_mode() in ("kernel", "mqa")
         if self.kernel:
             d_local = self.num_heads * self.head_dim
+            # MHA: q, k, v columns for every head. MQA: q for every head and one
+            # k and one v head (zero: the active key is masked).
+            kv_cols = 2 * self.head_dim if cross_mode() == "mqa" else 2 * d_local
             self.register_buffer(
-                "qkv_weight_fused", torch.zeros(embed_dim, 3 * d_local, dtype=dtype),
+                "qkv_weight_fused", torch.zeros(embed_dim, d_local + kv_cols, dtype=dtype),
                 persistent=False,
             )
             self.register_buffer(
-                "qkv_bias_fused", torch.zeros(1, 3 * d_local, dtype=dtype), persistent=False
+                "qkv_bias_fused", torch.zeros(1, d_local + kv_cols, dtype=dtype),
+                persistent=False,
             )
             self.register_buffer(
                 "out_weight_fused", torch.zeros(d_local, embed_dim, dtype=dtype),
@@ -957,7 +980,9 @@ class WhisperDecoder(nn.Module):
         # Prefill has one row, so it always uses the gather.
         mode = cross_mode()
         blocked = owner.blocked
-        if blocked:
+        if owner.mqa:
+            mode = "mqagather" if is_prefill else "mqa"
+        elif blocked:
             # Decode uses the kernel with a block table. Prefill has up to 128
             # tokens for each row, more than the kernel takes, so it gathers
             # the 12 blocks of each row and uses the plain attention.
@@ -968,6 +993,17 @@ class WhisperDecoder(nn.Module):
         cross_meta = None
         if mode == "kernel":
             cross_meta = self._cross_kernel_inputs(x, slots, meta, owner)
+        elif mode == "mqa":
+            cross_meta = self._cross_mqa_inputs(x, slots, meta, owner)
+        if mode == "mqagather":
+            rows = meta["block_table_tensor"].shape[0]
+            row_slots = (
+                torch.zeros(rows, dtype=torch.int32, device=x.device) if slots is None else slots
+            )
+            block_ids = (
+                row_slots.view(-1, 1).to(torch.int64) * 128
+                + torch.arange(128, device=x.device, dtype=torch.int64)
+            ).view(-1)
         if mode == "blockgather":
             rows = meta["block_table_tensor"].shape[0]
             row_slots = (
@@ -996,8 +1032,15 @@ class WhisperDecoder(nn.Module):
         for i, layer in enumerate(self.layers):
             cross_k = getattr(owner, f"cross_k_{i}")
             cross_v = getattr(owner, f"cross_v_{i}")
-            if mode == "kernel":
+            if mode in ("kernel", "mqa"):
                 pass
+            elif mode == "mqagather":
+                hl, d = owner.n_heads_local, cross_k.shape[-1]
+                cross_k, cross_v = (
+                    c.index_select(0, block_ids)
+                    .reshape(rows, hl, CROSS_CTX, d)[:, :, :WHISPER_ENCODER_TOKENS]
+                    for c in (cross_k, cross_v)
+                )
             elif mode == "blockgather":
                 h, d = cross_k.shape[1], cross_k.shape[3]
                 cross_k, cross_v = (
@@ -1070,6 +1113,37 @@ class WhisperDecoder(nn.Module):
             pos, bs=rows, q_head=heads, s_active=1, s_prior=s_ctx,
             block_len=CROSS_BLOCK, active_mask=active,
         )
+        return table, mask
+
+    def _cross_mqa_inputs(self, x, slots, meta, owner):
+        """Build the 2D block table and the per-head mask of the MQA cross-attention.
+
+        Each slot holds ``heads x 1536`` positions in 128 blocks (head-major).
+        Q head ``j`` is valid only on positions ``[j * 1536, j * 1536 + 1500)``.
+        The mask is built in sequence order and then moved to the kernel's
+        block-KV layout (sequence order is the block-length-1 layout).
+        """
+        from vllm_neuron.functional.attention.attention_decode_mask import (
+            _resize_block_len,
+            relayout_block_kv_mask,
+        )
+
+        rows = meta["block_table_tensor"].shape[0]
+        if slots is None:
+            slots = torch.zeros(rows, dtype=torch.int32, device=x.device)
+        heads = owner.n_heads_local
+        s_ctx = heads * CROSS_CTX
+        table = slots.view(-1, 1).to(torch.int32) * 128 + torch.arange(
+            128, device=x.device, dtype=torch.int32
+        )
+        t = torch.arange(s_ctx, device=x.device, dtype=torch.int32)
+        h = torch.arange(heads, device=x.device, dtype=torch.int32)
+        valid = ((t // CROSS_CTX).view(-1, 1) == h.view(1, -1)) & (
+            (t % CROSS_CTX) < WHISPER_ENCODER_TOKENS
+        ).view(-1, 1)
+        mask = valid.to(torch.float32).view(s_ctx, 1, heads, 1).expand(s_ctx, rows, heads, 1)
+        to_bl = _resize_block_len(owner.mqa_block, rows, heads, 1, s_ctx)
+        mask = relayout_block_kv_mask(mask.contiguous(), 1, to_bl)
         return table, mask
 
     def _request_slots(self, attn_metadata, device) -> torch.Tensor:
