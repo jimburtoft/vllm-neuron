@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -657,6 +658,14 @@ def _can_use_kernel(
         and T <= _MAX_T_FOR_I_SHARDING
         and not has_bias
     )
+    # nkilib mlp_cte_sharding re-enables I-sharding whenever intermediate_size > 4096,
+    # regardless of H/T. Opt-in mirror of that rule (A/B: VLLM_NEURON_MLP_CTE_I_OVERRIDE=1).
+    # Quantized weights have no torch fallback with scales, so mirror nkilib's rule for them too.
+    if (
+        os.environ.get("VLLM_NEURON_MLP_CTE_I_OVERRIDE") == "1"
+        or quantization_type != QuantizationType.NONE
+    ) and I > 4096 and not has_bias:
+        can_shard_on_i = True
     effective_i = I // lnc_degree if can_shard_on_i else I
     return math.ceil(effective_i / _SRC_PROJ_INT_DIM_TILE_SIZE) <= _NUM_HW_PSUM_BANKS
 
