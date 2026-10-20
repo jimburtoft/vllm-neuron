@@ -112,6 +112,7 @@ Truncated test checkpoints use the structural checks only.
 | Variable | Effect |
 |---|---|
 | `MUSE_GLIMMER_DECODE_TORCH=1` | Decode attention uses the plain-torch reference (`_torch_attention_decode_impl`) instead of the NKI megakernel. This is the escape hatch for kernel-suspect issues. |
+| `MUSE_GLIMMER_FP8=mlp` (or `mlp,attn`) | FP8 weights self-quantized from the BF16 checkpoint at load time (`fp8.py`): nkilib `QuantizationType.ROW`, per-output-channel e4m3 weight scales (240 range), per-token dynamic activation quant on prefill, weight-only on decode. No calibration. `mlp` frees 4.3 GiB/core (14.21 -> 9.92 GiB used after load, server config with vision TP=4) and allows `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.27` / `max_num_seqs` 32 (29.3 admitted; 0.30 is text-only: an image stress run hit `nrt_tensor_allocate status=4`). `attn` adds qkv/gate/o_proj but is slower at BS=13 (Task 021); use `mlp`. FP8 prefill graphs compile about 2.5x slower: set `VLLM_NEURON_BARRIER_TIMEOUT=14400` on a cold cache |
 | `MUSE_GLIMMER_STRICT_CONFIG=0/1` | Force-disable or force-enable the released-value asserts |
 | `MUSE_GLIMMER_COMPUTE_DTYPE=float32` | CPU-mode test knob: fp32 compute, for an exact structural comparison against HF fp32 (use with `LLM(dtype="float32")`) |
 
