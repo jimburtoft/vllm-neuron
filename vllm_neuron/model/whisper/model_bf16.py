@@ -121,6 +121,18 @@ def cross_k_transposed() -> bool:
     return os.environ.get("WHISPER_CROSS_KT", "0") == "1"
 
 
+def mqa_group(heads: int) -> int:
+    """Return the heads in one MQA cross-attention call (``WHISPER_CROSS_MQA_GROUP``, default 5).
+
+    One call spans ``group x 1536`` positions. The decode kernel's flash tiling
+    fails above 8192 positions, so groups stay at 5 heads or fewer.
+    """
+    g = min(int(os.environ.get("WHISPER_CROSS_MQA_GROUP", "5")), heads)
+    if heads % g != 0:
+        raise ValueError(f"WHISPER_CROSS_MQA_GROUP={g} must divide the {heads} heads of a rank.")
+    return g
+
+
 def cross_mode() -> str:
     """Return ``WHISPER_CROSS_MODE``: how a batched decode step reads the cross-KV.
 
@@ -368,9 +380,12 @@ class WhisperCrossKVEncoder(nn.Module):
         self.kt = cross_k_transposed() and not self.blocked
         self.n_heads_local = n_heads_local
         if self.mqa:
-            # One KV head: each slot holds heads x 1536 positions in 128 blocks.
-            self.mqa_block = n_heads_local * CROSS_CTX // 128
-            shape = (num_slots * 128, 1, self.mqa_block, head_dim)
+            # One KV head: each slot holds `groups` spans of g x 1536 positions,
+            # each span in 128 blocks of g x 12 positions.
+            self.mqa_g = mqa_group(n_heads_local)
+            self.mqa_groups = n_heads_local // self.mqa_g
+            self.mqa_block = self.mqa_g * CROSS_CTX // 128
+            shape = (num_slots * self.mqa_groups * 128, 1, self.mqa_block, head_dim)
         elif self.blocked:
             shape = (num_slots * CROSS_BLOCKS_PER_SLOT, n_heads_local, CROSS_BLOCK, head_dim)
         else:
@@ -390,7 +405,7 @@ class WhisperCrossKVEncoder(nn.Module):
             )
         slots = write_block_ids.to(torch.int64)
         if self.blocked:
-            nb = 128 if self.mqa else CROSS_BLOCKS_PER_SLOT
+            nb = 128 * self.mqa_groups if self.mqa else CROSS_BLOCKS_PER_SLOT
             rows = (
                 slots.view(-1, 1) * nb + torch.arange(nb, device=slots.device, dtype=slots.dtype)
             ).view(-1)
@@ -413,10 +428,10 @@ class WhisperCrossKVEncoder(nn.Module):
         return encoder_hidden
 
     def _to_mqa_blocks(self, x):
-        """``[n, h, 1500, d]`` to ``[n * 128, 1, h * 1536 / 128, d]``, head-major."""
+        """``[n, h, 1500, d]`` to ``[n * groups * 128, 1, g * 1536 / 128, d]``, head-major."""
         n, h, t, d = x.shape
         x = F.pad(x, (0, 0, 0, CROSS_CTX - t))  # [n, h, 1536, d]
-        return x.reshape(n * 128, 1, self.mqa_block, d)
+        return x.reshape(n * self.mqa_groups * 128, 1, self.mqa_block, d)
 
     @staticmethod
     def _to_blocks(x):
@@ -453,32 +468,45 @@ class CrossAttention(nn.Module):
             d_local = self.num_heads * self.head_dim
             # MHA: q, k, v columns for every head. MQA: q for every head and one
             # k and one v head (zero: the active key is masked).
-            kv_cols = 2 * self.head_dim if cross_mode() == "mqa" else 2 * d_local
+            self.mqa = cross_mode() == "mqa"
+            self.mqa_g = mqa_group(self.num_heads) if self.mqa else self.num_heads
+            self.mqa_groups = self.num_heads // self.mqa_g
+            gd = self.mqa_g * self.head_dim
+            kv_cols = 2 * self.head_dim if self.mqa else 2 * d_local
             self.register_buffer(
-                "qkv_weight_fused", torch.zeros(embed_dim, d_local + kv_cols, dtype=dtype),
+                "qkv_weight_fused",
+                torch.zeros(self.mqa_groups, embed_dim, gd + kv_cols, dtype=dtype),
                 persistent=False,
             )
             self.register_buffer(
-                "qkv_bias_fused", torch.zeros(1, d_local + kv_cols, dtype=dtype),
+                "qkv_bias_fused", torch.zeros(self.mqa_groups, 1, gd + kv_cols, dtype=dtype),
                 persistent=False,
             )
             self.register_buffer(
-                "out_weight_fused", torch.zeros(d_local, embed_dim, dtype=dtype),
+                "out_weight_fused", torch.zeros(self.mqa_groups, gd, embed_dim, dtype=dtype),
                 persistent=False,
             )
 
     @torch.no_grad()
     def finalize_weights(self) -> None:
-        """Build the kernel-mode weights: the scaled q weight and bias, zero K/V columns."""
+        """Build the kernel-mode weights: the scaled q weight and bias, zero K/V columns.
+
+        With MQA head groups, group ``i`` gets the q columns and the out_proj
+        rows of its heads.
+        """
         if not self.kernel:
             return
-        d_local = self.num_heads * self.head_dim
+        gd = self.mqa_g * self.head_dim
         wq = (self.q_proj.weight * self.scaling).t()  # [H, d_local]
+        bq = self.q_proj.bias * self.scaling
+        wo = self.out_proj.rpl.weight.t()  # [d_local, H]
         self.qkv_weight_fused.zero_()
-        self.qkv_weight_fused[:, :d_local].copy_(wq)
         self.qkv_bias_fused.zero_()
-        self.qkv_bias_fused[0, :d_local].copy_(self.q_proj.bias * self.scaling)
-        self.out_weight_fused.copy_(self.out_proj.rpl.weight.t().contiguous())
+        for i in range(self.mqa_groups):
+            cols = slice(i * gd, (i + 1) * gd)
+            self.qkv_weight_fused[i, :, :gd].copy_(wq[:, cols])
+            self.qkv_bias_fused[i, 0, :gd].copy_(bq[cols])
+            self.out_weight_fused[i].copy_(wo[cols].contiguous())
 
     def attn_kernel(self, hidden_states, cross_k, cross_v, table, mask):
         """Cross-attention with the NKI decode kernel over the blocked cross-KV.
@@ -493,25 +521,30 @@ class CrossAttention(nn.Module):
         from vllm_neuron import functional as NF
 
         B, S, hidden = hidden_states.shape
-        out = NF.attention_decode(
-            X=hidden_states,
-            X_hidden_dim_actual=hidden,
-            rmsnorm_X_enabled=False,
-            W_qkv=self.qkv_weight_fused,
-            bias_qkv=self.qkv_bias_fused,
-            K_cache_transposed=False,
-            active_blocks_table=table,
-            K_cache=cross_k,
-            V_cache=cross_v,
-            attention_mask=mask,
-            softmax_scale=1.0,
-            update_cache=False,
-            W_out=self.out_weight_fused,
-            bias_out=None,
-            transposed_out=False,
-        )
-        if isinstance(out, (tuple, list)):
-            out = out[0]
+        out = None
+        for i in range(self.mqa_groups):
+            # MQA groups: group i reads blocks [i * 128, (i + 1) * 128) of each slot.
+            tbl = table if i == 0 else table + i * 128
+            o = NF.attention_decode(
+                X=hidden_states,
+                X_hidden_dim_actual=hidden,
+                rmsnorm_X_enabled=False,
+                W_qkv=self.qkv_weight_fused[i],
+                bias_qkv=self.qkv_bias_fused[i],
+                K_cache_transposed=False,
+                active_blocks_table=tbl,
+                K_cache=cross_k,
+                V_cache=cross_v,
+                attention_mask=mask,
+                softmax_scale=1.0,
+                update_cache=False,
+                W_out=self.out_weight_fused[i],
+                bias_out=None,
+                transposed_out=False,
+            )
+            if isinstance(o, (tuple, list)):
+                o = o[0]
+            out = o if out is None else out + o
         out = out.reshape(B * S, hidden)
         if self.tp > 1:
             from torch.distributed._functional_collectives import all_reduce
@@ -1000,9 +1033,10 @@ class WhisperDecoder(nn.Module):
             row_slots = (
                 torch.zeros(rows, dtype=torch.int32, device=x.device) if slots is None else slots
             )
+            nbm = 128 * owner.mqa_groups
             block_ids = (
-                row_slots.view(-1, 1).to(torch.int64) * 128
-                + torch.arange(128, device=x.device, dtype=torch.int64)
+                row_slots.view(-1, 1).to(torch.int64) * nbm
+                + torch.arange(nbm, device=x.device, dtype=torch.int64)
             ).view(-1)
         if mode == "blockgather":
             rows = meta["block_table_tensor"].shape[0]
@@ -1131,9 +1165,11 @@ class WhisperDecoder(nn.Module):
         rows = meta["block_table_tensor"].shape[0]
         if slots is None:
             slots = torch.zeros(rows, dtype=torch.int32, device=x.device)
-        heads = owner.n_heads_local
+        # One head group: g heads, g x 1536 positions in 128 blocks. Group i of
+        # slot s starts at block (s * groups + i) * 128; attn_kernel adds i * 128.
+        heads = owner.mqa_g
         s_ctx = heads * CROSS_CTX
-        table = slots.view(-1, 1).to(torch.int32) * 128 + torch.arange(
+        table = slots.view(-1, 1).to(torch.int32) * (128 * owner.mqa_groups) + torch.arange(
             128, device=x.device, dtype=torch.int32
         )
         t = torch.arange(s_ctx, device=x.device, dtype=torch.int32)
