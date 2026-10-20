@@ -50,6 +50,7 @@ from vllm_neuron.model.kv_cache import (
     build_per_head_slot_mapping,
     paged_slot_indices,
 )
+from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
 from vllm_neuron.model.neuron_config import EncoderNeuronConfig, NeuronConfig
 from vllm_neuron.nn import ColumnParallelLinear, RowParallelLinear
 from vllm_neuron.nn.sampler import Sampler
@@ -796,7 +797,6 @@ class DecoderSelfAttention(nn.Module):
         out_proj bias is added after the TP all-reduce, as in the torch path.
         """
         from vllm_neuron import functional as NF
-        from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
 
         block_size = meta["block_size"]
         block_table = meta["block_table_tensor"]
