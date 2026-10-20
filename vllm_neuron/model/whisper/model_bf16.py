@@ -90,6 +90,16 @@ def fused_decode_enabled() -> bool:
 
 # Whisper always pads or cuts the audio to a 30 s window: 3000 mel frames, then
 # 1500 encoder positions after the stride-2 convolution.
+def fused_decode_max_rows() -> int:
+    """Return the largest decode batch that uses the fused decode kernel.
+
+    ``WHISPER_FUSED_DECODE_MAX_B`` (default: no limit). The kernel folds the
+    5 MHA heads of a rank into the batch, so its cost grows with the rows.
+    The torch path is faster from about 64 rows at TP4 (Task 013).
+    """
+    return int(os.environ.get("WHISPER_FUSED_DECODE_MAX_B", "1000000"))
+
+
 WHISPER_ENCODER_TOKENS = 1500
 # The kernel cross-attention mode keeps the cross-KV of a slot in
 # CROSS_BLOCKS_PER_SLOT blocks of CROSS_BLOCK tokens: 1536 positions, the 1500
@@ -872,7 +882,7 @@ class DecoderLayer(nn.Module):
         h = self.self_attn_layer_norm(x)
         if is_prefill:
             sa = self.self_attn.forward_prefill(h, meta)
-        elif self.self_attn.fused:
+        elif self.self_attn.fused and meta["block_table_tensor"].shape[0] <= fused_decode_max_rows():
             sa = self.self_attn.forward_decode_fused(h, meta, positions)
         else:
             sa = self.self_attn.forward_decode(h, meta, positions)
