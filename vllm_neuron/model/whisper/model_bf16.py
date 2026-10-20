@@ -246,13 +246,15 @@ class EncoderSelfAttention(nn.Module):
         self.k_proj = _cpl(embed_dim, embed_dim, False, dtype, tp_group)
         self.v_proj = _cpl(embed_dim, embed_dim, True, dtype, tp_group)
         self.out_proj = RowParallelLinearFP32Bias(embed_dim, embed_dim, dtype, tp_group)
+        # Read the flag one time: a read in forward adds an os.environ guard.
+        self.flash = encoder_flash_enabled()
 
     def _shape(self, x, seqlen, bsz):
         return x.view(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
 
     def forward(self, hidden_states):
         bsz, seqlen, _ = hidden_states.shape
-        if encoder_flash_enabled():
+        if self.flash:
             return self._forward_flash(hidden_states)
         q = self._shape(self.q_proj(hidden_states) * self.scaling, seqlen, bsz)
         k = self._shape(self.k_proj(hidden_states), seqlen, bsz)
@@ -927,6 +929,11 @@ class DecoderLayer(nn.Module):
         self.encoder_attn_layer_norm = nn.LayerNorm(d, dtype=dtype)
         self.mlp = MLP(d, cfg.decoder_ffn_dim, dtype, tp_group, part="decoder")
         self.final_layer_norm = nn.LayerNorm(d, dtype=dtype)
+        # Read the env flags one time. A read in forward puts an os.environ guard
+        # in the compiled graph, and the warm restore of the compiled package
+        # then fails when the variable is not set (KeyError on the guard).
+        self.fused_max_rows = fused_decode_max_rows()
+        self.skip_cross = cross_mode() == "none"
 
     def forward(
         self, x, cross_k, cross_v, meta, is_prefill, positions, slots=None, cross_meta=None,
@@ -938,14 +945,14 @@ class DecoderLayer(nn.Module):
         h = self.self_attn_layer_norm(x)
         if is_prefill:
             sa = self.self_attn.forward_prefill(h, meta)
-        elif self.self_attn.fused and meta["block_table_tensor"].shape[0] <= fused_decode_max_rows():
+        elif self.self_attn.fused and meta["block_table_tensor"].shape[0] <= self.fused_max_rows:
             sa = self.self_attn.forward_decode_fused(h, meta, positions)
         else:
             sa = self.self_attn.forward_decode(h, meta, positions)
         x = x + sa
 
         tokens, hidden = x.shape
-        if cross_mode() == "none" and not is_prefill:
+        if self.skip_cross and not is_prefill:
             # Timing only: skip the cross-attention (the output is wrong).
             x = x + self.mlp(self.final_layer_norm(x))
             return x
@@ -982,6 +989,9 @@ class WhisperDecoder(nn.Module):
         )
         self.layer_norm = nn.LayerNorm(d, dtype=dtype)
         self._cross_kv_owner: WhisperCrossKVEncoder | None = None
+        # Read the env flags one time (see DecoderLayer.__init__).
+        self.cross_mode = cross_mode()
+        self.cross_active = os.environ.get("WHISPER_CROSS_ACTIVE", "0") == "1"
 
     def bind_cross_kv(self, owner: WhisperCrossKVEncoder) -> None:
         """Point the cross-KV reads at the module that owns the buffers.
@@ -1011,7 +1021,7 @@ class WhisperDecoder(nn.Module):
         #     is exact (1 * v + 0 * others) and runs as one dense matmul.
         #   gather: index_select (software-DGE indirect DMA, slow).
         # Prefill has one row, so it always uses the gather.
-        mode = cross_mode()
+        mode = self.cross_mode
         blocked = owner.blocked
         if owner.mqa:
             mode = "mqagather" if is_prefill else "mqa"
@@ -1055,7 +1065,7 @@ class WhisperDecoder(nn.Module):
             # of B rows. The scheduler takes the lowest free slot, so this holds
             # when the live slots are 0..B-1; the runner must fall back
             # otherwise (the CPU test and the harness hold it by construction).
-            if os.environ.get("WHISPER_CROSS_ACTIVE", "0") == "1":
+            if self.cross_active:
                 active = min(slots.shape[0], owner.num_slots)
         if mode in ("onehot", "perm"):
             num_slots = owner.num_slots if active is None else active
