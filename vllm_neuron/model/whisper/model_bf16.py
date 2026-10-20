@@ -1044,10 +1044,6 @@ class WhisperDecoder(nn.Module):
                 torch.zeros(rows, dtype=torch.int32, device=x.device) if slots is None else slots
             )
             nbm = 128 * owner.mqa_groups
-            block_ids = (
-                row_slots.view(-1, 1).to(torch.int64) * nbm
-                + torch.arange(nbm, device=x.device, dtype=torch.int64)
-            ).view(-1)
         if mode == "blockgather":
             rows = meta["block_table_tensor"].shape[0]
             row_slots = (
@@ -1079,9 +1075,13 @@ class WhisperDecoder(nn.Module):
             if mode in ("kernel", "mqa"):
                 pass
             elif mode == "mqagather":
+                # The blocks of a slot are contiguous, so gather one slot per row
+                # instead of nbm blocks per row. A 512-block gather does not finish
+                # compiling with neuronx-cc 2.28 (SDK 2.33).
                 hl, d = owner.n_heads_local, cross_k.shape[-1]
                 cross_k, cross_v = (
-                    c.index_select(0, block_ids)
+                    c.view(-1, nbm * c.shape[1] * c.shape[2], d)
+                    .index_select(0, row_slots.to(torch.int64))
                     .reshape(rows, hl, CROSS_CTX, d)[:, :, :WHISPER_ENCODER_TOKENS]
                     for c in (cross_k, cross_v)
                 )
