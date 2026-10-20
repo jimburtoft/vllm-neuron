@@ -15,6 +15,7 @@ The same class is registered in two places:
 
 from __future__ import annotations
 
+import math
 from typing import ClassVar, Literal
 
 import torch
@@ -22,8 +23,12 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from vllm_neuron.model.interfaces import SupportsMaxPixels, SupportsSpatialMerge
-from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
+from vllm_neuron.model.interfaces import (
+    SupportsEncoderBudget,
+    SupportsMaxPixels,
+    SupportsSpatialMerge,
+)
+from vllm_neuron.model.neuron_config import NeuronConfig, EncoderNeuronConfig
 
 from .processing import (
     IMAGE_TOKEN,
@@ -41,7 +46,9 @@ ARCHITECTURE = "MuseGlimmerForConditionalGeneration"
     info=MuseGlimmerProcessingInfo,
     dummy_inputs=MuseGlimmerDummyInputsBuilder,
 )
-class MuseGlimmerForConditionalGeneration(nn.Module, SupportsSpatialMerge, SupportsMaxPixels):
+class MuseGlimmerForConditionalGeneration(
+    nn.Module, SupportsSpatialMerge, SupportsMaxPixels, SupportsEncoderBudget
+):
     """Validates the config and builds the MuseGlimmer Neuron implementation."""
 
     # vLLM front-end interface tags (inspected, never instantiated there).
@@ -84,7 +91,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsSpatialMerge, Suppo
         cls,
         hf_config: PretrainedConfig,
         text_neuron_config: NeuronConfig | None = None,
-        vision_neuron_config: VisionNeuronConfig | None = None,
+        encoder_neuron_config: EncoderNeuronConfig | None = None,
     ) -> nn.Module:
         cls._validate_config(hf_config, text_neuron_config)
         from .model_bf16 import MuseGlimmerForConditionalGeneration as Model
@@ -92,12 +99,34 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsSpatialMerge, Suppo
         return Model.from_configs(
             hf_config,
             text_neuron_config=text_neuron_config,
-            vision_neuron_config=vision_neuron_config,
+            encoder_neuron_config=encoder_neuron_config,
         )
 
     @classmethod
     def get_vision_token_merge_factor(cls, hf_config: PretrainedConfig) -> int:
         return hf_config.vision_config.merge_size**2
+
+    # -- encoder budget (vllm-neuron 0.29 contract) ------------------------
+    # Buckets are raw pre-merge patches; merge_size**2 patches -> one embed.
+    @classmethod
+    def get_max_encoder_embed_budget(cls, hf_config, encoder_neuron_config) -> int | None:
+        buckets = encoder_neuron_config.num_encoder_input_buckets
+        if not buckets:
+            return None
+        return max(buckets) // cls.get_vision_token_merge_factor(hf_config)
+
+    @classmethod
+    def get_max_encoder_blocks_per_request(cls, hf_config, encoder_neuron_config) -> int:
+        from vllm_neuron.utils.mm_utils import get_encoder_cache_block_size
+
+        buckets = encoder_neuron_config.num_encoder_input_buckets
+        if not buckets:
+            return 0
+        mu = cls.get_vision_token_merge_factor(hf_config)
+        cache_block_size = get_encoder_cache_block_size(
+            hf_config, encoder_neuron_config.encoder_attention_block_size
+        )
+        return math.ceil((max(buckets) // mu) / cache_block_size)
 
     @classmethod
     def get_max_pixels_token_count(cls, hf_config: PretrainedConfig, max_pixels: int) -> int:

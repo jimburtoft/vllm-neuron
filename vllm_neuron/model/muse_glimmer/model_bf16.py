@@ -51,10 +51,10 @@ import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
 from nkilib.core.utils.common_types import NormType, QuantizationType
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
-from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
+from vllm_neuron.model.neuron_config import NeuronConfig, EncoderNeuronConfig
 from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
-from vllm_neuron.model.qwen3_vl.utils.merge_vision_embeds import (
-    merge_vision_embeddings,
+from vllm_neuron.functional.merge_multimodal_embeddings import (
+    merge_multimodal_embeddings,
 )
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
@@ -856,8 +856,9 @@ class MuseGlimmerTextModel(nn.Module):
         positions: torch.Tensor,
         attn_metadata: dict,
         rank: torch.Tensor | None = None,
-        vision_embedding_blocks: tuple[torch.Tensor, ...] | None = None,
-        vision_positions: torch.Tensor | None = None,
+        encoder_embedding_buffer: torch.Tensor | None = None,
+        encoder_block_ids: torch.Tensor | None = None,
+        encoder_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         meta0 = attn_metadata["layers.0.self_attn"]
         is_prefill = meta0["max_query_len"] > meta0["decode_token_threshold"]
@@ -867,8 +868,21 @@ class MuseGlimmerTextModel(nn.Module):
         h = self.embed_norm(h)
 
         # Vision features replace placeholder rows AFTER embed_norm (HF order).
-        if is_prefill and vision_embedding_blocks is not None and vision_positions is not None:
-            h, _ = merge_vision_embeddings(h, vision_embedding_blocks, vision_positions, rank=self.rank)
+        # 0.29 contract: the whole encoder-cache buffer + per-step block ids; the SP
+        # rank comes from the runtime tensor so every rank traces one graph (SPMD).
+        if (
+            is_prefill
+            and encoder_embedding_buffer is not None
+            and encoder_block_ids is not None
+            and encoder_positions is not None
+        ):
+            h, _ = merge_multimodal_embeddings(
+                h,
+                encoder_embedding_buffer,
+                encoder_block_ids,
+                encoder_positions,
+                rank=self.tp_group.rank_in_group_tensor,
+            )
 
         position_embeddings = self.rotary_emb(positions)
 
@@ -972,8 +986,9 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         spec_decode_metadata=None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
-        vision_embedding_blocks: tuple[torch.Tensor, ...] | None = None,
-        vision_positions: torch.Tensor | None = None,
+        encoder_embedding_buffer: torch.Tensor | None = None,
+        encoder_block_ids: torch.Tensor | None = None,
+        encoder_positions: torch.Tensor | None = None,
         **kwargs,
     ):
         positions = positions.to(torch.int32)
@@ -988,8 +1003,9 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
             positions,
             attn_metadata=attn_metadata,
             rank=rank,
-            vision_embedding_blocks=vision_embedding_blocks,
-            vision_positions=vision_positions,
+            encoder_embedding_buffer=encoder_embedding_buffer,
+            encoder_block_ids=encoder_block_ids,
+            encoder_positions=encoder_positions,
         )
         h = torch.index_select(h, dim=0, index=sampling_positions)
         logits = self._softcap(self.lm_head(h))
@@ -1037,7 +1053,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         becomes ``T`` items ``[1, H, W]`` that share the video's block run
         (``group_ids``): a block holds whole temporal groups, each with its own
         full/window bounds, RoPE and position taps, so the features equal HF's.
-        A group must fit in one block (``H*W <= vision_attention_block_size``);
+        A group must fit in one block (``H*W <= encoder_attention_block_size``);
         a video spans ``ceil(T / (block // (H*W)))`` blocks, non-last blocks
         may carry a pad tail recorded in ``tokens_per_block``.
         """
@@ -1059,7 +1075,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         vnc = vc.neuron_config
         t0 = _time.perf_counter()
         mu = vc.merge_size**2
-        block_size = vnc.vision_attention_block_size
+        block_size = vnc.encoder_attention_block_size
         grid_thw = image_grid_thw.to(torch.int64).reshape(-1, 3)
         rows = grid_thw.tolist()
         if len(mm_hashes) != len(rows):
@@ -1072,7 +1088,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
             for t, h, w in rows:
                 if t * h * w > block_size:
                     raise ValueError(
-                        f"vision_attention_block_size={block_size} < image patches {t * h * w}; "
+                        f"encoder_attention_block_size={block_size} < image patches {t * h * w}; "
                         "an image must fit in one block. Increase the block size / bucket "
                         "or lower mm_processor_kwargs max_image_tokens."
                     )
@@ -1086,7 +1102,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         required_blocks = sum(len(b) for b in block_map)
         _bucket, num_blocks = select_vision_bucket(
             max(sum(tokens), required_blocks * block_size),
-            vnc.num_vision_tokens_buckets, block_size, dp_size=vnc.dp_size,
+            vnc.num_encoder_input_buckets, block_size, dp_size=vnc.dp_size,
         )
         assignment = ffd_pack_images(
             tokens, block_size, num_blocks, one_item_per_block=True, group_ids=group_ids
@@ -1116,13 +1132,17 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
             (t1 - t0) * 1e3, (_time.perf_counter() - t1) * 1e3,
         )
 
-    def build_vision_synthetic_inputs(
-        self, bucket: int, vision_neuron_config: VisionNeuronConfig, device: torch.device
+    def get_encoder(self) -> torch.nn.Module | None:
+        """The vision tower (None on a language-only pool)."""
+        return self.visual
+
+    def build_encoder_synthetic_inputs(
+        self, bucket: int, encoder_neuron_config: EncoderNeuronConfig, device: torch.device
     ) -> dict[str, torch.Tensor]:
         """Shape-only inputs for ``self.visual`` warmup / tracing (per bucket)."""
         vc = self.config.vision_config
-        bs = vision_neuron_config.vision_attention_block_size
-        dp = vision_neuron_config.dp_size
+        bs = encoder_neuron_config.encoder_attention_block_size
+        dp = encoder_neuron_config.dp_size
         nb = math.ceil(math.ceil(bucket / bs) / dp) * dp
         mu = vc.merge_size**2
         z = lambda *shape, dtype: torch.zeros(*shape, dtype=dtype, device=device)  # noqa: E731
@@ -1149,12 +1169,12 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         cls,
         hf_config: PretrainedConfig,
         text_neuron_config: NeuronConfig | None = None,
-        vision_neuron_config: VisionNeuronConfig | None = None,
+        encoder_neuron_config: EncoderNeuronConfig | None = None,
     ):
         config = MuseGlimmerConfig.from_configs(
             hf_config,
             text_neuron_config=text_neuron_config,
-            vision_neuron_config=vision_neuron_config,
+            encoder_neuron_config=encoder_neuron_config,
         )
         return cls(config)
 

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field, fields
 import torch
 from transformers import PretrainedConfig
 
-from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
+from vllm_neuron.model.neuron_config import NeuronConfig, EncoderNeuronConfig
 
 logger = logging.getLogger(__name__)
 
@@ -280,7 +280,7 @@ class MuseGlimmerVisionConfig:
         default_factory=lambda: {"rope_theta": 10000.0, "rope_type": "axial"}
     )
 
-    neuron_config: VisionNeuronConfig | None = None
+    neuron_config: EncoderNeuronConfig | None = None
 
     @property
     def head_dim(self) -> int:
@@ -299,7 +299,7 @@ class MuseGlimmerVisionConfig:
         return self.patch_temporal * 3 * self.patch_size**2
 
     @classmethod
-    def from_hf_config(cls, hf_vision_config, neuron_config: VisionNeuronConfig = None):
+    def from_hf_config(cls, hf_vision_config, neuron_config: EncoderNeuronConfig = None):
         config_dict = _to_dict(hf_vision_config)
         filtered = _filter_fields(cls, config_dict)
         if neuron_config is not None:
@@ -353,7 +353,7 @@ class MuseGlimmerConfig:
         cls,
         hf_config: PretrainedConfig | dict | str,
         text_neuron_config: NeuronConfig = None,
-        vision_neuron_config: VisionNeuronConfig = None,
+        encoder_neuron_config: EncoderNeuronConfig = None,
     ):
         if isinstance(hf_config, (str, bytes)):
             with open(hf_config) as f:
@@ -370,7 +370,7 @@ class MuseGlimmerConfig:
 
         text_config = MuseGlimmerTextConfig.from_hf_config(hf_text, text_neuron_config)
         vision_config = MuseGlimmerVisionConfig.from_hf_config(
-            hf_vision, vision_neuron_config
+            hf_vision, encoder_neuron_config
         )
         return cls(
             text_config=text_config,

@@ -278,17 +278,17 @@ class NeuronPlatform(Platform):
 
         from vllm.model_executor.models.registry import ModelRegistry
 
-        # Architectures that vLLM itself does not implement. Without a
-        # front-end registration, ModelConfig resolves them to the generic
-        # Transformers backend (e.g. TransformersMultiModalForCausalLM), the
-        # worker then loads by that resolved name, and the plugin model is
-        # never selected. Lazy "module:Class" strings keep the import cheap.
-        if "MuseGlimmerForConditionalGeneration" not in ModelRegistry.models:
-            ModelRegistry.register_model(
-                "MuseGlimmerForConditionalGeneration",
-                "vllm_neuron.model.muse_glimmer.factory:"
-                "MuseGlimmerForConditionalGeneration",
-            )
+        # Front-end registration for plugin multimodal architectures. vLLM 0.24
+        # has no MuseGlimmer and resolves it to the Transformers backend; vLLM
+        # 0.29 maps it to its own MuseGlimmerForCausalLM, whose processor emits
+        # different multimodal kwargs (image_pixel_values / *_feature_sizes)
+        # than the plugin encoder consumes (pixel_values / image_grid_thw). In
+        # both cases the plugin's processor must win, so override any existing
+        # entry. Lazy "module:Class" strings keep the import cheap.
+        _mg = "vllm_neuron.model.muse_glimmer.factory:MuseGlimmerForConditionalGeneration"
+        _cur = ModelRegistry.models.get("MuseGlimmerForConditionalGeneration")
+        if getattr(_cur, "module_name", None) != _mg.split(":")[0]:
+            ModelRegistry.register_model("MuseGlimmerForConditionalGeneration", _mg)
 
         if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             ModelRegistry.register_model(

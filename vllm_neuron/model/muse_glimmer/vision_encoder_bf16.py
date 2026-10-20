@@ -23,7 +23,7 @@ The window reorder of HF is replaced by the CPU pack order (see
 in their ``[bound_min, bound_max)`` tensors, selected per layer by the static
 ``layer_types`` list (no graph branch).
 
-Parallelism (``vision_neuron_config``):
+Parallelism (``encoder_neuron_config``):
   * DP (default, tp=1, dp=world): every rank holds all weights, processes
     ``num_blocks / dp`` blocks, then all-gathers the final features.
   * TP: attention heads, MLP intermediate and adapter (fc1 column / fc2 row)
@@ -46,8 +46,8 @@ from vllm_neuron.model.qwen3_vl.vision_encoder_bf16 import (
     gelu,
 )
 from vllm_neuron.parallel.neuron_parallel_state import (
-    get_neuron_vision_dp_group,
-    get_neuron_vision_tp_group,
+    get_neuron_encoder_dp_group,
+    get_neuron_encoder_tp_group,
 )
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
 
@@ -80,7 +80,7 @@ class MuseGlimmerVisionAttention(nn.Module):
         self.dtype = dtype
 
         # >>> PARALLELISM: heads sharded over the vision TP group <<<
-        self.tp_group = get_neuron_vision_tp_group()
+        self.tp_group = get_neuron_encoder_tp_group()
         self.world_size = self.tp_group.world_size
         if num_heads % self.world_size:
             raise ValueError(f"vision heads {num_heads} not divisible by vision TP {self.world_size}")
@@ -157,7 +157,7 @@ class MuseGlimmerVisionAdapter(nn.Module):
 
     def __init__(self, in_dim: int, hidden: int, dtype: torch.dtype) -> None:
         super().__init__()
-        self.tp_group = get_neuron_vision_tp_group()
+        self.tp_group = get_neuron_encoder_tp_group()
         self.world_size = self.tp_group.world_size
         if hidden % self.world_size:
             raise ValueError(f"projector_hidden_size {hidden} not divisible by vision TP")
@@ -224,7 +224,7 @@ class MuseGlimmerVisionModel(nn.Module):
         self.rms_eps = float(tc.rms_norm_eps)
 
         # >>> PARALLELISM: vision DP group (block scatter / gather) <<<
-        self.dp_group = get_neuron_vision_dp_group()
+        self.dp_group = get_neuron_encoder_dp_group()
         self.dp_size = self.dp_group.world_size if self.dp_group else 1
 
         self.patch_embedding_weight = nn.Parameter(torch.empty(self.patch_dim, self.hidden, dtype=dt))
@@ -370,7 +370,7 @@ class MuseGlimmerVisionModel(nn.Module):
     def load_weights(self, checkpoint_path: str, device="cpu", cache_dir: str | None = None) -> None:
         from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 
-        tp = get_neuron_vision_tp_group()
+        tp = get_neuron_encoder_tp_group()
         mappings = self.build_weight_mappings()
         params = dict(self.named_parameters())
         unmapped = sorted(set(params) - set(mappings))

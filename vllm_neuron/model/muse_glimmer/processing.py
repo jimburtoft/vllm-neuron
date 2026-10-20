@@ -16,7 +16,7 @@ locates that exact token run (``_get_prompt_updates``) and marks only the
 ``apply_chat_template(..., tokenize=True)`` exactly, for ``LLM.chat`` requests
 and for raw prompts holding the HF-rendered chat text (with or without the
 leading ``<|begin_of_text|>``: vLLM tokenizes with ``add_special_tokens=True``
-and a doubled leading BOS is collapsed, see ``_apply_hf_processor_tokens_only``).
+and a doubled leading BOS is collapsed, see ``_postprocess_prompt``).
 
 Video path (Task 007). Same split: the chat template renders one
 ``<|video|>`` per video and HF ``MuseGlimmerProcessor.replace_video_token``
@@ -163,30 +163,28 @@ class MuseGlimmerDummyInputsBuilder(BaseDummyInputsBuilder[MuseGlimmerProcessing
 
 
 class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessingInfo]):
-    def _call_hf_processor(
+    # vLLM 0.29 contract: the renderer tokenizes the prompt; ``_apply_hf_processor_main``
+    # only sees the media (no prompt text), and ``_postprocess_prompt`` sees the ids.
+    def _apply_hf_processor_main(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        # Text-prompt path: a prompt that already starts with BOS (rendered chat text) is
-        # tokenized without special tokens, as HF apply_chat_template does.
-        bos = self.info.get_tokenizer().bos_token
-        if bos and prompt.startswith(bos):
-            tok_kwargs = {**tok_kwargs, "add_special_tokens": False}
+        valid = mm_items.select({k for k, c in mm_items.get_all_counts().items() if c > 0})
+        mm_data, passthrough = self._get_hf_mm_data(valid)
         mm_data = dict(mm_data)
         videos = mm_data.pop("videos", None) or []
         if not videos:
-            return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+            return super()._apply_hf_processor_main(mm_items, hf_processor_mm_kwargs)
 
-        # Each video on its own through the HF processor (prompt = one <|video|>): HF
+        ctx = self.info.ctx
+        hf_proc = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        # Each video on its own through the HF processor (text = one <|video|>): HF
         # itself samples the frames and builds the timestamp/marker expansion.
-        video_kwargs = dict(mm_kwargs)
         video_repl, pv_list, grid_list = [], [], []
         for frames, metadata in videos:
             metadata = dict(metadata or {})
-            kw = dict(video_kwargs)
+            kw = dict(hf_processor_mm_kwargs)
             if "do_sample_frames" in metadata and "do_sample_frames" not in kw:
                 kw["do_sample_frames"] = bool(metadata["do_sample_frames"])
             meta = {k: metadata[k] for k in _HF_VIDEO_METADATA_KEYS if metadata.get(k) is not None}
@@ -194,11 +192,10 @@ class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessi
             meta.setdefault("fps", None)
             if "frames_indices" not in meta:
                 meta["frames_indices"] = list(range(len(frames)))
-            out = super()._call_hf_processor(
-                VIDEO_TOKEN,
-                {"videos": [frames], "video_metadata": [meta]},
-                kw,
-                {**tok_kwargs, "add_special_tokens": False},
+            out = ctx.call_hf_processor(
+                hf_proc,
+                {"text": VIDEO_TOKEN, "videos": [frames], "video_metadata": [meta]},
+                {**kw, "add_special_tokens": False},
             )
             ids = out["input_ids"]
             ids = ids.tolist() if hasattr(ids, "tolist") else ids
@@ -206,39 +203,29 @@ class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessi
             pv_list.append(out["pixel_values_videos"])
             grid_list.append(out["video_grid_thw"])
 
-        # Text (+ images) without videos: each <|video|> stays a single token, then is
-        # replaced by its HF expansion, in order.
-        text_kwargs = {k: v for k, v in mm_kwargs.items() if k not in ("fps", "num_frames")}
-        processed = super()._call_hf_processor(prompt, mm_data, text_kwargs, tok_kwargs)
-        ids = processed.pop("input_ids")
-        ids = ids.tolist() if hasattr(ids, "tolist") else ids
-        (prompt_ids,) = ids
-        vid = self.info.get_tokenizer().convert_tokens_to_ids(VIDEO_TOKEN)
-        expanded, k = [], 0
-        for t in prompt_ids:
-            if t == vid and k < len(video_repl):
-                expanded.extend(video_repl[k].tolist())
-                k += 1
-            else:
-                expanded.append(t)
-        if k != len(video_repl):
-            raise ValueError(f"MuseGlimmer: {len(video_repl)} videos but {k} {VIDEO_TOKEN} placeholders in the prompt")
-        processed["input_ids"] = [expanded]
+        if mm_data:  # images in the same request
+            text_kwargs = {k: v for k, v in hf_processor_mm_kwargs.items() if k not in ("fps", "num_frames")}
+            processed = ctx.call_hf_processor(hf_proc, mm_data, text_kwargs)
+            processed.pop("input_ids", None)
+            processed.pop("attention_mask", None)
+        else:
+            processed = BatchFeature({})
         processed["pixel_values_videos"] = torch.cat(pv_list)
         processed["video_grid_thw"] = torch.cat(grid_list)
         processed["video_prompt_ids"] = video_repl
+        processed.update(passthrough)
         return processed
 
-    def _apply_hf_processor_tokens_only(self, prompt_tokens: list[int]) -> list[int]:
-        # vLLM 0.24 tokenizes multimodal prompts with add_special_tokens=True for BOTH the
-        # chat and the completion path (``info.default_tok_params``). The MuseGlimmer chat
-        # template already renders <|begin_of_text|>, and HF apply_chat_template tokenizes
-        # without special tokens, so the chat path would start with a doubled BOS. Collapse
-        # it so prompt ids equal HF exactly (a completion prompt without BOS is unaffected).
+    def _postprocess_prompt(self, prompt: list[int]) -> list[int]:
+        # The renderer tokenizes multimodal prompts with add_special_tokens=True for both
+        # the chat and the completion route (``info.default_tok_params``). The MuseGlimmer
+        # chat template already renders <|begin_of_text|>, and HF apply_chat_template
+        # tokenizes without special tokens, so the chat route starts with a doubled BOS.
+        # Collapse it so prompt ids equal HF exactly (a prompt without BOS is unaffected).
         bos = self.info.get_tokenizer().bos_token_id
-        if bos is not None and len(prompt_tokens) >= 2 and prompt_tokens[0] == bos == prompt_tokens[1]:
-            return list(prompt_tokens[1:])
-        return prompt_tokens
+        if bos is not None and len(prompt) >= 2 and prompt[0] == bos == prompt[1]:
+            return list(prompt[1:])
+        return prompt
 
     def _get_mm_fields_config(
         self,

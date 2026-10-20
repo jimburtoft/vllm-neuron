@@ -296,7 +296,7 @@ def plan_video_items(
         per = h * w
         if per > block_size:
             raise ValueError(
-                f"vision_attention_block_size={block_size} < per-group patches {per} "
+                f"encoder_attention_block_size={block_size} < per-group patches {per} "
                 f"(video grid {t}x{h}x{w}); a temporal group must fit in one block. "
                 "Increase the block size or lower mm_processor_kwargs max_video_frame_tokens."
             )

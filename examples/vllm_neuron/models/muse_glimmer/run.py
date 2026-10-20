@@ -73,7 +73,7 @@ def main():
     ap.add_argument("--video-fps", type=float, default=2.0, help="source FPS of --video (processor samples at 2 FPS)")
     ap.add_argument("--question", default="Describe this image in detail.")
     ap.add_argument("--vision-block", type=int, default=4096,
-                    help="vision_attention_block_size (patches); max_image_tokens = block / 4")
+                    help="encoder_attention_block_size (patches); max_image_tokens = block / 4")
     ap.add_argument("--vision-tp", type=int, default=0, help="0 = vision DP (default)")
     ap.add_argument("--num-gpu-blocks-override", type=int, default=0,
                     help="CPU mode needs a small value (e.g. 256)")
@@ -96,18 +96,18 @@ def main():
 
     additional_config = {
         "neuron_config": neuron_config,
-        "vision_neuron_config": {
-            "vision_attention_block_size": args.vision_block,
+        "encoder_neuron_config": {
+            "encoder_attention_block_size": args.vision_block,
             # 96-frame 16:9 video = 48 groups of 576 patches -> ceil(48 / (block // 576)) blocks
-            "num_vision_tokens_buckets": sorted({args.vision_block,
+            "num_encoder_input_buckets": sorted({args.vision_block,
                                                  -(-48 // (args.vision_block // 576)) * args.vision_block}),
             "encoder_cache_num_blocks": 8,
         },
     }
     if args.vision_tp:
-        additional_config["vision_neuron_config"]["tp_size"] = args.vision_tp
+        additional_config["encoder_neuron_config"]["tp_size"] = args.vision_tp
     if args.lm_only:
-        additional_config["mm_language_model_only"] = True  # top level, not in vision_neuron_config
+        additional_config["mm_language_model_only"] = True  # top level, not in encoder_neuron_config
 
     kwargs = dict(
         model=args.model,

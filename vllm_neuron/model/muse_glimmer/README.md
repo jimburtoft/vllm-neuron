@@ -132,7 +132,7 @@ in `VLLM_NEURON_CPU_MODE=1` on a truncated checkpoint against HF fp32.
 | On-device sampling / logprobs gather | trn2 | Softcap applied before both |
 | `mm_language_model_only` (PD pool) | trn2 | Text-only serving without building the vision tower |
 | Images | trn2 | 1-window and multi-window; multi-image per request CPU only |
-| Vision DP (default) / vision TP | trn2 | DP=4 and `vision_neuron_config.tp_size=4` at text TP=4 |
+| Vision DP (default) / vision TP | trn2 | DP=4 and `encoder_neuron_config.tp_size=4` at text TP=4 |
 | Video | trn2 (16 frames) | One ViT item per temporal group. 96 frames: CPU only |
 | Mixed image + video | trn2 | |
 | `vllm serve` (text, image) | trn2 | `harness/perf_serve.sh` in the project |
@@ -152,10 +152,10 @@ in `VLLM_NEURON_CPU_MODE=1` on a truncated checkpoint against HF fp32.
 | `--max-model-len` | 8192 (tested) | 96-frame video needs >= 8192 |
 | `neuron_config.decode_context_length_buckets` | unset, or only values > 2560 (e.g. `[4096]`) | A bucket below the trimmed SWA window (80 blocks = 2560 tokens) is warmed with the wrong SWA shape and the first concurrent decode fails `fail_on_recompile` |
 | `--no-enable-prefix-caching` | set | APC untested |
-| `vision_neuron_config.tp_size` | `4` under concurrency | Saves 2.6 GiB/core vs DP and is 26 % faster at image BS=1. DP=4 with a 32-block encoder cache OOMed HBM at concurrency 4 |
-| `vision_neuron_config.vision_attention_block_size` | 4096 (tested); 16384 for HF-default max images | Must be >= patches of the largest image / temporal group |
-| `vision_neuron_config.num_vision_tokens_buckets` | `[4096]` images, `[4096, 8192]` short video | 96-frame video: 28672 at block 4096 (untested on trn2) |
-| `vision_neuron_config.encoder_cache_num_blocks` | 8 (single request), 16 (concurrency 4) | The derived default can be too small; each item takes whole blocks |
+| `encoder_neuron_config.tp_size` | `4` under concurrency | Saves 2.6 GiB/core vs DP and is 26 % faster at image BS=1. DP=4 with a 32-block encoder cache OOMed HBM at concurrency 4 |
+| `encoder_neuron_config.encoder_attention_block_size` | 4096 (tested); 16384 for HF-default max images | Must be >= patches of the largest image / temporal group |
+| `encoder_neuron_config.num_encoder_input_buckets` | `[4096]` images, `[4096, 8192]` short video | 96-frame video: 28672 at block 4096 (untested on trn2) |
+| `encoder_neuron_config.encoder_cache_num_blocks` | 8 (single request), 16 (concurrency 4) | The derived default can be too small; each item takes whole blocks |
 | `mm_processor_kwargs.max_image_tokens` | `vision_block // 4` | Caps images to the compiled block |
 
 ## Known limits
@@ -193,7 +193,7 @@ timestamps. A temporal group (`h*w` <= 576 patches at the default
 `block // (h*w)` groups, so a 96-frame 16:9 video (48 groups) needs 7 blocks at
 block 4096 (bucket 28672) or 2 blocks at block 16384 (bucket 32768).
 
-Vision config notes: `vision_attention_block_size` must be >= the patch count
+Vision config notes: `encoder_attention_block_size` must be >= the patch count
 of the largest image (`max_image_tokens * 4`; the HF default 4096 merged tokens
 needs 16384). Pass `mm_processor_kwargs={"max_image_tokens": block // 4}` to
 cap images to the compiled block. Set `encoder_cache_num_blocks` explicitly
