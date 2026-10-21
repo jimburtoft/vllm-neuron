@@ -8,6 +8,7 @@ from .qwen3 import DFlashQwen3ForCausalLM, Qwen3ForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 from .qwen3_asr import Qwen3ASRForConditionalGeneration
 from .muse_glimmer import MuseGlimmerForConditionalGeneration
+from .muse_glimmer.dflash_model import MuseGlimmerDFlashForCausalLM
 
 
 def get_models() -> list[tuple[str, type]]:
@@ -29,6 +30,8 @@ def get_models() -> list[tuple[str, type]]:
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
         ("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration),
         ("MuseGlimmerForConditionalGeneration", MuseGlimmerForConditionalGeneration),
+        # vLLM's EAGLEConfig renames the drafter arch to DFlash{arch} for method=dflash.
+        ("DFlashMuseGlimmerAssistantModel", MuseGlimmerDFlashForCausalLM),
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural

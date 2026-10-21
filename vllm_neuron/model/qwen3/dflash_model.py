@@ -329,11 +329,16 @@ class DFlashQwen3ForCausalLM(nn.Module):
     # These checkpoint weights are supplied by the target after loading.
     has_own_embed_tokens = False
     has_own_lm_head = False
+    # Checkpoint names of the context projection (z-lab layout); subclasses for
+    # checkpoints that name them differently override these.
+    ckpt_fc_weight_name = "fc.weight"
+    ckpt_hidden_norm_weight_name = "hidden_norm.weight"
+    model_cls = DFlashQwen3Model
 
     def __init__(self, config: DFlashConfig, start_layer_idx: int = 0):
         super().__init__()
         self.config = config
-        self.model = DFlashQwen3Model(config, start_layer_idx=start_layer_idx)
+        self.model = self.model_cls(config, start_layer_idx=start_layer_idx)
         self.num_speculative_tokens = config.block_size - 1
 
         self.tp_group = get_tp_group()
@@ -602,8 +607,8 @@ class DFlashQwen3ForCausalLM(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
 
         mappings = {}
-        mappings["model.fc.weight"] = "fc.weight"
-        mappings["model.hidden_norm.weight"] = "hidden_norm.weight"
+        mappings["model.fc.weight"] = self.ckpt_fc_weight_name
+        mappings["model.hidden_norm.weight"] = self.ckpt_hidden_norm_weight_name
         mappings["model.norm.weight"] = "norm.weight"
 
         for layer_id in range(len(self.model.layers)):

@@ -46,6 +46,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.model_executor.models.interfaces import SupportsEagle3
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
@@ -60,6 +61,7 @@ from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 from vllm_neuron.utils.weight_loader import (
     fused_qkv_weight_loader,
     set_weight_loader,
@@ -861,6 +863,8 @@ class MuseGlimmerTextModel(nn.Module):
         # layer_idx -> physical (k_ptr, v_ptr) group id, resolved in bind_kv_cache
         # (outside the trace). None -> per-layer deferred writes.
         self.kv_ptr_group_of: list[int] | None = None
+        # Spec decode: pre-layer capture indices, set by the runner (outside the trace).
+        self.aux_hidden_state_layers: list[int] = []
 
     def forward(
         self,
@@ -871,7 +875,7 @@ class MuseGlimmerTextModel(nn.Module):
         encoder_embedding_buffer: torch.Tensor | None = None,
         encoder_block_ids: torch.Tensor | None = None,
         encoder_positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         meta0 = attn_metadata["layers.0.self_attn"]
         is_prefill = meta0["max_query_len"] > meta0["decode_token_threshold"]
 
@@ -900,7 +904,12 @@ class MuseGlimmerTextModel(nn.Module):
 
         # Task 023: decode KV writes are deferred past the layer loop (mode >= 1).
         kv_writeback = [] if (not is_prefill and self.kv_defer_mode >= 1) else None
-        for layer in self.layers:
+        # Spec decode (EAGLE3 / DFlash): capture the residual stream entering each
+        # requested layer (= HF output_hidden_states of layer idx - 1).
+        aux = []
+        for idx, layer in enumerate(self.layers):
+            if idx in self.aux_hidden_state_layers:
+                aux.append(h)
             h = layer(h, positions, position_embeddings, attn_metadata, is_prefill, kv_writeback)
         if kv_writeback:
             _issue_decode_kv_writes(
@@ -910,7 +919,8 @@ class MuseGlimmerTextModel(nn.Module):
         h = self.norm(h)
         if is_prefill and self.world_size > 1:
             h = self.tp_group.all_gather(h, dim=0)
-        return h
+            aux = [self.tp_group.all_gather(a, dim=0) for a in aux]
+        return h, aux
 
 
 # ---------------------------------------------------------------------------
@@ -920,7 +930,8 @@ class MuseGlimmerTextModel(nn.Module):
 HF_TEXT_PREFIX = "model.language_model"
 
 
-class MuseGlimmerForConditionalGeneration(nn.Module):
+@async_speculative_decoding
+class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
     """MuseGlimmer multimodal model: text decoder + perception encoder."""
 
     def __init__(self, config: MuseGlimmerConfig):
@@ -1010,7 +1021,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         if is_prefill and ((T <= self.world_size) or (T % self.world_size != 0)):
             raise ValueError(f"Prompt Length ({T}) must be > world_size ({self.world_size}) for SP.")
 
-        h = self.language_model(
+        h, aux = self.language_model(
             input_ids,
             positions,
             attn_metadata=attn_metadata,
@@ -1021,20 +1032,43 @@ class MuseGlimmerForConditionalGeneration(nn.Module):
         )
         h = torch.index_select(h, dim=0, index=sampling_positions)
         logits = self._softcap(self.lm_head(h))
+        # Spec decode (DFlash / EAGLE3): one [T, n_aux * H] tensor, cat inside the NEFF.
+        aux_cat = torch.cat(aux, dim=-1) if aux else None
 
         gathered_logits = None
         if self._gather_logits:
             gathered_logits = self.tp_group.all_gather(logits, dim=1)
 
         if self.on_device_sampling_config is None:
-            return logits
+            return (logits, aux_cat) if aux_cat is not None else logits
 
         sampled = self.sampler(logits, sampling_params, logit_mask=logit_mask, tp_rank=rank)
         if spec_decode_metadata is not None:
             from vllm_neuron.nn.rejection_sampler import rejection_sampler
 
-            return rejection_sampler(spec_decode_metadata, sampled)
+            rejected = rejection_sampler(spec_decode_metadata, sampled)
+            if aux_cat is not None:
+                # @async_speculative_decoding appends last_accepted_token.
+                return rejected, aux_cat, gathered_logits
+            return rejected
+        if aux_cat is not None:
+            return sampled, aux_cat, gathered_logits
         return sampled, gathered_logits
+
+    # ── speculative decoding (SupportsEagle3 target interface) ──────────
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if layers is not None:
+            n = len(self.language_model.layers)
+            assert all(0 <= i < n for i in layers), (layers, n)
+            self.language_model.aux_hidden_state_layers = list(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        if self.language_model.aux_hidden_state_layers:
+            return tuple(self.language_model.aux_hidden_state_layers)
+        n = len(self.language_model.layers)
+        return (2, n // 2, n - 3)
+
 
     # ── multimodal ──────────────────────────────────────────────────────
 

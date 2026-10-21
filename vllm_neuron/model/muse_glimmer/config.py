@@ -348,6 +348,21 @@ class MuseGlimmerConfig:
     projector_hidden_size: int = 4096
     projector_hidden_act: str = "gelu"
 
+    # Text-decoder views read by the runner's spec-decode path (``model.config``):
+    # the DFlash proposer sizes its context fc from ``hidden_size`` and the async
+    # spec-decode decorator validates tokens against ``vocab_size``.
+    @property
+    def hidden_size(self) -> int:
+        return self.text_config.hidden_size
+
+    @property
+    def vocab_size(self) -> int:
+        return self.text_config.vocab_size
+
+    @property
+    def num_hidden_layers(self) -> int:
+        return self.text_config.num_hidden_layers
+
     @classmethod
     def from_configs(
         cls,
