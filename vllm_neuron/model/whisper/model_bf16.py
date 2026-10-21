@@ -1819,10 +1819,15 @@ class WhisperForConditionalGeneration(nn.Module):
 
     # ── KV cache ──────────────────────────────────────────────────────────
     def get_kv_spec(self) -> KVSpec:
+        # Slot self-KV mode keeps K/V in model-owned buffers. The runner still
+        # needs a paged spec to schedule, so give it one KV head: the paged cache
+        # is never read or written, and takes 1/heads of the HBM.
         layers = [
             LayerSpec(
                 name=layer.self_attn.layer_name,
-                num_kv_heads=layer.self_attn.num_key_value_heads_per_rank,
+                num_kv_heads=(
+                    1 if layer.self_attn.slot_kv else layer.self_attn.num_key_value_heads_per_rank
+                ),
                 head_size=layer.self_attn.head_dim,
                 dtype=self.dtype,
             )
