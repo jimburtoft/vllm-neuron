@@ -1,9 +1,16 @@
 # MuseGlimmer (vLLM-Neuron)
 
 Port of `MuseGlimmerForConditionalGeneration` (Muse-Glimmer-30B: image + video +
-text in, text out) to vLLM-Neuron 0.24 on trn2.
+text in, text out) to vLLM-Neuron on trn2. This branch targets vllm-neuron
+0.29.0.1.2.0 (SDK 2.33); the 0.24 branch is `muse-glimmer`.
 
-**Status (2026-10-18): text, image, video and mixed image+video verified on trn2.**
+**0.29 rebase (2026-10-21, SDK 2.33 DLAMI 20261020, vllm 0.29.0, transformers 5.17.0):**
+text 32/32 on 3 goldens (BF16; FP8 MLP 32/32, 32/32, 22/32 near-tie), image 32/32,
+video_short 25/32 (exact HF tie at step 25, margin 0.000). Decode BS=1 / BS=13:
+BF16 27.1 / 32.8 ms, FP8 MLP 20.5 / 27.1 ms. HBM after load unchanged
+(14.21 / 9.92 GiB per core); validated caps unchanged.
+
+**Status (2026-10-18, 0.24): text, image, video and mixed image+video verified on trn2.**
 Setup: trn2.3xlarge, LNC=2, SDK 2.32 (DLAMI 20260818), vllm 0.24.0 + vllm-neuron
 0.24.0.1.1.0 + this branch, text TP=4, BF16, against HF BF16 (transformers 5.15.0):
 - prompt ids equal HF on all 10 golden prompts; prefill logit cos 0.99999-1.00000;
@@ -21,7 +28,7 @@ Files:
 | `config.py` | Text/vision/top-level configs, plus load-time asserts for every special field |
 | `factory.py` | Registry class: `from_configs` for the worker, vLLM-model stubs and processor for the front-end |
 | `processing.py` | Front-end vLLM multimodal processor (image and video prompt expansion identical to HF `MuseGlimmerProcessor`) |
-| `model_bf16.py` | Text decoder, LM head + softcap, KV spec, weight loading, `embed_multimodal`, `build_vision_synthetic_inputs` |
+| `model_bf16.py` | Text decoder, LM head + softcap, KV spec, weight loading, `embed_multimodal`, `get_encoder` + `build_encoder_synthetic_inputs` |
 | `vision_encoder_bf16.py` | Perception encoder + adapter + projection + weightless RMSNorm, encoder-cache write, vision DP/TP |
 | `weight_loaders.py` | 3-tensor (q/k/v) fused vision QKV loaders, transposed replicated loader |
 | `utils/vision_preprocessing.py` | CPU: pack order, window/full bounds, merged-order gather, axial RoPE, bilinear taps (vendored HF math, transformers 5.15/5.20 agnostic) |
@@ -82,13 +89,19 @@ doubled BOS so prompt ids equal HF `apply_chat_template` (verified for
 
 ## Front-end registration
 
-vLLM 0.24 has no native MuseGlimmer. Without help, `ModelConfig` resolves the
-architecture to `TransformersMultiModalForCausalLM` and the plugin model is
-never used, even for text. `NeuronPlatform.pre_register_and_update`
-(`vllm_neuron/vllm/platform.py`) therefore registers
-`vllm_neuron.model.muse_glimmer.factory:MuseGlimmerForConditionalGeneration` in
-the front-end. The factory carries `@MULTIMODAL_REGISTRY.register_processor`
-and the vLLM model-interface stubs.
+vLLM 0.24 has no native MuseGlimmer and resolves the architecture to
+`TransformersMultiModalForCausalLM`. vLLM 0.29 ships its own
+`MuseGlimmerForCausalLM` and maps `MuseGlimmerForConditionalGeneration` to it;
+its processor emits different kwargs (`image_pixel_values`,
+`*_feature_sizes`) and rejects `max_image_tokens`. In both cases the plugin
+model would not be used. `register_plugin_model_architectures()`
+(`vllm_neuron/vllm/platform.py`) overrides the entry with
+`vllm_neuron.model.muse_glimmer.factory:MuseGlimmerForConditionalGeneration`.
+It runs in every process that resolves the class: the front-end
+(`pre_register_and_update`), the EngineCore (Neuron scheduler, which builds a
+`MultiModalBudget`) and the workers (`_init_encoder_cache`). The factory carries
+`@MULTIMODAL_REGISTRY.register_processor`, the vLLM model-interface stubs and
+`SupportsEncoderBudget` (0.29: without it the prefill gather is sized to 0 blocks).
 
 ## Config asserts
 
@@ -113,6 +126,7 @@ Truncated test checkpoints use the structural checks only.
 |---|---|
 | `MUSE_GLIMMER_DECODE_TORCH=1` | Decode attention uses the plain-torch reference (`_torch_attention_decode_impl`) instead of the NKI megakernel. This is the escape hatch for kernel-suspect issues. |
 | `MUSE_GLIMMER_FP8=mlp` (or `mlp,attn`) | FP8 weights self-quantized from the BF16 checkpoint at load time (`fp8.py`): nkilib `QuantizationType.ROW`, per-output-channel e4m3 weight scales (240 range), per-token dynamic activation quant on prefill, weight-only on decode. No calibration. `mlp` frees 4.3 GiB/core (14.21 -> 9.92 GiB used after load, server config with vision TP=4) and allows `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.27` / `max_num_seqs` 32 (29.3 admitted; 0.30 is text-only: an image stress run hit `nrt_tensor_allocate status=4`). `attn` adds qkv/gate/o_proj but is slower at BS=13 (Task 021); use `mlp`. FP8 prefill graphs compile about 2.5x slower: set `VLLM_NEURON_BARRIER_TIMEOUT=14400` on a cold cache |
+| `MUSE_GLIMMER_FP8_CTE_CHUNK` | Default 512. FP8 MLP prefill (CTE ROW) is split into row chunks of this size: nkilib 2.33 fails kernel validation (`NCC_INKI016 Stack out of memory`) at T >= 1024 for H=6656 / I=5120 per rank. Bit-exact with the un-chunked 2.32 kernel (simulator). 0 disables |
 | `MUSE_GLIMMER_STRICT_CONFIG=0/1` | Force-disable or force-enable the released-value asserts |
 | `MUSE_GLIMMER_COMPUTE_DTYPE=float32` | CPU-mode test knob: fp32 compute, for an exact structural comparison against HF fp32 (use with `LLM(dtype="float32")`) |
 
@@ -139,7 +153,7 @@ in `VLLM_NEURON_CPU_MODE=1` on a truncated checkpoint against HF fp32.
 | `mm_encoder_only` (VE pool) | No | Raises |
 | Prefix caching (APC) | Untested | Run with `enable_prefix_caching=False` |
 | DP / EP / attention-DP / DCP | N/A | Dense model, single node |
-| Eagle3 / DFlash speculative decoding | No | 0.24 has EAGLE3 only; the DFlash drafter needs vllm-neuron 0.29+ |
+| Eagle3 / DFlash speculative decoding | No | 0.29 has the DFlash drafter; the target needs aux hidden-state capture (`SupportsEagle3`, `set_aux_hidden_state_layers`, the 3/4-tuple return), not yet implemented here |
 | FP8 KV cache, quantized weights | No | Only `quantization in (None, "bf16")` |
 | Prefill MLP NKI kernel | No (torch fallback) | At TP=4, I/rank 4992 needs 10 PSUM banks and H=6656 < 7168 blocks I-sharding. Perf only |
 
@@ -166,7 +180,8 @@ in `VLLM_NEURON_CPU_MODE=1` on a truncated checkpoint against HF fp32.
 - The gate matmul runs outside the QKV kernel (an extra `[T, H] x [H, 1024]` per layer).
 - The bf16 encoder cache rounds vision features. This explains the residual cos gap vs HF fp32; it is the same rounding as the runner's other VLMs.
 - `LLM.chat` with a video content part needs a URL or data URI (vLLM's chat parser). Offline use goes through `prompt` + `multi_modal_data`.
-- This branch adds two runner/platform changes outside this directory: the `pre_register_and_update` registration and the SWA block alignment to 2 x 128 for LNC=2 (`_compute_swa_num_blocks`).
+- Changes outside this directory: the architecture registration (platform, scheduler, runner `_init_encoder_cache`), the SWA block alignment to 2 x 128 for LNC=2 plus `VLLM_NEURON_SWA_ALIGN_TOKENS` (`_compute_swa_num_blocks`), and in `functional/`: the opt-in MLP CTE I-shard override, the ROW-packed `[T, H+4]` MLP gate + ROW torch fallback, and `rmsnorm_quant(norm_type=NO_NORM)`. The o_proj ROW layout fix of the 0.24 branch is upstream in 0.29.
+- Legacy option names (`vision_neuron_config`, `num_vision_tokens_buckets`, `vision_attention_block_size`) still work on 0.29 with a deprecation warning; use `encoder_neuron_config` / `num_encoder_input_buckets` / `encoder_attention_block_size`.
 
 ## Running
 
