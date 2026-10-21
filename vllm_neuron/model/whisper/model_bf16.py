@@ -846,6 +846,27 @@ class DecoderSelfAttention(nn.Module):
         self.slot_k.index_put_((idx,), k.transpose(0, 1).reshape(T * h, d).to(self.slot_k.dtype))
         self.slot_v.index_put_((idx,), v.transpose(0, 1).reshape(T * h, d).to(self.slot_v.dtype))
 
+    def _slot_write_prefill(self, k, v, meta):
+        """Prefill write: one contiguous ``[h, 448, d]`` region for each row.
+
+        Whisper prefill always starts at position 0 (no prefix cache, no chunked
+        prefill for encoder-decoder models), so token ``j`` of a row is at position
+        ``j``. The pad tokens after the prompt and the zero tail go to positions that
+        decode masks until it writes them. A pad row writes the scratch slot. This
+        is one large DMA for each row, not one small DMA for each token and head.
+        """
+        h, T, d = k.shape
+        C = self.slot_ctx
+        rows = meta["block_table_tensor"].shape[0]
+        s = T // rows
+        slots = self._row_slots(meta, rows, k.device)
+        kb = self.slot_k.view(self.num_slots, h, C, d)
+        vb = self.slot_v.view(self.num_slots, h, C, d)
+        for buf, x in ((kb, k), (vb, v)):
+            val = x.view(h, rows, s, d).transpose(0, 1)[:, :, : min(s, C)]
+            val = F.pad(val, (0, 0, 0, C - val.shape[2])).to(buf.dtype)
+            buf.index_put_((slots,), val)
+
     def _slot_write_where(self, k, v, meta, positions):
         """Decode-only write with a one-hot ``torch.where`` (``WHISPER_SELF_WRITE=where``).
 
@@ -970,7 +991,7 @@ class DecoderSelfAttention(nn.Module):
         """
         q, k, v = self._project(hidden_states)
         if self.slot_kv:
-            self._slot_write(k, v, meta, positions)
+            self._slot_write_prefill(k, v, meta)
         else:
             self._write_kv_cache(k, v, meta["slot_mapping"], meta["block_size"])
 
