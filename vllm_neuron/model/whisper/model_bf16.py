@@ -963,12 +963,14 @@ class DecoderSelfAttention(nn.Module):
         rows = meta["block_table_tensor"].shape[0]
         s = T // rows
         slots = self._row_slots(meta, rows, k.device)
-        kb = self.slot_k.view(self.num_slots, h, C, d)
-        vb = self.slot_v.view(self.num_slots, h, C, d)
-        for buf, x in ((kb, k), (vb, v)):
+        # One 2D row of C * d values for each (slot, head). A 4D view of the buffer
+        # as the index_put_ target fails in neuronx-cc (NCC_ILTO901, reshape basis).
+        hh = torch.arange(h, device=k.device, dtype=torch.int64)
+        idx = (slots.view(rows, 1) * h + hh.view(1, h)).view(rows * h)
+        for buf, x in ((self.slot_k, k), (self.slot_v, v)):
             val = x.view(h, rows, s, d).transpose(0, 1)[:, :, : min(s, C)]
             val = F.pad(val, (0, 0, 0, C - val.shape[2])).to(buf.dtype)
-            buf.index_put_((slots,), val)
+            buf.view(self.num_slots * h, C * d).index_put_((idx,), val.reshape(rows * h, C * d))
 
     def _slot_write_where(self, k, v, meta, positions):
         """Decode-only write with a one-hot ``torch.where`` (``WHISPER_SELF_WRITE=where``).
