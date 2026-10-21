@@ -75,14 +75,16 @@ def _build_native(path, max_num_seqs=1):
     from vllm_neuron.model.whisper.model_bf16 import WhisperForConditionalGeneration
 
     hf_cfg = transformers.WhisperConfig.from_pretrained(path)
-    model = WhisperForConditionalGeneration.from_configs(
-        hf_cfg,
-        None,
-        None,
-        check_dims=False,
-        torch_dtype=torch.float32,
-        max_num_seqs=max_num_seqs,
-    )
+    with torch.device("meta"):
+        # The runner builds the model on meta; load_weights materializes it.
+        model = WhisperForConditionalGeneration.from_configs(
+            hf_cfg,
+            None,
+            None,
+            check_dims=False,
+            torch_dtype=torch.float32,
+            max_num_seqs=max_num_seqs,
+        )
     model.load_weights(str(path), torch.device("cpu"), None)
     model.eval()
     caches = {}
@@ -477,6 +479,8 @@ def test_slot_self_kv_batched(hf_checkpoint, monkeypatch, write, cross, in_out):
     monkeypatch.setenv("WHISPER_IN_OUT", in_out)
     model = _build_native(path, max_num_seqs=3)
     sa = model.decoder.layers[0].self_attn
+    # The runner builds on meta and load_weights calls to_empty: the slots must be zero.
+    assert all(int(lyr.self_attn.slot_k.abs().sum()) == 0 for lyr in model.decoder.layers)
     assert sa.slot_kv and sa.slot_k.shape == (4 * HEADS * 448, D_MODEL // HEADS)
     if "decoder" in in_out:
         assert model.decoder.layers[0].mlp.fc1.weight_layout == "in_out"

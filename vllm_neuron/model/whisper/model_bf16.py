@@ -1728,6 +1728,12 @@ class WhisperForConditionalGeneration(nn.Module):
         with torch.no_grad():
             for name, buf in self.audio_tower.named_buffers(recurse=False):
                 buf.zero_()
+            # to_empty leaves the slot self-KV uninitialized. A NaN in a masked
+            # position still gives NaN (NaN + -inf, 0 * NaN), so zero it.
+            for layer in self.decoder.layers:
+                if layer.self_attn.slot_kv:
+                    layer.self_attn.slot_k.zero_()
+                    layer.self_attn.slot_v.zero_()
         self.decoder.bind_cross_kv(self.audio_tower)
 
         hf_sd = load_hf_state(resolve_checkpoint_dir(checkpoint_path, cache_dir))
