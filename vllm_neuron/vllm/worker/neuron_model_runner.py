@@ -5379,6 +5379,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         sliding_window: int,
         block_size: int,
         kv_cache_group_id: int,
+        query_len: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """For a SWA decode step, compute:
         - the block_table_tensor trimmed to the window-relevant blocks, so
@@ -5394,7 +5395,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # compares numpy arrays, so a torch build would add nine host dispatches for each
         # step and then convert the result back.
         ctx_lens = self.input_batch.num_computed_tokens_cpu[:padded_num_reqs]
-        start_blocks = np.clip(ctx_lens // block_size - num_swa_blocks + 1, 0, None)
+        # The decode attention places the step's ``query_len`` active tokens in the
+        # last ``query_len`` slots of the trimmed buffer, so every prior token must
+        # sit below ``num_swa_blocks * block_size - query_len`` in the trimmed frame:
+        # ``ctx - start * block_size <= num_swa_blocks * block_size - query_len``.
+        # For plain decode (query_len 1) this is ``ctx // block_size - n + 1``. A
+        # speculative verify step (query_len 1 + k) needs the start pushed up to
+        # ``k`` tokens later; otherwise, when ``ctx % block_size > block_size - k``,
+        # the active block overwrites the newest prior tokens and the verify logits
+        # are wrong. The window stays covered: the aligned count leaves far more
+        # than ``sliding_window + query_len + block_size`` tokens.
+        start_blocks = np.clip(
+            (ctx_lens + query_len - 1) // block_size - num_swa_blocks + 1, 0, None
+        )
         gather_index = start_blocks[:, None] + np.arange(
             num_swa_blocks, dtype=start_blocks.dtype
         )
@@ -5640,6 +5653,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                             spec.sliding_window,
                             block_size,
                             kv_cache_group_id,
+                            query_len=max_query_len,
                         )
                     )
                 else:

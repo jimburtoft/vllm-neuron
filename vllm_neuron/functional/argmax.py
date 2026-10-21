@@ -22,6 +22,8 @@ from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 cascaded_max_jit = nki.jit()(cascaded_max)
+# nisa.nc_find_index8 free-dim limit (elements per partition).
+_FIND_INDEX8_MAX_FREE = 16384
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +201,15 @@ def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:
     # across `grid` programs. Each program gets a maximum of pmax rows.
     grid = 1 if envs.VLLM_NEURON_CPU_MODE else get_logical_nc_config()
     if shape[-2] > nl.tile_size.pmax * grid:
+        return False
+
+    # cascaded_max folds the vocab over floor(pmax / rows_per_program) partitions;
+    # nc_find_index8 then takes at most 16384 elements per partition. With a full
+    # 128-row program (e.g. DFlash verify, 16 seqs x 16 tokens at LNC=2) a 50512-wide
+    # vocab shard is one stage of 50512 elements and the kernel asserts.
+    rows_per_prg = -(-int(shape[-2]) // grid)
+    n_stages = min(nl.tile_size.pmax // max(rows_per_prg, 1), int(shape[dim]) // nl.tile_size.pmax)
+    if n_stages < 1 or -(-int(shape[dim]) // n_stages) > _FIND_INDEX8_MAX_FREE:
         return False
 
     return True
