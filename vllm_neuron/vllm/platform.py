@@ -201,6 +201,35 @@ def _apply_dcp_patch(ModelConfig):
     ModelConfig.verify_with_parallel_config = _patched_verify
 
 
+def register_plugin_model_architectures() -> None:
+    """Register plugin multimodal architectures in vLLM's ModelRegistry.
+
+    vLLM 0.24 has no MuseGlimmer and resolves it to the Transformers backend;
+    vLLM 0.29 maps it to its own MuseGlimmerForCausalLM, whose processor emits
+    different multimodal kwargs (image_pixel_values / *_feature_sizes) than the
+    plugin encoder consumes (pixel_values / image_grid_thw). The plugin
+    processor must win in every process that resolves the architecture: the
+    front-end (pre_register_and_update) and the workers, where vLLM 0.29 builds
+    a MultiModalBudget while sizing the encoder cache. Called from both
+    ``pre_register_and_update`` and the plugin ``register()`` entry point, which
+    runs in every process. Lazy "module:Class" strings keep the import cheap.
+    """
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    mg = "vllm_neuron.model.muse_glimmer.factory:MuseGlimmerForConditionalGeneration"
+    cur = ModelRegistry.models.get("MuseGlimmerForConditionalGeneration")
+    if getattr(cur, "module_name", None) != mg.split(":")[0]:
+        ModelRegistry.register_model("MuseGlimmerForConditionalGeneration", mg)
+        # get_model_architecture memoizes per process; drop any entry resolved
+        # before this registration (e.g. the vLLM-native class in a worker).
+        try:
+            from vllm.model_executor.model_loader import utils as _ml_utils
+
+            _ml_utils._MODEL_ARCH_BY_HASH.clear()
+        except (ImportError, AttributeError):
+            pass
+
+
 class NeuronPlatform(Platform):
     # OOT (Out-Of-Tree) refers to hardware platforms that are integrated with vLLM
     # through plugin projects.
@@ -276,21 +305,11 @@ class NeuronPlatform(Platform):
         # the Neuron policy before ModelConfig validation constructs the config.
         patch_vllm_config_for_neuron()
 
-        from vllm.model_executor.models.registry import ModelRegistry
-
-        # Front-end registration for plugin multimodal architectures. vLLM 0.24
-        # has no MuseGlimmer and resolves it to the Transformers backend; vLLM
-        # 0.29 maps it to its own MuseGlimmerForCausalLM, whose processor emits
-        # different multimodal kwargs (image_pixel_values / *_feature_sizes)
-        # than the plugin encoder consumes (pixel_values / image_grid_thw). In
-        # both cases the plugin's processor must win, so override any existing
-        # entry. Lazy "module:Class" strings keep the import cheap.
-        _mg = "vllm_neuron.model.muse_glimmer.factory:MuseGlimmerForConditionalGeneration"
-        _cur = ModelRegistry.models.get("MuseGlimmerForConditionalGeneration")
-        if getattr(_cur, "module_name", None) != _mg.split(":")[0]:
-            ModelRegistry.register_model("MuseGlimmerForConditionalGeneration", _mg)
+        register_plugin_model_architectures()
 
         if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
+            from vllm.model_executor.models.registry import ModelRegistry
+
             ModelRegistry.register_model(
                 "SyntheticNeuronModel",
                 "vllm_neuron.model.synthetic:SyntheticNeuronModel",

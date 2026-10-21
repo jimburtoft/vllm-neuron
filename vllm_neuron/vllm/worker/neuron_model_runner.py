@@ -1430,6 +1430,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             get_encoder_cache_block_size,
             get_max_encoder_blocks_per_request,
         )
+        from vllm_neuron.vllm.platform import register_plugin_model_architectures
+
+        # Worker processes do not run pre_register_and_update; without this the
+        # budget below resolves a vLLM-native class (e.g. vLLM 0.29's own
+        # MuseGlimmerForCausalLM) and its HF processor instead of the plugin's.
+        register_plugin_model_architectures()
         from vllm_neuron.vllm.worker.encoder_cache_blocks import EncoderCacheBlocks
 
         encoder_neuron_config = self.encoder_neuron_config
