@@ -910,16 +910,18 @@ class DecoderSelfAttention(nn.Module):
 
         self.k_cache = None
         self.v_cache = None
-        # WHISPER_SELF_KV=slot: model-owned contiguous self-KV, one [heads, 448, d]
-        # region for each request slot, flat as [slots * heads * 448, d] so that one
-        # index_put_ writes all heads of all tokens. The last slot is the scratch slot
-        # (pad rows and pad tokens). Read the flag one time (see DecoderLayer.__init__).
+        # WHISPER_SELF_KV=slot: model-owned contiguous self-KV, one [448, d] row of
+        # each (request slot, head), as a 3D [slots * heads, 448, d] buffer. The
+        # writes and reads index only dim 0 (and the position for a decode write):
+        # neuronx-cc fails on index_put_ into a reshaped view of a flat buffer
+        # (NCC_ILTO901, Task 024). The last slot is the scratch slot (pad rows and
+        # pad tokens). Read the flags one time (see DecoderLayer.__init__).
         self.slot_kv = self_kv_mode() == "slot"
         self.slot_ctx = cfg.max_target_positions
         self.num_slots = cfg.max_num_seqs + 1
         self.slot_write_where = self.slot_kv and self_kv_write() == "where"
         if self.slot_kv:
-            shp = (self.num_slots * self.num_heads * self.slot_ctx, self.head_dim)
+            shp = (self.num_slots * self.num_heads, self.slot_ctx, self.head_dim)
             self.register_buffer("slot_k", torch.zeros(shp, dtype=dtype), persistent=False)
             self.register_buffer("slot_v", torch.zeros(shp, dtype=dtype), persistent=False)
 
@@ -930,54 +932,50 @@ class DecoderSelfAttention(nn.Module):
             return torch.zeros(rows, dtype=torch.int64, device=device)
         return slots.to(torch.int64).view(rows)
 
-    def _slot_write(self, k, v, meta, positions):
-        """Write K/V ``[h, T, d]`` of each token to ``(slot of its row, head, position)``.
-
-        A pad token (slot_mapping -1) goes to the scratch slot. The tokens of a
-        row are contiguous, ``T // rows`` for each row.
-        """
-        h, T, d = k.shape
-        C = self.slot_ctx
-        rows = meta["block_table_tensor"].shape[0]
-        slots = self._row_slots(meta, rows, k.device).view(rows, 1).expand(rows, T // rows)
-        slots = slots.reshape(T)
-        scratch = torch.full_like(slots, self.num_slots - 1)
-        slots = torch.where(meta["slot_mapping"].view(T) < 0, scratch, slots)
-        pos = positions.to(torch.int64).view(T)
-        hh = torch.arange(h, device=k.device, dtype=torch.int64)
-        idx = ((slots.view(T, 1) * h + hh.view(1, h)) * C + pos.view(T, 1)).view(-1)
-        self.slot_k.index_put_((idx,), k.transpose(0, 1).reshape(T * h, d).to(self.slot_k.dtype))
-        self.slot_v.index_put_((idx,), v.transpose(0, 1).reshape(T * h, d).to(self.slot_v.dtype))
+    def _slot_head_rows(self, slots):
+        """Return the buffer row of each (slot, head), ``[len(slots) * heads]``, slot-major."""
+        h = self.num_heads
+        hh = torch.arange(h, device=slots.device, dtype=torch.int64)
+        return (slots.view(-1, 1) * h + hh.view(1, h)).view(-1)
 
     def _slot_write_prefill(self, k, v, meta):
-        """Prefill write: one contiguous ``[h, 448, d]`` region for each row.
+        """Prefill write: the whole ``[448, d]`` row of each (slot, head) of a batch row.
 
         Whisper prefill always starts at position 0 (no prefix cache, no chunked
         prefill for encoder-decoder models), so token ``j`` of a row is at position
         ``j``. The pad tokens after the prompt and the zero tail go to positions that
-        decode masks until it writes them. A pad row writes the scratch slot. This
-        is one large DMA for each row, not one small DMA for each token and head.
+        decode masks until it writes them. A pad row writes the scratch slot.
         """
         h, T, d = k.shape
         C = self.slot_ctx
         rows = meta["block_table_tensor"].shape[0]
         s = T // rows
-        slots = self._row_slots(meta, rows, k.device)
-        # One 2D row of C * d values for each (slot, head). A 4D view of the buffer
-        # as the index_put_ target fails in neuronx-cc (NCC_ILTO901, reshape basis).
-        hh = torch.arange(h, device=k.device, dtype=torch.int64)
-        idx = (slots.view(rows, 1) * h + hh.view(1, h)).view(rows * h)
+        idx = self._slot_head_rows(self._row_slots(meta, rows, k.device))
         for buf, x in ((self.slot_k, k), (self.slot_v, v)):
             val = x.view(h, rows, s, d).transpose(0, 1)[:, :, : min(s, C)]
             val = F.pad(val, (0, 0, 0, C - val.shape[2])).to(buf.dtype)
-            buf.view(self.num_slots * h, C * d).index_put_((idx,), val.reshape(rows * h, C * d))
+            buf.index_put_((idx,), val.reshape(rows * h, C, d))
+
+    def _slot_write_decode(self, k, v, meta, positions):
+        """Decode write: K/V ``[h, B, d]`` of each row to ``(slot, head, position)``.
+
+        A pad row (slot_mapping -1) writes the scratch slot.
+        """
+        h, B, d = k.shape
+        slots = self._row_slots(meta, B, k.device)
+        scratch = torch.full_like(slots, self.num_slots - 1)
+        slots = torch.where(meta["slot_mapping"].view(B) < 0, scratch, slots)
+        idx = self._slot_head_rows(slots)
+        pos = positions.to(torch.int64).view(B, 1).expand(B, h).reshape(B * h)
+        self.slot_k.index_put_((idx, pos), k.transpose(0, 1).reshape(B * h, d).to(self.slot_k.dtype))
+        self.slot_v.index_put_((idx, pos), v.transpose(0, 1).reshape(B * h, d).to(self.slot_v.dtype))
 
     def _slot_write_where(self, k, v, meta, positions):
-        """Decode-only write with a one-hot ``torch.where`` (``WHISPER_SELF_WRITE=where``).
+        """Decode write with a one-hot ``torch.where`` (``WHISPER_SELF_WRITE=where``).
 
         One exact one-hot matmul moves the K/V and the position of each row to its
         slot. A slot with no row (and the scratch slot) is left as it is. The where
-        then reads and writes the whole buffer, ``[slots, h, 448, d]``.
+        then reads and writes the whole buffer.
         """
         h, B, d = k.shape
         S, C = self.num_slots, self.slot_ctx
@@ -987,17 +985,16 @@ class DecoderSelfAttention(nn.Module):
             (torch.arange(S, device=k.device, dtype=torch.int64).view(1, S) == slots.view(B, 1))
             & live.view(B, 1)
         ).to(k.dtype)  # [B, S]
-        ks = torch.matmul(sel.t(), k.transpose(0, 1).reshape(B, h * d)).view(S, h, 1, d)
-        vs = torch.matmul(sel.t(), v.transpose(0, 1).reshape(B, h * d)).view(S, h, 1, d)
+        ks = torch.matmul(sel.t(), k.transpose(0, 1).reshape(B, h * d)).view(S * h, 1, d)
+        vs = torch.matmul(sel.t(), v.transpose(0, 1).reshape(B, h * d)).view(S * h, 1, d)
         pos = positions.to(torch.int64).view(B)
         hit = (sel.t().to(torch.int64) * pos.view(1, B)).sum(dim=1)  # [S]
         has = sel.sum(dim=0) > 0
         ar = torch.arange(C, device=k.device, dtype=torch.int64)
-        mask = ((ar.view(1, C) == hit.view(S, 1)) & has.view(S, 1)).view(S, 1, C, 1)
-        kb = self.slot_k.view(S, h, C, d)
-        vb = self.slot_v.view(S, h, C, d)
-        kb.copy_(torch.where(mask, ks.to(kb.dtype), kb))
-        vb.copy_(torch.where(mask, vs.to(vb.dtype), vb))
+        mask = ((ar.view(1, C) == hit.view(S, 1)) & has.view(S, 1))
+        mask = mask.view(S, 1, C).expand(S, h, C).reshape(S * h, C, 1)
+        self.slot_k.copy_(torch.where(mask, ks.to(self.slot_k.dtype), self.slot_k))
+        self.slot_v.copy_(torch.where(mask, vs.to(self.slot_v.dtype), self.slot_v))
 
     def forward_decode_slot(self, hidden_states, meta, positions):
         """Decode over the slot self-KV: read ``ctx`` positions of each row's slot and attend.
@@ -1014,10 +1011,10 @@ class DecoderSelfAttention(nn.Module):
         if self.slot_write_where:
             self._slot_write_where(k, v, meta, positions)
         else:
-            self._slot_write(k, v, meta, positions)
-        slots = self._row_slots(meta, B, hidden_states.device)
-        kc = self.slot_k.view(self.num_slots, h, C, d)[:, :, :c].index_select(0, slots)
-        vc = self.slot_v.view(self.num_slots, h, C, d)[:, :, :c].index_select(0, slots)
+            self._slot_write_decode(k, v, meta, positions)
+        idx = self._slot_head_rows(self._row_slots(meta, B, hidden_states.device))
+        kc = self.slot_k[:, :c].index_select(0, idx).view(B, h, c, d)
+        vc = self.slot_v[:, :c].index_select(0, idx).view(B, h, c, d)
         pos = positions.to(torch.int64).view(B)
         qd = q.transpose(0, 1).unsqueeze(2)  # [B, h, 1, d]
         attn = torch.matmul(qd, kc.transpose(-1, -2))  # [B, h, 1, c]

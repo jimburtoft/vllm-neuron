@@ -489,7 +489,7 @@ def test_slot_self_kv_batched(hf_checkpoint, monkeypatch, write, cross, in_out):
     sa = model.decoder.layers[0].self_attn
     # The runner builds on meta and load_weights calls to_empty: the slots must be zero.
     assert all(int(lyr.self_attn.slot_k.abs().sum()) == 0 for lyr in model.decoder.layers)
-    assert sa.slot_kv and sa.slot_k.shape == (4 * HEADS * 448, D_MODEL // HEADS)
+    assert sa.slot_kv and sa.slot_k.shape == (4 * HEADS, 448, D_MODEL // HEADS)
     if "decoder" in in_out:
         assert model.decoder.layers[0].mlp.fc1.weight_layout == "in_out"
     torch.manual_seed(2)
