@@ -550,3 +550,19 @@ def test_in_out_matches_out_in(hf_checkpoint, monkeypatch):
     lyr = model.encoder.layers[0]
     assert lyr.self_attn.q_proj.weight_layout == "in_out" and lyr.mlp.fc2.in_out
     torch.testing.assert_close(outs[0], outs[1], atol=1e-5, rtol=1e-5)
+
+
+def test_encoder_nf_matches_plain(hf_checkpoint, monkeypatch):
+    """WHISPER_ENCODER_NF=1 (fused LN + QKV, flash, o_proj; torch fallbacks on CPU) matches the plain encoder."""
+    path, _ = hf_checkpoint
+    torch.manual_seed(6)
+    mel = torch.randn(1, 128, 3000)
+    outs = []
+    for nf in ("0", "1"):
+        monkeypatch.setenv("WHISPER_ENCODER_FLASH", nf)
+        monkeypatch.setenv("WHISPER_ENCODER_NF", nf)
+        model = _build_native(path)
+        assert model.encoder.layers[0].self_attn.nf == (nf == "1")
+        with torch.no_grad():
+            outs.append(model.encoder(mel))
+    torch.testing.assert_close(outs[0], outs[1], atol=2e-4, rtol=2e-4)

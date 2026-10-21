@@ -61,6 +61,17 @@ from .weight_loaders import build_state, load_hf_state, resolve_checkpoint_dir
 logger = logging.getLogger(__name__)
 
 
+def encoder_nf_enabled() -> bool:
+    """Return True when ``WHISPER_ENCODER_NF=1`` fuses the encoder LayerNorm + QKV and the out-proj.
+
+    The encoder self-attention then runs ``NF.qkv_proj`` (LayerNorm, the fused
+    q/k/v weight and bias), the NKI flash attention, and ``NF.o_proj``, the same
+    path as the Qwen3-ASR audio encoder. It needs ``WHISPER_ENCODER_FLASH=1``.
+    The values are not byte-identical to the separate ops: gate it on WER.
+    """
+    return os.environ.get("WHISPER_ENCODER_NF", "0") == "1"
+
+
 def encoder_flash_enabled() -> bool:
     """Return True when ``WHISPER_ENCODER_FLASH=1`` selects NKI flash attention in the encoder."""
     return os.environ.get("WHISPER_ENCODER_FLASH", "0") == "1"
@@ -333,10 +344,38 @@ class EncoderSelfAttention(nn.Module):
         # Read the flags one time: a read in forward adds an os.environ guard.
         self.flash = encoder_flash_enabled()
         self.in_out = "encoder" in in_out_parts()
+        self.nf = encoder_nf_enabled()
+        if self.nf and not self.flash:
+            raise ValueError("WHISPER_ENCODER_NF=1 needs WHISPER_ENCODER_FLASH=1.")
+        if self.nf:
+            d_local = self.num_heads * self.head_dim
+            self.register_buffer(
+                "qkv_weight_nf", torch.zeros(embed_dim, 3 * d_local, dtype=dtype), persistent=False
+            )
+            self.register_buffer(
+                "qkv_bias_nf", torch.zeros(1, 3 * d_local, dtype=dtype), persistent=False
+            )
+            self.register_buffer(
+                "out_weight_nf", torch.zeros(d_local, embed_dim, dtype=dtype), persistent=False
+            )
 
     @torch.no_grad()
     def finalize_weights(self) -> None:
-        """Store q/k/v/out as ``[in, out]`` when ``encoder`` is in ``WHISPER_IN_OUT``."""
+        """Store q/k/v/out as ``[in, out]`` when ``encoder`` is in ``WHISPER_IN_OUT``.
+
+        With ``WHISPER_ENCODER_NF=1``, build the fused ``[H, 3 * d_local]`` q/k/v
+        weight (q scale folded in, zero k bias) and the ``[d_local, H]`` out weight.
+        """
+        if self.nf:
+            wq = self.q_proj.weight * self.scaling
+            self.qkv_weight_nf.copy_(
+                torch.cat([wq, self.k_proj.weight, self.v_proj.weight], dim=0).t().contiguous()
+            )
+            bq = self.q_proj.bias * self.scaling
+            self.qkv_bias_nf.copy_(
+                torch.cat([bq, torch.zeros_like(bq), self.v_proj.bias]).view(1, -1)
+            )
+            self.out_weight_nf.copy_(self.out_proj.rpl.weight.t().contiguous())
         if not self.in_out:
             return
         for lin in (self.q_proj, self.k_proj, self.v_proj):
@@ -359,6 +398,45 @@ class EncoderSelfAttention(nn.Module):
         out = out.transpose(1, 2).reshape(bsz, seqlen, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
+
+    def forward_nf(self, x, norm):
+        """LayerNorm + fused QKV (``NF.qkv_proj``), flash attention, and ``NF.o_proj``.
+
+        Args:
+            x: The residual stream ``[b, s, H]`` (before the LayerNorm).
+            norm: The ``self_attn_layer_norm`` of the layer.
+        """
+        from vllm_neuron import functional as NF
+        from nkilib.core.utils.common_types import NormType
+
+        bsz, seqlen, _ = x.shape
+        h, d = self.num_heads, self.head_dim
+        qkv = NF.qkv_proj(
+            hidden=x,
+            qkv_weights=self.qkv_weight_nf,
+            norm_weights=norm.weight.unsqueeze(0),
+            eps=norm.eps,
+            norm_type=NormType.LAYER_NORM,
+            bias=self.qkv_bias_nf,
+            norm_b=norm.bias.unsqueeze(0),
+        )
+        hd = h * d
+        q, k, v = (
+            qkv[:, :, i * hd : (i + 1) * hd]
+            .reshape(bsz, seqlen, h, d)
+            .permute(0, 2, 1, 3)
+            .reshape(bsz * h, seqlen, d)
+            for i in range(3)
+        )
+        out = NF.flash_attention(
+            q, k, v, scale=1.0, causal_mask=False, tp_q=True, tp_k=True, tp_out=True,
+        )  # [b * h, d, s]
+        y = NF.o_proj(out.view(bsz, h, d, seqlen), self.out_weight_nf)  # [b, s, H]
+        if self.out_proj.rpl.tp_size > 1:
+            from torch.distributed._functional_collectives import all_reduce
+
+            y = all_reduce(y, reduceOp="sum", group=self.out_proj.rpl.tp_group)
+        return y + self.out_proj.bias.to(y.dtype)
 
     def _forward_flash(self, hidden_states):
         """Run the encoder attention with the NKI flash attention kernel (non-causal)."""
@@ -416,7 +494,10 @@ class EncoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(d, dtype=dtype)
 
     def forward(self, x):
-        x = x + self.self_attn(self.self_attn_layer_norm(x))
+        if self.self_attn.nf:
+            x = x + self.self_attn.forward_nf(x, self.self_attn_layer_norm)
+        else:
+            x = x + self.self_attn(self.self_attn_layer_norm(x))
         x = x + self.mlp(self.final_layer_norm(x))
         return x
 
