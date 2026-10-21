@@ -131,6 +131,12 @@ class NeuronScheduler(Scheduler):
         if mm_registry is None:
             mm_registry = MULTIMODAL_REGISTRY
 
+        # The EngineCore process builds a MultiModalBudget here and never runs
+        # pre_register_and_update; resolve plugin multimodal architectures first.
+        from vllm_neuron.vllm.platform import register_plugin_model_architectures
+
+        register_plugin_model_architectures()
+
         super().__init__(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
