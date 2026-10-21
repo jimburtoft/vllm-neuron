@@ -296,8 +296,29 @@ class MLP(nn.Module):
         self.fc1 = _cpl(embed_dim, ffn_dim, True, dtype, tp_group)
         self.fc2 = RowParallelLinearFP32Bias(ffn_dim, embed_dim, dtype, tp_group)
         self.act = gelu_for(part)
+        # WHISPER_MLP_IN_OUT=1 (decoder only): keep fc1/fc2 as [in, out] so that
+        # the decode GEMVs read the weight tiles without a PE transpose.
+        self.in_out = part == "decoder" and os.environ.get("WHISPER_MLP_IN_OUT", "0") == "1"
+
+    @torch.no_grad()
+    def finalize_weights(self) -> None:
+        """Store the fc1 / fc2 weights as ``[in, out]`` (``WHISPER_MLP_IN_OUT=1``)."""
+        if not self.in_out:
+            return
+        self.register_buffer("w1_t", self.fc1.weight.t().contiguous(), persistent=False)
+        self.register_buffer("w2_t", self.fc2.rpl.weight.t().contiguous(), persistent=False)
+        self.fc1.weight = nn.Parameter(self.fc1.weight.new_empty(0), requires_grad=False)
+        self.fc2.rpl.weight = nn.Parameter(self.fc2.rpl.weight.new_empty(0), requires_grad=False)
 
     def forward(self, x):
+        if self.in_out:
+            h = self.act(torch.matmul(x, self.w1_t) + self.fc1.bias)
+            y = torch.matmul(h, self.w2_t)
+            if self.fc2.rpl.tp_size > 1:
+                from torch.distributed._functional_collectives import all_reduce
+
+                y = all_reduce(y, reduceOp="sum", group=self.fc2.rpl.tp_group)
+            return y + self.fc2.bias.to(y.dtype)
         return self.fc2(self.act(self.fc1(x)))
 
 
@@ -693,6 +714,63 @@ class DecoderSelfAttention(nn.Module):
 
         self.k_cache = None
         self.v_cache = None
+        # WHISPER_SELF_FLAT=<slots> (timing prototype, Task 022): a model-owned,
+        # slot-contiguous self-KV [slots, heads, ctx, d]. Decode row b uses slot b
+        # (rows == slots), so K/V reads are large contiguous DMAs, not paged gathers.
+        self.flat_slots = int(os.environ.get("WHISPER_SELF_FLAT", "0"))
+        self.flat_ctx = 448
+        # WHISPER_SELF_CTX=0: the read context follows the block-table width
+        # (a decode-context bucket), capped at 448.
+        self.flat_read_ctx = int(os.environ.get("WHISPER_SELF_CTX", "448"))
+        if self.flat_slots:
+            shp = (self.flat_slots * self.num_heads * self.flat_ctx, self.head_dim)
+            self.register_buffer("flat_k", torch.zeros(shp, dtype=dtype), persistent=False)
+            self.register_buffer("flat_v", torch.zeros(shp, dtype=dtype), persistent=False)
+
+    def _flat_write(self, k, v, meta, positions):
+        """Write K/V ``[h, T, d]`` of each token to ``(slot of its row, position)``.
+
+        Pad tokens (slot_mapping -1) go to the scratch slot (the last one).
+        """
+        h, T, d = k.shape
+        C = self.flat_ctx
+        rows = meta["block_table_tensor"].shape[0]
+        slots = meta["request_slots"].to(torch.int64).view(rows, 1).expand(rows, T // rows)
+        slots = slots.reshape(T)
+        scratch = torch.full_like(slots, self.flat_slots - 1)
+        slots = torch.where(meta["slot_mapping"].view(T) < 0, scratch, slots)
+        pos = positions.to(torch.int64).view(T)
+        hh = torch.arange(h, device=k.device, dtype=torch.int64)
+        idx = ((slots.view(T, 1) * h + hh.view(1, h)) * C + pos.view(T, 1)).view(-1)
+        self.flat_k.index_put_((idx,), k.transpose(0, 1).reshape(T * h, d))
+        self.flat_v.index_put_((idx,), v.transpose(0, 1).reshape(T * h, d))
+
+    def forward_decode_flat(self, hidden_states, meta, positions):
+        """Decode over the slot-contiguous self-KV: gather the rows' slots, attend ctx positions.
+
+        ``WHISPER_SELF_CTX`` is the context of this graph (a decode-context bucket).
+        """
+        B = meta["block_table_tensor"].shape[0]
+        h, d, C = self.num_heads, self.head_dim, self.flat_ctx
+        c = self.flat_read_ctx or min(
+            meta["block_table_tensor"].shape[1] * meta["block_size"], C
+        )
+        q, k, v = self._project(hidden_states)  # [h, B, d]
+        self._flat_write(k, v, meta, positions)
+        slots = meta["request_slots"].to(torch.int64).view(B)
+        kc = self.flat_k.view(self.flat_slots, h, C, d)[:, :, :c].index_select(0, slots)
+        vc = self.flat_v.view(self.flat_slots, h, C, d)[:, :, :c].index_select(0, slots)
+        pos = positions.to(torch.int64).view(B)
+        qd = q.transpose(0, 1).unsqueeze(2)  # [B, h, 1, d]
+        attn = torch.matmul(qd, kc.transpose(-1, -2))  # [B, h, 1, c]
+        ar = torch.arange(c, device=attn.device, dtype=torch.int64)
+        valid = ar.view(1, c) <= pos.view(B, 1)
+        neg = torch.full((), float("-inf"), dtype=attn.dtype, device=attn.device)
+        zero = torch.zeros((), dtype=attn.dtype, device=attn.device)
+        attn = attn + torch.where(valid, zero, neg).view(B, 1, 1, c)
+        attn = F.softmax(attn.to(torch.float32), dim=-1).to(vc.dtype)
+        ctx = torch.matmul(attn, vc)  # [B, h, 1, d]
+        return self.out_proj(ctx.reshape(B, h * d))
 
     @torch.no_grad()
     def finalize_weights(self) -> None:
@@ -744,7 +822,7 @@ class DecoderSelfAttention(nn.Module):
         self.k_cache.index_put_(index, k_f)
         self.v_cache.index_put_(index, v_f)
 
-    def forward_prefill(self, hidden_states, meta):
+    def forward_prefill(self, hidden_states, meta, positions=None):
         """Causal attention over the prompt, with the reference SDPA math.
 
         The decoder prompt has about 4 tokens, so a flash kernel gives no gain.
@@ -753,6 +831,8 @@ class DecoderSelfAttention(nn.Module):
         """
         q, k, v = self._project(hidden_states)
         self._write_kv_cache(k, v, meta["slot_mapping"], meta["block_size"])
+        if self.flat_slots:
+            self._flat_write(k, v, meta, positions)
 
         tokens = hidden_states.shape[0]
         rows = meta["block_table_tensor"].shape[0]
@@ -944,7 +1024,9 @@ class DecoderLayer(nn.Module):
         # slots, [S, h, 1500, d], and slots gives the slot of each row.
         h = self.self_attn_layer_norm(x)
         if is_prefill:
-            sa = self.self_attn.forward_prefill(h, meta)
+            sa = self.self_attn.forward_prefill(h, meta, positions)
+        elif self.self_attn.flat_slots:
+            sa = self.self_attn.forward_decode_flat(h, meta, positions)
         elif self.self_attn.fused and meta["block_table_tensor"].shape[0] <= self.fused_max_rows:
             sa = self.self_attn.forward_decode_fused(h, meta, positions)
         else:
@@ -1279,6 +1361,7 @@ class WhisperForConditionalGeneration(nn.Module):
             tp_group=tp_group,
         )
 
+        self.lm_in_out = os.environ.get("WHISPER_LMHEAD_IN_OUT", "0") == "1"
         nc = config.neuron_config
         self.on_device_sampling_config = nc.on_device_sampling_config if nc else None
         self.sampler = None
@@ -1353,6 +1436,8 @@ class WhisperForConditionalGeneration(nn.Module):
         return full[..., : self.config.vocab_size]
 
     def _logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.lm_in_out:
+            return torch.matmul(hidden_states.to(torch.float32), self.lm_w_t)
         return self.lm_head(hidden_states.to(torch.float32))
 
     def _mask_pad_local(self, local: torch.Tensor, rank) -> torch.Tensor:
@@ -1526,9 +1611,20 @@ class WhisperForConditionalGeneration(nn.Module):
                     )
                 )
         self._tie_lm_head()
+        if self.lm_in_out:
+            # WHISPER_LMHEAD_IN_OUT=1: keep the fp32 LM head as [d, vocab_local], so the
+            # decode GEMV reads the weight tiles without a PE transpose.
+            with torch.no_grad():
+                self.register_buffer(
+                    "lm_w_t", self.lm_head.weight.t().contiguous(), persistent=False
+                )
+                self.lm_head.weight = nn.Parameter(
+                    self.lm_head.weight.new_empty(0), requires_grad=False
+                )
         for layer in self.decoder.layers:
             layer.self_attn.finalize_weights()
             layer.encoder_attn.finalize_weights()
+            layer.mlp.finalize_weights()
 
         problems = enc_missing + enc_unexpected + dec_missing + dec_unexpected
         logger.info(
