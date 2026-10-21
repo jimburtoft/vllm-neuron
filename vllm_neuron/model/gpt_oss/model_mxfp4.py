@@ -23,6 +23,7 @@ ANNOTATION GUIDE:
 
 import logging
 import math
+import os
 
 import nki.language as nl
 import torch
@@ -100,6 +101,26 @@ DECODE_RSAG_TOKEN_THRESHOLD = 128
 DEFAULT_SELECTIVE_LOADING_THRESHOLD = 1.0
 
 logger = logging.getLogger(__name__)
+
+# ── Environment overrides (Trn3 MXFP4 path) ───────────────────────────────────
+# Defaults are the recommended configuration; the variables exist to A/B a
+# component or to fall back to the stock path.
+#
+# GPTOSS_MX_KV_WRITE      "scatter" (default) | "kernel"
+#     bf16-KV segmented prefill. "scatter" writes only the new K/V slots. "kernel"
+#     uses the qkv kernel's in-kernel write, whose wrapper bridges the 4D paged
+#     cache to the kernel's 3D layout by copying the whole K and V cache out and
+#     back on every prefill layer (functional/attention/qkv.py), so TTFT grows
+#     with KV cache size. Packed-FP8 KV keeps the in-kernel write.
+# GPTOSS_MASK_PAD_ROUTE   "1" (default) | "0"
+#     Zero the routing affinities of prefill padding tokens so they get no MoE
+#     blocks.
+# GPTOSS_DECODE_OPT       "3" (default) | integer | "base"
+#     neuronx-cc optimization level for the decode graph
+#     (GptOssForCausalLM.compiler_args_for). Prefill is unaffected.
+_GPTOSS_MX_KV_SCATTER = os.environ.get("GPTOSS_MX_KV_WRITE", "scatter") != "kernel"
+_GPTOSS_MASK_PAD_ROUTE = os.environ.get("GPTOSS_MASK_PAD_ROUTE", "1") == "1"
+
 
 
 # =============================================================================
@@ -665,6 +686,48 @@ class GptOssAttention(nn.Module):
                 # external o_proj below.
                 attn_output = fused_out.squeeze(0)
                 used_swa_fused = True
+            elif not self.fp8_packed and _GPTOSS_MX_KV_SCATTER:
+                # bf16 KV: project + RoPE without the in-kernel write, then
+                # scatter only the new slots (see GPTOSS_MX_KV_WRITE).
+                qkv = NF.qkv_proj(
+                    hidden=hidden_states.unsqueeze(0),
+                    qkv_weights=self.qkv_proj_weight,
+                    bias=self.qkv_proj_bias.unsqueeze(0),
+                    d_head=self.head_dim,
+                    cos_cache=cos_cache,
+                    sin_cache=sin_cache,
+                    num_q_heads=self.num_attention_heads_per_rank,
+                    num_kv_heads=self.num_kv_heads_for_weight,
+                ).squeeze(0)
+                q, k, v = torch.tensor_split(qkv, self.qkv_split_indices, dim=-1)
+                q = q.view(
+                    tokens, self.num_attention_heads_per_rank, self.head_dim
+                ).transpose(0, 1)
+                k = k.view(
+                    tokens, self.num_key_value_heads_per_rank, self.head_dim
+                ).transpose(0, 1)
+                v = v.view(
+                    tokens, self.num_key_value_heads_per_rank, self.head_dim
+                ).transpose(0, 1)
+                self._write_paged_kv_cache(k, v, slot_mapping, block_size)
+                attn_output = NF.segmented_attention(
+                    q,
+                    k_cache=self.k_cache,
+                    v_cache=self.v_cache,
+                    block_tables=block_table,
+                    prior_tokens=cached_seq_len,
+                    block_size=block_size,
+                    kv_segment_size=kv_segment_size,
+                    scale=self.scaling / self.k_scale_float,
+                    sliding_window=self.sliding_window,
+                    sink=self.sinks.unsqueeze(1),
+                    tp_q=True,
+                    tp_out=True,
+                    fp8_packed=False,
+                )  # [Nh, Dh, T] because tp_out=True
+                attn_out_is_d_major = True
+                if self.v_scale_float != 1.0:
+                    attn_output = attn_output / self.v_scale_float
             else:
                 # ── Non-SWA layer or a non-packed (bf16) KV cache: in-kernel
                 #    post-RoPE (packed-)FP8 K/V write folded into qkv_proj, then
@@ -1676,12 +1739,22 @@ class GptOssExperts(nn.Module):
                 expert_affinities, local_expert_indices
             )
 
+        # Padding tokens get no MoE blocks: the mapping assigns a block slot to every
+        # non-zero affinity, and the padding mask below only scales affinities after the
+        # slots are chosen. The kernel reads affinities from the packed tail, so the
+        # padding rows it never visits do not need their tail cleared.
+        if _GPTOSS_MASK_PAD_ROUTE and padding_mask is not None:
+            expert_affinities = expert_affinities * padding_mask.to(
+                expert_affinities.dtype
+            ).unsqueeze(1)
+
         # Build blockwise mapping
         # >>> PARALLELISM: ep_tp_group provides TP rank coordination within
         # the EP partition. For pure TP this is the full tp_group; for pure EP
         # it is a single-rank group (no sharding); for variable EP+TP it is
         # the TP sub-group within the EP partition.
-        # _expert_affinities_masked unused: moe_cte reads affinities from the packed tail.
+        # _expert_affinities_masked unused by shard_on_block_mx: it reads affinities from
+        # the packed tail. The shard_on_i_mx kernels take the dense masked affinities.
         (
             _expert_affinities_masked,
             token_position_to_id,
@@ -2290,6 +2363,22 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
     # The forward assembles the decode input_ids on the device, so the runner may send the
     # in-graph reorder arguments. A model without this attribute keeps the host swap path.
     supports_async_reorder = True
+
+    def compiler_args_for(self, graph_type, example_inputs, base):
+        """Per-graph neuronx-cc args: compile the decode graph at -O3.
+
+        -O3 disables the modular flow, which removes the function-return /
+        semaphore wrapper around every collective. Prefill keeps the caller's
+        level. GPTOSS_DECODE_OPT=<n> overrides the decode level; "base" keeps
+        the caller's level.
+        """
+        from vllm_neuron.utils.compiler_args_ctx import with_optimization_level
+
+        base = list(base or [])
+        lvl = os.environ.get("GPTOSS_DECODE_OPT", "3")
+        if graph_type == "decode" and lvl != "base":
+            return with_optimization_level(base, int(lvl))
+        return base
 
     def __init__(self, config: GptOssConfig, batch_size: int):
         super().__init__()
