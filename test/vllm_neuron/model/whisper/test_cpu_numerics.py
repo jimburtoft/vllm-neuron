@@ -451,3 +451,98 @@ def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
 
     for r in range(2):
         assert tokens[r] == _hf_greedy(hf, mels[r], len(tokens[r]) - n), r
+
+
+@pytest.mark.parametrize(
+    "write,cross,in_out",
+    [("index", "mask", "decoder,lm_head"), ("where", "mask", "decoder,lm_head"),
+     ("index", "mqa", "decoder,lm_head,encoder"), ("where", "mqa", "none")],
+)
+def test_slot_self_kv_batched(hf_checkpoint, monkeypatch, write, cross, in_out):
+    """WHISPER_SELF_KV=slot (model-owned contiguous self-KV) gives the HF greedy tokens.
+
+    Two requests in slots 2 and 0: one prefill each, then batched decode in the
+    reverse slot order with a padded third row. The decode table is 2 blocks wide
+    (a 16-position context bucket) and then 6 blocks, so both context widths run.
+    The paged caches hold noise and are never read.
+    """
+    from vllm_neuron.functional.attention import attention_decode as _ad
+
+    if cross == "mqa" and not hasattr(_ad, "_fold_gqa_block_kv_mask"):
+        pytest.skip("The MQA cross mode needs the GQA decode-mask fold (#4817).")
+    path, hf = hf_checkpoint
+    monkeypatch.setenv("WHISPER_SELF_KV", "slot")
+    monkeypatch.setenv("WHISPER_SELF_WRITE", write)
+    monkeypatch.setenv("WHISPER_CROSS_MODE", cross)
+    monkeypatch.setenv("WHISPER_IN_OUT", in_out)
+    model = _build_native(path, max_num_seqs=3)
+    sa = model.decoder.layers[0].self_attn
+    assert sa.slot_kv and sa.slot_k.shape == (4 * HEADS * 448, D_MODEL // HEADS)
+    if "decoder" in in_out:
+        assert model.decoder.layers[0].mlp.fc1.weight_layout == "in_out"
+    torch.manual_seed(2)
+    mels = [torch.randn(1, 128, 3000), torch.randn(1, 128, 3000)]
+    req_slots = [2, 0]
+    for r in range(2):
+        model.embed_multimodal(
+            input_features=mels[r], encoder_cache=_FakeEncoderCache(), mm_hashes=[f"c{r}"],
+            request_slots=[req_slots[r]],
+        )
+    tokens = [list(PROMPT), list(PROMPT)]
+    n = len(PROMPT)
+    # The paged slot mapping only marks real (>= 0) and pad (-1) tokens in slot mode.
+    for r in range(2):
+        table = torch.full((1, MAX_BLOCKS_PER_SEQ), -1, dtype=torch.int32)
+        out = model(
+            input_ids=torch.tensor(PROMPT + [0] * 4, dtype=torch.int32),
+            positions=torch.tensor(list(range(n)) + [n - 1] * 4, dtype=torch.int32),
+            attn_metadata=_metadata(
+                model, torch.tensor(list(range(n)) + [-1] * 4), table, n + 4,
+                request_slots=[req_slots[r]],
+            ),
+            sampling_positions=torch.tensor([n - 1]),
+        )
+        tokens[r].append(int(out[0].argmax()))
+    order = [1, 0]
+    for step in range(8):
+        width = 2 if step < 4 else MAX_BLOCKS_PER_SEQ
+        table = torch.full((3, width), -1, dtype=torch.int32)
+        pos = [len(tokens[r]) - 1 for r in order]
+        assert max(pos) < width * BLOCK_SIZE
+        out = model(
+            input_ids=torch.tensor([tokens[r][-1] for r in order] + [0], dtype=torch.int32),
+            positions=torch.tensor(pos + [0], dtype=torch.int32),
+            attn_metadata=_metadata(
+                model, torch.tensor([1, 1, -1]), table, 1,
+                request_slots=[req_slots[r] for r in order] + [3],
+            ),
+            sampling_positions=torch.arange(3),
+        )
+        for row, r in enumerate(order):
+            tokens[r].append(int(out[row].argmax()))
+    for r in range(2):
+        assert tokens[r] == _hf_greedy(hf, mels[r], len(tokens[r]) - n), r
+
+
+def test_in_out_matches_out_in(hf_checkpoint, monkeypatch):
+    """WHISPER_IN_OUT=decoder,lm_head,encoder gives the same logits as WHISPER_IN_OUT=none."""
+    path, _ = hf_checkpoint
+    torch.manual_seed(5)
+    mel = torch.randn(1, 128, 3000)
+    outs = []
+    for parts in ("none", "decoder,lm_head,encoder"):
+        monkeypatch.setenv("WHISPER_IN_OUT", parts)
+        model = _build_native(path)
+        model.embed_multimodal(input_features=mel, encoder_cache=_FakeEncoderCache(), mm_hashes=["c"])
+        table = torch.full((1, MAX_BLOCKS_PER_SEQ), -1, dtype=torch.int32)
+        table[0, 0] = 3
+        n = len(PROMPT)
+        outs.append(model(
+            input_ids=torch.tensor(PROMPT, dtype=torch.int32),
+            positions=torch.arange(n, dtype=torch.int32),
+            attn_metadata=_metadata(model, torch.tensor([24 + p for p in range(n)]), table, n),
+            sampling_positions=torch.tensor([n - 1]),
+        ))
+    lyr = model.encoder.layers[0]
+    assert lyr.self_attn.q_proj.weight_layout == "in_out" and lyr.mlp.fc2.in_out
+    torch.testing.assert_close(outs[0], outs[1], atol=1e-5, rtol=1e-5)

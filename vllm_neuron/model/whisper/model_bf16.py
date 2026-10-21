@@ -101,6 +101,73 @@ def fused_decode_max_rows() -> int:
     return int(os.environ.get("WHISPER_FUSED_DECODE_MAX_B", "1000000"))
 
 
+def in_out_parts() -> set[str]:
+    """Return the parts whose linear weights are stored as ``[in, out]`` (``WHISPER_IN_OUT``).
+
+    ``WHISPER_IN_OUT`` is a comma list of ``decoder`` (decoder MLP, self-attention
+    q/k/v/out and cross-attention q/out), ``lm_head`` and ``encoder``. The default is
+    ``decoder,lm_head``. ``none`` stores all weights as ``[out, in]``.
+
+    With ``[out, in]`` weights, the compiler adds one PE transpose for each 128 x 128
+    weight tile on every decode step (Task 022: 30.4 k transposes, 2.6 ms at B=16).
+    ``[in, out]`` weights give the same values: the matmul reads the same products
+    in the same order.
+    """
+    raw = os.environ.get("WHISPER_IN_OUT", "decoder,lm_head")
+    parts = {p.strip() for p in raw.split(",") if p.strip()}
+    unknown = parts - {"decoder", "lm_head", "encoder", "none"}
+    if unknown:
+        raise ValueError(
+            f"WHISPER_IN_OUT has unknown parts {sorted(unknown)}. "
+            "Use a comma list of decoder, lm_head and encoder, or none."
+        )
+    return parts - {"none"}
+
+
+def self_kv_mode() -> str:
+    """Return ``WHISPER_SELF_KV``: where the decoder self-attention keeps its K/V.
+
+    * ``paged`` (default): the block-managed paged KV cache of the runner.
+    * ``slot``: model-owned contiguous K/V, one ``[heads, 448, d]`` region for each
+      request slot (the same slots as the cross-KV). Decode reads the first ``ctx``
+      positions of the slot of each row, where ``ctx`` is the decode-context bucket
+      (the block-table width). Each read is a large contiguous DMA, not a paged gather.
+
+    Raises:
+        ValueError: If the value is not ``paged`` or ``slot``.
+    """
+    mode = os.environ.get("WHISPER_SELF_KV", "paged")
+    if mode not in ("paged", "slot"):
+        raise ValueError(f"WHISPER_SELF_KV={mode!r}: use paged or slot.")
+    return mode
+
+
+def self_kv_write() -> str:
+    """Return ``WHISPER_SELF_WRITE``: how slot mode writes the new K/V (``index`` or ``where``).
+
+    * ``index`` (default): ``index_put_`` of one row for each token and head.
+    * ``where``: a one-hot ``torch.where`` over the whole buffer (intern-whisper style).
+      It reads and writes the full buffer on each step.
+    """
+    mode = os.environ.get("WHISPER_SELF_WRITE", "index")
+    if mode not in ("index", "where"):
+        raise ValueError(f"WHISPER_SELF_WRITE={mode!r}: use index or where.")
+    return mode
+
+
+def to_in_out(linear: nn.Module) -> None:
+    """Store the weight of a ``ColumnParallelLinear`` as ``[in, out]``.
+
+    ``ColumnParallelLinear`` then runs ``x @ W + b`` instead of ``F.linear``.
+    Call this method after the weights load.
+    """
+    if getattr(linear, "weight_layout", "out_in") == "in_out":
+        return
+    with torch.no_grad():
+        linear.weight = nn.Parameter(linear.weight.t().contiguous(), requires_grad=False)
+    linear.weight_layout = "in_out"
+
+
 WHISPER_ENCODER_TOKENS = 1500
 # The kernel cross-attention mode keeps the cross-KV of a slot in
 # CROSS_BLOCKS_PER_SLOT blocks of CROSS_BLOCK tokens: 1536 positions, the 1500
@@ -218,9 +285,25 @@ class RowParallelLinearFP32Bias(nn.Module):
             in_features, out_features, bias=False, dtype=dtype, tp_group=tp_group
         )
         self.bias = nn.Parameter(torch.empty(out_features, dtype=torch.float32))
+        self.in_out = False
+
+    @torch.no_grad()
+    def set_in_out(self) -> None:
+        """Store the weight as ``[in_local, out]`` and run ``x @ W``, then the all-reduce."""
+        if self.in_out:
+            return
+        self.rpl.weight = nn.Parameter(self.rpl.weight.t().contiguous(), requires_grad=False)
+        self.in_out = True
 
     def forward(self, x):
-        y = self.rpl(x)
+        if self.in_out:
+            y = torch.matmul(x, self.rpl.weight)
+            if self.rpl.tp_size > 1:
+                from torch.distributed._functional_collectives import all_reduce
+
+                y = all_reduce(y, reduceOp="sum", group=self.rpl.tp_group)
+        else:
+            y = self.rpl(x)
         return y + self.bias.to(y.dtype)
 
 
@@ -247,8 +330,18 @@ class EncoderSelfAttention(nn.Module):
         self.k_proj = _cpl(embed_dim, embed_dim, False, dtype, tp_group)
         self.v_proj = _cpl(embed_dim, embed_dim, True, dtype, tp_group)
         self.out_proj = RowParallelLinearFP32Bias(embed_dim, embed_dim, dtype, tp_group)
-        # Read the flag one time: a read in forward adds an os.environ guard.
+        # Read the flags one time: a read in forward adds an os.environ guard.
         self.flash = encoder_flash_enabled()
+        self.in_out = "encoder" in in_out_parts()
+
+    @torch.no_grad()
+    def finalize_weights(self) -> None:
+        """Store q/k/v/out as ``[in, out]`` when ``encoder`` is in ``WHISPER_IN_OUT``."""
+        if not self.in_out:
+            return
+        for lin in (self.q_proj, self.k_proj, self.v_proj):
+            to_in_out(lin)
+        self.out_proj.set_in_out()
 
     def _shape(self, x, seqlen, bsz):
         return x.view(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -296,29 +389,18 @@ class MLP(nn.Module):
         self.fc1 = _cpl(embed_dim, ffn_dim, True, dtype, tp_group)
         self.fc2 = RowParallelLinearFP32Bias(ffn_dim, embed_dim, dtype, tp_group)
         self.act = gelu_for(part)
-        # WHISPER_MLP_IN_OUT=1 (decoder only): keep fc1/fc2 as [in, out] so that
-        # the decode GEMVs read the weight tiles without a PE transpose.
-        self.in_out = part == "decoder" and os.environ.get("WHISPER_MLP_IN_OUT", "0") == "1"
+        # Read the flag one time: a read in forward adds an os.environ guard.
+        self.in_out = part in in_out_parts()
 
     @torch.no_grad()
     def finalize_weights(self) -> None:
-        """Store the fc1 / fc2 weights as ``[in, out]`` (``WHISPER_MLP_IN_OUT=1``)."""
+        """Store the fc1 / fc2 weights as ``[in, out]`` when the part is in ``WHISPER_IN_OUT``."""
         if not self.in_out:
             return
-        self.register_buffer("w1_t", self.fc1.weight.t().contiguous(), persistent=False)
-        self.register_buffer("w2_t", self.fc2.rpl.weight.t().contiguous(), persistent=False)
-        self.fc1.weight = nn.Parameter(self.fc1.weight.new_empty(0), requires_grad=False)
-        self.fc2.rpl.weight = nn.Parameter(self.fc2.rpl.weight.new_empty(0), requires_grad=False)
+        to_in_out(self.fc1)
+        self.fc2.set_in_out()
 
     def forward(self, x):
-        if self.in_out:
-            h = self.act(torch.matmul(x, self.w1_t) + self.fc1.bias)
-            y = torch.matmul(h, self.w2_t)
-            if self.fc2.rpl.tp_size > 1:
-                from torch.distributed._functional_collectives import all_reduce
-
-                y = all_reduce(y, reduceOp="sum", group=self.fc2.rpl.tp_group)
-            return y + self.fc2.bias.to(y.dtype)
         return self.fc2(self.act(self.fc1(x)))
 
 
@@ -518,6 +600,17 @@ class CrossAttention(nn.Module):
         With MQA head groups, group ``i`` gets the q columns and the out_proj
         rows of its heads.
         """
+        self._build_kernel_weights()
+        parts = in_out_parts()
+        if "decoder" in parts:
+            to_in_out(self.q_proj)
+            self.out_proj.set_in_out()
+        if "encoder" in parts:
+            # k_proj / v_proj run in the encoder graph (the cross-KV projection).
+            to_in_out(self.k_proj)
+            to_in_out(self.v_proj)
+
+    def _build_kernel_weights(self) -> None:
         if not self.kernel:
             return
         gd = self.mqa_g * self.head_dim
@@ -714,52 +807,91 @@ class DecoderSelfAttention(nn.Module):
 
         self.k_cache = None
         self.v_cache = None
-        # WHISPER_SELF_FLAT=<slots> (timing prototype, Task 022): a model-owned,
-        # slot-contiguous self-KV [slots, heads, ctx, d]. Decode row b uses slot b
-        # (rows == slots), so K/V reads are large contiguous DMAs, not paged gathers.
-        self.flat_slots = int(os.environ.get("WHISPER_SELF_FLAT", "0"))
-        self.flat_ctx = 448
-        # WHISPER_SELF_CTX=0: the read context follows the block-table width
-        # (a decode-context bucket), capped at 448.
-        self.flat_read_ctx = int(os.environ.get("WHISPER_SELF_CTX", "448"))
-        if self.flat_slots:
-            shp = (self.flat_slots * self.num_heads * self.flat_ctx, self.head_dim)
-            self.register_buffer("flat_k", torch.zeros(shp, dtype=dtype), persistent=False)
-            self.register_buffer("flat_v", torch.zeros(shp, dtype=dtype), persistent=False)
+        # WHISPER_SELF_KV=slot: model-owned contiguous self-KV, one [heads, 448, d]
+        # region for each request slot, flat as [slots * heads * 448, d] so that one
+        # index_put_ writes all heads of all tokens. The last slot is the scratch slot
+        # (pad rows and pad tokens). Read the flag one time (see DecoderLayer.__init__).
+        self.slot_kv = self_kv_mode() == "slot"
+        self.slot_ctx = cfg.max_target_positions
+        self.num_slots = cfg.max_num_seqs + 1
+        self.slot_write_where = self.slot_kv and self_kv_write() == "where"
+        if self.slot_kv:
+            shp = (self.num_slots * self.num_heads * self.slot_ctx, self.head_dim)
+            self.register_buffer("slot_k", torch.zeros(shp, dtype=dtype), persistent=False)
+            self.register_buffer("slot_v", torch.zeros(shp, dtype=dtype), persistent=False)
 
-    def _flat_write(self, k, v, meta, positions):
-        """Write K/V ``[h, T, d]`` of each token to ``(slot of its row, position)``.
+    def _row_slots(self, meta, rows, device):
+        """Return the request slot of each batch row, ``[rows]`` int64 (slot 0 if the runner sends none)."""
+        slots = meta.get("request_slots")
+        if slots is None:
+            return torch.zeros(rows, dtype=torch.int64, device=device)
+        return slots.to(torch.int64).view(rows)
 
-        Pad tokens (slot_mapping -1) go to the scratch slot (the last one).
+    def _slot_write(self, k, v, meta, positions):
+        """Write K/V ``[h, T, d]`` of each token to ``(slot of its row, head, position)``.
+
+        A pad token (slot_mapping -1) goes to the scratch slot. The tokens of a
+        row are contiguous, ``T // rows`` for each row.
         """
         h, T, d = k.shape
-        C = self.flat_ctx
+        C = self.slot_ctx
         rows = meta["block_table_tensor"].shape[0]
-        slots = meta["request_slots"].to(torch.int64).view(rows, 1).expand(rows, T // rows)
+        slots = self._row_slots(meta, rows, k.device).view(rows, 1).expand(rows, T // rows)
         slots = slots.reshape(T)
-        scratch = torch.full_like(slots, self.flat_slots - 1)
+        scratch = torch.full_like(slots, self.num_slots - 1)
         slots = torch.where(meta["slot_mapping"].view(T) < 0, scratch, slots)
         pos = positions.to(torch.int64).view(T)
         hh = torch.arange(h, device=k.device, dtype=torch.int64)
         idx = ((slots.view(T, 1) * h + hh.view(1, h)) * C + pos.view(T, 1)).view(-1)
-        self.flat_k.index_put_((idx,), k.transpose(0, 1).reshape(T * h, d))
-        self.flat_v.index_put_((idx,), v.transpose(0, 1).reshape(T * h, d))
+        self.slot_k.index_put_((idx,), k.transpose(0, 1).reshape(T * h, d).to(self.slot_k.dtype))
+        self.slot_v.index_put_((idx,), v.transpose(0, 1).reshape(T * h, d).to(self.slot_v.dtype))
 
-    def forward_decode_flat(self, hidden_states, meta, positions):
-        """Decode over the slot-contiguous self-KV: gather the rows' slots, attend ctx positions.
+    def _slot_write_where(self, k, v, meta, positions):
+        """Decode-only write with a one-hot ``torch.where`` (``WHISPER_SELF_WRITE=where``).
 
-        ``WHISPER_SELF_CTX`` is the context of this graph (a decode-context bucket).
+        One exact one-hot matmul moves the K/V and the position of each row to its
+        slot. A slot with no row (and the scratch slot) is left as it is. The where
+        then reads and writes the whole buffer, ``[slots, h, 448, d]``.
+        """
+        h, B, d = k.shape
+        S, C = self.num_slots, self.slot_ctx
+        slots = self._row_slots(meta, B, k.device)
+        live = (meta["slot_mapping"].view(B) >= 0) & (slots < S - 1)
+        sel = (
+            (torch.arange(S, device=k.device, dtype=torch.int64).view(1, S) == slots.view(B, 1))
+            & live.view(B, 1)
+        ).to(k.dtype)  # [B, S]
+        ks = torch.matmul(sel.t(), k.transpose(0, 1).reshape(B, h * d)).view(S, h, 1, d)
+        vs = torch.matmul(sel.t(), v.transpose(0, 1).reshape(B, h * d)).view(S, h, 1, d)
+        pos = positions.to(torch.int64).view(B)
+        hit = (sel.t().to(torch.int64) * pos.view(1, B)).sum(dim=1)  # [S]
+        has = sel.sum(dim=0) > 0
+        ar = torch.arange(C, device=k.device, dtype=torch.int64)
+        mask = ((ar.view(1, C) == hit.view(S, 1)) & has.view(S, 1)).view(S, 1, C, 1)
+        kb = self.slot_k.view(S, h, C, d)
+        vb = self.slot_v.view(S, h, C, d)
+        kb.copy_(torch.where(mask, ks.to(kb.dtype), kb))
+        vb.copy_(torch.where(mask, vs.to(vb.dtype), vb))
+
+    def forward_decode_slot(self, hidden_states, meta, positions):
+        """Decode over the slot self-KV: read ``ctx`` positions of each row's slot and attend.
+
+        ``ctx`` is the decode-context bucket: the block-table width times the block
+        size, capped at 448. The runner picks the bucket from the largest position
+        in the batch (``decode_context_length_buckets``), so every position of the
+        batch is below ``ctx``. Positions after the query are masked.
         """
         B = meta["block_table_tensor"].shape[0]
-        h, d, C = self.num_heads, self.head_dim, self.flat_ctx
-        c = self.flat_read_ctx or min(
-            meta["block_table_tensor"].shape[1] * meta["block_size"], C
-        )
+        h, d, C = self.num_heads, self.head_dim, self.slot_ctx
+        c = min(meta["block_table_tensor"].shape[1] * meta["block_size"], C)
         q, k, v = self._project(hidden_states)  # [h, B, d]
-        self._flat_write(k, v, meta, positions)
-        slots = meta["request_slots"].to(torch.int64).view(B)
-        kc = self.flat_k.view(self.flat_slots, h, C, d)[:, :, :c].index_select(0, slots)
-        vc = self.flat_v.view(self.flat_slots, h, C, d)[:, :, :c].index_select(0, slots)
+        if self.slot_write_where:
+            self._slot_write_where(k, v, meta, positions)
+        else:
+            self._slot_write(k, v, meta, positions)
+        slots = self._row_slots(meta, B, hidden_states.device)
+        kc = self.slot_k.view(self.num_slots, h, C, d)[:, :, :c].index_select(0, slots)
+        vc = self.slot_v.view(self.num_slots, h, C, d)[:, :, :c].index_select(0, slots)
         pos = positions.to(torch.int64).view(B)
         qd = q.transpose(0, 1).unsqueeze(2)  # [B, h, 1, d]
         attn = torch.matmul(qd, kc.transpose(-1, -2))  # [B, h, 1, c]
@@ -780,6 +912,13 @@ class DecoderSelfAttention(nn.Module):
         runs with ``softmax_scale=1``. This is the same math as ``_project``,
         which scales q after the bias.
         """
+        self._build_fused_weights()
+        if "decoder" in in_out_parts():
+            for lin in (self.q_proj, self.k_proj, self.v_proj):
+                to_in_out(lin)
+            self.out_proj.set_in_out()
+
+    def _build_fused_weights(self) -> None:
         if not self.fused:
             return
         wq = self.q_proj.weight * self.scaling  # [d_local, H]
@@ -830,9 +969,10 @@ class DecoderSelfAttention(nn.Module):
         The pad tokens are after the real tokens, so the causal mask hides them.
         """
         q, k, v = self._project(hidden_states)
-        self._write_kv_cache(k, v, meta["slot_mapping"], meta["block_size"])
-        if self.flat_slots:
-            self._flat_write(k, v, meta, positions)
+        if self.slot_kv:
+            self._slot_write(k, v, meta, positions)
+        else:
+            self._write_kv_cache(k, v, meta["slot_mapping"], meta["block_size"])
 
         tokens = hidden_states.shape[0]
         rows = meta["block_table_tensor"].shape[0]
@@ -1025,8 +1165,8 @@ class DecoderLayer(nn.Module):
         h = self.self_attn_layer_norm(x)
         if is_prefill:
             sa = self.self_attn.forward_prefill(h, meta, positions)
-        elif self.self_attn.flat_slots:
-            sa = self.self_attn.forward_decode_flat(h, meta, positions)
+        elif self.self_attn.slot_kv:
+            sa = self.self_attn.forward_decode_slot(h, meta, positions)
         elif self.self_attn.fused and meta["block_table_tensor"].shape[0] <= self.fused_max_rows:
             sa = self.self_attn.forward_decode_fused(h, meta, positions)
         else:
@@ -1361,7 +1501,7 @@ class WhisperForConditionalGeneration(nn.Module):
             tp_group=tp_group,
         )
 
-        self.lm_in_out = os.environ.get("WHISPER_LMHEAD_IN_OUT", "0") == "1"
+        self.lm_in_out = "lm_head" in in_out_parts()
         nc = config.neuron_config
         self.on_device_sampling_config = nc.on_device_sampling_config if nc else None
         self.sampler = None
@@ -1436,8 +1576,6 @@ class WhisperForConditionalGeneration(nn.Module):
         return full[..., : self.config.vocab_size]
 
     def _logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.lm_in_out:
-            return torch.matmul(hidden_states.to(torch.float32), self.lm_w_t)
         return self.lm_head(hidden_states.to(torch.float32))
 
     def _mask_pad_local(self, local: torch.Tensor, rank) -> torch.Tensor:
@@ -1612,15 +1750,12 @@ class WhisperForConditionalGeneration(nn.Module):
                 )
         self._tie_lm_head()
         if self.lm_in_out:
-            # WHISPER_LMHEAD_IN_OUT=1: keep the fp32 LM head as [d, vocab_local], so the
-            # decode GEMV reads the weight tiles without a PE transpose.
-            with torch.no_grad():
-                self.register_buffer(
-                    "lm_w_t", self.lm_head.weight.t().contiguous(), persistent=False
-                )
-                self.lm_head.weight = nn.Parameter(
-                    self.lm_head.weight.new_empty(0), requires_grad=False
-                )
+            # The fp32 LM head as [d, vocab_local]: the decode GEMV reads the weight
+            # tiles without a PE transpose.
+            to_in_out(self.lm_head)
+        for layer in self.encoder.layers:
+            layer.self_attn.finalize_weights()
+            layer.mlp.finalize_weights()
         for layer in self.decoder.layers:
             layer.self_attn.finalize_weights()
             layer.encoder_attn.finalize_weights()
