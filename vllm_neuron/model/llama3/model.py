@@ -35,6 +35,7 @@ from vllm_neuron.functional.attention.attention_decode import (
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, build_per_head_block_table
 from vllm_neuron.parallel.neuron_parallel_state import shard_select
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm_neuron.utils.dtype_utils import (
     FP8_CLAMP_MAX,
     validate_fp8_segmented_supported,
@@ -912,7 +913,15 @@ class LlamaAttention(nn.Module):
         # The slots index the flat num_blocks * kv_heads pool that the table targets.
         # Only one token per request is measured on device. Multi-token decode
         # (speculative verify) keeps the 2D table and the path it used before.
-        if nkh > 1 and S_decode == 1 and not self.fp8_packed and not dcp_decode_active:
+        # Without a kernel (CPU mode with the NKI simulator off) keep the 2D table:
+        # the torch fallback reads only that layout.
+        if (
+            nkh > 1
+            and S_decode == 1
+            and not self.fp8_packed
+            and not dcp_decode_active
+            and can_run_kernel(hidden_states)
+        ):
             active_blocks_table = build_per_head_block_table(block_table, nkh).to(
                 torch.int32
             )
