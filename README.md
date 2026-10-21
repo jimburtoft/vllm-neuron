@@ -1,5 +1,48 @@
 # vLLM Neuron Plugin (Beta)
 
+> **About this fork (branch `voxtral-neuron-0.29`).** This is a community fork of
+> [vllm-project/vllm-neuron](https://github.com/vllm-project/vllm-neuron) at release
+> 0.29.0.1.2.0. It adds native [Voxtral](https://huggingface.co/mistralai/Voxtral-Mini-3B-2507)
+> audio support with DFlash speculative decoding, plus the fixes that support needs. It is not an
+> official AWS release. The upstream proposal is
+> [vllm-project/vllm-neuron#69](https://github.com/vllm-project/vllm-neuron/pull/69).
+>
+> **What it adds on top of 0.29.0.1.2.0:**
+> - Voxtral-Mini-3B-2507 on Trn2: audio encoder, adapter and decoder on Neuron, plus
+>   `/v1/audio/transcriptions`. Recipe: [docs/model-recipes/voxtral.md](docs/model-recipes/voxtral.md).
+> - DFlash: a reduced draft vocabulary and mask embedding, more than 256 verification tokens, and
+>   an on-device argmax guard for batch 16 and above.
+> - `neuron_config.spec_decode_max_prompt_len`: skips speculation for long prompts (long audio).
+> - Fixes:
+>   - the GQA decode mask layout for multi-token verify;
+>   - no split of a multimodal prompt when prefill is single-shot (wrong output with several long
+>     audio requests);
+>   - TP=1 greedy sampler compile at decode batch > 1;
+>   - `rope_parameters` / `hf_text_config` config reads;
+>   - safetensors index filtering.
+>
+> **Run it on the Neuron SDK 2.33 DLAMI** (`Deep Learning AMI Neuron (Ubuntu 24.04) SDK 2.33.0`).
+> This is how it was tested on `trn2.3xlarge`. The fork goes first on `PYTHONPATH`, so the DLAMI
+> venv stays unchanged:
+>
+> ```bash
+> git clone -b voxtral-neuron-0.29 https://github.com/jimburtoft/vllm-neuron.git
+> source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/activate
+> export PYTHONPATH=$PWD/vllm-neuron
+> vllm serve mistralai/Voxtral-Mini-3B-2507 --tokenizer-mode mistral \
+>     --tensor-parallel-size 4 --max-model-len 2048 --max-num-seqs 1 \
+>     --max-num-batched-tokens 2048 --limit-mm-per-prompt '{"audio": 1}' \
+>     --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [512, 2048],
+>         "on_device_sampling_config": {"all_greedy": true}},
+>       "encoder_neuron_config": {"num_encoder_input_buckets": [1, 4],
+>         "encoder_attention_block_size": 375, "tp_size": 4}}'
+> ```
+>
+> The recipe covers DFlash, batching and long-audio settings. Measured results on SDK 2.33:
+> - Earnings22 WER 7.80% (7.77% with the DFlash draft).
+> - LibriSpeech single-request p50 latency 203 ms, or 86 ms with the draft.
+> - 121x real-time at 32 concurrent requests with the draft.
+
 The vLLM Neuron plugin is the recommended serving solution for large language models on AWS Trainium. It extends [vLLM](https://docs.vllm.ai/) with a Neuron backend, providing the same vLLM APIs and configuration you are already familiar with.
 
 > **If you are using vLLM with NxD Inference (0.5.x plugin version),** see the [release-0.5.3 branch](https://github.com/aws-neuron/private-vllm-neuron/tree/release-0.5.3) and the [NxD Inference + vLLM documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/index.html). To migrate to the plugin based on 0.21.0+, see the [migration guide](docs/getting-started/migration-nxdi-to-vllm-neuron.md).
