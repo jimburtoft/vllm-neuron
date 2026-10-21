@@ -367,7 +367,7 @@ def test_fused_decode_matches_torch_path(hf_checkpoint, monkeypatch):
 @pytest.mark.parametrize(
     "mode,fused,kt",
     [("kernel", "0", "0"), ("kernel", "1", "0"), ("perm", "1", "0"), ("perm", "1", "1"),
-     ("mask", "1", "1"), ("perm-active", "1", "1"), ("mqa", "0", "0"), ("mqa", "1", "0"), ("mqa2", "1", "0")],
+     ("mask", "1", "1"), ("perm-active", "1", "1"), ("mqa", "0", "0"), ("mqa", "1", "0"), ("mqa2", "1", "0"), ("mqa4pad", "1", "0")],
 )
 def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
     """WHISPER_CROSS_MODE=kernel (blocked cross-KV, attention_decode) and perm give the HF tokens.
@@ -384,6 +384,14 @@ def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
         # Two MQA head groups of 2 heads (the test model has 4 heads).
         mode = "mqa"
         monkeypatch.setenv("WHISPER_CROSS_MQA_GROUP", "2")
+    if mode == "mqa4pad":
+        # One group of 4 heads (6144 positions), padded to 8192 as a span above
+        # one flash tile would be (the test forces the pad at this size).
+        mode = "mqa"
+        monkeypatch.setenv("WHISPER_CROSS_MQA_GROUP", "4")
+        from vllm_neuron.model.whisper import model_bf16 as _mb
+
+        monkeypatch.setattr(_mb, "mqa_span", lambda g: 8192)
     if mode == "perm-active":
         # The batch has 3 rows and the slots are 2, 0 and 3 (scratch): every
         # slot is below the first 4, so the active window covers them.

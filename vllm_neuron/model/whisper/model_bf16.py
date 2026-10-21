@@ -203,13 +203,28 @@ def cross_k_transposed() -> bool:
 def mqa_group(heads: int) -> int:
     """Return the heads in one MQA cross-attention call (``WHISPER_CROSS_MQA_GROUP``, default 5).
 
-    One call spans ``group x 1536`` positions. The decode kernel's flash tiling
-    fails above 8192 positions, so groups stay at 5 heads or fewer.
+    One call spans ``group x 1536`` positions, padded by ``mqa_span``. Without the
+    pad, the decode kernel's flash tiling fails above 8192 positions.
     """
     g = min(int(os.environ.get("WHISPER_CROSS_MQA_GROUP", "5")), heads)
     if heads % g != 0:
         raise ValueError(f"WHISPER_CROSS_MQA_GROUP={g} must divide the {heads} heads of a rank.")
     return g
+
+
+def mqa_span(group: int) -> int:
+    """Return the positions of one MQA call: ``group x 1536``, padded to whole flash tiles.
+
+    ``WHISPER_CROSS_MQA_PAD=1`` (default) pads a span above 8192 positions to a
+    multiple of 8192. The decode kernel's flash tiling fails on a partial last
+    tile (10 heads: 15360 positions), and runs a padded span (16384) correctly
+    (Task 025). The pad positions are masked. ``WHISPER_CROSS_MQA_PAD=0`` keeps the
+    unpadded span.
+    """
+    span = group * CROSS_CTX
+    if os.environ.get("WHISPER_CROSS_MQA_PAD", "1") == "1" and span > 8192:
+        span = -(-span // 8192) * 8192
+    return span
 
 
 def cross_mode() -> str:
@@ -571,7 +586,8 @@ class WhisperCrossKVEncoder(nn.Module):
             # each span in 128 blocks of g x 12 positions.
             self.mqa_g = mqa_group(n_heads_local)
             self.mqa_groups = n_heads_local // self.mqa_g
-            self.mqa_block = self.mqa_g * CROSS_CTX // 128
+            self.mqa_span = mqa_span(self.mqa_g)
+            self.mqa_block = self.mqa_span // 128
             shape = (num_slots * self.mqa_groups * 128, 1, self.mqa_block, head_dim)
         elif self.blocked:
             shape = (num_slots * CROSS_BLOCKS_PER_SLOT, n_heads_local, CROSS_BLOCK, head_dim)
@@ -615,9 +631,15 @@ class WhisperCrossKVEncoder(nn.Module):
         return encoder_hidden
 
     def _to_mqa_blocks(self, x):
-        """``[n, h, 1500, d]`` to ``[n * groups * 128, 1, g * 1536 / 128, d]``, head-major."""
+        """``[n, h, 1500, d]`` to ``[n * groups * 128, 1, span / 128, d]``, head-major.
+
+        Each group holds its g heads end to end (1536 positions each), then zero
+        pad to the span.
+        """
         n, h, t, d = x.shape
         x = F.pad(x, (0, 0, 0, CROSS_CTX - t))  # [n, h, 1536, d]
+        x = x.reshape(n, self.mqa_groups, self.mqa_g * CROSS_CTX, d)
+        x = F.pad(x, (0, 0, 0, self.mqa_span - self.mqa_g * CROSS_CTX))
         return x.reshape(n * self.mqa_groups * 128, 1, self.mqa_block, d)
 
     @staticmethod
@@ -1403,9 +1425,11 @@ class WhisperDecoder(nn.Module):
                 # instead of nbm blocks per row. A 512-block gather does not finish
                 # compiling with neuronx-cc 2.28 (SDK 2.33).
                 hl, d = owner.n_heads_local, cross_k.shape[-1]
+                g, groups, span = owner.mqa_g, owner.mqa_groups, owner.mqa_span
                 cross_k, cross_v = (
                     c.view(-1, nbm * c.shape[1] * c.shape[2], d)
                     .index_select(0, row_slots.to(torch.int64))
+                    .reshape(rows, groups, span, d)[:, :, : g * CROSS_CTX]
                     .reshape(rows, hl, CROSS_CTX, d)[:, :, :WHISPER_ENCODER_TOKENS]
                     for c in (cross_k, cross_v)
                 )
@@ -1502,7 +1526,7 @@ class WhisperDecoder(nn.Module):
         # One head group: g heads, g x 1536 positions in 128 blocks. Group i of
         # slot s starts at block (s * groups + i) * 128; attn_kernel adds i * 128.
         heads = owner.mqa_g
-        s_ctx = heads * CROSS_CTX
+        s_ctx = owner.mqa_span
         table = slots.view(-1, 1).to(torch.int32) * (128 * owner.mqa_groups) + torch.arange(
             128, device=x.device, dtype=torch.int32
         )
