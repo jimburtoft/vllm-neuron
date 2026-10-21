@@ -189,8 +189,15 @@ class DFlashQwen3Model(nn.Module):
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Embed the flattened draft block with the target's embedding table."""
-        return self.embed_tokens(input_ids, scatter_tokens=False)
+        """Embed the flattened draft block with the target's embedding table.
+
+        The vocab-shard offset must come from the runtime rank tensor: without it the
+        embedding bakes this rank's Python-int offset into a graph that SPMD compile
+        shares across ranks, so every rank looks up rank 0's vocab range (mask token
+        and most bonus tokens embed to zero).
+        """
+        rank = getattr(get_tp_group(), "rank_in_group_tensor", None)
+        return self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
 
     @torch.no_grad()
     def forward(

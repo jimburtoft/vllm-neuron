@@ -70,11 +70,23 @@ def _draft_config(hf_config, neuron_config: NeuronConfig | None) -> DFlashConfig
         cfg.sliding_window = int(window)
     else:
         cfg.sliding_window = None
+    # Debug knob: MUSE_GLIMMER_DFLASH_WINDOW=0 drops the drafter window (plain non-causal mask).
+    if os.environ.get("MUSE_GLIMMER_DFLASH_WINDOW", "1") == "0":
+        cfg.sliding_window = None
     return cfg
 
 
 class MuseGlimmerDFlashModel(DFlashQwen3Model):
-    """Backbone with the drafter's inclusive bidirectional sliding window."""
+    """Backbone with the drafter's inclusive bidirectional sliding window.
+
+    The decode mask is always built here (the base class builds it with ``bs=B``).
+    With several KV heads per rank (8 KV heads at TP=4 -> 2) the fused decode kernel
+    folds the KV heads into the batch (``B * nkh`` lines of ``q_heads / nkh`` heads);
+    the block-KV shuffled mask layout depends on that batch through the LNC
+    sharding decision, so the mask must be generated for the folded batch. The
+    folded ``[S_prior, B*nkh, q/nkh, S]`` mask is the same memory as
+    ``[S_prior, B, q, S]`` (heads of KV head h are contiguous).
+    """
 
     @torch.no_grad()
     def precompute_and_store_context_kv(self, context_states, context_positions, context_slot_mapping):
@@ -88,27 +100,28 @@ class MuseGlimmerDFlashModel(DFlashQwen3Model):
     def forward(self, input_ids, positions, attn_metadata):
         W = getattr(self.config, "sliding_window", None)
         attn0 = self.layers[0].self_attn
-        layer0_meta = attn_metadata[f"layers.{attn0.layer_idx}.self_attn"]
-        if W is not None and layer0_meta.get("attention_mask", None) is None:
+        name0 = f"layers.{attn0.layer_idx}.self_attn"
+        layer0_meta = attn_metadata[name0]
+        if layer0_meta.get("attention_mask", None) is None:
             bs = layer0_meta["block_table_tensor"].shape[0]
             block_size = layer0_meta["block_size"]
             s_prior = layer0_meta["max_blocks_per_seq"] * block_size
             s_active = positions.shape[0] // bs
-            pos = positions.view(1, bs * s_active).to(torch.float32)
+            nkh = attn0.num_key_value_heads_per_rank
+            pos = positions.view(bs, 1, s_active).to(torch.float32)
+            pos = pos.expand(bs, nkh, s_active).reshape(1, bs * nkh * s_active)
             mask = gen_attention_decode_mask(
                 pos_ids=pos,
-                bs=bs,
-                q_head=attn0.num_attention_heads_per_rank,
+                bs=bs * nkh,
+                q_head=attn0.num_attention_heads_per_rank // nkh,
                 s_active=s_active,
                 s_prior=s_prior,
-                start_pos=torch.clamp(pos - float(W), min=0.0),
+                start_pos=torch.clamp(pos - float(W), min=0.0) if W is not None else None,
                 block_len=block_size,
                 is_causal=False,
-            )
+            ).reshape(s_prior, bs, attn0.num_attention_heads_per_rank, s_active)
             attn_metadata = dict(attn_metadata)
-            attn_metadata[f"layers.{attn0.layer_idx}.self_attn"] = dict(
-                layer0_meta, attention_mask=mask
-            )
+            attn_metadata[name0] = dict(layer0_meta, attention_mask=mask)
         return super().forward(input_ids, positions, attn_metadata)
 
 
