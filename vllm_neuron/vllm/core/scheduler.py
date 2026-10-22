@@ -155,6 +155,7 @@ class NeuronScheduler(Scheduler):
 
         self._instrument_encoder_cache_manager()
         self._cap_encoder_budget_to_bucket(vllm_config)
+        self._align_token_budget_to_kv_blocks(kv_cache_config)
 
         # TODO: Support additional scheduling policies
         scheduler_policy = vllm_config.scheduler_config.policy
@@ -524,6 +525,56 @@ class NeuronScheduler(Scheduler):
 
         ecm.check_and_update_cache = _counting_check
         logger.info("Instrumented scheduler encoder cache hit/query metrics.")
+
+    def _align_token_budget_to_kv_blocks(self, kv_cache_config: "KVCacheConfig") -> None:
+        """Keep every chunked-prefill boundary on a KV block boundary.
+
+        A prefill chunk after the first runs the segmented attention kernel, which
+        requires ``prior_tokens`` (the tokens cached before the chunk) to be a
+        multiple of the KV block size. With another prior length it returns wrong
+        values for most rows without an error; the torch fallback has no such limit,
+        so CPU mode hides it.
+
+        Without speculation the chunk length is ``max_num_batched_tokens`` (a bucket,
+        block-aligned). With speculative decoding upstream caps a chunk at
+        ``max_num_batched_tokens - max_num_new_slots_for_drafting``
+        (DFlash: ``num_speculative_tokens``, e.g. 4096 - 15 = 4081), so the second
+        chunk starts at an unaligned prior. Round the per-step token budget down to
+        a multiple of every KV group's block size (it is also below the input budget,
+        so it is the binding cap). Decode steps are unaffected: ``bs * (1 + k)`` is
+        far below the budget.
+        """
+        import math
+
+        sizes = {
+            g.kv_cache_spec.block_size
+            for g in (kv_cache_config.kv_cache_groups or [])
+            if getattr(g.kv_cache_spec, "block_size", 0)
+        }
+        if not sizes:
+            return
+        align = 1
+        for s in sizes:
+            align = align * s // math.gcd(align, s)
+        spec = self.vllm_config.speculative_config
+        draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+        cap = min(
+            self.max_num_scheduled_tokens,
+            self.scheduler_config.max_num_batched_tokens - draft_slots,
+        )
+        aligned = cap // align * align
+        if aligned <= 0 or aligned == self.max_num_scheduled_tokens:
+            return
+        logger.info(
+            "Chunked prefill token budget %d -> %d (multiple of KV block size %d; "
+            "draft slots %d): the segmented prefill kernel needs block-aligned prior "
+            "lengths.",
+            self.max_num_scheduled_tokens,
+            aligned,
+            align,
+            draft_slots,
+        )
+        self.max_num_scheduled_tokens = aligned
 
     def _cap_encoder_budget_to_bucket(self, vllm_config: "VllmConfig") -> None:
         """Limit encoder inputs per step so they fit one compiled encoder bucket.
