@@ -19,6 +19,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_neuron import envs
+from vllm_neuron.vllm.core import kv_admission
 from vllm_neuron.metrics import (
     NUM_BATCHED_TOKENS_PADDING,
     NUM_SEQS_PADDING,
@@ -335,7 +336,20 @@ class NeuronScheduler(Scheduler):
             max_concurrent if max_concurrent > 0 else self.max_num_seqs
         )
 
-        if 0 < max_concurrent < self.max_num_seqs:
+        # Opt-in: admit by the sum of each live request's real peak KV blocks
+        # (sliding-window groups shrink to the window after prefill) instead of
+        # the worst-case count cap above. See kv_admission.py.
+        self._real_admission: kv_admission.AdmissionParams | None = None
+        self._kv_high_water: int = 0
+        self._kv_used_high_water: int = 0
+        self._real_preemptions: int = 0
+        if envs.VLLM_NEURON_SWA_REAL_ADMISSION:
+            self._real_admission = self._build_real_admission(
+                vllm_config, kv_cache_config
+            )
+        if self._real_admission is not None:
+            self._max_kv_concurrent = self.max_num_seqs
+        elif 0 < max_concurrent < self.max_num_seqs:
             logger.warning(
                 "max_num_seqs (%d) exceeds worst-case KV cache capacity (%d "
                 "concurrent requests at max_model_len=%d, assuming no prefix "
@@ -715,6 +729,152 @@ class NeuronScheduler(Scheduler):
         parked in the send-lane awaiting their NIXL handoff."""
         return len(self.running) + len(self._pending_kv_send)
 
+    def _build_real_admission(
+        self, vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig"
+    ) -> "kv_admission.AdmissionParams | None":
+        """Describe the KV groups for real-peak admission, or None to fall back.
+
+        Every input comes from the live configs: the pool size, each group's spec
+        (block size, window, retained tokens) and vLLM's own per-group charge, and
+        the real max_concurrent_batches / spec / lookahead / watermark settings.
+        """
+        from vllm.utils.math_utils import cdiv
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            MLAAttentionSpec,
+            SlidingWindowMLASpec,
+            SlidingWindowSpec,
+        )
+
+        reason = None
+        if not kv_cache_config.kv_cache_groups:
+            reason = "no KV cache groups"
+        elif vllm_config.kv_transfer_config is not None:
+            reason = "a KV connector is configured"
+        elif vllm_config.parallel_config.decode_context_parallel_size > 1:
+            reason = "decode context parallelism is enabled"
+        groups: list[kv_admission.GroupDesc] = []
+        for group in kv_cache_config.kv_cache_groups if reason is None else []:
+            spec = group.kv_cache_spec
+            upstream = cdiv(
+                spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
+            )
+            # Exact types only: subclasses (R-SWA, sink, chunked-local, ...) free
+            # blocks differently, so they fall back to the worst-case cap.
+            if type(spec) in (SlidingWindowSpec, SlidingWindowMLASpec):
+                groups.append(
+                    kv_admission.GroupDesc(
+                        kind="swa",
+                        block_size=spec.block_size,
+                        upstream_blocks=upstream,
+                        sliding_window=spec.sliding_window,
+                        extra_retained_tokens=spec.extra_retained_tokens,
+                    )
+                )
+            elif type(spec) in (FullAttentionSpec, MLAAttentionSpec):
+                groups.append(
+                    kv_admission.GroupDesc(
+                        kind="full", block_size=spec.block_size, upstream_blocks=upstream
+                    )
+                )
+            else:
+                reason = f"unsupported KV spec {type(spec).__name__}"
+                break
+        if reason is not None:
+            logger.warning(
+                "VLLM_NEURON_SWA_REAL_ADMISSION=1 ignored (%s); keeping the "
+                "worst-case KV admission cap.",
+                reason,
+            )
+            return None
+
+        decode_tokens = 1 + vllm_config.num_speculative_tokens + max(
+            0, self.max_jump_forward_tokens
+        )
+        params = kv_admission.make_params(
+            groups,
+            num_blocks=kv_cache_config.num_blocks,
+            max_model_len=self.max_model_len,
+            max_concurrent_batches=vllm_config.max_concurrent_batches,
+            decode_tokens=decode_tokens,
+            lookahead_tokens=vllm_config.num_lookahead_tokens,
+            watermark_blocks=int(
+                vllm_config.scheduler_config.watermark * kv_cache_config.num_blocks
+            ),
+        )
+        ml_prompt = self.max_model_len // 2
+        logger.info(
+            "Real-peak KV admission enabled: pool %d blocks (%d usable), %d SWA + %d "
+            "full-attention groups, max_concurrent_batches=%d, decode tokens/step=%d. "
+            "Per-request charge: upstream %d blocks (count cap %d) vs real peak "
+            "%d blocks for a %d-token prompt + %d new tokens (%d concurrent of that "
+            "shape). Admission sums each live request's real peak.",
+            params.num_blocks,
+            params.usable_blocks,
+            sum(g.kind == "swa" for g in groups),
+            sum(g.kind == "full" for g in groups),
+            params.max_concurrent_batches,
+            params.decode_tokens,
+            params.upstream_blocks_per_request,
+            params.legacy_cap,
+            kv_admission.request_peak_blocks(params, ml_prompt, self.max_model_len),
+            ml_prompt,
+            self.max_model_len - ml_prompt,
+            kv_admission.uniform_cap(params, ml_prompt, self.max_model_len - ml_prompt),
+        )
+        return params
+
+    def _real_peak_blocks(self, request: Request) -> int:
+        """Real per-request peak KV blocks (all groups) for the rest of its life.
+
+        A request whose prefill has not finished (waiting, preempted, or mid
+        prefill) will prefill every token it has so far (a preempted one
+        re-prefills its outputs too); after that, only the prompt counts.
+        """
+        params = self._real_admission
+        assert params is not None
+        if request.num_computed_tokens < request.num_tokens and (
+            request.num_computed_tokens < request.num_prompt_tokens
+            or request.status != RequestStatus.RUNNING
+        ):
+            prefill_len = request.num_tokens
+        else:
+            prefill_len = request.num_prompt_tokens
+        final_len = request.num_prompt_tokens + request.max_tokens
+        return kv_admission.request_peak_blocks(params, prefill_len, final_len)
+
+    def _real_kv_demand(self) -> int:
+        """Sum of real peaks over requests that hold or will hold KV this step."""
+        return sum(self._real_peak_blocks(r) for r in self.running) + sum(
+            self._real_peak_blocks(r) for r in self.waiting
+        )
+
+    def _real_kv_room_for(self, request: Request) -> bool:
+        params = self._real_admission
+        assert params is not None
+        return (
+            self._real_kv_demand() + self._real_peak_blocks(request)
+            <= params.usable_blocks
+        )
+
+    def _record_real_kv_high_water(self) -> None:
+        live = len(self.running)
+        if live <= self._kv_high_water:
+            return
+        self._kv_high_water = live
+        pool = self.kv_cache_manager.block_pool
+        used = pool.num_gpu_blocks - pool.get_num_free_blocks()
+        self._kv_used_high_water = max(self._kv_used_high_water, used)
+        if live % 16 == 0 or live == self.max_num_seqs:
+            logger.info(
+                "Real-peak KV admission: %d live requests (new high), %d KV blocks "
+                "in use, real-peak demand %d of %d usable.",
+                live,
+                used,
+                self._real_kv_demand(),
+                self._real_admission.usable_blocks,
+            )
+
     def _is_dispatched_producer(self, request: Request) -> bool:
         """A do_remote_decode producer past its (final) prefill chunk and safe to
         park: it holds KV blocks awaiting the async send but no longer needs the
@@ -906,6 +1066,24 @@ class NeuronScheduler(Scheduler):
                     self._kv_in_use(),
                     self._max_kv_concurrent,
                 )
+            return False
+
+        # Real-peak admission (opt-in): admit only while the sum of every live
+        # request's real peak KV blocks fits the pool, so no later allocate_slots
+        # can fail and preempt.
+        if self._real_admission is not None and not self._real_kv_room_for(request):
+            if not self._kv_exhaustion_warned:
+                logger.warning(
+                    "Prefill deferred: %d requests hold a real-peak KV demand of %d "
+                    "blocks; request %s needs %d more of %d usable. Waiting for "
+                    "decode requests to complete.",
+                    self._kv_in_use(),
+                    self._real_kv_demand(),
+                    request.request_id,
+                    self._real_peak_blocks(request),
+                    self._real_admission.usable_blocks,
+                )
+                self._kv_exhaustion_warned = True
             return False
 
         return True
@@ -1299,7 +1477,9 @@ class NeuronScheduler(Scheduler):
                 if not self._is_structured_output_grammar_waiter(req):
                     deferred.append(req)
                     continue
-                if can_admit and not kept_one:
+                if can_admit and not kept_one and (
+                    self._real_admission is None or self._real_kv_room_for(req)
+                ):
                     kept_one = True
                     deferred.append(req)
                     continue
@@ -1371,6 +1551,19 @@ class NeuronScheduler(Scheduler):
         # exec and NIXL send.
         if self._pure_producer:
             self._release_dispatched_producers()
+
+        if self._real_admission is not None:
+            preempted = getattr(scheduler_output, "preempted_req_ids", None)
+            if preempted:
+                self._real_preemptions += len(preempted)
+                logger.warning(
+                    "Real-peak KV admission: %d request(s) preempted this step "
+                    "(%d total) at %d live requests.",
+                    len(preempted),
+                    self._real_preemptions,
+                    len(self.running),
+                )
+            self._record_real_kv_high_water()
 
         return scheduler_output
 

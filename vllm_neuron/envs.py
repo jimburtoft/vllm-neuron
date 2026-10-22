@@ -47,6 +47,9 @@ if TYPE_CHECKING:
     VLLM_NEURON_MIN_KV_BUDGET_GIB: float = 1.0
     VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION: float = 0.30
     VLLM_NEURON_RESERVED_HEADROOM_GIB: float | None = None
+    # Admit by each request's real peak KV (sliding-window groups at window size
+    # after prefill) instead of vLLM's worst-case per-request charge. Off by default.
+    VLLM_NEURON_SWA_REAL_ADMISSION: bool = False
     VLLM_NEURON_WORKER_TERMINATION_TIMEOUT: int = 5
     VLLM_NEURON_NIXL_PROGRESS_THREAD_DELAY_US: int = 0
     # Build the NIXL agent with reader-writer thread sync. On by default; 0 keeps NIXL's NONE.
@@ -332,6 +335,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         maybe_convert_float(os.getenv("VLLM_NEURON_RESERVED_HEADROOM_GIB"))
         if os.getenv("VLLM_NEURON_RESERVED_HEADROOM_GIB") is not None
         else None
+    ),
+    # Scheduler KV admission by real per-request peak blocks (see
+    # vllm_neuron/vllm/core/kv_admission.py). Off: the worst-case count cap from
+    # vLLM's get_max_concurrency_for_kv_cache_config, unchanged.
+    "VLLM_NEURON_SWA_REAL_ADMISSION": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_SWA_REAL_ADMISSION")) or False
     ),
     # Local cache directory for model checkpoints
     "VLLM_NEURON_CHECKPOINT_CACHE": lambda: os.getenv(
