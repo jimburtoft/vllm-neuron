@@ -52,8 +52,13 @@ from .weight_loader import (
 def gelu(x: torch.Tensor) -> torch.Tensor:
     """GELU via erf — traceable on Neuron (libtorch_neuronx_lite patches F.gelu
     with a C extension that torch.compile/Dynamo cannot trace through). Matches
-    the audio encoder's activation_function == "gelu" (exact, not tanh)."""
-    return 0.5 * x * (1.0 + torch.erf(x * 0.7071067811865476))
+    the audio encoder's activation_function == "gelu" (exact, not tanh).
+
+    Compute the GELU in fp32 and cast the result back to the input dtype. In
+    bf16, ``1 + erf(x)`` loses most of its digits for x below approximately -2.
+    """
+    xf = x.float()
+    return (0.5 * xf * (1.0 + torch.erf(xf * 0.7071067811865476))).to(x.dtype)
 
 
 # =============================================================================
