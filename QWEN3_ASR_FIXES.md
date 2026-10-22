@@ -1,6 +1,18 @@
 # Qwen3-ASR fixes for vllm-neuron 0.29.0.1.2.0
 
-This branch is the public `release-0.29.0.1.2.0` (vLLM 0.29.0, SDK 2.33) plus three Qwen3-ASR fixes. The same fixes are proposed for the vllm-neuron development line.
+This branch is the public `release-0.29.0.1.2.0` (vLLM 0.29.0, SDK 2.33) plus the Qwen3-ASR fixes below. The same fixes are proposed for the vllm-neuron development line.
+
+**Champion stack (clone both):**
+- vllm-neuron: `https://github.com/jimburtoft/vllm-neuron`, branch `qwen3-asr/0.29-champion` (this branch)
+- nkilib: `https://github.com/jimburtoft/nki-library`, branch `qwen3-asr/2.33-champion`. It holds two single-token decode kernel improvements; see `QWEN3_ASR_CHAMPION.md` there.
+
+```bash
+git clone -b qwen3-asr/0.29-champion https://github.com/jimburtoft/vllm-neuron.git
+git clone -b qwen3-asr/2.33-champion https://github.com/jimburtoft/nki-library.git
+source vllm-neuron/qwen3_asr/setup_champion.sh $PWD/nki-library   # sets PYTHONPATH, private NKI caches, OMP_NUM_THREADS
+```
+
+Run inside an SDK 2.33 vLLM environment, either the DLAMI venv `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0` or the 2.33 vLLM container. The script checks that `vllm_neuron` and `nkilib` resolve to the clones.
 
 ## The fixes
 
@@ -9,10 +21,14 @@ This branch is the public `release-0.29.0.1.2.0` (vLLM 0.29.0, SDK 2.33) plus th
 | LNC launch grids | `flash_attention`, `qkv_proj`, `o_proj` and `merge_multimodal_embeddings` launch with the configured LNC instead of a fixed grid of 2 | **LNC=1 works**: 8 replicas (TP1 × DP8) on one trn2.3xlarge |
 | TP1 argmax | The TP1 NKI argmax reads its uint32 index through a no-op `torch.gather` (works around `NCC_IDDT901` at batch ≥ 2), plus a stage free-size guard (`nc_find_index8` limit) | **TP1 batching compiles** at `max_num_seqs` ≥ 2 |
 | Encoder shard order | At encoder DP > 1, shard the audio blocks across DP ranks before the conv frontend | +17 % (8 s) / +5 % (30 s) at encoder DP 2. Unchanged at DP 1 |
+| Encoder GELU in fp32 | Compute the encoder GELU in fp32 and cast back. The bf16 `1 + erf(x)` loses its digits for x < −2 | Fixes the LNC=1 encoder TP2 accuracy miss (BC 0.9896 → 0.9986). Encoder −7 % (LNC=1 25.6 → 23.7 ms, LNC=2 20.1 → 18.6 ms). WER unchanged |
+| API-server listeners | Each internal-DP API worker binds its own SO_REUSEPORT listener (`VLLM_NEURON_API_SERVER_REUSEPORT`, default on) | Removes the random up-to-30 % throughput drops where one API process took most connections |
 
-Files: `vllm_neuron/functional/{argmax,merge_multimodal_embeddings}.py`, `vllm_neuron/functional/attention/{attention_cte,qkv,o_proj}.py`, `vllm_neuron/model/qwen3_asr/audio_encoder_bf16.py`.
+Files: `vllm_neuron/functional/{argmax,merge_multimodal_embeddings}.py`, `vllm_neuron/functional/attention/{attention_cte,qkv,o_proj}.py`, `vllm_neuron/model/qwen3_asr/audio_encoder_bf16.py`, `vllm_neuron/envs.py`, `vllm_neuron/vllm/patches/dp_load_balancer_patch.py`.
 
 ## Results
+
+The table below is for the first three fixes with the stock nkilib. Re-measurement of the full champion stack (all five fixes plus the champion nkilib) is pending a trn2 slot. Each fix was measured separately, as listed in the fixes table and in the nkilib `QWEN3_ASR_CHAMPION.md`.
 
 **Setup**
 - **Hardware:** one trn2.3xlarge (1 Trainium2 device).
@@ -42,12 +58,10 @@ vllm serve Qwen/Qwen3-ASR-1.7B --tensor-parallel-size 1 --data-parallel-size 4 -
 # LNC=1, 8 replicas: NEURON_LOGICAL_NC_CONFIG=1 VLLM_NEURON_RESERVED_HEADROOM_GIB=2 VLLM_NEURON_DISABLE_PARALLEL_TRACE=1, --data-parallel-size 8
 ```
 
-## Known issue: uneven API-server load (vLLM 0.29)
+## API-server load (vLLM 0.29)
 
-With more than one API server process, which is the default when data parallel is above 1, vLLM 0.29 accepts every connection from one shared socket.
+vLLM 0.29 has every API process accept from one shared socket. A client's keep-alive pool can then land mostly on one process, which becomes CPU-bound, and throughput drops at random. With TP1 × DP8, 5 of 22 runs were up to 30 % low.
 
-- **Symptom:** a client's keep-alive pool can land mostly on one API process. That process becomes CPU-bound, so throughput drops at random, by up to about 30 %. With TP1 × DP8, 5 of 22 benchmark runs were affected.
-- **Upstream fix:** vLLM 0.32 accepts each connection on the least-loaded worker (<https://github.com/vllm-project/vllm/pull/60723>).
-- **On 0.29:**
-  - Check each API server's request share in the server log. If one takes more than about 50 %, restart the server before measuring.
-  - Or use fewer API servers.
+- **On this branch** each API worker binds its own SO_REUSEPORT listener, so the kernel spreads connections across the workers. Set `VLLM_NEURON_API_SERVER_REUSEPORT=0` to get the old behavior.
+- **Upstream** vLLM 0.32 fixes the same problem with a least-loaded accept (<https://github.com/vllm-project/vllm/pull/60723>). That fix spreads connections more evenly than kernel hashing.
+- **When benchmarking**, still record each API server's request share and flag runs where one takes > 50 %.
