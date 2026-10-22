@@ -30,6 +30,14 @@ maxima. If the scheduler admits only while the sum of these peaks over all live
 requests fits the usable pool, no ``allocate_slots`` call can fail, so no request
 is preempted.
 
+With VLLM_NEURON_SWA_EARLY_FREE=1 the scheduler frees a request's out-of-window
+SWA blocks as soon as its prefill output is processed (instead of at its first
+decode allocation, which the Neuron scheduler can postpone for many steps while it
+hides decodes behind other prefills), and from then on charges that request only
+the decode-phase bound (``phase_charge``). With N live requests of which k_p are
+still in the prefill phase, admission is then
+``(N - k_p) * decode + k_p * prefill <= usable``.
+
 This module imports nothing from vLLM so the arithmetic can be checked on any CPU.
 """
 
@@ -132,6 +140,22 @@ def request_peak_blocks(p: AdmissionParams, prefill_len: int, final_len: int) ->
     final_len: prompt + max_tokens (clamped to max_model_len inside).
     """
     return max(prefill_phase_blocks(p, prefill_len), decode_phase_blocks(p, final_len))
+
+
+def phase_charge(
+    p: AdmissionParams, prefill_len: int, final_len: int, swa_freed: bool
+) -> int:
+    """Admission charge for one request, by phase (VLLM_NEURON_SWA_EARLY_FREE).
+
+    swa_freed: the request's prefill output has been processed, no prefill
+        tokens are still in flight, and its out-of-window SWA blocks were freed
+        right away (``NeuronScheduler._swa_early_free``). From then on it never
+        holds more than the decode-phase bound, so that is its charge. Otherwise
+        the charge is the unchanged ``request_peak_blocks``.
+    """
+    if swa_freed:
+        return decode_phase_blocks(p, final_len)
+    return request_peak_blocks(p, prefill_len, final_len)
 
 
 def uniform_cap(p: AdmissionParams, prompt_len: int, max_tokens: int) -> int:

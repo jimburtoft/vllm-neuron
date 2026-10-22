@@ -347,6 +347,34 @@ class NeuronScheduler(Scheduler):
             self._real_admission = self._build_real_admission(
                 vllm_config, kv_cache_config
             )
+        # Opt-in on top of real-peak admission: free a request's out-of-window
+        # SWA blocks as soon as its prefill output is processed and charge it only
+        # its decode-phase peak from then on. Maps request id -> num_preemptions at
+        # the time of the free (a preempted request must re-prefill, so its early
+        # free no longer holds).
+        self._swa_early_free = False
+        self._swa_freed: dict[str, int] = {}
+        self._swa_early_freed_blocks: int = 0
+        if envs.VLLM_NEURON_SWA_EARLY_FREE:
+            if self._real_admission is None:
+                logger.warning(
+                    "VLLM_NEURON_SWA_EARLY_FREE=1 ignored: it needs real-peak KV "
+                    "admission (VLLM_NEURON_SWA_REAL_ADMISSION=1, supported KV specs)."
+                )
+            else:
+                self._swa_early_free = True
+                p = self._real_admission
+                ml_prompt = self.max_model_len // 2
+                logger.info(
+                    "SWA early free enabled: out-of-window sliding-window blocks are "
+                    "freed when a request's prefill output is processed; such a "
+                    "request is then charged its decode-phase peak (%d blocks for a "
+                    "%d-token prompt + %d new tokens) instead of %d.",
+                    kv_admission.decode_phase_blocks(p, self.max_model_len),
+                    ml_prompt,
+                    self.max_model_len - ml_prompt,
+                    kv_admission.request_peak_blocks(p, ml_prompt, self.max_model_len),
+                )
         if self._real_admission is not None:
             self._max_kv_concurrent = self.max_num_seqs
         elif 0 < max_concurrent < self.max_num_seqs:
@@ -403,6 +431,9 @@ class NeuronScheduler(Scheduler):
                     grammar.rollback(len(jf_tokens))
 
         result = super().update_from_output(scheduler_output, model_runner_output)
+
+        if self._swa_early_free:
+            self._free_swa_after_prefill(scheduler_output)
 
         # Prefill-async pipeline: retire producers from the send-lane once their
         # KV send completes. super() above frees a finished-sending req and deletes
@@ -479,6 +510,7 @@ class NeuronScheduler(Scheduler):
         """
         # clear jf tokens at req_id for removed request.
         self._pending_jf_tokens.pop(request.request_id, None)
+        self._swa_freed.pop(request.request_id, None)
 
         kv_xfer_params, ec_xfer_params = super()._free_request(
             request, delay_free_blocks
@@ -824,15 +856,71 @@ class NeuronScheduler(Scheduler):
         )
         return params
 
+    def _free_swa_after_prefill(self, scheduler_output: "SchedulerOutput") -> None:
+        """VLLM_NEURON_SWA_EARLY_FREE: free out-of-window SWA blocks at prefill end.
+
+        Runs after the base update_from_output, which has already decremented
+        each scheduled request's num_in_flight_tokens for this step. For each
+        request of this step whose processed tokens now cover its prompt, call the
+        KV manager's remove_skipped_blocks on the processed-token basis,
+        ``max(0, num_computed_tokens - num_in_flight_tokens)``: the same call and
+        the same basis vLLM's allocate_slots uses before every allocation, only
+        earlier (the Neuron scheduler can hide a finished prefill's decodes behind
+        other prefills for many steps, during which it keeps all prompt blocks).
+
+        Async safety (K steps in flight): with processed = c, a SlidingWindow
+        group frees only whole blocks below c - window + 1. Every step still in
+        flight was scheduled for this request at positions >= c (they are what
+        num_in_flight_tokens counts), and a token at position q >= c attends
+        [q - window + 1, q], all >= c - window + 1. So no in-flight step reads or
+        writes a freed block; a freed block reused by another request is written
+        only by steps scheduled after this point. Full-attention groups free
+        nothing.
+        """
+        pool = self.kv_cache_manager.block_pool
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            if (
+                request is None
+                or request.is_finished()
+                or request.status != RequestStatus.RUNNING
+                or self._swa_freed.get(req_id) == request.num_preemptions
+            ):
+                continue
+            processed = max(
+                0, request.num_computed_tokens - request.num_in_flight_tokens
+            )
+            if processed < request.num_prompt_tokens:
+                continue
+            free_before = pool.get_num_free_blocks()
+            self.kv_cache_manager.remove_skipped_blocks(
+                req_id, processed, num_prompt_tokens=request.num_prompt_tokens
+            )
+            self._swa_early_freed_blocks += pool.get_num_free_blocks() - free_before
+            self._swa_freed[req_id] = request.num_preemptions
+
     def _real_peak_blocks(self, request: Request) -> int:
         """Real per-request peak KV blocks (all groups) for the rest of its life.
 
         A request whose prefill has not finished (waiting, preempted, or mid
         prefill) will prefill every token it has so far (a preempted one
         re-prefills its outputs too); after that, only the prompt counts.
+        With VLLM_NEURON_SWA_EARLY_FREE, a running request whose out-of-window
+        SWA blocks were freed at prefill end is charged its decode-phase peak.
         """
         params = self._real_admission
         assert params is not None
+        if (
+            self._swa_early_free
+            and request.status == RequestStatus.RUNNING
+            and self._swa_freed.get(request.request_id) == request.num_preemptions
+        ):
+            return kv_admission.phase_charge(
+                params,
+                request.num_prompt_tokens,
+                request.num_prompt_tokens + request.max_tokens,
+                swa_freed=True,
+            )
         if request.num_computed_tokens < request.num_tokens and (
             request.num_computed_tokens < request.num_prompt_tokens
             or request.status != RequestStatus.RUNNING
@@ -868,11 +956,18 @@ class NeuronScheduler(Scheduler):
         if live % 16 == 0 or live == self.max_num_seqs:
             logger.info(
                 "Real-peak KV admission: %d live requests (new high), %d KV blocks "
-                "in use, real-peak demand %d of %d usable.",
+                "in use, real-peak demand %d of %d usable%s.",
                 live,
                 used,
                 self._real_kv_demand(),
                 self._real_admission.usable_blocks,
+                (
+                    f", {sum(1 for r in self.running if self._swa_freed.get(r.request_id) == r.num_preemptions)}"
+                    f" SWA-freed (decode-phase charge), {self._swa_early_freed_blocks}"
+                    " blocks freed early so far"
+                )
+                if self._swa_early_free
+                else "",
             )
 
     def _is_dispatched_producer(self, request: Request) -> bool:

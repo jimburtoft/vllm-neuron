@@ -50,6 +50,10 @@ if TYPE_CHECKING:
     # Admit by each request's real peak KV (sliding-window groups at window size
     # after prefill) instead of vLLM's worst-case per-request charge. Off by default.
     VLLM_NEURON_SWA_REAL_ADMISSION: bool = False
+    # With real-peak admission: free out-of-window sliding-window blocks as soon as
+    # a request's prefill output is processed, then charge it only its decode-phase
+    # peak. Off by default; ignored unless VLLM_NEURON_SWA_REAL_ADMISSION=1.
+    VLLM_NEURON_SWA_EARLY_FREE: bool = False
     VLLM_NEURON_WORKER_TERMINATION_TIMEOUT: int = 5
     VLLM_NEURON_NIXL_PROGRESS_THREAD_DELAY_US: int = 0
     # Build the NIXL agent with reader-writer thread sync. On by default; 0 keeps NIXL's NONE.
@@ -341,6 +345,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # vLLM's get_max_concurrency_for_kv_cache_config, unchanged.
     "VLLM_NEURON_SWA_REAL_ADMISSION": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_SWA_REAL_ADMISSION")) or False
+    ),
+    # Early free of out-of-window SWA blocks at prefill end + decode-phase charge
+    # (vllm_neuron/vllm/core/scheduler.py NeuronScheduler._swa_early_free). Needs
+    # VLLM_NEURON_SWA_REAL_ADMISSION=1; off: unchanged.
+    "VLLM_NEURON_SWA_EARLY_FREE": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_SWA_EARLY_FREE")) or False
     ),
     # Local cache directory for model checkpoints
     "VLLM_NEURON_CHECKPOINT_CACHE": lambda: os.getenv(
