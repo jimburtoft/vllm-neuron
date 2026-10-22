@@ -4,6 +4,7 @@
 import contextlib
 import logging
 import multiprocessing
+import socket
 from collections import Counter
 from typing import Any
 
@@ -244,6 +245,48 @@ def _api_server_manager_init(
     )
 
 
+def _own_listen_socket(sock, args):
+    """Give this API worker its own SO_REUSEPORT listener on the shared address.
+
+    vLLM hands every API worker the same listening socket, so the workers drain one
+    accept queue and whichever wakes first takes a burst of connections: one of 16
+    workers held ~43% of a 1024-connection decode benchmark and starved the engines
+    of new requests. Separate SO_REUSEPORT listeners let the kernel hash
+    connections evenly across the workers.
+    """
+    from vllm_neuron import envs
+
+    if not envs.VLLM_NEURON_API_SERVER_REUSEPORT:
+        return sock
+    if int(getattr(args, "api_server_count", None) or 1) <= 1:
+        return sock
+    if not isinstance(sock, socket.socket) or sock.family not in (
+        socket.AF_INET,
+        socket.AF_INET6,
+    ):
+        return sock
+
+    # vLLM set SO_REUSEPORT on the parent socket for api_server_count > 1, and the
+    # parent never listens on it, so only the per-worker listeners take connections.
+    # Bind the full getsockname() tuple: for IPv6 it carries flowinfo and scope_id, and
+    # a link-local address does not bind without its scope.
+    own = socket.socket(sock.family, socket.SOCK_STREAM)
+    try:
+        own.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        own.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        own.bind(sock.getsockname())
+    except OSError as error:
+        own.close()
+        logger.warning(
+            "API worker keeps the shared listening socket: binding its own "
+            "SO_REUSEPORT listener failed (%s).",
+            error,
+        )
+        return sock
+    sock.close()
+    return own
+
+
 def _run_api_server_worker_proc(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
@@ -251,6 +294,7 @@ def _run_api_server_worker_proc(
     from vllm_neuron.vllm.patches import apply_patches
 
     apply_patches()
+    sock = _own_listen_socket(sock, args)
 
     shared_inflight = getattr(args, _SHARED_INFLIGHT_ARG, None)
     if shared_inflight is not None:
