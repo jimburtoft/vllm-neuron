@@ -3997,9 +3997,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 and self.vllm_config.kv_transfer_config.is_kv_consumer
                 and self._local_step_forces_nonspec(scheduler_output)
             )
+            # Read only the live rows. The padding rows still hold the lengths of
+            # finished requests, which would pick a larger ctx bucket than needed.
             local_max_decode_ctx_len = (
-                int(self.input_batch.num_computed_tokens_cpu[:padded_num_reqs].max())
-                if padded_num_reqs > 0
+                int(self.input_batch.num_computed_tokens_cpu[:num_reqs].max())
+                if num_reqs > 0
                 and self.neuron_config.decode_context_length_buckets is not None
                 else 0
             )
