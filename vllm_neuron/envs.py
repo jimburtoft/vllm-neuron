@@ -63,6 +63,9 @@ if TYPE_CHECKING:
     # ports.
     VLLM_NEURON_MPEXECUTOR_PORT_OFFSET: int = 0
     VLLM_NEURON_DISABLE_NKI_KERNELS: bool = False
+    # Give each internal-DP API worker its own SO_REUSEPORT listener so the kernel
+    # spreads client connections evenly. ON by default; set "0" for the shared socket.
+    VLLM_NEURON_API_SERVER_REUSEPORT: bool = True
     # The fused GPT-OSS tail has ONE flag, and it defaults ON. Its entry in
     # environment_variables below carries the default and the parsing.
     VLLM_NEURON_GPT_OSS_TAIL_KERNEL: bool = True
@@ -396,6 +399,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_NEURON_GIL_SWITCH_INTERVAL_S"
     ),
     # Disable NKI kernels — forces can_run_kernel() to return False
+    # Read in every API worker at startup, so an unusual spelling must not raise.
+    "VLLM_NEURON_API_SERVER_REUSEPORT": lambda: optional_perf_bool(
+        "VLLM_NEURON_API_SERVER_REUSEPORT", True
+    ),
     "VLLM_NEURON_DISABLE_NKI_KERNELS": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_NKI_KERNELS")) or False
     ),
