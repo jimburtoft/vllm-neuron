@@ -153,7 +153,8 @@ in `VLLM_NEURON_CPU_MODE=1` on a truncated checkpoint against HF fp32.
 | `mm_encoder_only` (VE pool) | No | Raises |
 | Prefix caching (APC) | Untested | Run with `enable_prefix_caching=False` |
 | DP / EP / attention-DP / DCP | N/A | Dense model, single node |
-| Eagle3 / DFlash speculative decoding | No | 0.29 has the DFlash drafter; the target needs aux hidden-state capture (`SupportsEagle3`, `set_aux_hidden_state_layers`, the 3/4-tuple return), not yet implemented here |
+| DFlash speculative decoding | trn2 (text, mml 4096) | `speculative_config={"method": "dflash", "model": <Muse-Glimmer-30B-assistant>, "num_speculative_tokens": 15}`, greedy only, MNS <= 16. Drafter `dflash_model.py` (`DFlashMuseGlimmerAssistantModel`, inclusive bidirectional SWA 2048). Target aux taps via `SupportsEagle3`. Acceptance length 4.1, c=1 2.7-3.0x on the 43 natural prompts. KV cap 0.07 (BF16) / 0.12 (FP8 MLP). **Not validated above `max_model_len` 4096 (SWA-trimmed decode): a non-near-tie divergence remains on a 5246-token prompt.** Images untested |
+| Eagle3 | Untested | The target hooks are shared with DFlash; no Muse Glimmer Eagle3 head exists |
 | FP8 KV cache, quantized weights | No | Only `quantization in (None, "bf16")` |
 | Prefill MLP NKI kernel | No (torch fallback) | At TP=4, I/rank 4992 needs 10 PSUM banks and H=6656 < 7168 blocks I-sharding. Perf only |
 
