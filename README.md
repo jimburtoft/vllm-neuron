@@ -10,7 +10,9 @@
 > **What it adds on top of 0.29.0.1.2.0:**
 > - Voxtral-Mini-3B-2507 on Trn2: audio encoder, adapter and decoder on Neuron, plus
 >   `/v1/audio/transcriptions`. Recipe: [docs/model-recipes/voxtral.md](docs/model-recipes/voxtral.md).
-> - DFlash: a reduced draft vocabulary and mask embedding, more than 256 verification tokens, and
+> - DFlash with the public draft [`jburtoft/Voxtral-Mini-3B-2507-DFlash`](https://huggingface.co/jburtoft/Voxtral-Mini-3B-2507-DFlash)
+>   (training code: [jimburtoft/voxtral-dflash](https://github.com/jimburtoft/voxtral-dflash)):
+>   a reduced draft vocabulary and mask embedding, more than 256 verification tokens, and
 >   an on-device argmax guard for batch 16 and above.
 > - `neuron_config.spec_decode_max_prompt_len`: skips speculation for long prompts (long audio).
 > - Fixes:
