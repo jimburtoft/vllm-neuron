@@ -132,7 +132,10 @@ def to_cache(attn, x: torch.Tensor, which: str, cache: torch.Tensor) -> torch.Te
     if not is_fp8(cache):
         return x.to(cache.dtype)
     if is_fp8(x):
-        return x.to(cache.dtype)
+        # Decode: the megakernel already quantized the active K/V. Re-clamp to the trn2
+        # range in case its clamp used the e4m3fn bound (448); exact for in-range values.
+        m = fp8_max()
+        return x.to(torch.float32).clamp(-m, m).to(cache.dtype)
     return quantize(x, attn.kv_k_qscale if which == "k" else attn.kv_v_qscale, cache.dtype)
 
 
