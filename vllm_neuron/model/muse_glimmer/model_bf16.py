@@ -75,6 +75,7 @@ from vllm_neuron.model.qwen3_vl.utils.vision_block_packing import (
 )
 
 from . import fp8 as _fp8
+from . import kv_fp8 as _kv_fp8
 from .config import MuseGlimmerConfig, MuseGlimmerTextConfig
 from .utils.vision_preprocessing import pack_vision_inputs, plan_video_items
 from .vision_encoder_bf16 import MuseGlimmerVisionModel
@@ -196,8 +197,9 @@ def _issue_decode_kv_writes(writeback: list, group_of: list[int] | None) -> None
         p = torch.cat([i[2] for i in idx])
         d = attn0.head_dim
         kc, vc = attn0.k_cache, attn0.v_cache
-        kc.index_put_((b, h, p), torch.cat([it[2].reshape(-1, d) for it in items]).to(kc.dtype))
-        vc.index_put_((b, h, p), torch.cat([it[3].reshape(-1, d) for it in items]).to(vc.dtype))
+        # Task 028: FP8 KV -> per-layer quantization before the concat (scales differ per layer).
+        kc.index_put_((b, h, p), torch.cat([_kv_fp8.to_cache(it[1], it[2].reshape(-1, d), "k", kc) for it in items]))
+        vc.index_put_((b, h, p), torch.cat([_kv_fp8.to_cache(it[1], it[3].reshape(-1, d), "v", vc) for it in items]))
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +371,11 @@ class MuseGlimmerAttention(nn.Module):
 
         self.k_cache = None
         self.v_cache = None
+        # Task 028: FP8 KV state, set in bind_kv_cache by kv_fp8.setup (outside the trace).
+        self.kv_fp8 = False
+        self.k_dq = 1.0
+        self.v_dq = 1.0
+        _kv_fp8.register_buffers(self)
         self._setup_weight_loaders()
 
     def _setup_weight_loaders(self):
@@ -470,8 +477,32 @@ class MuseGlimmerAttention(nn.Module):
     def _write_paged_kv(self, k, v, slot_mapping, block_size):
         """k, v: [nkh, T, d] -> 4D paged cache [blocks, nkh, block, d]."""
         idx = self._paged_kv_indices(slot_mapping, block_size, k.device)
-        self.k_cache.index_put_(idx, k.reshape(-1, self.head_dim).to(self.k_cache.dtype))
-        self.v_cache.index_put_(idx, v.reshape(-1, self.head_dim).to(self.v_cache.dtype))
+        # Task 028: fp8 caches quantize (scale + clamp) here; already-fp8 values pass through.
+        self.k_cache.index_put_(idx, _kv_fp8.to_cache(self, k.reshape(-1, self.head_dim), "k", self.k_cache))
+        self.v_cache.index_put_(idx, _kv_fp8.to_cache(self, v.reshape(-1, self.head_dim), "v", self.v_cache))
+
+    def _fp8_decode_mask(self, attn_metadata, pos, swa_start, B, S, s_prior, block_size):
+        """Task 028: full [s_prior, B, q_heads, S] decode mask for the FP8 path, cached per step.
+
+        The mask depends only on (sliding, s_prior) and the positions. Every SWA KV group
+        gets the same ``swa_kv_pos_offset`` values (same context lengths, window and
+        block size), so one mask serves all sliding layers and one all full layers.
+        """
+        key = f"_mg_kvfp8_mask_{int(self.is_sliding)}_{s_prior}"
+        m = attn_metadata.get(key)
+        if m is not None:
+            return m
+        m = NF.gen_attention_decode_mask(
+            pos_ids=pos.reshape(1, B * S),
+            bs=B,
+            q_head=self.num_attention_heads_per_rank,
+            s_active=S,
+            s_prior=s_prior,
+            start_pos=swa_start.reshape(1, B * S) if swa_start is not None else None,
+            block_len=block_size,
+        )
+        attn_metadata[key] = m
+        return m
 
     # ── prefill ─────────────────────────────────────────────────────────
 
@@ -528,11 +559,14 @@ class MuseGlimmerAttention(nn.Module):
                 prior_tokens=meta.get("cached_seq_len"),
                 block_size=meta["block_size"],
                 kv_segment_size=kv_segment_size,
-                scale=self.scaling,
+                # Task 028: FP8 cache read -> K dequant folded into the scale.
+                scale=self.scaling * self.k_dq if self.kv_fp8 else self.scaling,
                 sliding_window=self.sliding_window,
                 tp_q=True,
                 tp_out=True,
             )  # [N, D, T]
+            if self.kv_fp8:
+                attn_output = (attn_output * self.kv_v_dq).to(self.dtype)  # V dequant, before the gate
         else:
             # attention_cte handles GQA natively (q batch N, kv batch N/groups): no K/V replication.
             attn_output = NF.flash_attention(
@@ -616,6 +650,14 @@ class MuseGlimmerAttention(nn.Module):
 
         on_kernel = can_run_kernel(X) and not _decode_torch_forced()
         qkv_w, qkv_q = self._qkv_args(on_kernel)
+        # Task 028: FP8 KV. The kernel quantizes the active K/V with k_scale / v_scale
+        # (returns them in fp8) and reads the fp8 cache; the K dequant folds into the
+        # softmax scale, the V dequant multiplies the output before the gate.
+        kv_q = {}
+        softmax_scale = self.scaling
+        if self.kv_fp8:
+            softmax_scale = self.scaling * self.k_dq
+            kv_q = dict(k_scale=self.kv_k_qscale, v_scale=self.kv_v_qscale)
         decode_kwargs = dict(
             X=X,
             W_qkv=qkv_w,
@@ -630,9 +672,10 @@ class MuseGlimmerAttention(nn.Module):
             active_blocks_table=table,
             K_cache=k_cache,
             V_cache=v_cache,
-            softmax_scale=self.scaling,
+            softmax_scale=softmax_scale,
             update_cache=False,
             W_out=None,  # gate must be applied before o_proj
+            **kv_q,
         )
         if _decode_torch_forced():
             from vllm_neuron.functional.attention.attention_decode import (
@@ -656,19 +699,30 @@ class MuseGlimmerAttention(nn.Module):
             if qkv_q:
                 qkv_q = dict(quantization_type_qkv=qkv_q["quantization_type"],
                              weight_dequant_scale_qkv=qkv_q["qkv_w_scale"])
+            mask_kw = dict(pos_ids=pos, swa_start_pos_ids=swa_start)
+            if self.kv_fp8:
+                if _kv_fp8.fused_mask_allowed():
+                    mask_kw["fp8_fused_mask_allowed"] = True
+                else:
+                    # FP8 + fused mask is not validated per bucket: use the external
+                    # mask (what attention_decode would build), generated once per step
+                    # per (sliding, window offset, context) instead of once per layer.
+                    mask_kw = dict(attention_mask=self._fp8_decode_mask(
+                        attn_metadata, pos, swa_start, B, S, table.shape[-1] * block_size, block_size))
             output, K_new, V_new = NF.attention_decode(
                 **qkv_q,
                 K_cache_transposed=False,
-                pos_ids=pos,
-                swa_start_pos_ids=swa_start,
                 transposed_out=False,
                 out_in_sb=False,
+                **mask_kw,
                 **decode_kwargs,
             )
 
         # output: [B, Nq, d, S] -> [B*S, Nq*d]
         attn = output.permute(0, 3, 1, 2).reshape(B * S, self.q_size)
         gate = self._gate(hidden_states)
+        if self.kv_fp8:
+            gate = gate * self.kv_v_dq  # Task 028: V dequant before the gate (cannot fold into W_out)
         attn = (attn * gate).to(self.dtype)
         out = self._o_proj_tokens(attn)  # [B*S, H]
 
@@ -1252,6 +1306,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
             layer.self_attn.v_cache = kv_caches[name][1]
         # Task 023: resolve physical-buffer groups here, never inside the trace.
         lm = self.language_model
+        _kv_fp8.setup(lm.layers)  # Task 028: FP8 KV scales (no-op for a bf16 cache)
         lm.kv_ptr_group_of = _resolve_kv_ptr_groups(lm.layers)
         if lm.kv_ptr_group_of is not None:
             groups: dict[int, list[int]] = {}
@@ -1322,6 +1377,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         if missing:
             raise RuntimeError(f"MuseGlimmer: checkpoint did not provide: {missing}")
         self.load_state_dict(sd, strict=False, assign=True)
+        _kv_fp8.load_scales(self.language_model.layers)  # Task 028 (unused with a bf16 cache)
         # Vision tower (model.vision_tower.*, vision_adapter, vision_projection) on the
         # vision TP group (DP: full copy per rank).
         if self.visual is not None:
