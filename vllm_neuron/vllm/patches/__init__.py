@@ -20,6 +20,10 @@ def apply_patches():
 
     apply_dp_load_balancer_patch()
 
+    from vllm_neuron.vllm.patches.audio_fp32_patch import apply_audio_fp32_patch
+
+    apply_audio_fp32_patch()
+
     # patches/jf_grammar_patch.py wraps a specific
     # StructuredOutputManager and is applied from NeuronScheduler.__init__.
 
