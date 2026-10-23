@@ -157,6 +157,12 @@ def _compute_local_max(tensor: Tensor, dim: int) -> tuple[Tensor, Tensor]:
         # also rejects uint32. Cast here to make the dtype the same as the
         # torch.max fallback below.
         index = index.to(torch.int64)
+        # Keep an elementwise op between the kernel output and the later casts.
+        # Without it, neuronx-cc merges a [B > 1, 1] uint32 to int32 cast with a
+        # layout change into one dtype-changing DRAM-to-DRAM copy, and rejects it
+        # (NCC_IDDT901). This happens in the TP=1 greedy sampler. The kernel indices
+        # are >= 0, so the values do not change.
+        index = torch.clamp(index, min=0)
         # Restore dimension if squeezed
         if is_3d:
             value = value.unsqueeze(0)
