@@ -42,9 +42,9 @@ from vllm_neuron.functional.attention.attention_decode import (
 from vllm_neuron.model.kv_cache import (
     KVSpec,
     LayerSpec,
-    build_per_head_block_table,
     build_per_head_slot_mapping,
 )
+from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.dtype_utils import (
     FP8_CLAMP_MAX,
