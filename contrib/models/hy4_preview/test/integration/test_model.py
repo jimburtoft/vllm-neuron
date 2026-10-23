@@ -109,7 +109,9 @@ def test_needle_30k(llm) -> None:
     from vllm import SamplingParams
 
     prompt = needle_prompt(llm.get_tokenizer(), NEEDLE_TOKENS)
-    (output,) = llm.generate([prompt], SamplingParams(max_tokens=16, temperature=0.0))
+    # 64, not 16: on some numerics the first greedy tokens are a short
+    # reasoning preamble before the pass key.
+    (output,) = llm.generate([prompt], SamplingParams(max_tokens=64, temperature=0.0))
     text = output.outputs[0].text
     print(f"{len(output.prompt_token_ids)} tokens -> {text!r}")
     assert len(output.prompt_token_ids) > 28000

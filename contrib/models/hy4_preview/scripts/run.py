@@ -124,7 +124,7 @@ def main() -> None:
         "--bench",
         action="store_true",
         help="after the prompts, measure TTFT / TPOT at --bench-input-len in / "
-        "--bench-output-len out, one request, median of 3 (trn2/hy4/bench_32k.py method)",
+        "--bench-output-len out, one request, median of 3",
     )
     parser.add_argument(
         "--decode-ctx-buckets",
@@ -138,6 +138,19 @@ def main() -> None:
         help='JSON merged into neuron_config last, e.g. '
         '{"prefill_context_length_buckets": [4096, 8192, 16384]} '
         "(default: $HY4_EXTRA_NEURON_CONFIG)",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        default=None,
+        help="after the prompts, capture an NRT device profile (rank 0) of one "
+        "--bench-input-len request with --profile-output-len tokens out",
+    )
+    parser.add_argument("--profile-output-len", type=int, default=8)
+    parser.add_argument(
+        "--bench-concurrency",
+        type=int,
+        default=1,
+        help="with --bench: also time this many simultaneous requests (decode TPOT at that batch)",
     )
     parser.add_argument("--bench-input-len", type=int, default=31744)
     parser.add_argument("--bench-output-len", type=int, default=256)
@@ -159,6 +172,8 @@ def main() -> None:
     if args.num_gpu_blocks:
         extra["num_gpu_blocks_override"] = args.num_gpu_blocks
 
+    if args.profile_dir:
+        extra["profiler_config"] = {"profiler": "cuda"}
     chunk = min(args.prefill_chunk, args.max_model_len)
     extra_nc = json.loads(args.extra_neuron_config) if args.extra_neuron_config else {}
     llm = LLM(
@@ -176,6 +191,11 @@ def main() -> None:
         cpu_distributed_timeout_seconds=4 * 3600,
         enable_prefix_caching=False,
         additional_config={
+            **(
+                {"neuron_profiler": {"output_dir": args.profile_dir}}
+                if args.profile_dir
+                else {}
+            ),
             "neuron_config": {
                 "quantization": "bf16",
                 "num_batched_tokens_buckets": [chunk],
@@ -233,6 +253,28 @@ def main() -> None:
         print(f"NEEDLE {'FOUND' if found else 'MISSED'} in {elapsed:.1f} s")
     if args.bench:
         bench(llm, args.bench_input_len, args.bench_output_len)
+        if args.bench_concurrency > 1:
+            bench_batch(llm, args.bench_input_len, args.bench_output_len, args.bench_concurrency)
+    if args.profile_dir:
+        profile(llm, args.bench_input_len, args.profile_output_len)
+
+
+def profile(llm, input_len: int, output_len: int) -> None:
+    """One warm request, then the same request again under the NRT profiler."""
+    import torch
+    from vllm.inputs import TokensPrompt
+
+    vocab = llm.get_tokenizer().vocab_size
+    ids = torch.randint(1000, min(vocab, 120000) - 1000, (input_len,),
+                        generator=torch.Generator().manual_seed(1)).tolist()
+    sp = SamplingParams(max_tokens=output_len, temperature=0.0, ignore_eos=True)
+    llm.generate([TokensPrompt(prompt_token_ids=ids)], sp, use_tqdm=False)
+    llm.start_profile()
+    t0 = time.perf_counter()
+    llm.generate([TokensPrompt(prompt_token_ids=ids)], sp, use_tqdm=False)
+    dt = time.perf_counter() - t0
+    llm.stop_profile()
+    print(f"PROFILE_DONE input={input_len} output={output_len} wall={dt:.2f}s", flush=True)
 
 
 def bench(llm, input_len: int, output_len: int, repeats: int = 3) -> None:
@@ -268,6 +310,40 @@ def bench(llm, input_len: int, output_len: int, repeats: int = 3) -> None:
         "output_throughput_tok_s": round(1 / tpot, 2),
     }), flush=True)
 
+
+
+def bench_batch(llm, input_len: int, output_len: int, n: int, repeats: int = 3) -> None:
+    """n simultaneous requests: decode TPOT at batch n = (T(out) - T(1)) / (out - 1), median of 3."""
+    import json
+    import statistics
+
+    import torch
+    from vllm.inputs import TokensPrompt
+
+    vocab = llm.get_tokenizer().vocab_size
+    g = torch.Generator().manual_seed(1)
+
+    def timed(n_out: int) -> float:
+        prompts = [
+            TokensPrompt(prompt_token_ids=torch.randint(
+                1000, min(vocab, 120000) - 1000, (input_len,), generator=g).tolist())
+            for _ in range(n)
+        ]
+        sp = SamplingParams(max_tokens=n_out, temperature=0.0, ignore_eos=True)
+        t0 = time.perf_counter()
+        llm.generate(prompts, sp, use_tqdm=False)
+        return time.perf_counter() - t0
+
+    timed(2)
+    first = [timed(1) for _ in range(repeats)]
+    full = [timed(output_len) for _ in range(repeats)]
+    t1, tn = statistics.median(first), statistics.median(full)
+    tpot = (tn - t1) / (output_len - 1)
+    print("BENCH_BATCH_RESULT", json.dumps({
+        "input_len": input_len, "output_len": output_len, "concurrency": n,
+        "all_prefills_s": round(t1, 3), "e2e_s": round(tn, 3), "tpot_ms": round(tpot * 1e3, 1),
+        "output_throughput_tok_s": round(n / tpot, 2),
+    }), flush=True)
 
 if __name__ == "__main__":
     main()

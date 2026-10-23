@@ -34,7 +34,21 @@ python contrib/models/hy4_preview/scripts/convert_mxfp8_to_neuron_fp8.py \
 
 # 3. Use the XLA compile route (see "Known limitations")
 export VLLM_NEURON_BACKEND=vllm_neuron
+# 4. Recommended: key-sharded decode attention (see "Layout")
+export HY4_DEC_CP=1
 ```
+
+Recommended neuron_config additions (used for the "optimized" numbers under
+"Measured"): decode context buckets, so short contexts decode against a shorter
+span, and several KV segment sizes, which bound a prefill chunk's prefix:
+
+```json
+{"decode_context_length_buckets": [4096, 8192, 16384],
+ "kv_segment_size_buckets": [2048, 4096, 8192]}
+```
+
+Pass them in `--additional-config`'s `neuron_config` for `vllm serve`, or as
+`run.py --extra-neuron-config '<json>'` (or `$HY4_EXTRA_NEURON_CONFIG`).
 
 ### Serve with the OpenAI-compatible server
 
@@ -46,6 +60,8 @@ vllm serve <dir>/Hy4-preview-neuron-fp8 \
     --distributed-timeout-seconds 14400 \
     --additional-config '{"neuron_config": {"quantization": "bf16",
         "num_batched_tokens_buckets": [2048], "num_seqs_buckets": [1, 4],
+        "decode_context_length_buckets": [4096, 8192, 16384],
+        "kv_segment_size_buckets": [2048, 4096, 8192],
         "on_device_sampling_config": {"all_greedy": true}}}'
 
 curl http://localhost:8000/v1/completions -H "Content-Type: application/json" \
@@ -60,6 +76,10 @@ python contrib/models/hy4_preview/scripts/run.py --model <dir>/Hy4-preview-neuro
 python contrib/models/hy4_preview/scripts/run.py --model <dir>/Hy4-preview-neuron-fp8 --needle 30000
 # TTFT / TPOT at 31,744 in / 256 out, one request, median of 3
 python contrib/models/hy4_preview/scripts/run.py --model <dir>/Hy4-preview-neuron-fp8 --bench
+# also time N simultaneous requests (decode TPOT at batch N)
+python contrib/models/hy4_preview/scripts/run.py --model <dir>/Hy4-preview-neuron-fp8 --bench --bench-concurrency 4
+# NRT device profile (rank 0) of one --bench-input-len request
+python contrib/models/hy4_preview/scripts/run.py --model <dir>/Hy4-preview-neuron-fp8 --profile-dir <dir>/profile
 ```
 
 `scripts/run.py` builds `LLM(...)` with the arguments above; the demo prompts and
@@ -93,8 +113,13 @@ takes `MAX_NUM_SEQS` (4) and `SEQ_BUCKETS` (`[1, 4]`).
 
 | Instance / SDK version | 2.33 (vllm-neuron 0.29.0.1.2.0) | 2.27 (vllm-neuron 0.24) | earlier |
 | ---------------------- | ------------------------------- | ----------------------- | ---------- |
-| Trn3                   | Not tested                      | Not tested              | Not tested |
+| Trn3                   | Not tested (see note)           | Not tested              | Not tested |
 | Trn2 (trn2.48xlarge)   | Working, single node and 1P1D   | Working (previous port) | Not tested |
+
+Trn3: an optional native-MXFP8 expert path is included
+(`convert_mxfp8_to_neuron_fp8.py --keep-mx-experts`, `neuron_quantization.format`
+`mxfp8_experts`, routed experts through nkilib's MX `moe_tkg`; `src/mx_experts.py`).
+It refuses to load on any other platform. Only its CPU unit tests are reported here.
 
 ## Example Checkpoints
 
@@ -112,7 +137,19 @@ HY4_MODEL=<dir>/Hy4-preview-neuron-fp8 VLLM_NEURON_BACKEND=vllm_neuron \
 ```
 
 The integration test checks greedy generations against the recorded outputs
-below and the ~30K-token pass-key retrieval. The template's logit validation is
+below and the ~30K-token pass-key retrieval.
+
+CPU unit tests (no device, no vLLM install needed; the nkilib-reference MX test
+is skipped unless `nkilib` is importable):
+
+```bash
+pytest contrib/models/hy4_preview/test/unit
+```
+
+They cover the selective decode MoE against the dense path and an fp32
+reference, key-sharded decode attention against the replicated one (2/4/8 ranks,
+shuffled all-gather order), the kv-segment prefill bound (bitwise identical),
+the uint8 selection all-gather, and the MXFP8 expert layouts and loaders. The template's logit validation is
 not used: its transformers reference would need the 770B model in fp32 on the
 host.
 
@@ -169,6 +206,37 @@ At one request in flight 1P1D costs ~1.7 s of KV transfer on top of the
 prefill and nothing per token; what it buys -- decode steps that a prefill
 never stalls -- shows only under concurrency, which this table does not measure.
 
+### With selective decode MoE and key-sharded decode attention
+
+Same stack (SDK 2.33, vllm-neuron 0.29), same flags as above plus `HY4_DEC_CP=1`
+and the recommended `decode_context_length_buckets` / `kv_segment_size_buckets`.
+"Before" is this README's original build. `run.py --bench`, one request, 256
+output tokens, median of 3:
+
+| input tokens | before: TTFT | before: TPOT | optimized: TTFT | optimized: TPOT |
+|---|---|---|---|---|
+| 31,744 | 87.47 s | 192.4 ms | 76.36 s | 81.3 ms |
+| 16,384 | | | 32.87 s | 81.4 ms |
+| 8,192 | | | 11.12 s | 59.6 ms |
+| 4,096 | 10.95 s | 194.7 ms | 3.61 s | 49.6 ms |
+
+`vllm bench serve` (random dataset, `--ignore-eos`, seed 0), single node:
+
+| input / output | concurrency | before: output tok/s | optimized: output tok/s | median TPOT before / optimized |
+|---|---|---|---|---|
+| 4096 / 256 | 1 | 4.23 | 15.74 | 194.4 / 49.6 ms |
+| 1024 / 256 | 4 | 4.65 | 19.07 | |
+
+At concurrency 4 the KV cache (40,384 tokens at `max_model_len` 32768) admits
+requests about one at a time (vLLM logs "Prefill deferred"), so this is not a
+batch-4 decode number.
+
+Accuracy, before and after: GSM8K, first 200 test questions (chat template,
+greedy, 320 tokens) 0.735 both, identical predictions on 145 of 200; the pass
+key is found; the demo outputs below reproduce.
+
+### Other
+
 Pass key at the start of 28,804 tokens (`--needle 30000`): found, 87.7 s end to end
 (93.8 s in an earlier run on the same stack).
 KV cache 40,384 tokens at `--gpu-memory-utilization 0.8` (704 values x 78 layers
@@ -211,9 +279,15 @@ replicated) ~= 15 GiB.
 
 **Pure TP over 64 ranks.** One attention head per rank. Every rank holds all
 256 experts and 32 of each one's 2048 intermediate columns. The MoE runs in
-torch, dense over the 256 local experts with zero affinity on the unselected
-ones -- exact, one prefill and one decode graph, and independent of whether
-Trn2's MoE kernels accept fp8 weights (`NF.moe_tkg` rejects `float8` today).
+torch, independent of whether Trn2's MoE kernels accept fp8 weights
+(`NF.moe_tkg` rejects `float8` today). Graphs of up to
+`HY4_SELECTIVE_MOE_MAX_TOKENS` (2) rows -- decode -- gather only the `rows x 8`
+selected experts' fp8 weights (stored expert-major, one contiguous read each)
+and apply the row scales to the matmul outputs; larger graphs run dense over the
+256 local experts with zero affinity on the unselected ones (at 4 rows dense
+was faster). The router picks each slot's weight with a one-hot rather than
+`torch.gather`, which made neuronx-cc fail with NCC_IESL002 next to the
+selective path.
 The kernel path (`moe_cte` shard_on_block FP8 / `moe_tkg`) needs
 `2048 / tp_degree` to be a multiple of 128, so `ep_degree >= 4`; not done here.
 
@@ -240,6 +314,24 @@ with an online softmax, so the `[chunk, span]` probabilities are never live at
 once (that, plus 128-aligned slices of the cache entry, took the 28.8K needle
 from 825 s to 129 s).
 
+**Key-sharded decode attention (`HY4_DEC_CP=1`).** Without it each rank scores
+the whole span for its one head. With it rank `r` gathers only its 1/64 of the
+block table and handles those keys for all 64 heads: the absorbed queries and
+the indexer scores are all-gathered, the global top-2048 threshold is bisected
+over the gathered scores (order-independent, so identical on every rank), and
+the softmax partials are merged with a max all-gather and one all-reduce of
+numerators and denominators. The cache stays replicated; only the read is
+split. Requires the block-table width to divide by the TP degree, otherwise
+the replicated path runs.
+
+**Prefill prefix bound.** With more than one `kv_segment_size_buckets` entry,
+the plugin picks the smallest segment that holds the whole prefix, so a prefill
+graph compiled for a smaller segment knows `cached_seq_len <= kv_segment_size`
+and attends only to that many keys (rounded up to whole 2048-key blocks: the
+result is bitwise identical). The model checks the plugin's picker at startup
+(`HY4_PREFILL_SPAN_KVSEG=0` turns this off). `HY4_SEL_GATHER_DTYPE=uint8`
+(opt-in) halves the bytes of the prefill DSA-mask all-gather; exact.
+
 **Chunked prefill** is the plugin's segmented prefill: one chunk of one request
 per step, attending to the `cached_seq_len` tokens already in the cache plus
 causally to itself. `max_num_batched_tokens` (`--prefill-chunk`, default 2048)
@@ -247,11 +339,12 @@ must be one of 512/1024/2048/4096/8192.
 
 ## Known limitations
 
-* **Cost grows with the cache span, not the prompt.** Every prefill chunk
-  attends to (and every full layer's indexer scores) the whole 32K span, because
-  the graph is static: ~5.5 s per 2048-token chunk whatever the prefix. Decode
-  likewise reads the whole span (192 ms per token). Bucketing the prefix length,
-  and a real sparse gather instead of a masked dense attention, are next.
+* **Attention cost still grows with the bucketed span.** Decode no longer
+  reads every expert, and the decode-context and kv-segment buckets cut the span
+  for short contexts, but a prefill chunk whose prefix exceeds the largest
+  `kv_segment_size_buckets` entry still attends to (and its indexer scores) the
+  full 32K span. A real sparse gather instead of a masked dense attention is
+  next.
 * **Zeroing the gathered context is a 2.8x speed matter, not a correctness
   one.** Keys beyond the prefix are masked out of the scores either way, but a
   build that left the context unmasked ran ~150 s per chunk (2306 s for the
@@ -259,6 +352,11 @@ must be one of 512/1024/2048/4096/8192.
   per subgraph) and an 85 min compile. Why is not understood.
 * **Context is 32K, not 1M.** The latent cache is replicated on every rank, so
   KV capacity (40K tokens at gmu 0.8) is per rank, not per instance.
+  `HY4_DEC_CP` splits the decode *read* across ranks but keeps the cache
+  replicated, so the cap remains.
+* **Tried and not kept:** bf16 attention-score inputs (slower end to end on
+  device); selective MoE at 4 rows (dense is faster there); `bmm` / `F.silu`
+  formulations of the selective path (NCC_IESL002).
 * **A neuronx-cc miscompile is worked around, not fixed.** In decode, masking
   the gathered `[rows, 32K, 704]` context with `in_prefix` (by `where` or by a
   multiply) made the device compute `in_prefix` *itself* wrongly wherever it was
