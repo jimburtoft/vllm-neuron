@@ -132,6 +132,13 @@ def main() -> None:
         help="decode context-length buckets, e.g. 4096,8192,16384 (the plugin's "
         "decode_context_length_buckets; max_model_len is always the fallback)",
     )
+    parser.add_argument(
+        "--extra-neuron-config",
+        default=os.environ.get("HY4_EXTRA_NEURON_CONFIG") or None,
+        help='JSON merged into neuron_config last, e.g. '
+        '{"prefill_context_length_buckets": [4096, 8192, 16384]} '
+        "(default: $HY4_EXTRA_NEURON_CONFIG)",
+    )
     parser.add_argument("--bench-input-len", type=int, default=31744)
     parser.add_argument("--bench-output-len", type=int, default=256)
     args = parser.parse_args()
@@ -153,6 +160,7 @@ def main() -> None:
         extra["num_gpu_blocks_override"] = args.num_gpu_blocks
 
     chunk = min(args.prefill_chunk, args.max_model_len)
+    extra_nc = json.loads(args.extra_neuron_config) if args.extra_neuron_config else {}
     llm = LLM(
         model=args.model,
         **extra,
@@ -200,6 +208,7 @@ def main() -> None:
                     if args.capture_dir
                     else {}
                 ),
+                **extra_nc,
             },
         },
     )

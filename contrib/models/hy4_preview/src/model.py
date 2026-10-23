@@ -82,6 +82,54 @@ PERF_SKIP = {x for x in os.environ.get("HY4_PERF_SKIP", "").split(",") if x}
 # recommended on (see the README).
 DEC_CP = os.environ.get("HY4_DEC_CP", "0") == "1"
 
+# Prefill prefix bound from ``kv_segment_size`` (see ``prefill_span_bound``).
+# Inert unless neuron_config.kv_segment_size_buckets has more than one entry;
+# ``HY4_PREFILL_SPAN_KVSEG=0`` turns it off.
+PREFILL_SPAN_KVSEG = os.environ.get("HY4_PREFILL_SPAN_KVSEG", "1") == "1"
+# Dtype of the prefill DSA-selection all-gather: "bf16" (the PR's) or "uint8"
+# (half the bytes; 0/1 values, so exact either way). Opt-in until it has run on
+# device: a uint8 collective is not exercised elsewhere in this model.
+SEL_GATHER_DTYPE = os.environ.get("HY4_SEL_GATHER_DTYPE", "bf16")
+if SEL_GATHER_DTYPE not in ("bf16", "uint8"):
+    raise ValueError(f"HY4_SEL_GATHER_DTYPE must be bf16 or uint8, got {SEL_GATHER_DTYPE!r}")
+
+
+def prefill_span_bound(kv_segment_size: int, kv_segment_size_buckets) -> int | None:
+    """Upper bound on ``cached_seq_len`` implied by a prefill graph's ``kv_segment_size``.
+
+    The runner picks ``kv_segment_size`` with ``pick_kv_segment_size``, which
+    returns the smallest configured bucket that holds the whole prefix in one
+    segment, and the largest bucket for any prefix longer than that. So a
+    segment size *below* the largest bucket means ``cached_seq_len <=
+    kv_segment_size``; the largest bucket bounds nothing. ``None`` = no bound.
+    ``check_prefill_span_bound`` verifies this against the plugin's picker.
+    """
+    buckets = sorted(kv_segment_size_buckets or [])
+    if not PREFILL_SPAN_KVSEG or len(buckets) < 2 or not kv_segment_size:
+        return None
+    if kv_segment_size >= buckets[-1]:
+        return None
+    # Rounded up to whole ``ATTN_KEY_BLOCK``s, so the online softmax sees the
+    # same key blocks as the full span (only fully masked ones are dropped)
+    # and the output is bitwise identical, not just equal up to rounding.
+    return -(-int(kv_segment_size) // ATTN_KEY_BLOCK) * ATTN_KEY_BLOCK
+
+
+def check_prefill_span_bound(kv_segment_size_buckets, limit: int = 1 << 17) -> bool:
+    """True if the plugin's ``pick_kv_segment_size`` honours ``prefill_span_bound``."""
+    buckets = sorted(kv_segment_size_buckets or [])
+    if len(buckets) < 2:
+        return True
+    try:
+        from vllm_neuron.utils.bucket_utils import pick_kv_segment_size
+    except ImportError:
+        return False
+    for cached in range(0, limit + 1):
+        bound = prefill_span_bound(pick_kv_segment_size(cached, buckets), buckets)
+        if bound is not None and cached > bound:
+            return False
+    return True
+
 
 def _all_reduce(group, t: torch.Tensor) -> torch.Tensor:
     return t if "collectives" in PERF_SKIP else group.all_reduce(t)
@@ -435,6 +483,7 @@ class HYV4Attention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.layer_name = f"layers.{layer_idx}.self_attn"
+        self.neuron_config = config.neuron_config
         self.dtype = config.torch_dtype
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
@@ -824,7 +873,11 @@ class HYV4Attention(nn.Module):
         # bf16 for the collective, which bool may not be on every backend; back
         # by a cast, not ``> 0.5``: a bf16-vs-Python-float compare lowers to an
         # f64 constant, which neuronx-cc rejects (NCC_ESPP004).
-        gathered = _all_gather(self.tp_group, local.to(torch.bfloat16), 0, world)
+        # ``HY4_SEL_GATHER_DTYPE=uint8`` halves the bytes; the 0/1 values are
+        # cast to bf16 after the collective, so ``ordered`` is identical.
+        wire = torch.uint8 if SEL_GATHER_DTYPE == "uint8" else torch.bfloat16
+        gathered = _all_gather(self.tp_group, local.to(wire), 0, world)
+        gathered = gathered.to(torch.bfloat16)
         if "collectives" in PERF_SKIP:
             sources = torch.arange(world, dtype=torch.float32, device=iq.device)
         else:
@@ -861,6 +914,19 @@ class HYV4Attention(nn.Module):
 
         prior = metadata["cached_seq_len"].reshape(1, 1).to(torch.long)
         block_table = metadata["block_table_tensor"][:1]
+        # Static prefix bound for this graph (``prefill_span_bound``): keys past
+        # it are past ``cached_seq_len``, i.e. masked, so dropping them is exact.
+        # The plugin's ``prefill_context_length_buckets`` instead trims the
+        # table itself, which ``_gather`` already follows.
+        nc = self.neuron_config
+        bound = prefill_span_bound(
+            metadata.get("kv_segment_size", 0),
+            getattr(nc, "kv_segment_size_buckets", None) if nc is not None else None,
+        )
+        if bound is not None:
+            blocks = -(-bound // self._block_size())
+            if blocks < block_table.shape[1]:
+                block_table = block_table[:, :blocks]
         live = torch.ones(1, 1, dtype=torch.bool, device=x.device)
         ctx = self._gather(block_table, live)[0]  # [ctx_len, 704]
         ctx_len = ctx.shape[0]
@@ -1352,6 +1418,16 @@ class HYV4ForCausalLM(nn.Module):
         self.rank = self.tp_group.rank_in_group
 
         nc = config.neuron_config
+        seg_buckets = getattr(nc, "kv_segment_size_buckets", None) if nc else None
+        if PREFILL_SPAN_KVSEG and seg_buckets and len(seg_buckets) > 1:
+            # The bound trusts pick_kv_segment_size's rule; refuse to run if the
+            # installed plugin picks differently (set HY4_PREFILL_SPAN_KVSEG=0).
+            if not check_prefill_span_bound(seg_buckets):
+                raise RuntimeError(
+                    f"kv_segment_size_buckets={seg_buckets}: the plugin's "
+                    "pick_kv_segment_size does not bound cached_seq_len as "
+                    "prefill_span_bound assumes; set HY4_PREFILL_SPAN_KVSEG=0"
+                )
 
         self.model = self.text_model_cls(config)
 
