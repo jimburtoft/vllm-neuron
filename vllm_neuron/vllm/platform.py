@@ -560,6 +560,30 @@ class NeuronPlatform(Platform):
             )
             encoder_config[new_name] = encoder_config.pop(old_name)
 
+    @staticmethod
+    def _maybe_use_bf16_for_whisper(model_config, architectures) -> None:
+        """Run Whisper and its paged KV cache in bfloat16.
+
+        Whisper large-v3 ships with ``torch_dtype`` float16, so vLLM resolves
+        ``model_config.dtype``, and with it the KV cache dtype, to float16. The
+        native model computes in bfloat16 (``WhisperConfig.from_configs``), so
+        the decode attention multiplied a bf16 query by an fp16 cache and the
+        trace failed. An explicit ``--dtype bfloat16`` is left as it is.
+
+        Args:
+            model_config: The vLLM model config. Its ``dtype`` may be changed.
+            architectures: The ``architectures`` of the HF config.
+        """
+        if "WhisperForConditionalGeneration" not in architectures:
+            return
+        if model_config.dtype in (torch.float16, torch.float32):
+            logger.info(
+                "Whisper: using dtype bfloat16 instead of %s for the model and "
+                "the KV cache.",
+                model_config.dtype,
+            )
+            model_config.dtype = torch.bfloat16
+
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Configure vLLM for vLLM Neuron platform."""
@@ -661,6 +685,7 @@ class NeuronPlatform(Platform):
             or "WhisperForConditionalGeneration" in architectures
         ):
             os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        cls._maybe_use_bf16_for_whisper(model_config, architectures)
 
         # vLLM-Neuron owns the decode-only weight decision; the customer does not
         # set decode_only_weights. A model reads it to skip its prefill-only
