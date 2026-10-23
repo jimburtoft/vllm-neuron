@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
 from .neuron_slot_mapping import compute_slot_mapping_cpu
 
 if TYPE_CHECKING:
@@ -319,7 +321,8 @@ def compute_swa_num_blocks(
     or the compiled graph shape and the runtime shape diverge.
 
     Sizing: the window needs ``sliding_window // block_size + 1`` blocks,
-    padded up to the attention kernel's partition-tile divisibility, then
+    padded up to a multiple of ``lnc * P_MAX`` tokens (each s_prior shard of
+    the attention kernel must be a ``P_MAX`` multiple), then
     clipped to the full-context block count because the request-state block
     table is only allocated that wide. The clip binds when
     ``sliding_window >= max_model_len`` (small / smoke configs); in that
@@ -336,9 +339,17 @@ def compute_swa_num_blocks(
         The trimmed block-table width for the sliding-window group.
     """
     min_blocks = sliding_window // block_size + 1
-    blocks_per_pmax = SWA_ATTENTION_PMAX // block_size
+    # Each s_prior shard must be a P_MAX multiple (NCC_INKI016). The attention
+    # kernel shards s_prior across the lnc programs when it does not
+    # batch-shard, and nkilib batch-shards only when bs * q_head * s_active >=
+    # P_MAX. A model with few query heads per rank therefore shards s_prior for
+    # small batches of any parity, so align the window to lnc * P_MAX.
+    # Same rule as the V1 runner's _compute_swa_num_blocks.
+    blocks_per_tile = max(
+        1, (get_logical_nc_config() * SWA_ATTENTION_PMAX) // block_size
+    )
     num_swa_blocks = (
-        (min_blocks + blocks_per_pmax - 1) // blocks_per_pmax * blocks_per_pmax
+        (min_blocks + blocks_per_tile - 1) // blocks_per_tile * blocks_per_tile
     )
     dcp_block_size = block_size * max(dcp_size, 1)
     full_ctx_blocks = (max_model_len + dcp_block_size - 1) // dcp_block_size
