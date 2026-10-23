@@ -29,7 +29,7 @@ import logging
 import os
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 import torch
 
@@ -40,6 +40,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 # torch._dynamo.guards logs this at WARNING for every guard that caching_precompile
 # drops, once per graph and rank: about 1,760 lines per rank on GPT-OSS 120B.
@@ -222,6 +224,63 @@ def _neff_cache_dir() -> str:
         return ""
 
 
+# Environment variables that change the compiled programs or the KV pool size, but that
+# vLLM does not hash. A model can read its own mode variables at load (for example,
+# WHISPER_CROSS_MODE selects the cross-attention graph). Each prefix or name below goes
+# into the fingerprint, so that each mode and each pool size gets its own package.
+_FINGERPRINT_ENV_PREFIXES = ("WHISPER_",)
+_FINGERPRINT_ENV_NAMES = (
+    "VLLM_NEURON_RESERVED_HEADROOM_GIB",
+    "VLLM_NEURON_RESERVED_HEADROOM_GIB_NATIVE",
+    "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION",
+    "VLLM_NEURON_MIN_KV_BUDGET_GIB",
+    "VLLM_NEURON_COMPILE_CACHE_TAG",
+)
+
+
+def _kv_pool_inputs(vllm_config: "VllmConfig") -> dict[str, Any]:
+    """Return the inputs that set the size of the KV page pool.
+
+    On Neuron, the KV page pool is an input of fixed shape in each compiled program,
+    so a new pool size gives new programs. vLLM leaves the pool size out of
+    ``CacheConfig.compute_hash()``. Without these inputs, a restart with a new
+    ``--num-gpu-blocks-override`` or a new ``--gpu-memory-utilization`` restores the
+    package of the old pool size, and the restore loads the programs of both sizes
+    (``status=4 Allocation Failure``). Adapted from the development-line fix
+    ``dd5695e0cb``; this version also adds ``gpu_memory_utilization``.
+
+    Examples:
+        >>> from types import SimpleNamespace
+        >>> cfg = SimpleNamespace(cache_config=SimpleNamespace(
+        ...     block_size=32, num_gpu_blocks_override=300,
+        ...     kv_cache_memory_bytes=None, gpu_memory_utilization=0.9))
+        >>> _kv_pool_inputs(cfg)["num_gpu_blocks_override"]
+        300
+    """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    return {
+        "block_size": getattr(cache_config, "block_size", None),
+        "num_gpu_blocks_override": getattr(cache_config, "num_gpu_blocks_override", None),
+        "kv_cache_memory_bytes": getattr(cache_config, "kv_cache_memory_bytes", None),
+        "gpu_memory_utilization": getattr(cache_config, "gpu_memory_utilization", None),
+    }
+
+
+def _fingerprint_env() -> dict[str, str]:
+    """Return the environment variables that the fingerprint covers, sorted by name.
+
+    Examples:
+        >>> os.environ["WHISPER_CROSS_MODE"] = "mqa"
+        >>> _fingerprint_env()["WHISPER_CROSS_MODE"]
+        'mqa'
+    """
+    return {
+        name: value
+        for name, value in sorted(os.environ.items())
+        if name in _FINGERPRINT_ENV_NAMES or name.startswith(_FINGERPRINT_ENV_PREFIXES)
+    }
+
+
 def build_fingerprint_inputs(
     vllm_config: "VllmConfig",
     neuron_config: Any,
@@ -238,7 +297,8 @@ def build_fingerprint_inputs(
     Examples:
         >>> inputs = build_fingerprint_inputs(vllm_config, neuron_config)  # doctest: +SKIP
         >>> set(inputs) == {"config_hash", "buckets", "platform_target",
-        ...                  "compiler_options", "versions", "neff_cache_dir"}  # doctest: +SKIP
+        ...                  "compiler_options", "versions", "neff_cache_dir",
+        ...                  "kv_pool", "env"}  # doctest: +SKIP
         True
     """
     return {
@@ -248,6 +308,8 @@ def build_fingerprint_inputs(
         "compiler_options": _compiler_options(vllm_config),
         "versions": _versions(),
         "neff_cache_dir": _neff_cache_dir(),
+        "kv_pool": _kv_pool_inputs(vllm_config),
+        "env": _fingerprint_env(),
     }
 
 
@@ -406,6 +468,42 @@ def log_precompile_state() -> dict[str, object]:
             "TORCHINDUCTOR_AUTOGRAD_CACHE=1 before the first torch import."
         )
     return state
+
+
+def compile_with_restore_fallback(compile_fn: Callable[[], T]) -> T:
+    """Run a ``torch.compile()`` call, and compile again if the package restore fails.
+
+    With caching-precompile on, ``torch.compile()`` of a model restores the saved
+    package of its forward. When the restore fails (for example, a NEFF of the package
+    does not load), torch starts an empty package a second time and raises
+    "CompilePackage is already initialized". The first error is the real cause, and
+    this function logs it. It then turns off caching-precompile for the process and
+    runs the call again, so that the worker compiles cold instead of stopping.
+    Adapted from the development-line fix ``1bc0a2e863``.
+
+    Args:
+        compile_fn: A function that runs the ``torch.compile()`` call.
+
+    Returns:
+        The result of ``compile_fn``.
+
+    Raises:
+        Exception: The error of ``compile_fn`` when caching-precompile is off, or the
+            error of the second call.
+    """
+    try:
+        return compile_fn()
+    except Exception as error:
+        if not caching_precompile_enabled():
+            raise
+        logger.warning(
+            "The torch compile package did not restore (%s: %s). This worker turns "
+            "off caching-precompile and compiles the model again.",
+            type(error).__name__,
+            error,
+        )
+        torch._dynamo.config.caching_precompile = False
+        return compile_fn()
 
 
 def caching_precompile_enabled() -> bool:

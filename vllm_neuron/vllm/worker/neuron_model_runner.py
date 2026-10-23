@@ -1781,15 +1781,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             get_precompile_guard_filter_fn,
         )
 
-        # torch.compile pops guard_filter_fn from options, so build a fresh dict.
-        guard_filter_fn = get_precompile_guard_filter_fn()
-        guard_opt = {"guard_filter_fn": guard_filter_fn} if guard_filter_fn else {}
-        return torch.compile(
-            model,
-            backend=get_compile_backend_name(),
-            fullgraph=self._fullgraph_enabled,
-            options={**self.compile_options, **guard_opt},
-        )
+        from vllm_neuron.vllm.inductor_cache import compile_with_restore_fallback
+
+        def compile_model():
+            # torch.compile pops guard_filter_fn from options, so build a fresh dict.
+            guard_filter_fn = get_precompile_guard_filter_fn()
+            guard_opt = {"guard_filter_fn": guard_filter_fn} if guard_filter_fn else {}
+            return torch.compile(
+                model,
+                backend=get_compile_backend_name(),
+                fullgraph=self._fullgraph_enabled,
+                options={**self.compile_options, **guard_opt},
+            )
+
+        # A failed restore of the precompile package compiles cold.
+        return compile_with_restore_fallback(compile_model)
 
     def redecorate_compiled_model(self) -> None:
         """Wrap the model, its encoder, and the drafter again, so fresh wrappers load the package.
