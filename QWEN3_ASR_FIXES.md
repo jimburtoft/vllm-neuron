@@ -28,25 +28,26 @@ Files: `vllm_neuron/functional/{argmax,merge_multimodal_embeddings}.py`, `vllm_n
 
 ## Results
 
-The table below is for the first three fixes with the stock nkilib. Re-measurement of the full champion stack (all five fixes plus the champion nkilib) is pending a trn2 slot. Each fix was measured separately, as listed in the fixes table and in the nkilib `QWEN3_ASR_CHAMPION.md`.
-
-**Setup**
-- **Hardware:** one trn2.3xlarge (1 Trainium2 device).
-- **Image:** SDK 2.33 release image (`neuron_native`).
+These are for the full champion stack: this branch plus the champion nkilib. They were measured 2026-10-23 on one trn2.3xlarge in the SDK 2.33 release vLLM image (vllm 0.29.0, nki 0.7.0, neuronx-cc 2.28.7631), set up with `qwen3_asr/setup_champion.sh`.
 - **Client:** `vllm bench serve --backend openai-audio --endpoint /v1/audio/transcriptions`.
-- **Workload:** 2048 Earnings22 requests, greedy decoding, 256-token cap.
-- **Metric:** throughput, in audio seconds per wall second.
+- **Workload:** 2048 Earnings22 requests, greedy decoding, 256-token cap, `OMP_NUM_THREADS=1`.
+- **Metric:** throughput in audio seconds per wall second. Each result is 2 runs on one server.
 
 | configuration | 30 s clips | 8 s clips |
 |---|---|---|
 | release, unpatched: best layout that runs (TP2 × DP2, LNC=2) | 963–965 | 442 |
-| this branch: TP1 × DP4, LNC=2, max_num_seqs 48 | **1,355–1,384** | **950–981** |
-| this branch: TP1 × DP8, LNC=1, max_num_seqs 48 | **1,533–1,548** | **1,072–1,162** |
-| this branch: TP2 × DP2, LNC=2 | 1,027–1,030 | 528–530 |
+| **champion**: TP1 × DP4, LNC=2, max_num_seqs 48 | **1,390–1,397** | **977–978** |
+| **champion**: TP1 × DP8, LNC=1, max_num_seqs 48 | **1,553–1,562** | — |
 
-- **Earnings22 WER:** 6.01–6.06 % (upstream `run_accuracy_asr`, 341 chunks). Reference gate: 6.24 %.
-- **Single stream (TP4, LNC=2, 30 s):** TTFT 46–48 ms, E2E p50 361–365 ms.
-- **Without this branch:** the unpatched release can't compile TP1 at `max_num_seqs` ≥ 2, and can't run at LNC=1.
+| single stream (TP4, LNC=2, 30 s clip, 256 requests) | TTFT p50 | ITL p50 | E2E p50 |
+|---|---|---|---|
+| release, unpatched | 46–48 ms | 3.60 ms | 359–365 ms |
+| **champion** | **44.9–46.0 ms** | **3.14 ms** | **323–324 ms** (−11 %) |
+
+- **Earnings22 WER** (upstream `run_accuracy_asr`, 341 chunks, champion TP1 × DP4): **5.99 %**. Reference gate: 6.24 %.
+- **API-server balance:** the largest per-worker request share was 0.26–0.29 with 4 servers and 0.15 with 8, so the load is even (fair share is 0.25 and 0.125).
+- **`decode_context_length_buckets`:** leave it unset. With the champion nkilib, `[512]` is slower (E2E 328–331 vs 323–324 ms).
+- **Without this branch:** the unpatched release can't compile TP1 at `max_num_seqs` ≥ 2 and can't run at LNC=1.
 
 ## Recommended settings
 ```bash
