@@ -103,6 +103,23 @@ def _decode_torch_forced() -> bool:
 KV_DEFER_ENV = "MUSE_GLIMMER_KV_DEFER"
 
 
+# Task 029: neuronx-cc -O level for the plain decode graph only (runner per-graph policy,
+# ``compiler_args_for``). Unset or "" keeps the engine level (0.29 native route: -O2).
+# -O3 disables neuronx-cc modular flow (as Qwen3-VL's decode policy). Prefill, the
+# encoder and spec-verify graphs keep the engine level. An explicit
+# --optimization-level disables per-graph policies in the runner.
+DECODE_OPT_ENV = "MUSE_GLIMMER_DECODE_OPT"
+
+
+def _decode_opt_level() -> int | None:
+    v = os.environ.get(DECODE_OPT_ENV, "").strip()
+    if not v:
+        return None
+    if v not in ("1", "2", "3"):
+        raise ValueError(f"{DECODE_OPT_ENV}={v!r} not in (1, 2, 3)")
+    return int(v)
+
+
 def _kv_defer_mode() -> int:
     v = os.environ.get(KV_DEFER_ENV, "2").strip()
     if v not in ("0", "1", "2"):
@@ -1051,6 +1068,24 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         commutes with vocab sharding and is applied before sampling and
         before the logprobs gather)."""
         return torch.tanh(logits.to(torch.float32) * self.logit_pre_scale) * self.logit_softcap
+
+    @property
+    def compiler_args_for(self):
+        """Task 029: per-graph neuronx-cc policy, present only with MUSE_GLIMMER_DECODE_OPT set.
+
+        The runner enables per-graph args when this attribute is not None, so with the
+        env unset every graph keeps the engine level exactly as before.
+        """
+        level = _decode_opt_level()
+        if level is None:
+            return None
+        from vllm_neuron.utils.compiler_args_ctx import with_optimization_level
+
+        def policy(graph_type, example_inputs, base):
+            base = list(base or [])
+            return with_optimization_level(base, level) if graph_type == "decode" else base
+
+        return policy
 
     @torch.no_grad()
     def forward(
