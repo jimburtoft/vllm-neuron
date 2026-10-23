@@ -20,6 +20,11 @@ def apply_patches():
 
     apply_dp_load_balancer_patch()
 
+    # After the DP load-balancer patch: it wraps the same API server manager.
+    from vllm_neuron.vllm.patches.api_accept_patch import apply_api_accept_patch
+
+    apply_api_accept_patch()
+
     # patches/jf_grammar_patch.py wraps a specific
     # StructuredOutputManager and is applied from NeuronScheduler.__init__.
 
