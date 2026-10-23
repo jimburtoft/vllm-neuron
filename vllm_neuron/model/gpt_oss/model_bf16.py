@@ -427,6 +427,11 @@ class GptOssAttention(nn.Module):
         self.k_scale_float = 1.0
         self.v_scale_float = 1.0
 
+        # Resolve the compile target here, at construction. decode_kv_fold runs
+        # inside the Dynamo trace, and on the XLA route the trace cannot call
+        # the runtime query behind get_platform_target.
+        self._is_trn2 = _platform_is_trn2()
+
         # Set up weight loaders for checkpoint loading
         self._setup_weight_loaders()
 
@@ -820,7 +825,7 @@ class GptOssAttention(nn.Module):
         so Trn3 keeps the shared-table path until that is resolved.
         """
         kv = self.num_key_value_heads_per_rank
-        if kv <= 1 or self.fp8_packed or not _platform_is_trn2():
+        if kv <= 1 or self.fp8_packed or not self._is_trn2:
             return 1
         return kv if can_run_kernel(self.qkv_proj_weight) else 1
 
