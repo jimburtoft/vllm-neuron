@@ -284,8 +284,8 @@ torch, independent of whether Trn2's MoE kernels accept fp8 weights
 `HY4_SELECTIVE_MOE_MAX_TOKENS` (2) rows -- decode -- gather only the `rows x 8`
 selected experts' fp8 weights (stored expert-major, one contiguous read each)
 and apply the row scales to the matmul outputs; larger graphs run dense over the
-256 local experts with zero affinity on the unselected ones (at 4 rows dense
-was faster). The router picks each slot's weight with a one-hot rather than
+256 local experts with zero affinity on the unselected ones (the best
+cut-over for 4-row decode is not yet measured on the full model). The router picks each slot's weight with a one-hot rather than
 `torch.gather`, which made neuronx-cc fail with NCC_IESL002 next to the
 selective path.
 The kernel path (`moe_cte` shard_on_block FP8 / `moe_tkg`) needs
@@ -355,7 +355,7 @@ must be one of 512/1024/2048/4096/8192.
   `HY4_DEC_CP` splits the decode *read* across ranks but keeps the cache
   replicated, so the cap remains.
 * **Tried and not kept:** bf16 attention-score inputs (slower end to end on
-  device); selective MoE at 4 rows (dense is faster there); `bmm` / `F.silu`
+  device); `bmm` / `F.silu`
   formulations of the selective path (NCC_IESL002).
 * **A neuronx-cc miscompile is worked around, not fixed.** In decode, masking
   the gathered `[rows, 32K, 704]` context with `in_prefix` (by `where` or by a

@@ -315,8 +315,8 @@ def route_topk(
     # Each slot's score by a one-hot over experts, not ``torch.gather(scores, 1,
     # idx)``: with the selective decode MoE in the graph, the gather of the
     # sigmoid scores made neuronx-cc 2.28 fail with NCC_IESL002 ("Expected to
-    # find a definition before read for shared tensor logistic.N"; trn2.48xlarge,
-    # 2-layer sweep: every formulation with the gather failed, every one with
+    # find a definition before read for shared tensor logistic.N"; trn2.48xlarge:
+    # every formulation tried with the gather failed to compile, every one with
     # the one-hot compiled). Same values: each one-hot row selects one score.
     experts = torch.arange(scores.shape[-1], device=idx.device, dtype=idx.dtype)
     one_hot = (idx.unsqueeze(-1) == experts).to(scores.dtype)  # [T, K, E]
@@ -353,9 +353,10 @@ def route(
 
 # Up to this many tokens the routed experts are evaluated per (token, selected
 # expert) -- gathering only those experts' weights -- instead of densely over
-# all of them. Measured (4 layers, 4K context, HY4_DEC_CP=1): at 1 row the
-# selective path is ~2.8x faster than dense, at 4 rows dense is ~8% faster, so
-# the gathered path is used for 1-2 row graphs only. ``=0`` restores dense everywhere.
+# all of them. The default covers the 1-row decode graph (and a 2-row bucket if
+# one is configured); larger graphs keep the dense path. The best cut-over for
+# 4-row decode has not been measured on the full model. ``=0`` restores dense
+# everywhere.
 SELECTIVE_MOE_MAX_TOKENS = int(os.environ.get("HY4_SELECTIVE_MOE_MAX_TOKENS", "2"))
 
 # MXFP8 experts (Trn3): up to this many tokens ``moe_tkg`` runs selective (only
