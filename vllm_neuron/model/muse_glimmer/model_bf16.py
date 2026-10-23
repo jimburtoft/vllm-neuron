@@ -104,19 +104,21 @@ KV_DEFER_ENV = "MUSE_GLIMMER_KV_DEFER"
 
 
 # Task 029: neuronx-cc -O level for the plain decode graph only (runner per-graph policy,
-# ``compiler_args_for``). Unset or "" keeps the engine level (0.29 native route: -O2).
-# -O3 disables neuronx-cc modular flow (as Qwen3-VL's decode policy). Prefill, the
-# encoder and spec-verify graphs keep the engine level. An explicit
-# --optimization-level disables per-graph policies in the runner.
+# ``compiler_args_for``). Default 3: -O3 disables neuronx-cc modular flow (as Qwen3-VL's
+# decode policy) and on trn2 / SDK 2.33 cuts the decode step 10-13 % at BS >= 32 (FP8 MLP,
+# BF16 and FP8 KV), is neutral at BS <= 16, and gives the same greedy tokens and logits
+# as -O2 (Task 029). "off" (or "0") keeps the engine level for every graph (0.29 native
+# route: -O2). Prefill, the encoder and spec-verify graphs keep the engine level. An
+# explicit --optimization-level disables per-graph policies in the runner.
 DECODE_OPT_ENV = "MUSE_GLIMMER_DECODE_OPT"
 
 
 def _decode_opt_level() -> int | None:
-    v = os.environ.get(DECODE_OPT_ENV, "").strip()
-    if not v:
+    v = os.environ.get(DECODE_OPT_ENV, "3").strip().lower() or "3"
+    if v in ("off", "0"):
         return None
     if v not in ("1", "2", "3"):
-        raise ValueError(f"{DECODE_OPT_ENV}={v!r} not in (1, 2, 3)")
+        raise ValueError(f"{DECODE_OPT_ENV}={v!r} not in (off, 1, 2, 3)")
     return int(v)
 
 
@@ -1071,10 +1073,10 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
 
     @property
     def compiler_args_for(self):
-        """Task 029: per-graph neuronx-cc policy, present only with MUSE_GLIMMER_DECODE_OPT set.
+        """Task 029: per-graph neuronx-cc policy (decode graph -O, ``MUSE_GLIMMER_DECODE_OPT``).
 
-        The runner enables per-graph args when this attribute is not None, so with the
-        env unset every graph keeps the engine level exactly as before.
+        The runner enables per-graph args when this attribute is not None. With
+        ``MUSE_GLIMMER_DECODE_OPT=off`` it is None and every graph keeps the engine level.
         """
         level = _decode_opt_level()
         if level is None:
