@@ -41,6 +41,8 @@ expert and the dense layer-0 MLP are not.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -63,11 +65,13 @@ def _as_bytes(t: torch.Tensor) -> torch.Tensor:
 
 
 def _expert_gate_up_loader(intermediate: int, shard: int) -> SafetensorsWeightLoader:
-    """``[E, 2I, H]`` fp8 -> this rank's ``[H, E, 2, I/tp]`` fp8.
+    """``[E, 2I, H]`` fp8 -> this rank's ``[E, H, 2, I/tp]`` fp8.
 
     Rows ``[0, I)`` of each expert are gate and ``[I, 2I)`` are up (contiguous
-    halves, ``chunk(2)`` in ``HYV4Experts._apply_gate``). Stored hidden-major so
-    the forward is one ``[T, H] @ [H, E * 2 * I_r]`` matmul.
+    halves, ``chunk(2)`` in ``HYV4Experts._apply_gate``). Stored expert-major so
+    that one expert is one contiguous ``H * 2 * I_r`` read: decode gathers only
+    the selected experts (see ``HYV4MoE._forward_selected``), and prefill runs
+    one batched matmul over all of them.
     """
 
     def transform(slices: list, rank: int) -> torch.Tensor:
@@ -83,7 +87,7 @@ def _expert_gate_up_loader(intermediate: int, shard: int) -> SafetensorsWeightLo
             source[:, intermediate + start : intermediate + start + shard, :]
         )
         out = torch.stack((gate, up), dim=1)  # [E, 2, I_r, H]
-        return out.permute(3, 0, 1, 2).contiguous().view(FP8)
+        return out.permute(0, 3, 1, 2).contiguous().view(FP8)
 
     return SafetensorsWeightLoader(transform=transform)
 
@@ -162,6 +166,32 @@ class HYV4MLP(nn.Module):
         ) @ self.down_proj_weight
 
 
+def route_topk(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    correction_bias: torch.Tensor,
+    top_k: int,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """-> (``[T, K]`` expert ids, ``[T, K]`` fp32 weights). DeepSeek-V3 routing."""
+    logits = hidden_states.float() @ router_weight.float().t()
+    scores = torch.sigmoid(logits)
+    _, idx = torch.topk(scores + correction_bias.float(), top_k, dim=-1)
+    # Each slot's score by a one-hot over experts, not ``torch.gather(scores, 1,
+    # idx)``: with the selective decode MoE in the graph, the gather of the
+    # sigmoid scores made neuronx-cc 2.28 fail with NCC_IESL002 ("Expected to
+    # find a definition before read for shared tensor logistic.N"; trn2.48xlarge,
+    # 2-layer sweep: every formulation with the gather failed, every one with
+    # the one-hot compiled). Same values: each one-hot row selects one score.
+    experts = torch.arange(scores.shape[-1], device=idx.device, dtype=idx.dtype)
+    one_hot = (idx.unsqueeze(-1) == experts).to(scores.dtype)  # [T, K, E]
+    weights = (one_hot * scores.unsqueeze(1)).sum(dim=-1)
+    if norm_topk_prob:
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return idx, weights * routed_scaling_factor
+
+
 def route(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
@@ -172,23 +202,27 @@ def route(
 ) -> torch.Tensor:
     """Dense ``[T, E]`` affinities, zero outside each token's top-k.
 
-    Returned dense rather than as (indices, weights) because the expert compute
-    below is dense over experts; built from a one-hot instead of a scatter,
+    Returned dense rather than as (indices, weights) because the prefill expert
+    compute is dense over experts; built from a one-hot instead of a scatter,
     which keeps the trace free of ``index_put``.
     """
-    logits = hidden_states.float() @ router_weight.float().t()
-    scores = torch.sigmoid(logits)
-    _, idx = torch.topk(scores + correction_bias.float(), top_k, dim=-1)
-    weights = torch.gather(scores, 1, idx)
-    if norm_topk_prob:
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-    weights = weights * routed_scaling_factor
+    idx, weights = route_topk(
+        hidden_states, router_weight, correction_bias, top_k,
+        routed_scaling_factor, norm_topk_prob,
+    )
     # A comparison, not ``F.one_hot``: the capture backend hands topk's indices
     # back as int32, which ``one_hot`` rejects.
-    experts = torch.arange(scores.shape[-1], device=idx.device, dtype=idx.dtype)
+    experts = torch.arange(router_weight.shape[0], device=idx.device, dtype=idx.dtype)
     one_hot = (idx.unsqueeze(-1) == experts).to(weights.dtype)  # [T, K, E]
     return (one_hot * weights.unsqueeze(-1)).sum(dim=1)
 
+
+# Up to this many tokens the routed experts are evaluated per (token, selected
+# expert) -- gathering only those experts' weights -- instead of densely over
+# all of them. Measured (4 layers, 4K context, HY4_DEC_CP=1): at 1 row the
+# selective path is ~2.8x faster than dense, at 4 rows dense is ~8% faster, so
+# the gathered path is used for 1-2 row graphs only. ``=0`` restores dense everywhere.
+SELECTIVE_MOE_MAX_TOKENS = int(os.environ.get("HY4_SELECTIVE_MOE_MAX_TOKENS", "2"))
 
 class HYV4MoE(nn.Module):
     """Router + 256 fp8 experts (dense over experts, masked) + shared expert.
@@ -216,7 +250,7 @@ class HYV4MoE(nn.Module):
         h, e, i_r = self.hidden_size, self.num_experts, self.inter_per_rank
 
         self.experts_gate_up_weight = nn.Parameter(
-            torch.empty(h, e, 2, i_r, dtype=FP8), requires_grad=False
+            torch.empty(e, h, 2, i_r, dtype=FP8), requires_grad=False
         )
         self.experts_gate_up_scale = nn.Parameter(
             torch.empty(1, e * 2 * i_r, dtype=torch.float32), requires_grad=False
@@ -256,6 +290,66 @@ class HYV4MoE(nn.Module):
 
     def forward(self, normed: torch.Tensor) -> torch.Tensor:
         normed = normed.to(self.dtype)
+        if normed.shape[0] <= SELECTIVE_MOE_MAX_TOKENS:
+            out = self._forward_selected(normed)
+        else:
+            out = self._forward_dense(normed)
+        if self.shared_experts is not None:
+            out = out + self.shared_experts(normed)
+        return out
+
+    def _forward_selected(self, normed: torch.Tensor) -> torch.Tensor:
+        """Routed experts per (token, selected expert): reads ``T * top_k`` experts.
+
+        The dense path reads (and converts) all 256 local experts on every step;
+        at decode only ``T * 8`` of them carry a non-zero affinity. Here the
+        selected experts' fp8 weights and row scales are gathered (one contiguous
+        block per expert, see ``_expert_gate_up_loader``), converted to bf16, and
+        multiplied per pair. Both row scales are per output channel of their own
+        expert, so they are applied to the matmul outputs in fp32 -- the same
+        product as dequantising the weight first, without materialising it.
+        """
+        tokens = normed.shape[0]
+        e, h, i_r, k = self.num_experts, self.hidden_size, self.inter_per_rank, self.top_k
+        idx, weights = route_topk(
+            normed,
+            self.router_weight,
+            self.e_score_correction_bias,
+            k,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )  # [T, K], [T, K] fp32
+        flat = idx.reshape(-1).to(torch.long)  # [T*K]
+        pairs = flat.shape[0]
+
+        w_gu = torch.index_select(self.experts_gate_up_weight, 0, flat)  # [P, H, 2, I_r]
+        s_gu = torch.index_select(
+            self.experts_gate_up_scale.view(e, 2 * i_r), 0, flat
+        )  # [P, 2*I_r]
+        x = normed.repeat_interleave(k, dim=0)  # [P, H]
+        gate_up = torch.einsum(
+            "ph,phc->pc", x, w_gu.to(self.dtype).view(pairs, h, 2 * i_r)
+        )
+        gate_up = (gate_up.reshape(pairs, 2 * i_r).float() * s_gu).view(pairs, 2, i_r)
+        act = self._act(gate_up[:, 0, :], gate_up[:, 1, :])
+        act = act * weights.reshape(pairs, 1)  # [P, I_r] fp32
+
+        w_d = torch.index_select(self.experts_down_weight, 0, flat)  # [P, I_r, H]
+        s_d = torch.index_select(self.experts_down_scale, 0, flat)  # [P, 1, H]
+        down = torch.einsum("pi,pih->ph", act.to(self.dtype), w_d.to(self.dtype))
+        down = down.float() * s_d.view(pairs, h)
+        return down.view(tokens, k, h).sum(dim=1).to(self.dtype)
+
+    def _act(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        """Clamped SwiGLU on fp32 ``gate``/``up`` for the selective path."""
+        if self.swiglu_limit > 0:
+            gate = gate.clamp(max=self.swiglu_limit)
+            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        # SiLU spelt out: the dense path's ``F.silu`` hit NCC_IESL002 in the
+        # gathered graph (as did a ``bmm`` formulation of the two matmuls).
+        return gate * torch.sigmoid(gate) * up
+
+    def _forward_dense(self, normed: torch.Tensor) -> torch.Tensor:
         tokens = normed.shape[0]
         e, i_r = self.num_experts, self.inter_per_rank
 
@@ -270,10 +364,11 @@ class HYV4MoE(nn.Module):
 
         # gate/up: the per-row scale is per *output* column here, so it applies
         # after the matmul and the weight only needs a dtype convert.
-        gate_up = normed @ self.experts_gate_up_weight.to(self.dtype).view(
-            self.hidden_size, -1
+        w_gu = self.experts_gate_up_weight.to(self.dtype).view(e, self.hidden_size, 2 * i_r)
+        gate_up = torch.einsum("th,ehc->tec", normed, w_gu)
+        gate_up = (gate_up.float().reshape(tokens, -1) * self.experts_gate_up_scale).view(
+            tokens, e, 2, i_r
         )
-        gate_up = (gate_up.float() * self.experts_gate_up_scale).view(tokens, e, 2, i_r)
         gate, up = gate_up[:, :, 0, :], gate_up[:, :, 1, :]
         if self.swiglu_limit > 0:
             gate = gate.clamp(max=self.swiglu_limit)
@@ -286,10 +381,6 @@ class HYV4MoE(nn.Module):
         down = (self.experts_down_weight.float() * self.experts_down_scale).to(
             self.dtype
         )
-        out = act.to(self.dtype).reshape(tokens, e * i_r) @ down.view(
+        return act.to(self.dtype).reshape(tokens, e * i_r) @ down.view(
             e * i_r, self.hidden_size
         )
-
-        if self.shared_experts is not None:
-            out = out + self.shared_experts(normed)
-        return out
