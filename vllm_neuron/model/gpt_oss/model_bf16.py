@@ -929,9 +929,11 @@ class GptOssAttention(nn.Module):
             active_blocks_table = build_per_head_block_table(
                 block_table, self.num_key_value_heads_per_rank
             )
+            # The kernel reads kv_cache_update_idx as uint32. On this branch
+            # build_per_head_slot_mapping keeps the slot_mapping dtype, so cast here.
             kv_cache_update_idx = build_per_head_slot_mapping(
                 slot_mapping, block_size, self.num_key_value_heads_per_rank, B_local
-            )
+            ).to(torch.uint32)
         else:
             active_blocks_table = block_table
             kv_cache_update_idx = slot_mapping.view(B_local, S_decode).to(torch.uint32)
