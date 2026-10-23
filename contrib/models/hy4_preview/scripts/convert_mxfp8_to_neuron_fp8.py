@@ -27,7 +27,7 @@ embeddings, lm_head, the gate projection) are copied through untouched.
 
 ``config.json`` loses its ``quantization_config`` -- vLLM would otherwise try to
 build a ModelOpt MXFP8 method it has no Neuron kernel for -- and gains a
-``neuron_quantization`` block that ``vllm_neuron/model/hy_v4`` checks for, so
+``neuron_quantization`` block that the contrib model (``src/model.py``) checks for, so
 the original MXFP8 directory is rejected with a pointer back here rather than
 loading scales as weights.
 
@@ -35,11 +35,25 @@ Requantising MX to per-row loses precision wherever one row spans several MX
 exponents; the script reports the relative error it introduces (on a sample of
 experts per layer) so that cost is a number, not a guess.
 
+**Trn3: ``--keep-mx-experts``.** Trn3 has MX matmuls (nkilib ``moe_tkg``, MX
+path), so there the routed experts need no requantisation: ``gate_up_proj``,
+``gate_up_proj_scale``, ``down_proj`` and ``down_proj_scale`` are copied through
+unchanged (OCP ``e4m3fn`` + ``e8m0``, ``down_proj`` not transposed) and the
+model tiles them at load time. Every other MXFP8 tensor is dequantised to bf16
+exactly as in the default mode, and ``neuron_quantization.format`` is
+``mxfp8_experts`` instead of ``fp8_row_experts``. Without the flag the output is
+unchanged.
+
 Usage::
 
     python convert_mxfp8_to_neuron_fp8.py \\
         --src <dir>/Hy4-preview-FP8 \\
         --dst <dir>/Hy4-preview-neuron-fp8 --workers 24
+
+    # Trn3 (native MXFP8 experts):
+    python convert_mxfp8_to_neuron_fp8.py --keep-mx-experts \\
+        --src <dir>/Hy4-preview-FP8 \\
+        --dst <dir>/Hy4-preview-neuron-mx --workers 24
 """
 
 from __future__ import annotations
@@ -144,7 +158,8 @@ def _existing(path: Path) -> tuple[dict[str, str], int] | None:
 
 
 def convert_shard(args: tuple) -> tuple[str, dict[str, str], list, int]:
-    src, dst, fname, weight_map = args
+    src, dst, fname, weight_map = args[:4]
+    keep_mx_experts = len(args) > 4 and args[4]
     done = _existing(Path(dst) / fname)
     if done is not None:
         return fname, done[0], [], done[1]
@@ -164,7 +179,11 @@ def convert_shard(args: tuple) -> tuple[str, dict[str, str], list, int]:
             if scale_key not in weight_map:
                 raise KeyError(f"{key} is fp8 but has no {scale_key}")
             scale = sources.get(scale_key)
-            if key.endswith(EXPERT_SUFFIXES):
+            if keep_mx_experts and key.endswith(EXPERT_SUFFIXES):
+                # Trn3: the published OCP e4m3fn values and e8m0 exponents,
+                # byte for byte; the model tiles them at load time.
+                out[key], out[scale_key] = tensor, scale
+            elif key.endswith(EXPERT_SUFFIXES):
                 q, s = _convert_expert(key, tensor, scale, stats)
                 if key.endswith(".down_proj"):
                     # [E, H, I] -> [E, I, H]: a TP shard of I becomes a row slice,
@@ -200,6 +219,13 @@ def main() -> None:
         default=None,
         help="convert only these shard filenames (for a quick check)",
     )
+    parser.add_argument(
+        "--keep-mx-experts",
+        action="store_true",
+        help="Trn3: copy the routed experts' MXFP8 tensors (and their e8m0 scales) "
+        "through unchanged instead of requantising them to Trn2 per-row fp8; "
+        "writes neuron_quantization.format=mxfp8_experts",
+    )
     args = parser.parse_args()
 
     src, dst = Path(args.src), Path(args.dst)
@@ -211,11 +237,20 @@ def main() -> None:
     quant = config.pop("quantization_config", None)
     if quant is None or quant.get("quantization", {}).get("quant_algo") != "MXFP8":
         raise SystemExit(f"{src} is not the ModelOpt MXFP8 checkpoint: {quant}")
-    config["neuron_quantization"] = {
-        "format": "fp8_row_experts",
-        "fp8_max": FP8_MAX_TRN2,
-        "source": "modelopt-mxfp8",
-    }
+    if args.keep_mx_experts:
+        config["neuron_quantization"] = {
+            "format": "mxfp8_experts",
+            "fp8_dtype": "float8_e4m3fn",
+            "scale_dtype": "e8m0",
+            "block_size": MX_BLOCK,
+            "source": "modelopt-mxfp8",
+        }
+    else:
+        config["neuron_quantization"] = {
+            "format": "fp8_row_experts",
+            "fp8_max": FP8_MAX_TRN2,
+            "source": "modelopt-mxfp8",
+        }
     (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
     for path in src.iterdir():
@@ -233,7 +268,10 @@ def main() -> None:
     shards = sorted(set(weight_map.values()))
     if args.only:
         shards = [s for s in shards if s in set(args.only)]
-    todo = [(str(src), str(dst), s, weight_map) for s in shards]
+    if args.keep_mx_experts:
+        todo = [(str(src), str(dst), s, weight_map, True) for s in shards]
+    else:
+        todo = [(str(src), str(dst), s, weight_map) for s in shards]
 
     new_map: dict[str, str] = {}
     all_stats: list = []

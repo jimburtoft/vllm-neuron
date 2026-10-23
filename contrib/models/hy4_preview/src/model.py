@@ -148,7 +148,13 @@ def _capture(layer_idx: int, name: str, tensor: torch.Tensor) -> None:
         capture_tensor(f"hy4.l{layer_idx}.{name}", tensor)
 
 
-from .moe import HYV4MLP, HYV4MoE
+from .moe import (
+    FORMAT_FP8_ROW,
+    FORMAT_MXFP8,
+    HYV4MLP,
+    HYV4MoE,
+    require_mx_platform,
+)
 
 HF_PREFIX = "model"
 
@@ -1337,6 +1343,7 @@ class HYV4TextModel(nn.Module):
 def checkpoint_mappings(config: HYV4Config) -> dict[str, str]:
     """Port parameter name -> converted-checkpoint key, for every loaded parameter."""
     m: dict[str, str] = {}
+    mx_experts = (config.neuron_quantization or {}).get("format") == FORMAT_MXFP8
     for i in range(config.num_hidden_layers):
         hf, ours = f"{HF_PREFIX}.layers.{i}", f"model.layers.{i}"
         m[f"{ours}.input_layernorm.weight"] = f"{hf}.input_layernorm.weight"
@@ -1372,7 +1379,11 @@ def checkpoint_mappings(config: HYV4Config) -> dict[str, str]:
             m[f"{mlp}.e_score_correction_bias"] = f"{hm}.gate.e_score_correction_bias"
             m[f"{mlp}.experts_gate_up_weight"] = f"{hm}.experts.gate_up_proj"
             m[f"{mlp}.experts_gate_up_scale"] = f"{hm}.experts.gate_up_proj_scale"
-            m[f"{mlp}.experts_down_weight"] = f"{hm}.experts.down_proj_t"
+            # fp8-row checkpoints store the down weight transposed; the MXFP8
+            # expert checkpoint keeps the published [E, H, I] ``down_proj``.
+            m[f"{mlp}.experts_down_weight"] = (
+                f"{hm}.experts.down_proj" if mx_experts else f"{hm}.experts.down_proj_t"
+            )
             m[f"{mlp}.experts_down_scale"] = f"{hm}.experts.down_proj_scale"
             shared, hs = f"{mlp}.shared_experts", f"{hm}.shared_experts"
         else:
@@ -1556,13 +1567,19 @@ class HYV4ForCausalLM(nn.Module):
             raise NotImplementedError("Hy4 is a text-only model")
         config = HYV4Config.from_configs(hf_config, neuron_config=text_neuron_config)
         quant = config.neuron_quantization or {}
-        if quant.get("format") != "fp8_row_experts":
+        fmt = quant.get("format")
+        if fmt == FORMAT_MXFP8:
+            # Native MXFP8 experts run nkilib MX moe_tkg, which is Trn3-only.
+            # Checked once here, outside any traced region.
+            require_mx_platform()
+        elif fmt != FORMAT_FP8_ROW:
             raise ValueError(
                 "HYV4ForCausalLM on Neuron loads the Trn2 fp8 checkpoint written by "
                 "contrib/models/hy4_preview/scripts/convert_mxfp8_to_neuron_fp8.py "
                 "(config.json has no neuron_quantization.format=fp8_row_experts). "
                 "The bf16 checkpoint does not fit one trn2.48xlarge, and the "
-                "published MXFP8 one has no Trn2 kernel."
+                "published MXFP8 one has no Trn2 kernel. On Trn3, convert with "
+                "--keep-mx-experts (format mxfp8_experts)."
             )
         return cls(config)
 
