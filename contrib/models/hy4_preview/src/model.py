@@ -77,6 +77,10 @@ DEBUG_LAYERS = {int(x) for x in os.environ.get("HY4_DEBUG_LAYERS", "0").split(",
 # DSA mask all-gather a local repeat; "attn"/"moe" replace that sub-block's
 # output with zeros (attention then writes no KV and selects nothing).
 PERF_SKIP = {x for x in os.environ.get("HY4_PERF_SKIP", "").split(",") if x}
+# ``HY4_DEC_CP=1``: decode attention sharded by KEY across the TP ranks instead
+# of replicated per head (``HYV4Attention.forward_decode_cp``). Off by default;
+# recommended on (see the README).
+DEC_CP = os.environ.get("HY4_DEC_CP", "0") == "1"
 
 
 def _all_reduce(group, t: torch.Tensor) -> torch.Tensor:
@@ -267,15 +271,37 @@ def select_topk(scores: torch.Tensor, visible: torch.Tensor, k: int) -> torch.Te
     result is exactly the top-k up to keys tied with the k-th score.
     """
     s = scores.float()
+    return visible & (s >= topk_threshold(s, visible, k))
+
+
+def topk_threshold(
+    s: torch.Tensor,
+    visible: torch.Tensor,
+    k: int,
+    extra: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``select_topk``'s per-row threshold ``lo`` ``[rows, 1]`` over fp32 ``s``.
+
+    It depends only on the multiset of visible scores per row (max, min and
+    counts), not on their order, so it can run over keys gathered from ranks
+    in any order (``forward_decode_cp``). ``extra`` ``[rows, 1]`` is one more
+    always-visible score, counted as if it were a column of ``s`` (so callers
+    need not concatenate it).
+    """
     hi = s.masked_fill(~visible, -_BIG).amax(dim=-1, keepdim=True)
     lo = s.masked_fill(~visible, _BIG).amin(dim=-1, keepdim=True)
+    if extra is not None:
+        hi = torch.maximum(hi, extra)
+        lo = torch.minimum(lo, extra)
     for _ in range(TOPK_BISECTION_STEPS):
         mid = (lo + hi) * 0.5
         count = ((s >= mid) & visible).float().sum(dim=-1, keepdim=True)
+        if extra is not None:
+            count = count + (extra >= mid).float()
         up = count >= k
         lo = torch.where(up, mid, lo)
         hi = torch.where(up, hi, mid)
-    return visible & (s >= lo)
+    return lo
 
 
 def _zero_beyond(ctx: torch.Tensor, limit: torch.Tensor) -> torch.Tensor:
@@ -305,6 +331,20 @@ def _zero_beyond(ctx: torch.Tensor, limit: torch.Tensor) -> torch.Tensor:
     keep = (limit.float().view(rows, 1) - positions.view(1, ctx_len)) > half
     keep = keep.to(ctx.dtype)
     return ctx * (keep.unsqueeze(-1) if ctx.dim() == 3 else keep.view(ctx_len, 1))
+
+
+def _zero_beyond_at(
+    ctx: torch.Tensor, limit: torch.Tensor, key_pos: torch.Tensor
+) -> torch.Tensor:
+    """``_zero_beyond`` for ``ctx [rows, n, D]`` whose keys sit at ``key_pos [n]``.
+
+    Same separately computed float predicate (see ``_zero_beyond``), for a
+    rank's key shard whose positions are not ``arange(n)``.
+    """
+    rows, n = ctx.shape[0], ctx.shape[1]
+    half = torch.full((1, 1), 0.5, dtype=torch.float32, device=ctx.device)
+    keep = (limit.float().view(rows, 1) - key_pos.float().view(1, n)) > half
+    return ctx * keep.to(ctx.dtype).unsqueeze(-1)
 
 
 class HYV4Indexer(nn.Module):
@@ -715,6 +755,10 @@ class HYV4Attention(nn.Module):
                 f"layer ran before it"
             )
         if metadata["max_query_len"] <= metadata["decode_token_threshold"]:
+            if DEC_CP and self.cp_supported(metadata["block_table_tensor"].shape[1]):
+                return self.forward_decode_cp(
+                    x, positions, position_embeddings, metadata, selected, rank
+                )
             rows = metadata["block_table_tensor"].shape[0]
             # See forward_decode_split for why the batch picks the form.
             split = rows == 1 or rows >= 16
@@ -964,6 +1008,151 @@ class HYV4Attention(nn.Module):
         out = self._finish(o_lat, gate)
         _capture(self.layer_idx, "attn_in", x)
         _capture(self.layer_idx, "selected", selected.to(torch.bfloat16))
+        _capture(self.layer_idx, "attn_out", out)
+        return out, selected
+
+    # ── decode, sharded by key (HY4_DEC_CP=1) ────────────────────────────
+    #
+    # No torch.cat / torch.stack anywhere in this path (an earlier version
+    # failed neuronx-cc with NCC_IFML902 "FlattenMacroLoop ... Cannot remove an
+    # edge" on an aten cat inside it): the current token's key is handled as
+    # separate terms, and each collective carries one unpadded tensor.
+
+    def cp_supported(self, width: int) -> bool:
+        """Key-sharded decode needs the block table to split evenly over ranks."""
+        return self.world_size > 1 and width % self.world_size == 0
+
+    def _cp_pick(self, r: torch.Tensor, dev) -> torch.Tensor:
+        """``[nh, world * nh]`` 0/1 matrix taking this rank's heads out of a
+        head axis in all-gather block order (not tp-rank order on Trn2; the
+        ranks are gathered too, as in ``_select_prefill``)."""
+        world, nh = self.world_size, self.num_heads
+        if "collectives" in PERF_SKIP:
+            sources = torch.arange(world, dtype=torch.float32, device=dev)
+        else:
+            sources = self.tp_group.all_gather(r.reshape(1).to(torch.float32), dim=0)
+        at_me = (sources.view(world) == r.reshape(1).to(torch.float32)).to(torch.float32)
+        eye = torch.eye(nh, dtype=torch.float32, device=dev)
+        return (eye.view(nh, 1, nh) * at_me.view(1, world, 1)).reshape(nh, world * nh)
+
+    def forward_decode_cp(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        position_embeddings: tuple,
+        metadata: dict,
+        selected: tuple | None,
+        rank: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple]:
+        """Decode attention sharded by KEY across the TP ranks; same result as
+        ``forward_decode_split``.
+
+        The cache is still replicated, but rank ``r`` gathers only block-table
+        columns ``[r * nb, (r + 1) * nb)`` (``nb = width / world``), i.e. key
+        positions ``[r * n, (r + 1) * n)``, and handles them for ALL heads.
+        The current token's own key is not in the gather; its query, entry
+        and therefore its scores are identical on every rank, so it is added
+        as a separate term (once, after the merge), never concatenated.
+
+        1. all-gather the absorbed queries ``[reqs, nh, 576]`` -> all heads;
+        2. full-indexer layers: all-gather the local indexer scores
+           ``[reqs, n]`` (invisible at ``-_BIG``); the global top-k threshold
+           is ``select_topk``'s bisection over them plus the own-token score
+           as an always-visible extra term. It depends only on the multiset of
+           scores, so the gather order does not matter, and it is bit-identical
+           on all ranks. -> local mask ``[reqs, n]`` and own-token bit
+           ``[reqs, 1]``. Also gathers the ranks for the head pick (step 5).
+           Shared layers reuse all three (``selected`` is a tuple here);
+        3. local scores ``[reqs, heads, n]``; all-gather the per-head local
+           maxima; ``M`` = max over ranks and the selected own-token score;
+        4. all-reduce the unnormalised numerators ``[reqs, heads, 512]`` and
+           denominators ``[reqs, heads]``, then add the own-token term;
+        5. take this rank's heads (``_cp_pick``), fold the sink in once
+           (rescaling to ``max(M, sink)``), then ``w_uv`` / gate / ``o_proj``.
+        """
+        cos, sin = position_embeddings
+        block_table = metadata["block_table_tensor"]
+        num_reqs, width = block_table.shape
+        world, nh = self.world_size, self.num_heads
+        dev = x.device
+        x = x.to(self.dtype)
+        query, entry, gate, q_resid = self._project(x, cos, sin)
+        self._write_kv(entry, metadata)
+
+        if rank is None:
+            rank = torch.tensor(self.tp_group.rank_in_group, device=dev)
+        r = rank.reshape(1).to(torch.long)
+        nb = width // world
+        shard = nb * self._block_size()
+        cols = r * nb + torch.arange(nb, device=dev)
+        local_bt = torch.index_select(block_table, 1, cols)
+        live_rows = (metadata["slot_mapping"].view(num_reqs, -1)[:, 0] > 0).view(-1, 1)
+        ctx = self._gather(local_bt, live_rows)  # [reqs, shard, 704]
+        key_pos = r * shard + torch.arange(shard, device=dev)  # [shard]
+        limit = positions.view(num_reqs, 1)
+        in_prefix = key_pos.view(1, shard) < limit  # [reqs, shard]
+        ctx = _zero_beyond_at(ctx, limit, key_pos)
+        own = entry.to(ctx.dtype)  # [reqs, 704], the same on every rank
+
+        if self.indexer is not None:
+            iq, iw = self.indexer.queries(q_resid, x, cos, sin)  # [reqs, 32, 128]
+            s_ctx = torch.relu((iq @ ctx[..., self.index_slice].transpose(1, 2)).float())
+            idx_ctx = (iw.unsqueeze(1) @ s_ctx).squeeze(1)  # [reqs, shard]
+            s_own = torch.relu(
+                torch.einsum("rhd,rd->rh", iq, own[:, self.index_slice]).float()
+            )
+            idx_own = (iw * s_own).sum(dim=-1, keepdim=True)  # [reqs, 1]
+            masked = idx_ctx.masked_fill(~in_prefix, -_BIG)
+            every = _all_gather(self.tp_group, masked, 1, world)  # [reqs, world*shard]
+            half = torch.full((1, 1), -0.5 * _BIG, dtype=torch.float32, device=dev)
+            lo = topk_threshold(every, every > half, self.index_topk, idx_own)
+            selected = (in_prefix & (idx_ctx >= lo), idx_own >= lo, self._cp_pick(r, dev))
+        sel_ctx, sel_own, pick = selected
+
+        # 1. every head's absorbed query (order: all-gather blocks).
+        q_all = _all_gather(self.tp_group, query.float(), 1, world)  # [reqs, heads, 576]
+
+        # 3. local scores, global max.
+        lat = ctx[..., self.latent_slice]  # [reqs, shard, 576]
+        own_lat = own[:, self.latent_slice]  # [reqs, 576]
+        scores = (q_all @ lat.float().transpose(1, 2)) * self.scaling  # [reqs, heads, shard]
+        # A finite floor (see _attend_blocked): a rank may have no selected key.
+        floor = -1.0e30
+        scores = scores.masked_fill(~sel_ctx.unsqueeze(1), floor)
+        a = torch.einsum("rhc,rc->rh", q_all, own_lat.float()) * self.scaling
+        a = a.masked_fill(~sel_own, floor)  # [reqs, heads]
+        m_loc = scores.amax(dim=-1)  # [reqs, heads]
+        m_all = _all_gather(self.tp_group, m_loc.unsqueeze(0), 0, world).amax(dim=0)
+        m = torch.maximum(m_all, a)
+
+        # 4. unnormalised local partials, merged across ranks.
+        p = torch.exp(scores - m.unsqueeze(-1))
+        den = p.sum(dim=-1)  # [reqs, heads]
+        rank_v = self.kv_lora_rank
+        # Contract the whole 576-wide row and slice the small output, not the
+        # gathered latent (a strided view of it spills).
+        num = (p.to(self.dtype) @ lat).float()[..., :rank_v]  # [reqs, heads, 512]
+        pa = torch.exp(a - m)  # [reqs, heads]; 0 when the own key is unselected
+        own_v = own_lat[:, :rank_v].float()  # [reqs, 512]
+        m_mine = torch.einsum("jh,rh->rj", pick, m)  # [reqs, nh]
+        pa_mine = torch.einsum("jh,rh->rj", pick, pa)
+        num_all = _all_reduce(self.tp_group, num)
+        den_all = _all_reduce(self.tp_group, den)
+        num_mine = torch.einsum("jh,rhc->rjc", pick, num_all)  # [reqs, nh, 512]
+        den_mine = torch.einsum("jh,rh->rj", pick, den_all)  # [reqs, nh]
+        num_mine = num_mine + pa_mine.unsqueeze(-1) * own_v.unsqueeze(1)
+        den_mine = den_mine + pa_mine
+
+        # 5. the sink joins once, as in _attend_blocked.
+        sink = self.sinks.float().view(1, nh)
+        m_f = torch.maximum(m_mine, sink)
+        scale = torch.exp(m_mine - m_f)
+        o_lat = num_mine * scale.unsqueeze(-1) / (
+            den_mine * scale + torch.exp(sink - m_f)
+        ).unsqueeze(-1)  # [reqs, nh, 512]
+        out = self._finish(o_lat, gate)
+        _capture(self.layer_idx, "attn_in", x)
+        _capture(self.layer_idx, "selected", sel_ctx.to(torch.bfloat16))
         _capture(self.layer_idx, "attn_out", out)
         return out, selected
 

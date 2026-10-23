@@ -126,6 +126,12 @@ def main() -> None:
         help="after the prompts, measure TTFT / TPOT at --bench-input-len in / "
         "--bench-output-len out, one request, median of 3 (trn2/hy4/bench_32k.py method)",
     )
+    parser.add_argument(
+        "--decode-ctx-buckets",
+        default=None,
+        help="decode context-length buckets, e.g. 4096,8192,16384 (the plugin's "
+        "decode_context_length_buckets; max_model_len is always the fallback)",
+    )
     parser.add_argument("--bench-input-len", type=int, default=31744)
     parser.add_argument("--bench-output-len", type=int, default=256)
     args = parser.parse_args()
@@ -171,6 +177,15 @@ def main() -> None:
                     [int(b) for b in args.seq_buckets.split(",")]
                     if args.seq_buckets
                     else sorted({1, args.max_num_seqs})
+                ),
+                **(
+                    {
+                        "decode_context_length_buckets": [
+                            int(b) for b in args.decode_ctx_buckets.split(",")
+                        ]
+                    }
+                    if args.decode_ctx_buckets
+                    else {}
                 ),
                 "on_device_sampling_config": (
                     None if args.host_sampling else {"all_greedy": True}
