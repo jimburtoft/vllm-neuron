@@ -4,7 +4,7 @@ This branch is the public `release-0.29.0.1.2.0` (vLLM 0.29.0, SDK 2.33) plus th
 
 **Champion stack (clone both):**
 - vllm-neuron: `https://github.com/jimburtoft/vllm-neuron`, branch `qwen3-asr/0.29-champion` (this branch)
-- nkilib: `https://github.com/jimburtoft/nki-library`, branch `qwen3-asr/2.33-champion`. It holds two single-token decode kernel improvements; see `QWEN3_ASR_CHAMPION.md` there.
+- nkilib: `https://github.com/jimburtoft/nki-library`, branch `qwen3-asr/2.33-champion`. It holds two single-token decode kernel improvements and one batched-decode improvement; see `QWEN3_ASR_CHAMPION.md` there.
 
 ```bash
 git clone -b qwen3-asr/0.29-champion https://github.com/jimburtoft/vllm-neuron.git
@@ -28,7 +28,7 @@ Files: `vllm_neuron/functional/{argmax,merge_multimodal_embeddings}.py`, `vllm_n
 
 ## Results
 
-These are for the full champion stack: this branch plus the champion nkilib. They were measured 2026-10-23 on one trn2.3xlarge in the SDK 2.33 release vLLM image (vllm 0.29.0, nki 0.7.0, neuronx-cc 2.28.7631), set up with `qwen3_asr/setup_champion.sh`.
+These are for the full champion stack: this branch plus the champion nkilib. They were measured 2026-10-23 (throughput rows re-measured with the batched-decode attention change, interleaved against the stack without it: 1,366–1,383 and 1,517–1,526) on one trn2.3xlarge in the SDK 2.33 release vLLM image (vllm 0.29.0, nki 0.7.0, neuronx-cc 2.28.7631), set up with `qwen3_asr/setup_champion.sh`.
 - **Client:** `vllm bench serve --backend openai-audio --endpoint /v1/audio/transcriptions`.
 - **Workload:** 2048 Earnings22 requests, greedy decoding, 256-token cap, `OMP_NUM_THREADS=1`.
 - **Metric:** throughput in audio seconds per wall second. Each result is 2 runs on one server.
@@ -36,13 +36,13 @@ These are for the full champion stack: this branch plus the champion nkilib. The
 | configuration | 30 s clips | 8 s clips |
 |---|---|---|
 | release, unpatched: best layout that runs (TP2 × DP2, LNC=2) | 963–965 | 442 |
-| **champion**: TP1 × DP4, LNC=2, max_num_seqs 48 | **1,390–1,397** | **977–978** |
-| **champion**: TP1 × DP8, LNC=1, max_num_seqs 48 | **1,553–1,562** | — |
+| **champion**: TP1 × DP4, LNC=2, max_num_seqs 48 | **1,412–1,413** | **978** |
+| **champion**: TP1 × DP8, LNC=1, max_num_seqs 48 | **1,568–1,577** | — |
 
 | single stream (TP4, LNC=2, 30 s clip, 256 requests) | TTFT p50 | ITL p50 | E2E p50 |
 |---|---|---|---|
 | release, unpatched | 46–48 ms | 3.60 ms | 359–365 ms |
-| **champion** | **44.9–46.0 ms** | **3.14 ms** | **323–324 ms** (−11 %) |
+| **champion** | **44.9–47.5 ms** | **3.13–3.14 ms** | **319–324 ms** (−11 %) |
 
 - **Earnings22 WER** (upstream `run_accuracy_asr`, 341 chunks, champion TP1 × DP4): **5.99 %**. Reference gate: 6.24 %.
 - **API-server balance:** the largest per-worker request share was 0.26–0.29 with 4 servers and 0.15 with 8, so the load is even (fair share is 0.25 and 0.125).
