@@ -32,7 +32,8 @@ from vllm_neuron.functional.attention.attention_decode import (
     _swizzle_packed_k,
     _unswizzle_packed_k,
 )
-from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, build_per_head_block_table
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
 from vllm_neuron.parallel.neuron_parallel_state import shard_select
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.neuron_utils import can_run_kernel
