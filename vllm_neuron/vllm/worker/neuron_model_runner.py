@@ -74,6 +74,7 @@ from vllm_neuron.vllm.worker.neuron_ec_connector_model_runner_mixin import (
     EncoderCacheReadError,
     NeuronECConnectorModelRunnerMixin,
 )
+from vllm_neuron.vllm.worker.request_slots import RequestSlotTable
 from vllm_neuron.metrics import (
     COMPILATION_TIME,
     DEVICE_ENCODER_CACHE_ACTIVE_BLOCKS,
@@ -791,6 +792,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     _dp_identity_resolved: bool = False
     _dp_identity_constant: int | None = None
     _previous_dummy_output: Any = None
+    # Stable request slots for model-owned per-request state. load_model makes the
+    # table for a model that sets ``uses_request_slots``; None for all other models.
+    request_slots: RequestSlotTable | None = None
     # Serialises InputBatch mutation between the worker main thread and the async-output
     # thread. See _batch_mutation_lock for the race and for why it cannot deadlock. A
     # mutable class attribute would be shared between runners, so __init__ makes the lock.
@@ -2234,8 +2238,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         unwrapped = getattr(self.model, "_orig_mod", self.model)
         if getattr(unwrapped, "uses_request_slots", False):
-            from vllm_neuron.vllm.worker.request_slots import RequestSlotTable
-
             self.request_slots = RequestSlotTable(unwrapped.num_request_slots)
             logger.info(
                 "Request slots enabled: %d slots (1 scratch)",
