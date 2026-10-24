@@ -110,12 +110,22 @@ LLM(model="openai/gpt-oss-20b", tensor_parallel_size=4, max_model_len=8192,
 ```
 
 Use `max_num_batched_tokens=2048` when most prompts are longer than about 500 tokens.
+
+Use the default compile route and optimization level: leave `VLLM_NEURON_BACKEND` unset
+and do not pass `--optimization-level`. With these changes the default (native) route at
+its default `-O2` matches the XLA route (`VLLM_NEURON_BACKEND=vllm_neuron`) within a few
+percent on prefill and decode, and compiles about 2x faster. Forcing `-O1` on the native
+route makes decode about 15-25% slower. (Without these changes, stock GPT-OSS BF16 decode
+on the native route is about 3x slower than on the XLA route on Trn2; the GQA decode
+attention change above avoids that.)
 Every component can be switched back to the original path with an environment
 variable (`GPTOSS_KV_WRITE=kernel`, `GPTOSS_PREFILL_IMPL=shard_on_block`,
 `GPTOSS_DECODE_ATTN=torch`, `GPTOSS_PREFILL_NSB=-1`, `GPTOSS_MASK_PAD_ROUTE=0`,
 `GPTOSS_GU_MAJOR=0`, `GPTOSS_DECODE_OPT=base`); see the top of
 `vllm_neuron/model/gpt_oss/model_bf16.py`. Decode graphs compile at `-O3` by default
-(`GPTOSS_DECODE_OPT`).
+(`GPTOSS_DECODE_OPT`). On the XLA route this lifts the decode graph from `-O1`; on the
+native route `-O2` decode is already as fast, so the hook has no measurable effect there.
+An explicit `--optimization-level` turns the per-graph hook off.
 
 ## Known issues
 
