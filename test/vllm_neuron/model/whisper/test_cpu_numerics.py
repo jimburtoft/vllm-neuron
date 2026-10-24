@@ -605,3 +605,30 @@ def test_cross_kv_fused_matches_per_layer(hf_checkpoint, monkeypatch, cross):
                        for i in range(LAYERS) for k in ("k", "v")]
     for a, b in zip(bufs["0"], bufs["1"]):
         torch.testing.assert_close(a, b, atol=2e-2, rtol=2e-2)
+
+
+def test_fp8_decoder_mlp_close_to_bf16(hf_checkpoint, monkeypatch):
+    """WHISPER_FP8=decoder_mlp: per-channel fp8 fc1 / fc2 give logits close to bf16 (CPU dequant path)."""
+    path, _ = hf_checkpoint
+    torch.manual_seed(4)
+    mel = torch.randn(1, 128, 3000)
+    n = len(PROMPT)
+    logits = {}
+    for fp8 in ("", "decoder_mlp"):
+        monkeypatch.setenv("WHISPER_FP8", fp8)
+        model = _build_native(path)
+        if fp8:
+            mlp = model.decoder.layers[0].mlp
+            assert mlp.fp8 and mlp.w1_q.dtype == torch.float8_e4m3fn and mlp.fc1.weight.numel() == 0
+        model.embed_multimodal(input_features=mel, encoder_cache=_FakeEncoderCache(), mm_hashes=["c"])
+        table = torch.full((1, MAX_BLOCKS_PER_SEQ), -1, dtype=torch.int32)
+        table[0, 0] = 1
+        out = model(
+            input_ids=torch.tensor(PROMPT, dtype=torch.int32),
+            positions=torch.arange(n, dtype=torch.int32),
+            attn_metadata=_metadata(model, torch.arange(BLOCK_SIZE, BLOCK_SIZE + n), table, n),
+            sampling_positions=torch.tensor([n - 1]),
+        )
+        logits[fp8] = out
+    a, b = logits[""].float().flatten(), logits["decoder_mlp"].float().flatten()
+    assert torch.nn.functional.cosine_similarity(a, b, dim=0) > 0.99

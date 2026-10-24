@@ -553,6 +553,33 @@ class EncoderSelfAttention(nn.Module):
         return self.out_proj(out.reshape(bsz, seqlen, self.num_heads * self.head_dim))
 
 
+FP8_MAX = 240.0  # trn2 nkilib float8_e4m3; a value <= 240 has the same bits in float8_e4m3fn
+
+
+def fp8_parts() -> set[str]:
+    """Return ``WHISPER_FP8``: the parts with fp8 weights (``decoder_mlp`` or empty).
+
+    ``decoder_mlp``: the decoder fc1 / fc2 weights in float8 e4m3 with one fp32 scale
+    per output channel (``absmax / 240``), quantized at load. Decode runs the nkilib
+    MLP kernel (``QuantizationType.ROW``, weight-only: the activations stay bf16).
+    Prefill dequantizes in torch. This is a precision change: gate it on WER.
+    """
+    raw = os.environ.get("WHISPER_FP8", "")
+    parts = {p.strip() for p in raw.split(",") if p.strip()}
+    unknown = parts - {"decoder_mlp"}
+    if unknown:
+        raise ValueError(f"WHISPER_FP8 has unknown parts {sorted(unknown)}. Use decoder_mlp.")
+    return parts
+
+
+def quantize_per_out_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(fp8 [K, N], fp32 scale [1, N])`` for a ``[K, N]`` (contraction-major) weight."""
+    wf = w.to(torch.float32)
+    scale = (wf.abs().amax(dim=0, keepdim=True) / FP8_MAX).clamp(min=1e-12)
+    q = (wf / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return q, scale
+
+
 class MLP(nn.Module):
     def __init__(self, embed_dim, ffn_dim, dtype, tp_group, part="encoder"):
         super().__init__()
@@ -561,17 +588,69 @@ class MLP(nn.Module):
         self.act = gelu_for(part)
         # Read the flag one time: a read in forward adds an os.environ guard.
         self.in_out = part in in_out_parts()
+        self.fp8 = part == "decoder" and "decoder_mlp" in fp8_parts()
+        self.dtype = dtype
+        if self.fp8:
+            i_local = self.fc1.weight.shape[0]
+            # The fp8 weights replace fc1.weight / fc2.rpl.weight after loading.
+            self.register_buffer("w1_q", torch.zeros(embed_dim, i_local, dtype=torch.float8_e4m3fn), persistent=False)
+            self.register_buffer("w1_s", torch.zeros(128, i_local, dtype=torch.float32), persistent=False)
+            self.register_buffer("w2_q", torch.zeros(i_local, embed_dim, dtype=torch.float8_e4m3fn), persistent=False)
+            self.register_buffer("w2_s", torch.zeros(128, embed_dim, dtype=torch.float32), persistent=False)
+            self.register_buffer("b1", torch.zeros(1, i_local, dtype=dtype), persistent=False)
+            self.register_buffer("b0", torch.zeros(1, i_local, dtype=dtype), persistent=False)
 
     @torch.no_grad()
     def finalize_weights(self) -> None:
-        """Store the fc1 / fc2 weights as ``[in, out]`` when the part is in ``WHISPER_IN_OUT``."""
+        """Store the fc1 / fc2 weights as ``[in, out]`` (``WHISPER_IN_OUT``), or quantize them (``WHISPER_FP8``)."""
+        if self.fp8:
+            w1 = self.fc1.weight if getattr(self.fc1, "weight_layout", "out_in") == "in_out" else self.fc1.weight.t()
+            w2 = self.fc2.rpl.weight if self.fc2.in_out else self.fc2.rpl.weight.t()
+            q1, s1 = quantize_per_out_channel(w1)
+            q2, s2 = quantize_per_out_channel(w2)
+            self.w1_q.copy_(q1)
+            self.w1_s.copy_(s1.expand(128, -1))
+            self.w2_q.copy_(q2)
+            self.w2_s.copy_(s2.expand(128, -1))
+            self.b1.copy_(self.fc1.bias.view(1, -1).to(self.b1.dtype))
+            # Free the bf16 copies: an empty weight keeps the module tree loadable.
+            self.fc1.weight = nn.Parameter(torch.empty(0, dtype=self.dtype), requires_grad=False)
+            self.fc2.rpl.weight = nn.Parameter(torch.empty(0, dtype=self.dtype), requires_grad=False)
+            return
         if not self.in_out:
             return
         to_in_out(self.fc1)
         self.fc2.set_in_out()
 
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
+    def _dequant(self, q, s):
+        return (q.to(torch.float32) * s[0:1]).to(self.dtype)
+
+    def forward(self, x, is_prefill=True):
+        if not self.fp8:
+            return self.fc2(self.act(self.fc1(x)))
+        from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+        if is_prefill or not can_run_kernel(x):
+            h = self.act(torch.matmul(x, self._dequant(self.w1_q, self.w1_s)) + self.b1)
+            y = torch.matmul(h, self._dequant(self.w2_q, self.w2_s))
+        else:
+            from nkilib.core.utils.common_types import ActFnType, QuantizationType
+
+            from vllm_neuron import functional as NF
+
+            # skip_gate: GELU(x W1 + b1) W2. b0 is a zero gate bias: nkilib takes the
+            # bias tile dtype from the gate bias (it fails with an up bias only).
+            y = NF.mlp(
+                x, self.w1_q, self.w1_q, self.w2_q, skip_gate=True, act_fn=ActFnType.GELU,
+                gate_b=self.b0, up_b=self.b1, quantization_type=QuantizationType.ROW,
+                gate_w_scale=self.w1_s, up_w_scale=self.w1_s, down_w_scale=self.w2_s,
+                output_dtype="bfloat16",
+            )
+        if self.fc2.rpl.tp_size > 1:
+            from torch.distributed._functional_collectives import all_reduce
+
+            y = all_reduce(y, reduceOp="sum", group=self.fc2.rpl.tp_group)
+        return y + self.fc2.bias.to(y.dtype)
 
 
 class EncoderLayer(nn.Module):
@@ -1427,7 +1506,7 @@ class DecoderLayer(nn.Module):
         tokens, hidden = x.shape
         if self.skip_cross and not is_prefill:
             # Timing only: skip the cross-attention (the output is wrong).
-            x = x + self.mlp(self.final_layer_norm(x))
+            x = x + self.mlp(self.final_layer_norm(x), is_prefill)
             return x
         if cross_meta is not None and isinstance(cross_meta[0], str):
             _, xslots, qmask, group = cross_meta
@@ -1451,7 +1530,7 @@ class DecoderLayer(nn.Module):
             ca = self.encoder_attn.attn_cached(hc, cross_k, cross_v)
         x = x + ca.reshape(tokens, hidden)
 
-        x = x + self.mlp(self.final_layer_norm(x))
+        x = x + self.mlp(self.final_layer_norm(x), is_prefill)
         return x
 
 
