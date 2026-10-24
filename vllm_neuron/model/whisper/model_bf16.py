@@ -1429,7 +1429,7 @@ class DecoderLayer(nn.Module):
             # Timing only: skip the cross-attention (the output is wrong).
             x = x + self.mlp(self.final_layer_norm(x))
             return x
-        if cross_meta is not None and cross_meta[0] == "xkernel":
+        if cross_meta is not None and isinstance(cross_meta[0], str):
             _, xslots, qmask, group = cross_meta
             hc = self.encoder_attn_layer_norm(x)
             ca = self.encoder_attn.attn_xkernel(hc, cross_k, cross_v, xslots, qmask, group)
