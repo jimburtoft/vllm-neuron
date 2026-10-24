@@ -450,30 +450,6 @@ class EncoderSelfAttention(nn.Module):
             to_in_out(lin)
         self.out_proj.set_in_out()
 
-    def attn_xkernel(self, hc, cross_k, cross_v, slots, qmask, group):
-        """Cross-attention of B decode rows with the Whisper cross-attention kernel.
-
-        Args:
-            hc: ``[B, H]`` after the LayerNorm.
-            cross_k: ``[S, h, d, 1536]`` K^T of all slots.
-            cross_v: ``[S, h, 1536, d]`` V of all slots.
-            slots: ``[B]`` int32, the slot of each row.
-            qmask: the kernel head-pair mask (see ``xkernel_qmask``).
-            group: rows per kernel group.
-        """
-        from vllm_neuron.functional.whisper_cross_attention import (
-            whisper_cross_attention_decode,
-        )
-
-        B = hc.shape[0]
-        h, d = self.num_heads, self.head_dim
-        q = (self.q_proj(hc) * self.scaling).view(B, h, d)
-        kp, vh, vb = self.xkernel_dma
-        ctx = whisper_cross_attention_decode(
-            q, cross_k, cross_v, slots, qmask, group, k_pairs=kp, v_heads=vh, pv_block=vb
-        )
-        return self.out_proj(ctx.reshape(B, h * d))
-
     def _shape(self, x, seqlen, bsz):
         return x.view(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
 
@@ -978,6 +954,30 @@ class CrossAttention(nn.Module):
 
             out = all_reduce(out, reduceOp="sum", group=self.tp_group)
         return (out + self.out_proj.bias.to(out.dtype)).view(B, S, hidden)
+
+    def attn_xkernel(self, hc, cross_k, cross_v, slots, qmask, group):
+        """Cross-attention of B decode rows with the Whisper cross-attention kernel.
+
+        Args:
+            hc: ``[B, H]`` after the LayerNorm.
+            cross_k: ``[S, h, d, 1536]`` K^T of all slots.
+            cross_v: ``[S, h, 1536, d]`` V of all slots.
+            slots: ``[B]`` int32, the slot of each row.
+            qmask: the kernel head-pair mask (see ``xkernel_qmask``).
+            group: rows per kernel group.
+        """
+        from vllm_neuron.functional.whisper_cross_attention import (
+            whisper_cross_attention_decode,
+        )
+
+        B = hc.shape[0]
+        h, d = self.num_heads, self.head_dim
+        q = (self.q_proj(hc) * self.scaling).view(B, h, d)
+        kp, vh, vb = self.xkernel_dma
+        ctx = whisper_cross_attention_decode(
+            q, cross_k, cross_v, slots, qmask, group, k_pairs=kp, v_heads=vh, pv_block=vb
+        )
+        return self.out_proj(ctx.reshape(B, h * d))
 
     def _shape(self, x, seqlen, bsz):
         return x.view(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
