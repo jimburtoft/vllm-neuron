@@ -65,28 +65,55 @@ def encoder_flash_enabled() -> bool:
     return os.environ.get("WHISPER_ENCODER_FLASH", "0") == "1"
 
 
+def _gqa_mask_fold_mode() -> str | None:
+    """How this tree gives the decode kernel its folded GQA mask layout.
+
+    Whisper is MHA, so the decode kernel folds several KV heads per rank into
+    the batch, and the block-KV mask must have that folded layout. Two forms of
+    the fix exist:
+
+    - ``"in_decode"``: ``attention_decode`` folds a ``(B, q_heads)`` mask itself
+      (``_fold_gqa_block_kv_mask``). The caller builds the mask unfolded.
+    - ``"in_mask"``: ``gen_attention_decode_mask`` takes ``kv_heads`` and builds
+      the folded mask. The caller must pass ``kv_heads``.
+
+    Returns:
+        The mode, or None when the tree has neither form.
+    """
+    import inspect
+
+    from vllm_neuron.functional.attention import attention_decode as _ad
+    from vllm_neuron.functional.attention import attention_decode_mask as _adm
+
+    if hasattr(_ad, "_fold_gqa_block_kv_mask"):
+        return "in_decode"
+    if "kv_heads" in inspect.signature(_adm.gen_attention_decode_mask).parameters:
+        return "in_mask"
+    return None
+
+
 def fused_decode_enabled() -> bool:
     """Return True when ``WHISPER_FUSED_DECODE=1`` selects the NKI decode attention.
 
-    Whisper is MHA, so the kernel folds several KV heads per rank into the
-    batch. The decode mask must have the folded layout. Without that fold the
-    kernel output is wrong, and nothing fails, so check that it is present.
+    Without the folded GQA mask layout the kernel output is wrong and nothing
+    fails, so check that this tree has one form of the fix
+    (``_gqa_mask_fold_mode``).
 
     Raises:
-        RuntimeError: If the fused decode is selected and the GQA mask fold is
-            not in ``attention_decode``.
+        RuntimeError: If the fused decode is selected and the tree has no GQA
+            mask fold.
     """
     if os.environ.get("WHISPER_FUSED_DECODE", "0") != "1":
         return False
-    from vllm_neuron.functional.attention import attention_decode as _ad
-
-    if not hasattr(_ad, "_fold_gqa_block_kv_mask"):
+    if _gqa_mask_fold_mode() is None:
         raise RuntimeError(
-            "WHISPER_FUSED_DECODE=1 needs the GQA decode-mask fold in "
-            "attention_decode (_fold_gqa_block_kv_mask). This tree does not have "
-            "it. Unset WHISPER_FUSED_DECODE, or use a tree with the fold."
+            "WHISPER_FUSED_DECODE=1 needs the folded GQA decode-mask layout: "
+            "either attention_decode folds the mask (_fold_gqa_block_kv_mask), "
+            "or gen_attention_decode_mask takes kv_heads. This tree has neither. "
+            "Unset WHISPER_FUSED_DECODE, or use a tree with the fold."
         )
     return True
+
 
 # Whisper always pads or cuts the audio to a 30 s window: 3000 mel frames, then
 # 1500 encoder positions after the stride-2 convolution.
@@ -533,6 +560,11 @@ class DecoderSelfAttention(nn.Module):
             return self._fused_decode_call(
                 hidden_states, attention_mask, update_idx, table, B, S, tokens, hidden
             )
+        # Build the mask in the form the tree folds it (_gqa_mask_fold_mode):
+        # unfolded when attention_decode folds it, folded here otherwise.
+        mask_kwargs = {}
+        if _gqa_mask_fold_mode() == "in_mask":
+            mask_kwargs["kv_heads"] = nkh
         attention_mask = NF.gen_attention_decode_mask(
             pos_ids=positions.view(1, B * S).to(torch.float32),
             bs=B,
@@ -541,6 +573,7 @@ class DecoderSelfAttention(nn.Module):
             s_prior=S_ctx,
             start_pos=None,
             block_len=block_size,
+            **mask_kwargs,
         )
         # The NKI kernel needs per-head slots and a per-head [B, kv_heads, blocks]
         # table for MHA. The CPU torch fallback takes the base [B, S] slots and
