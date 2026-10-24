@@ -110,12 +110,55 @@ LLM(model="openai/gpt-oss-20b", tensor_parallel_size=4, max_model_len=8192,
 ```
 
 Use `max_num_batched_tokens=2048` when most prompts are longer than about 500 tokens.
+
+Use the default compile route and optimization level: leave `VLLM_NEURON_BACKEND` unset
+and do not pass `--optimization-level`. With these changes the default (native) route at
+its default `-O2` matches the XLA route (`VLLM_NEURON_BACKEND=vllm_neuron`) within a few
+percent on prefill and decode, and compiles about 2x faster. Forcing `-O1` on the native
+route makes decode about 15-25% slower. (Without these changes, stock GPT-OSS BF16 decode
+on the native route is about 3x slower than on the XLA route on Trn2; the GQA decode
+attention change above avoids that.)
+
 Every component can be switched back to the original path with an environment
 variable (`GPTOSS_KV_WRITE=kernel`, `GPTOSS_PREFILL_IMPL=shard_on_block`,
 `GPTOSS_DECODE_ATTN=torch`, `GPTOSS_PREFILL_NSB=-1`, `GPTOSS_MASK_PAD_ROUTE=0`,
 `GPTOSS_GU_MAJOR=0`, `GPTOSS_DECODE_OPT=base`); see the top of
 `vllm_neuron/model/gpt_oss/model_bf16.py`. Decode graphs compile at `-O3` by default
 (`GPTOSS_DECODE_OPT`).
+
+## Trn3 performance options
+
+On Trn3 the model runs the published MXFP4 checkpoint natively (`model_mxfp4.py`, MX
+matmul kernels); no `quantization` setting is needed. Use `tensor_parallel_size=8`: the
+MXFP4 weight loaders reject TP=4 (per-rank intermediate size 768 is not a multiple of 512).
+
+Changes on this branch for the MXFP4 path:
+- segmented prefill writes only the new token slots into the paged KV cache
+  (`GPTOSS_MX_KV_WRITE=kernel` restores the in-kernel write, whose wrapper copies the
+  whole cache per layer); this is worth about 4x on time to first token;
+- prefill padding tokens get no MoE blocks (`GPTOSS_MASK_PAD_ROUTE`);
+- decode compiles at `-O3` (`GPTOSS_DECODE_OPT`); no measurable effect on the native route.
+
+Recommended starting point (one Trn3 instance, 8 logical cores at LNC=2):
+
+```python
+LLM(model="openai/gpt-oss-20b", tensor_parallel_size=8, max_model_len=8192,
+    block_size=128, max_num_batched_tokens=2048, enable_prefix_caching=False,
+    additional_config={"neuron_config": {
+        "num_batched_tokens_buckets": [128, 256, 512, 1024, 2048],
+        "decode_context_length_buckets": [1024, 2048, 4096, 7168],
+        "on_device_sampling_config": {"all_greedy": True}}})
+```
+
+`num_batched_tokens_buckets` compiles smaller prefill graphs, so short prompts do not pay
+for the full 2048-token chunk (time to first token 19 ms at 128 tokens instead of 37 ms,
+with 82 ms at 4096 tokens unchanged). Without it every prefill chunk is padded to
+`max_num_batched_tokens`. Each entry must be a multiple of 128 and the last must equal
+`max_num_batched_tokens`.
+
+Leave `VLLM_NEURON_BACKEND` unset and do not pass `--optimization-level`: the default
+(native) route at `-O2` matched the XLA route and `-O3` within about 1% on prefill and
+decode, and compiled 2.5x faster than the XLA route. `-O1` made decode about 25% slower.
 
 ## Known issues
 
