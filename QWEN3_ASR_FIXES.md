@@ -28,7 +28,7 @@ Files: `vllm_neuron/functional/{argmax,merge_multimodal_embeddings}.py`, `vllm_n
 
 ## Results
 
-These are for the full champion stack: this branch plus the champion nkilib. They were measured 2026-10-23 (throughput rows re-measured with the batched-decode attention change, interleaved against the stack without it: 1,366–1,383 and 1,517–1,526) on one trn2.3xlarge in the SDK 2.33 release vLLM image (vllm 0.29.0, nki 0.7.0, neuronx-cc 2.28.7631), set up with `qwen3_asr/setup_champion.sh`.
+These are for the full champion stack: this branch plus the champion nkilib. They were measured 2026-10-23/24. The throughput rows were re-measured with the champion nkilib's batched-decode attention changes and `decode_context_length_buckets [512]`; the stack without them gave 1,366–1,383 and 1,517–1,526. All runs on one trn2.3xlarge in the SDK 2.33 release vLLM image (vllm 0.29.0, nki 0.7.0, neuronx-cc 2.28.7631), set up with `qwen3_asr/setup_champion.sh`.
 - **Client:** `vllm bench serve --backend openai-audio --endpoint /v1/audio/transcriptions`.
 - **Workload:** 2048 Earnings22 requests, greedy decoding, 256-token cap, `OMP_NUM_THREADS=1`.
 - **Metric:** throughput in audio seconds per wall second. Each result is 2 runs on one server.
@@ -36,17 +36,19 @@ These are for the full champion stack: this branch plus the champion nkilib. The
 | configuration | 30 s clips | 8 s clips |
 |---|---|---|
 | release, unpatched: best layout that runs (TP2 × DP2, LNC=2) | 963–965 | 442 |
-| **champion**: TP1 × DP4, LNC=2, max_num_seqs 48 | **1,412–1,413** | **978** |
-| **champion**: TP1 × DP8, LNC=1, max_num_seqs 48 | **1,568–1,577** | — |
+| **champion**: TP1 × DP4, LNC=2, max_num_seqs 48, decode bucket [512] | **1,508–1,516** | **1,042–1,058** |
+| **champion**: TP1 × DP8, LNC=1, max_num_seqs 48, decode bucket [512] | **1,712–1,722** | **1,297** |
 
 | single stream (TP4, LNC=2, 30 s clip, 256 requests) | TTFT p50 | ITL p50 | E2E p50 |
 |---|---|---|---|
 | release, unpatched | 46–48 ms | 3.60 ms | 359–365 ms |
 | **champion** | **44.9–47.5 ms** | **3.13–3.14 ms** | **319–324 ms** (−11 %) |
 
-- **Earnings22 WER** (upstream `run_accuracy_asr`, 341 chunks, champion TP1 × DP4): **5.99 %**. Reference gate: 6.24 %.
+- **Earnings22 WER** (upstream `run_accuracy_asr`, 341 chunks, champion TP1 × DP4): **6.01 %** with the decode bucket [512] (5.99 % without). Reference gate: 6.24 %.
 - **API-server balance:** the largest per-worker request share was 0.26–0.29 with 4 servers and 0.15 with 8, so the load is even (fair share is 0.25 and 0.125).
-- **`decode_context_length_buckets`:** leave it unset. With the champion nkilib, `[512]` is slower (E2E 328–331 vs 323–324 ms).
+- **`decode_context_length_buckets`:** depends on the workload.
+  - **Throughput:** use `[512]`. The champion nkilib keeps the fast K gather at the 512 bucket, giving +5.7 % (LNC2) / +8.4 % (LNC1) on 30 s clips.
+  - **Single stream (TP4, B=1):** leave it unset. `[512]` is ~5 ms slower there (328–331 vs 323–324 ms), because the batched-decode path does not apply at B=1.
 - **Without this branch:** the unpatched release can't compile TP1 at `max_num_seqs` ≥ 2 and can't run at LNC=1.
 
 ## Recommended settings
@@ -55,7 +57,8 @@ export OMP_NUM_THREADS=1        # REQUIRED on trn2.3xlarge (12 vCPU): otherwise 
 # LNC=2 (default), 4 replicas:
 vllm serve Qwen/Qwen3-ASR-1.7B --tensor-parallel-size 1 --data-parallel-size 4 --max-num-seqs 48 \
   --max-model-len 1024 --max-num-batched-tokens 1024 --no-enable-prefix-caching --dtype bfloat16 \
-  --additional-config '{"neuron_config":{"quantization":"bf16","num_batched_tokens_buckets":[128,256,512,1024],"num_seqs_buckets":[1,2,4,8,16,32,48]},"encoder_neuron_config":{"num_encoder_input_buckets":[1,2,4],"encoder_attention_block_size":128,"dp_size":1}}'
+  --additional-config '{"neuron_config":{"quantization":"bf16","num_batched_tokens_buckets":[128,256,512,1024],"num_seqs_buckets":[1,2,4,8,16,32,48],"decode_context_length_buckets":[512]},"encoder_neuron_config":{"num_encoder_input_buckets":[1,2,4],"encoder_attention_block_size":128,"dp_size":1}}'
+# Throughput: keep "decode_context_length_buckets":[512] (above). Single stream (TP4): remove it.
 # LNC=1, 8 replicas: NEURON_LOGICAL_NC_CONFIG=1 VLLM_NEURON_RESERVED_HEADROOM_GIB=2 VLLM_NEURON_DISABLE_PARALLEL_TRACE=1, --data-parallel-size 8
 ```
 
