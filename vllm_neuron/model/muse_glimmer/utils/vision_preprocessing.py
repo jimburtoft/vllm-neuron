@@ -168,9 +168,81 @@ class PackedVisionInputs:
     window_bound_min: torch.Tensor  # [nb, bs, 1] int32 (window attention)
     window_bound_max: torch.Tensor
     merged_order: torch.Tensor  # [nb, bs // merge**2] int64, block-local gather index
+    # Task 020 window-chunk layout (only with ``win_chunks``): window layers attend in
+    # ``K = win_chunks`` sub-blocks of ``C = win_chunk`` rows per block.
+    win_gather: torch.Tensor | None = None  # [nb, K*C] int64: chunk slot -> block-local row
+    win_scatter: torch.Tensor | None = None  # [nb, bs] int64: block-local row -> chunk slot
+    win_bound_min: torch.Tensor | None = None  # [nb*K, C, 1] int32, chunk-local
+    win_bound_max: torch.Tensor | None = None
 
     def as_kwargs(self) -> dict[str, torch.Tensor]:
-        return dict(self.__dict__)
+        return {k: v for k, v in self.__dict__.items() if v is not None}
+
+
+# ---------------------------------------------------------------------------
+# Task 020: window-chunk planning
+# ---------------------------------------------------------------------------
+
+
+class WindowChunkOverflow(ValueError):
+    """A block's windows need more ``win_chunk``-row chunks than the graph has."""
+
+
+def frame_window_sizes(h: int, w: int, win: int = WINDOW_PATCHES) -> list[int]:
+    """Token count of each window of one frame, in pack order (row-major windows)."""
+    return [min(win, h - wy) * min(win, w - wx) for wy in range(0, h, win) for wx in range(0, w, win)]
+
+
+def ffd_chunks(sizes: list[int], chunk: int) -> list[list[int]]:
+    """First-fit-decreasing of window indices into ``chunk``-row bins (each size <= chunk)."""
+    order = sorted(range(len(sizes)), key=lambda i: (-sizes[i], i))
+    bins: list[list[int]] = []
+    room: list[int] = []
+    for i in order:
+        for b in range(len(bins)):
+            if room[b] >= sizes[i]:
+                bins[b].append(i)
+                room[b] -= sizes[i]
+                break
+        else:
+            bins.append([i])
+            room.append(chunk - sizes[i])
+    return bins
+
+
+def window_chunks_needed(grid_rows: list[tuple[int, int, int]], chunk: int, win: int = WINDOW_PATCHES) -> int:
+    """Chunks one block needs for these items (all frames of all rows in the block)."""
+    sizes: list[int] = []
+    for t, h, w in grid_rows:
+        sizes += frame_window_sizes(h, w, win) * t
+    return len(ffd_chunks(sizes, chunk))
+
+
+_MAX_CHUNKS: dict[tuple[int, int, int, int], int] = {}
+
+
+def max_window_chunks(rows: int, chunk: int, win: int = WINDOW_PATCHES, merge: int = 2) -> int:
+    """Worst-case chunks for any content one block of ``rows`` can hold.
+
+    A block holds one image, or ``k`` same-size temporal groups of one video
+    (``one_item_per_block``), so this enumerates every even ``h x w`` grid with
+    ``h*w <= rows`` and every ``k <= rows // (h*w)``. Cached per geometry.
+    """
+    key = (rows, chunk, win, merge)
+    if key in _MAX_CHUNKS:
+        return _MAX_CHUNKS[key]
+    worst = 1
+    for h in range(merge, rows + 1, merge):
+        for w in range(merge, rows // h + 1, merge):
+            sizes = frame_window_sizes(h, w, win)
+            kmax = rows // (h * w)
+            if len(sizes) == 1:  # one window per frame: bins = ceil(k / per-chunk)
+                need = -(-kmax // (chunk // sizes[0]))
+            else:
+                need = max(len(ffd_chunks(sizes * k, chunk)) for k in range(1, kmax + 1))
+            worst = max(worst, need)
+    _MAX_CHUNKS[key] = worst
+    return worst
 
 
 def pack_vision_inputs(
@@ -184,6 +256,8 @@ def pack_vision_inputs(
     merge_size: int = 2,
     window: int = WINDOW_PATCHES,
     rope_dtype: torch.dtype | None = None,
+    win_chunks: int = 0,
+    win_chunk: int = 1024,
 ) -> PackedVisionInputs:
     """Pack items (rows of ``grid_thw``, raster-ordered ``pixel_values``) into blocks.
 
@@ -193,6 +267,13 @@ def pack_vision_inputs(
 
     ``rope_dtype``: round cos/sin through this dtype (HF casts them to the
     hidden-state dtype before the fp32 rotation), then keep fp32.
+
+    ``win_chunks`` (Task 020, ``MUSE_GLIMMER_VIS_WIN_SPLIT``): also build the
+    window-chunk layout. Each block's windows are FFD-packed into ``win_chunks``
+    chunks of ``win_chunk`` rows; ``win_gather`` lists, per chunk slot, the
+    block-local row it holds (pad slots point at a pad row or row 0 and get
+    bounds ``(0, 0)``), and ``win_scatter`` maps each block row back to its slot.
+    The block layout itself (and so every non-window op) is unchanged.
     """
     nb, bs = assignment.num_blocks, assignment.block_size
     mu = merge_size * merge_size
@@ -254,6 +335,10 @@ def pack_vision_inputs(
         if off > bs:
             raise ValueError(f"block {b} overflows: {off} > {bs}")
 
+    win = {}
+    if win_chunks:
+        win = _window_chunk_layout(assignment, rows, wmin, wmax, win_chunks, win_chunk, bs, window)
+
     return PackedVisionInputs(
         pixel_values=pix,
         pos_emb_idx=tap_idx,
@@ -265,7 +350,56 @@ def pack_vision_inputs(
         window_bound_min=wmin,
         window_bound_max=wmax,
         merged_order=morder,
+        **win,
     )
+
+
+def _window_chunk_layout(assignment, rows, wmin, wmax, K, C, bs, window) -> dict[str, torch.Tensor]:
+    """Task 020: per block, FFD the windows into ``K`` chunks of ``C`` rows (see pack_vision_inputs)."""
+    if C > bs or bs > K * C:
+        raise ValueError(f"window chunks: need C <= bs <= K*C, got C={C} bs={bs} K={K}")
+    nb = assignment.num_blocks
+    gather = torch.zeros(nb, K * C, dtype=torch.int64)
+    scatter = torch.zeros(nb, bs, dtype=torch.int64)
+    bmin = torch.zeros(nb * K, C, 1, dtype=torch.int32)
+    bmax = torch.zeros(nb * K, C, 1, dtype=torch.int32)
+    for b, items in enumerate(assignment.bins):
+        # windows of this block as (start row, size), in pack order
+        wins: list[tuple[int, int]] = []
+        off = 0
+        for i in sorted(items):
+            t, h, w = rows[i]
+            for _ in range(t):
+                for n in frame_window_sizes(h, w, window):
+                    wins.append((off, n))
+                    off += n
+        bins = ffd_chunks([n for _, n in wins], C)
+        if len(bins) > K:
+            raise WindowChunkOverflow(f"block {b}: windows need {len(bins)} chunks of {C} rows > {K}")
+        used = torch.zeros(K * C, dtype=torch.bool)
+        covered = torch.zeros(bs, dtype=torch.bool)
+        for k, members in enumerate(bins):
+            o = 0
+            for wi in sorted(members):
+                start, n = wins[wi]
+                slot = k * C + o
+                gather[b, slot : slot + n] = torch.arange(start, start + n)
+                scatter[b, start : start + n] = torch.arange(slot, slot + n)
+                bmin[b * K + k, o : o + n, 0] = o
+                bmax[b * K + k, o : o + n, 0] = o + n
+                used[slot : slot + n] = True
+                o += n
+        for start, n in wins:
+            covered[start : start + n] = True
+        # block pad rows (no window): park them in free slots, bounds (0, 0)
+        pad_rows = (~covered).nonzero().flatten()
+        free = (~used).nonzero().flatten()[: pad_rows.numel()]
+        gather[b, free] = pad_rows
+        scatter[b, pad_rows] = free
+        # sanity: same window bounds as the block layout, chunk-shifted
+        assert torch.equal((wmax[b, :off, 0] - wmin[b, :off, 0]).long(),
+                           (bmax.view(nb, K * C)[b, scatter[b, :off]] - bmin.view(nb, K * C)[b, scatter[b, :off]]).long())
+    return dict(win_gather=gather, win_scatter=scatter, win_bound_min=bmin, win_bound_max=bmax)
 
 
 # ---------------------------------------------------------------------------

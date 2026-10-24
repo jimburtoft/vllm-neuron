@@ -40,6 +40,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import vllm_neuron.functional as NF
+from nkilib.core.utils.common_types import ActFnType, NormType
 from vllm_neuron.model.qwen3_vl.vision_encoder_bf16 import (
     Qwen3VLVisionMLP,
     _rotate_half,
@@ -68,6 +69,49 @@ def vision_compute_dtype() -> torch.dtype:
     return getattr(torch, name)
 
 
+# Task 020: vision encoder knobs (read once at model build; all default to the Task 005 graph).
+# MUSE_GLIMMER_VIS_OPT       neuronx-cc -O for the encoder graph (per-graph policy), off = engine level.
+# MUSE_GLIMMER_VIS_WIN_SPLIT 1: window layers attend in 1024-row sub-blocks ([nb*bs/1024, 1024]); the
+#                            CPU packer then keeps every 32x32 window inside one 1024-row chunk.
+# MUSE_GLIMMER_VIS_MLP       torch (erf GELU, default) | nki (NF.mlp skip_gate, nl.gelu) | fp32gelu.
+# MUSE_GLIMMER_VIS_LN        torch (default) | fused (norm1 into NF.qkv_proj, norm2 into NF.mlp LAYER_NORM).
+# MUSE_GLIMMER_VIS_ROPE      fp32 (default, HF) | bf16 (rotation in the compute dtype).
+VIS_OPT_ENV = "MUSE_GLIMMER_VIS_OPT"
+VIS_WIN_SPLIT_ENV = "MUSE_GLIMMER_VIS_WIN_SPLIT"
+VIS_MLP_ENV = "MUSE_GLIMMER_VIS_MLP"
+VIS_LN_ENV = "MUSE_GLIMMER_VIS_LN"
+VIS_ROPE_ENV = "MUSE_GLIMMER_VIS_ROPE"
+WIN_CHUNK = 1024  # 32 x 32 patches: the largest window
+
+
+def _env_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    v = os.environ.get(name, default).strip().lower() or default
+    if v not in allowed:
+        raise ValueError(f"{name}={v!r} not in {allowed}")
+    return v
+
+
+def vision_opt_level() -> int | None:
+    v = _env_choice(VIS_OPT_ENV, "off", ("off", "0", "1", "2", "3"))
+    return None if v in ("off", "0") else int(v)
+
+
+def vision_win_split() -> bool:
+    return _env_choice(VIS_WIN_SPLIT_ENV, "0", ("0", "1")) == "1"
+
+
+def vision_mlp_mode() -> str:
+    return _env_choice(VIS_MLP_ENV, "torch", ("torch", "nki", "fp32gelu"))
+
+
+def vision_ln_mode() -> str:
+    return _env_choice(VIS_LN_ENV, "torch", ("torch", "fused"))
+
+
+def vision_rope_mode() -> str:
+    return _env_choice(VIS_ROPE_ENV, "fp32", ("fp32", "bf16"))
+
+
 class MuseGlimmerVisionAttention(nn.Module):
     """Non-causal MHA (16 heads x 96) with q/k/v bias, axial RoPE and bounds."""
 
@@ -78,6 +122,7 @@ class MuseGlimmerVisionAttention(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.scale = self.head_dim**-0.5
         self.dtype = dtype
+        self.rope_mode = vision_rope_mode()
 
         # >>> PARALLELISM: heads sharded over the vision TP group <<<
         self.tp_group = get_neuron_encoder_tp_group()
@@ -101,37 +146,111 @@ class MuseGlimmerVisionAttention(nn.Module):
             ),
         )
 
-    def forward(self, x, cos, sin, bound_min, bound_max):
+    def forward(self, x, cos, sin, bound_min, bound_max, ln=None, win=None):
+        """``ln``: optional ``(weight, bias, eps)`` LayerNorm fused into the QKV kernel (Task 020).
+
+        ``win``: optional ``(gather [nb, K*C], scatter [nb, bs], K, C)``: attend in
+        ``nb*K`` sub-blocks of ``C`` rows instead of ``nb`` blocks of ``bs`` rows; the
+        bounds are then the chunk-local ``[nb*K, C, 1]`` tensors (Task 020).
+        """
         nb, bs, _ = x.shape
         n, d = self.num_heads_per_rank, self.head_dim
         x = x.to(self.dtype)
-        qkv = NF.qkv_proj(hidden=x, qkv_weights=self.qkv_weight, bias=self.qkv_bias.unsqueeze(0))
+        if ln is None:
+            qkv = NF.qkv_proj(hidden=x, qkv_weights=self.qkv_weight, bias=self.qkv_bias.unsqueeze(0))
+        else:
+            lw, lb, eps = ln
+            qkv = NF.qkv_proj(
+                hidden=x, qkv_weights=self.qkv_weight, bias=self.qkv_bias.unsqueeze(0),
+                norm_weights=lw.unsqueeze(0), norm_b=lb.unsqueeze(0), norm_type=NormType.LAYER_NORM, eps=eps,
+            )
         hd = n * d
         q = qkv[:, :, :hd].reshape(nb, bs, n, d)
         k = qkv[:, :, hd : 2 * hd].reshape(nb, bs, n, d)
         v = qkv[:, :, 2 * hd :].reshape(nb, bs, n, d)
 
         # <-- MODEL-SPECIFIC: axial 2D RoPE applied in fp32 (HF upcasts q/k).
-        c = cos.to(torch.float32).unsqueeze(2)
-        s = sin.to(torch.float32).unsqueeze(2)
-        qf, kf = q.to(torch.float32), k.to(torch.float32)
+        # MUSE_GLIMMER_VIS_ROPE=bf16 (Task 020): rotate in the compute dtype instead.
+        rd = self.dtype if self.rope_mode == "bf16" else torch.float32
+        c = cos.to(rd).unsqueeze(2)
+        s = sin.to(rd).unsqueeze(2)
+        qf, kf = q.to(rd), k.to(rd)
         q = (qf * c + _rotate_half(qf) * s).to(self.dtype)
         k = (kf * c + _rotate_half(kf) * s).to(self.dtype)
 
-        q = q.permute(0, 2, 1, 3).reshape(nb * n, bs, d)
-        k = k.permute(0, 2, 1, 3).reshape(nb * n, bs, d)
-        v = v.permute(0, 2, 1, 3).reshape(nb * n, bs, d)
+        if win is not None:
+            gather, scatter, K, C = win  # flat row indices (block offsets folded in)
+            # [nb*bs, n*d] rows -> [nb*K*C] chunk slots (pad slots read a pad row; bounds (0, 0))
+            q, k, v = (torch.index_select(t.reshape(nb * bs, n * d), 0, gather) for t in (q, k, v))
+            nb_a, bs_a = nb * K, C
+        else:
+            nb_a, bs_a = nb, bs
+        q = q.reshape(nb_a, bs_a, n, d).permute(0, 2, 1, 3).reshape(nb_a * n, bs_a, d)
+        k = k.reshape(nb_a, bs_a, n, d).permute(0, 2, 1, 3).reshape(nb_a * n, bs_a, d)
+        v = v.reshape(nb_a, bs_a, n, d).permute(0, 2, 1, 3).reshape(nb_a * n, bs_a, d)
         bmin = bound_min.repeat_interleave(n, dim=0)
         bmax = bound_max.repeat_interleave(n, dim=0)
         o = NF.flash_attention(
             q, k, v, scale=self.scale, causal_mask=False, tp_q=True, tp_k=True,
             bound_min=bmin, bound_max=bmax,
         )
-        o = o.view(nb, n, bs, d).permute(0, 1, 3, 2)  # [nb, N, D, S]
+        if win is not None:
+            # [nb*K*n, C, d] -> chunk-slot rows [nb*K*C, n*d] -> block rows -> [nb, N, D, S]
+            o = o.view(nb * K, n, C, d).permute(0, 2, 1, 3).reshape(nb * K * C, n * d)
+            o = torch.index_select(o, 0, scatter).reshape(nb, bs, n, d).permute(0, 2, 3, 1)
+        else:
+            o = o.view(nb, n, bs, d).permute(0, 1, 3, 2)  # [nb, N, D, S]
         out = NF.o_proj(o, self.proj_weight)
         if self.world_size > 1:
             self.tp_group.all_reduce(out)
         return out + self.proj_bias
+
+
+class MuseGlimmerVisionMLP(Qwen3VLVisionMLP):
+    """fc1 (+bias) -> GELU -> fc2 -> all-reduce -> + bias, with Task 020 variants.
+
+    ``MUSE_GLIMMER_VIS_MLP``:
+      * ``torch`` (default): torch matmuls + erf GELU (= Qwen3VLVisionMLP).
+      * ``fp32gelu``: the erf GELU in fp32 (qwen3-asr Task 022: the bf16 erf form does
+        not fuse into the ScalarE GELU activation on neuronx-cc 2.28; the fp32 form does).
+      * ``nki``: nkilib MLP kernel, ``skip_gate=True``, ``ActFnType.GELU`` (``nl.gelu``,
+        exact erf) with the fc1 bias; fc2 bias stays outside (after the all-reduce).
+    ``ln`` (``MUSE_GLIMMER_VIS_LN=fused`` with ``nki``) folds norm2 into the kernel.
+    """
+
+    def __init__(self, hidden_size, intermediate_size, dtype, mode: str):
+        super().__init__(hidden_size, intermediate_size, dtype)
+        # nkilib mlp_cte_sharding forces I-sharding at intermediate_size >= 4096, and I-sharding
+        # drops projection biases: wrong output with the fc1 bias (simulator, H=1024 I=4096: cos
+        # 0.90; the qwen3-asr cos 0.19). Vision TP=4 has I/rank = 2240; TP<=2 falls back to torch.
+        if mode == "nki" and self.intermediate_size_per_rank >= 4096:
+            mode = "torch"
+        self.mode = mode
+
+    def forward(self, hidden_states, ln=None):
+        if self.mode == "nki":
+            shp = hidden_states.shape
+            h2 = hidden_states.reshape(-1, shp[-1])
+            kw = {}
+            if ln is not None:
+                lw, lb, eps = ln
+                kw = dict(ln_w=lw.unsqueeze(0), norm_b=lb.unsqueeze(0), norm_type=NormType.LAYER_NORM, eps=eps)
+            out = NF.mlp(h2, self.fc1_weight, self.fc1_weight, self.fc2_weight, skip_gate=True,
+                         act_fn=ActFnType.GELU, up_b=self.fc1_bias.unsqueeze(0), **kw)
+            out = out.reshape(shp)
+        else:
+            if ln is not None:
+                lw, lb, eps = ln
+                hidden_states = F.layer_norm(hidden_states, (hidden_states.shape[-1],), lw, lb, eps)
+            out = hidden_states @ self.fc1_weight + self.fc1_bias
+            if self.mode == "fp32gelu":
+                out = gelu(out.to(torch.float32)).to(hidden_states.dtype)
+            else:
+                out = gelu(out)
+            out = out @ self.fc2_weight
+        if self.world_size > 1:
+            self.tp_group.all_reduce(out)
+        return out + self.fc2_bias
 
 
 class MuseGlimmerVisionBlock(nn.Module):
@@ -144,11 +263,22 @@ class MuseGlimmerVisionBlock(nn.Module):
         self.norm1 = nn.LayerNorm(vc.hidden_size, eps=1e-5, dtype=dtype)
         self.norm2 = nn.LayerNorm(vc.hidden_size, eps=1e-5, dtype=dtype)
         self.attn = MuseGlimmerVisionAttention(vc.hidden_size, vc.num_attention_heads, dtype)
-        self.mlp = Qwen3VLVisionMLP(vc.hidden_size, vc.intermediate_size, dtype)
+        self.mlp = MuseGlimmerVisionMLP(vc.hidden_size, vc.intermediate_size, dtype, vision_mlp_mode())
+        # LN fusion: norm1 -> NF.qkv_proj LAYER_NORM; norm2 -> NF.mlp LAYER_NORM (nki MLP only).
+        self.fuse_ln = vision_ln_mode() == "fused"
 
-    def forward(self, x, cos, sin, full_bounds, window_bounds):
+    def _ln(self, norm):
+        return (norm.weight, norm.bias, norm.eps)
+
+    def forward(self, x, cos, sin, full_bounds, window_bounds, win=None):
         bmin, bmax = window_bounds if self.layer_type == WINDOW else full_bounds
-        x = x + self.attn(self.norm1(x), cos, sin, bmin, bmax)
+        w = win if self.layer_type == WINDOW else None
+        if self.fuse_ln:
+            x = x + self.attn(x, cos, sin, bmin, bmax, ln=self._ln(self.norm1), win=w)
+            if self.mlp.mode == "nki":
+                return x + self.mlp(x, ln=self._ln(self.norm2))
+            return x + self.mlp(self.norm2(x))
+        x = x + self.attn(self.norm1(x), cos, sin, bmin, bmax, win=w)
         return x + self.mlp(self.norm2(x))
 
 
@@ -254,8 +384,16 @@ class MuseGlimmerVisionModel(nn.Module):
         window_bound_min: torch.Tensor,
         window_bound_max: torch.Tensor,
         merged_order: torch.Tensor,
+        win_gather: torch.Tensor | None = None,
+        win_scatter: torch.Tensor | None = None,
+        win_bound_min: torch.Tensor | None = None,
+        win_bound_max: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Local blocks -> features ``[nb, bs / merge_unit, text_hidden]`` (HF merged order)."""
+        """Local blocks -> features ``[nb, bs / merge_unit, text_hidden]`` (HF merged order).
+
+        ``win_*`` (Task 020 window split): window layers attend in chunks; see
+        ``pack_vision_inputs(win_chunks=...)``. Requires ``bs % 128 == 0`` (no in-graph pad).
+        """
         nb, real_bs, _ = pixel_values.shape
         mu = self.merge_unit
         real_merged = real_bs // mu
@@ -278,8 +416,18 @@ class MuseGlimmerVisionModel(nn.Module):
         h = self.ln_pre(h)
         full_b = (bound_min, bound_max)
         win_b = (window_bound_min, window_bound_max)
+        win = None
+        if win_gather is not None:
+            if pad:
+                raise ValueError(f"window split needs block rows % {_ATTN_SEQ_ALIGN} == 0, got {real_bs}")
+            K = win_gather.shape[1] // WIN_CHUNK
+            ob = torch.arange(nb, dtype=win_gather.dtype, device=win_gather.device).unsqueeze(1)
+            g = (win_gather + ob * real_bs).reshape(-1)
+            sc = (win_scatter + ob * (K * WIN_CHUNK)).reshape(-1)
+            win = (g, sc, K, WIN_CHUNK)
+            win_b = (win_bound_min, win_bound_max)
         for layer in self.layers:
-            h = layer(h, cos, sin, full_b, win_b)
+            h = layer(h, cos, sin, full_b, win_b, win=win)
         h = self.ln_post(h)
 
         # <-- MODEL-SPECIFIC: channel-interleaved 2x2 shuffle (pack order makes it a reshape).
@@ -312,9 +460,21 @@ class MuseGlimmerVisionModel(nn.Module):
         merged_order: torch.Tensor,
         encoder_cache_buffer: torch.Tensor,
         write_block_ids: torch.Tensor,
+        win_gather: torch.Tensor | None = None,
+        win_scatter: torch.Tensor | None = None,
+        win_bound_min: torch.Tensor | None = None,
+        win_bound_max: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # >>> PARALLELISM: DP scatter (each rank takes its slice of blocks) <<<
         if self.dp_size > 1:
+            if win_gather is not None:
+                nb0 = pixel_values.shape[0]
+                per0 = nb0 // self.dp_size
+                K = win_gather.shape[1] // WIN_CHUNK
+                s0 = self.dp_group.rank_in_group * per0
+                win_gather, win_scatter = win_gather[s0 : s0 + per0], win_scatter[s0 : s0 + per0]
+                win_bound_min = win_bound_min[s0 * K : (s0 + per0) * K]
+                win_bound_max = win_bound_max[s0 * K : (s0 + per0) * K]
             nb = pixel_values.shape[0]
             assert nb % self.dp_size == 0, f"num_blocks {nb} not divisible by vision dp {self.dp_size}"
             per = nb // self.dp_size
@@ -331,10 +491,15 @@ class MuseGlimmerVisionModel(nn.Module):
         feats = self.encode(
             pixel_values, pos_emb_idx, pos_emb_weight, cos, sin, bound_min, bound_max,
             window_bound_min, window_bound_max, merged_order,
+            win_gather, win_scatter, win_bound_min, win_bound_max,
         )
         # >>> PARALLELISM: DP gather <<<
         if self.dp_size > 1:
             feats = self.dp_group.all_gather(feats, dim=0)
+        # Task 020 small buckets: a block of fewer rows than the cache block fills its head.
+        cache_rows = encoder_cache_buffer.shape[1]
+        if feats.shape[1] < cache_rows:
+            feats = F.pad(feats, (0, 0, 0, cache_rows - feats.shape[1]))
         encoder_cache_buffer.index_put_((write_block_ids,), feats.to(encoder_cache_buffer.dtype))
         return encoder_cache_buffer
 

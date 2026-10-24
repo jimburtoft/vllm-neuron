@@ -78,7 +78,13 @@ from . import fp8 as _fp8
 from . import kv_fp8 as _kv_fp8
 from .config import MuseGlimmerConfig, MuseGlimmerTextConfig
 from .utils.vision_preprocessing import pack_vision_inputs, plan_video_items
-from .vision_encoder_bf16 import MuseGlimmerVisionModel
+from .vision_encoder_bf16 import (
+    WIN_CHUNK,
+    MuseGlimmerVisionModel,
+    vision_opt_level,
+    vision_win_split,
+)
+from .utils.vision_preprocessing import max_window_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +126,45 @@ def _decode_opt_level() -> int | None:
     if v not in ("1", "2", "3"):
         raise ValueError(f"{DECODE_OPT_ENV}={v!r} not in (off, 1, 2, 3)")
     return int(v)
+
+
+# Task 020: vision encoder graph shape knobs (see vision_encoder_bf16.py for the module knobs).
+VIS_SMALL_BLOCK_ENV = "MUSE_GLIMMER_VIS_SMALL_BLOCK"
+_VIS_TIMING_FILE = os.environ.get("MUSE_GLIMMER_VIS_TIMING_FILE", "")
+
+
+def _vis_timing() -> bool:
+    """Task 020 host/device split of each VE call (adds two device syncs; off by default).
+
+    On when ``MUSE_GLIMMER_VIS_TIMING=1``, or when ``$MUSE_GLIMMER_VIS_TIMING_FILE.on``
+    exists (toggle at run time without restarting a server).
+    """
+    if os.environ.get("MUSE_GLIMMER_VIS_TIMING", "0") == "1":
+        return True
+    return bool(_VIS_TIMING_FILE) and os.path.exists(_VIS_TIMING_FILE + ".on")
+
+
+def _vis_small_block(vnc) -> bool:
+    """Buckets below the block size compile ONE block of ``bucket`` rows (block = image size)."""
+    on = os.environ.get(VIS_SMALL_BLOCK_ENV, "0").strip() == "1"
+    return on and vnc.dp_size == 1
+
+
+def _graph_block_rows(bucket: int, vnc) -> tuple[int, int]:
+    """(rows per block, num_blocks) of the encoder graph for ``bucket``."""
+    bs, dp = vnc.encoder_attention_block_size, vnc.dp_size
+    if bucket < bs and _vis_small_block(vnc):
+        if bucket % 128:
+            raise ValueError(f"{VIS_SMALL_BLOCK_ENV}: bucket {bucket} must be a multiple of 128")
+        return bucket, 1
+    return bs, math.ceil(math.ceil(bucket / bs) / dp) * dp
+
+
+def _vis_win_chunks(rows: int) -> int:
+    """Window-split chunk count for a block of ``rows`` (0 = no split)."""
+    if not vision_win_split() or rows <= WIN_CHUNK:
+        return 0
+    return max_window_chunks(rows, WIN_CHUNK)
 
 
 def _kv_defer_mode() -> int:
@@ -1079,13 +1124,18 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         ``MUSE_GLIMMER_DECODE_OPT=off`` it is None and every graph keeps the engine level.
         """
         level = _decode_opt_level()
-        if level is None:
+        vis = vision_opt_level()  # Task 020: encoder graph -O (MUSE_GLIMMER_VIS_OPT)
+        if level is None and vis is None:
             return None
         from vllm_neuron.utils.compiler_args_ctx import with_optimization_level
 
         def policy(graph_type, example_inputs, base):
             base = list(base or [])
-            return with_optimization_level(base, level) if graph_type == "decode" else base
+            if graph_type == "decode" and level is not None:
+                return with_optimization_level(base, level)
+            if graph_type == "encoder" and vis is not None:
+                return with_optimization_level(base, vis)
+            return base
 
         return policy
 
@@ -1241,8 +1291,14 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
             max(sum(tokens), required_blocks * block_size),
             vnc.num_encoder_input_buckets, block_size, dp_size=vnc.dp_size,
         )
+        # Task 020 (MUSE_GLIMMER_VIS_SMALL_BLOCK): one-block requests run the smallest
+        # bucket that holds them; a bucket below the block size is ONE block of `bucket` rows.
+        blk_rows = block_size
+        if required_blocks == 1 and _vis_small_block(vnc):
+            _bucket = min(b for b in vnc.num_encoder_input_buckets if b >= sum(tokens))
+            blk_rows, num_blocks = _graph_block_rows(_bucket, vnc)
         assignment = ffd_pack_images(
-            tokens, block_size, num_blocks, one_item_per_block=True, group_ids=group_ids
+            tokens, blk_rows, num_blocks, one_item_per_block=True, group_ids=group_ids
         )
         packed = pack_vision_inputs(
             pixel_values.reshape(-1, vc.patch_dim),
@@ -1253,6 +1309,8 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
             num_grid_per_side=vc.pos_emb_height,
             merge_size=vc.merge_size,
             rope_dtype=self.visual.dtype,
+            win_chunks=_vis_win_chunks(blk_rows),
+            win_chunk=WIN_CHUNK,
         )
         flat = [b for blocks in block_map for b in blocks]
         write_ids = torch.tensor(flat + [cache.scratch_block_id] * (num_blocks - len(flat)), dtype=torch.int64)
@@ -1262,12 +1320,44 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         kw = packed.as_kwargs()
         kw["pixel_values"] = kw["pixel_values"].to(self.visual.dtype)
         kw = {k: v.to(device) for k, v in kw.items()}
-        self.visual(**kw, encoder_cache_buffer=cache.buffer, write_block_ids=write_ids.to(device))
+        write_dev = write_ids.to(device)
+        timing = _vis_timing()
+        sync = (lambda: torch.neuron.synchronize()) if device.type == "neuron" else (lambda: None)
+        if timing:  # Task 020: host / H2D / device split (synchronize so each part is real)
+            sync()
+            t_h2d = _time.perf_counter()
+        with self._scoped_encoder_args():
+            self.visual(**kw, encoder_cache_buffer=cache.buffer, write_block_ids=write_dev)
+        if timing:
+            sync()
+            t2 = _time.perf_counter()
+            rec = dict(pid=os.getpid(), items=len(grid_thw), video=int(is_video), patches=sum(tokens),
+                       bucket=_bucket, rows=blk_rows, blocks=num_blocks, cpu_ms=(t1 - t0) * 1e3,
+                       h2d_ms=(t_h2d - t1) * 1e3, device_ms=(t2 - t_h2d) * 1e3, t=_time.time())
+            logger.warning("VIS_TIMING %s", rec)
+            if _VIS_TIMING_FILE:
+                import json as _json
+
+                with open(_VIS_TIMING_FILE, "a") as fh:
+                    fh.write(_json.dumps(rec) + "\n")
         logger.debug(
             "[embed_multimodal] %d %s, %d patches, %d blocks: cpu=%.1fms device=%.1fms",
-            len(rows), "videos" if is_video else "images", sum(tokens), num_blocks,
+            len(grid_thw), "videos" if is_video else "images", sum(tokens), num_blocks,
             (t1 - t0) * 1e3, (_time.perf_counter() - t1) * 1e3,
         )
+
+    def _scoped_encoder_args(self):
+        """Task 020: scope the "encoder" per-graph compiler args (MUSE_GLIMMER_VIS_OPT) for the VE call."""
+        from contextlib import nullcontext
+
+        base = getattr(self, "_neuron_base_compiler_args", None)
+        policy = self.compiler_args_for
+        # Unset knob: no scope, exactly the pre-020 call (same graph hash as warmup).
+        if base is None or policy is None or vision_opt_level() is None:
+            return nullcontext()
+        from libtorch_neuronx_lite.compile.compiler_args import scoped_compiler_args
+
+        return scoped_compiler_args(policy("encoder", None, base))
 
     def get_encoder(self) -> torch.nn.Module | None:
         """The vision tower (None on a language-only pool)."""
@@ -1278,11 +1368,18 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
     ) -> dict[str, torch.Tensor]:
         """Shape-only inputs for ``self.visual`` warmup / tracing (per bucket)."""
         vc = self.config.vision_config
-        bs = encoder_neuron_config.encoder_attention_block_size
-        dp = encoder_neuron_config.dp_size
-        nb = math.ceil(math.ceil(bucket / bs) / dp) * dp
+        bs, nb = _graph_block_rows(bucket, encoder_neuron_config)
         mu = vc.merge_size**2
         z = lambda *shape, dtype: torch.zeros(*shape, dtype=dtype, device=device)  # noqa: E731
+        win = {}
+        K = _vis_win_chunks(bs)
+        if K:  # Task 020 window split: chunk gather/scatter + chunk-local bounds
+            win = {
+                "win_gather": z(nb, K * WIN_CHUNK, dtype=torch.int64),
+                "win_scatter": z(nb, bs, dtype=torch.int64),
+                "win_bound_min": z(nb * K, WIN_CHUNK, 1, dtype=torch.int32),
+                "win_bound_max": z(nb * K, WIN_CHUNK, 1, dtype=torch.int32),
+            }
         return {
             "pixel_values": z(nb, bs, vc.patch_dim, dtype=self.visual.dtype),
             "pos_emb_idx": z(4, nb, bs, dtype=torch.int32),
@@ -1297,7 +1394,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
             "merged_order": torch.arange(bs // mu, dtype=torch.int64).repeat(nb, 1).to(device)
             if device != torch.device("meta")
             else z(nb, bs // mu, dtype=torch.int64),
-        }
+        } | win  # same kwarg order as embed_multimodal (PackedVisionInputs field order)
 
     # ── construction ────────────────────────────────────────────────────
 
