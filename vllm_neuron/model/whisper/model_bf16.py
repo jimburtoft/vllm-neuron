@@ -730,6 +730,7 @@ class WhisperCrossKVEncoder(nn.Module):
             # The kernel pairs heads: an odd head count (TP4: 5) gets one zero head.
             n_ctx = CROSS_CTX
             self.xk_heads = xkernel_heads(n_heads_local)
+            self.decoder_xkernel_vb = xkernel_dma()[2]
             shape = (num_slots, self.xk_heads, n_ctx, head_dim)
         else:
             shape = (num_slots, n_heads_local, n_ctx, head_dim)
@@ -1618,7 +1619,9 @@ class WhisperDecoder(nn.Module):
 
             from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
-            group = xkernel_group(owner.xk_heads, rows, lnc=get_logical_nc_config())
+            # The one-column PV (VB=0) needs a multiple of 4 units per group.
+            umult = 4 if owner.decoder_xkernel_vb == 0 else 2
+            group = xkernel_group(owner.xk_heads, rows, lnc=get_logical_nc_config(), unit_mult=umult)
             qmask = xkernel_qmask(
                 owner.xk_heads, group, device=x.device, dtype=self.embed_tokens.weight.dtype
             )
