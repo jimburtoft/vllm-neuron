@@ -1331,9 +1331,17 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         if timing:
             sync()
             t2 = _time.perf_counter()
+            # synchronize() can return before the native-backend graph finishes (Task 020 pod 1:
+            # 3 ms for a 50-layer encode); a host read of the written cache row waits for it.
+            try:
+                cache.buffer[int(write_ids[0])][:1].cpu()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("VIS_TIMING readback failed: %r", e)
+            t3 = _time.perf_counter()
             rec = dict(pid=os.getpid(), items=len(grid_thw), video=int(is_video), patches=sum(tokens),
                        bucket=_bucket, rows=blk_rows, blocks=num_blocks, cpu_ms=(t1 - t0) * 1e3,
-                       h2d_ms=(t_h2d - t1) * 1e3, device_ms=(t2 - t_h2d) * 1e3, t=_time.time())
+                       h2d_ms=(t_h2d - t1) * 1e3, device_ms=(t2 - t_h2d) * 1e3,
+                       readback_ms=(t3 - t_h2d) * 1e3, t=_time.time())
             logger.warning("VIS_TIMING %s", rec)
             if _VIS_TIMING_FILE:
                 import json as _json
