@@ -15,7 +15,9 @@ Layouts (H = heads per rank, S = slots, C = 1536 positions, of which 1500 are va
   slots   [1, B] int32: the slot of each row.
   qmask   [128, NP*U] bf16 (NP = U/2): 1 at (k, p, 2p) for k < 64 and at
           (k, p, 2p+1) for k >= 64, else 0. Built one time by the caller.
-  out     [B/G, 4, G*H/4 * 64] bf16. The context of unit u = 4 f + q of group g
+  dmask   [U, VB*64] fp32 (PV=1): 1 at (u, 64 (u % VB) + c), else 0.
+  out     PV=1: [B*H, 64] bf16, row = row * H + head.
+          PV=0: [B/G, 4, G*H/4 * 64] bf16. The context of unit u = 4 f + q of group g
           (unit u = row-in-group * H + head) is out[g, q, 64 f : 64 f + 64].
 
 Math for each unit (row, head): s = q . K[:1500] (fp32), p = softmax(s) in fp32,
@@ -25,10 +27,17 @@ Parameters:
   G   rows per group (G * H units on the score partitions, <= 128).
   KP  head pairs per K DMA (divides H / 2).
   VH  heads per V DMA (divides H).
+  PV  1: blocked PV. Block b of VB units of one row: stationary = p^T with only the
+      columns of block b (the other columns stay zero), moving = the V of the VB heads
+      side by side (N = 64 VB). All blocks accumulate in one PSUM tile [U, 64 VB];
+      unit u keeps column block u % VB (dmask), which is exact (the other blocks
+      get p_u . V of a neighbour times 0). 0: one 1-column matmul per (unit, chunk).
+  VB  units per PV block (PV=1; divides H and VH; 64 VB <= 512).
 """
 import nki
 import nki.isa as nisa
 import nki.language as nl
+from nkilib.core.utils.kernel_assert import kernel_assert
 
 C = 1536
 VALID = 1500
@@ -37,7 +46,7 @@ QK_W = 512
 
 
 @nki.jit
-def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, G=4, KP=5, VH=10):
+def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, VH=10, PV=1, VB=5):
     """See the module docstring."""
     B = slots.shape[1]
     H = 2 * q_t.shape[1] // B
@@ -46,7 +55,24 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, G=4, KP=5, VH=10):
     NG = B // G
     HP = H // 2
     F4 = U // 4
-    out = nl.ndarray((NG, 4, F4 * 64), dtype=q_t.dtype, buffer=nl.shared_hbm)
+    NB = U // VB
+    kernel_assert(U <= 128 and U % 4 == 0, "whisper_xattn_decode: G * H must be a multiple of 4 up to 128")
+    kernel_assert(NG * G == B, "whisper_xattn_decode: G must divide the batch")
+    kernel_assert(HP % KP == 0 and H % VH == 0, "whisper_xattn_decode: KP must divide H / 2 and VH must divide H")
+    kernel_assert(PV == 0 or (VH % VB == 0 and VB * 64 <= 512), "whisper_xattn_decode: VB must divide VH, 64 VB <= 512")
+    if PV == 1:
+        out = nl.ndarray((B * H, 64), dtype=q_t.dtype, buffer=nl.shared_hbm)
+        dm_sb = nl.ndarray((U, VB * 64), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=dm_sb, src=dmask[0:U, 0:VB * 64])
+        # One zero-padded p^T per PV block. Only the VB columns of the block are
+        # written each group; the zeros stay.
+        ptz = []
+        for b in range(NB):
+            t = nl.ndarray((128, NCH, U), dtype=q_t.dtype, buffer=nl.sbuf)
+            nisa.memset(dst=t, value=0.0)
+            ptz.append(t)
+    else:
+        out = nl.ndarray((NG, 4, F4 * 64), dtype=q_t.dtype, buffer=nl.shared_hbm)
 
     slot_sb = nl.ndarray((1, B), dtype=nl.int32, buffer=nl.sbuf)
     nisa.dma_copy(dst=slot_sb, src=slots[0:1, 0:B])
@@ -114,6 +140,35 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, G=4, KP=5, VH=10):
         pt_ps = nl.ndarray((128, NCH, U), dtype=q_t.dtype, buffer=nl.psum)
         for j in range(NCH):
             nisa.nc_transpose(dst=pt_ps[0:128, j, 0:U], data=pb[0:U, 0:128, j])
+        if PV == 1:
+            for b in range(NB):
+                nisa.tensor_copy(dst=ptz[b][0:128, 0:NCH, b * VB:(b + 1) * VB],
+                                 src=pt_ps[0:128, 0:NCH, b * VB:(b + 1) * VB])
+            o_ps = nl.ndarray((U, VB * 64), dtype=nl.float32, buffer=nl.psum)
+            first = 1
+            for r in range(G):
+                for vc in range(H // VH):
+                    vb = nl.ndarray((128, VH, NCH * 64), dtype=v_cache.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(
+                        dst=vb,
+                        src=v_cache.ap(pattern=[[NCH * 64, 128], [C * 64, VH], [1, NCH * 64]],
+                                       offset=vc * VH * C * 64, scalar_offset=sl[r], indirect_dim=0),
+                    )
+                    for bb in range(VH // VB):
+                        b = (r * H + vc * VH) // VB + bb
+                        for j in range(NCH):
+                            nisa.nc_matmul(dst=o_ps, stationary=ptz[b][0:128, j, 0:U],
+                                           moving=vb[0:128, bb * VB:(bb + 1) * VB, 64 * j:64 * j + 64],
+                                           accumulate=(first == 0))
+                            first = 0
+            o_m = nl.ndarray((U, VB, 64), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=o_m.reshape((U, VB * 64)), data1=o_ps, data2=dm_sb, op=nl.multiply)
+            o_sb = nl.ndarray((U, 64), dtype=q_t.dtype, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=o_sb, op=nl.add,
+                               data=o_m.ap(pattern=[[VB * 64, U], [1, 64], [64, VB]]), axis=2)
+            nisa.dma_copy(dst=out[g * U:(g + 1) * U, 0:64], src=o_sb)
+            continue
+
         pt = nl.ndarray((128, NCH, U), dtype=q_t.dtype, buffer=nl.sbuf)
         nisa.tensor_copy(dst=pt, src=pt_ps)
 
@@ -172,6 +227,16 @@ def xkernel_qmask(heads: int, group: int, device=None, dtype=None):
     u = torch.arange(units, device=device).view(1, 1, units)
     m = u == 2 * p + (k >= 64).to(p.dtype)
     return m.to(dtype or torch.float32).reshape(128, pairs * units)
+
+
+def xkernel_dmask(heads: int, group: int, vb: int, device=None):
+    """Return the ``[U, 64 vb]`` fp32 column-block mask of the blocked PV (PV=1)."""
+    import torch
+
+    units = group * heads
+    col = torch.arange(64 * vb, device=device).view(1, -1) // 64
+    unit = torch.arange(units, device=device).view(-1, 1) % vb
+    return (col == unit).to(torch.float32)
 
 
 def whisper_xattn_decode_torch(q, k_cache, v_cache, slots):

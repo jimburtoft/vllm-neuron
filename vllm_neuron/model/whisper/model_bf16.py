@@ -285,10 +285,16 @@ def cross_kv_fused() -> bool:
     return os.environ.get("WHISPER_CROSS_KV_FUSED", "0") == "1"
 
 
-def xkernel_dma() -> tuple[int, int]:
-    """Return ``WHISPER_XKERNEL_DMA=KP,VH`` (default ``5,10``): head pairs per K DMA, heads per V DMA."""
-    kp, vh = os.environ.get("WHISPER_XKERNEL_DMA", "5,10").split(",")
-    return int(kp), int(vh)
+def xkernel_dma() -> tuple[int, int, int]:
+    """Return ``WHISPER_XKERNEL_DMA=KP,VH[,VB]`` (default ``5,10,5``).
+
+    KP head pairs per K DMA, VH heads per V DMA, VB units per blocked-PV matmul
+    (0: one-column PV).
+    """
+    parts = [int(x) for x in os.environ.get("WHISPER_XKERNEL_DMA", "5,10,5").split(",")]
+    if len(parts) == 2:
+        parts.append(5)
+    return parts[0], parts[1], parts[2]
 WHISPER_MEL_FRAMES = 3000
 
 
@@ -462,9 +468,9 @@ class EncoderSelfAttention(nn.Module):
         B = hc.shape[0]
         h, d = self.num_heads, self.head_dim
         q = (self.q_proj(hc) * self.scaling).view(B, h, d)
-        kp, vh = self.xkernel_dma
+        kp, vh, vb = self.xkernel_dma
         ctx = whisper_cross_attention_decode(
-            q, cross_k, cross_v, slots, qmask, group, k_pairs=kp, v_heads=vh
+            q, cross_k, cross_v, slots, qmask, group, k_pairs=kp, v_heads=vh, pv_block=vb
         )
         return self.out_proj(ctx.reshape(B, h * d))
 
