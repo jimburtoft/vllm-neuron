@@ -157,17 +157,21 @@ def xkernel_group(heads: int, rows: int) -> int:
     return g
 
 
-def xkernel_qmask(heads: int, group: int):
-    """Return the ``[128, NP * U]`` 0/1 head-pair mask of the kernel, as a torch tensor."""
+def xkernel_qmask(heads: int, group: int, device=None, dtype=None):
+    """Return the ``[128, NP * U]`` 0/1 head-pair mask of the kernel.
+
+    Entry ``(k, p, u)`` is 1 when ``u == 2 p + (k >= 64)``. It is built from
+    ``arange`` comparisons, so that it traces as device ops in a compiled graph.
+    """
     import torch
 
     units = group * heads
     pairs = units // 2
-    m = torch.zeros(128, pairs, units)
-    idx = torch.arange(pairs)
-    m[:64, idx, 2 * idx] = 1.0
-    m[64:, idx, 2 * idx + 1] = 1.0
-    return m.reshape(128, pairs * units)
+    k = torch.arange(128, device=device).view(128, 1, 1)
+    p = torch.arange(pairs, device=device).view(1, pairs, 1)
+    u = torch.arange(units, device=device).view(1, 1, units)
+    m = u == 2 * p + (k >= 64).to(p.dtype)
+    return m.to(dtype or torch.float32).reshape(128, pairs * units)
 
 
 def whisper_xattn_decode_torch(q, k_cache, v_cache, slots):

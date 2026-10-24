@@ -1523,8 +1523,8 @@ class WhisperDecoder(nn.Module):
             )
 
             group = xkernel_group(owner.n_heads_local, rows)
-            qmask = xkernel_qmask(owner.n_heads_local, group).to(
-                device=x.device, dtype=self.embed_tokens.weight.dtype
+            qmask = xkernel_qmask(
+                owner.n_heads_local, group, device=x.device, dtype=self.embed_tokens.weight.dtype
             )
             cross_meta = ("xkernel", xslots.to(torch.int32), qmask, group)
         if mode == "xgather":
