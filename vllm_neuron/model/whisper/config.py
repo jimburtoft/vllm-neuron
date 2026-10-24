@@ -116,6 +116,17 @@ class WhisperConfig:
         return cls(**filtered)
 
 
+def current_max_model_len() -> int | None:
+    """Return ``max_model_len`` of the current vLLM config, or None if no config is set."""
+    try:
+        from vllm.config import get_current_vllm_config
+
+        value = get_current_vllm_config().model_config.max_model_len
+    except (AssertionError, AttributeError, RuntimeError, ImportError):
+        return None
+    return int(value) if value else None
+
+
 def _current_max_num_seqs() -> int:
     """Return ``max_num_seqs`` of the current vLLM config, or 1 if no config is set."""
     try:

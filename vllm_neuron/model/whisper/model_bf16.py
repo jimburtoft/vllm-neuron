@@ -153,6 +153,33 @@ def self_kv_mode() -> str:
     return mode
 
 
+def slot_ctx(max_target_positions: int) -> int:
+    """Return ``WHISPER_SLOT_CTX``: the positions of each slot of the slot self-KV (default 448).
+
+    A shorter slot saves HBM (``2 x layers x heads x d x 2`` bytes per position and
+    slot), which leaves room for more slots. Every position that decode writes must
+    fit, so the server ``max_model_len`` must not be larger.
+
+    Raises:
+        ValueError: If the value is not a multiple of 128 up to ``max_target_positions``,
+            or if the vLLM ``max_model_len`` is larger.
+    """
+    from .config import current_max_model_len
+
+    ctx = int(os.environ.get("WHISPER_SLOT_CTX", str(max_target_positions)))
+    if ctx != max_target_positions and (ctx % 128 != 0 or ctx > max_target_positions):
+        raise ValueError(
+            f"WHISPER_SLOT_CTX={ctx}: use a multiple of 128 up to {max_target_positions}."
+        )
+    mml = current_max_model_len()
+    if mml is not None and mml > ctx:
+        raise ValueError(
+            f"WHISPER_SLOT_CTX={ctx} is below max_model_len={mml}: a decode position "
+            "would not fit in its slot. Set --max-model-len to at most WHISPER_SLOT_CTX."
+        )
+    return ctx
+
+
 def self_kv_write() -> str:
     """Return ``WHISPER_SELF_WRITE``: how slot mode writes the new K/V (``index`` or ``where``).
 
@@ -239,9 +266,29 @@ def cross_mode() -> str:
     * ``mqa``: the same kernel with one KV head: the heads of a slot are laid
       end to end (head-major, 1536 positions each), and a per-head mask keeps
       each q head on its own span. The kernel then runs B rows, not B * heads.
+    * ``xkernel``: the Whisper cross-attention decode kernel
+      (``vllm_neuron/_kernels/whisper``). Each slot keeps K^T ``[h, d, 1536]`` and
+      V ``[h, 1536, d]``; the kernel reads the K and V of each row in large DMAs
+      and runs the 1500-position softmax in fp32 (Task 034).
     * ``onehot`` / ``gather``: older modes, kept for comparison.
     """
     return os.environ.get("WHISPER_CROSS_MODE", "mask")
+
+
+def cross_kv_fused() -> bool:
+    """Return True when ``WHISPER_CROSS_KV_FUSED=1``: one GEMM projects the cross K|V of all layers.
+
+    The encoder graph then runs one ``[T, H] x [H, layers * 2 * H_local]`` matmul
+    instead of ``2 x layers`` matmuls of ``[H, H_local]`` (Task 033). The weights are
+    a concatenated copy, ``[H, layers * 2 * H_local]`` (about 210 MB at TP1).
+    """
+    return os.environ.get("WHISPER_CROSS_KV_FUSED", "0") == "1"
+
+
+def xkernel_dma() -> tuple[int, int]:
+    """Return ``WHISPER_XKERNEL_DMA=KP,VH`` (default ``5,10``): head pairs per K DMA, heads per V DMA."""
+    kp, vh = os.environ.get("WHISPER_XKERNEL_DMA", "5,10").split(",")
+    return int(kp), int(vh)
 WHISPER_MEL_FRAMES = 3000
 
 
@@ -396,6 +443,30 @@ class EncoderSelfAttention(nn.Module):
         for lin in (self.q_proj, self.k_proj, self.v_proj):
             to_in_out(lin)
         self.out_proj.set_in_out()
+
+    def attn_xkernel(self, hc, cross_k, cross_v, slots, qmask, group):
+        """Cross-attention of B decode rows with the Whisper cross-attention kernel.
+
+        Args:
+            hc: ``[B, H]`` after the LayerNorm.
+            cross_k: ``[S, h, d, 1536]`` K^T of all slots.
+            cross_v: ``[S, h, 1536, d]`` V of all slots.
+            slots: ``[B]`` int32, the slot of each row.
+            qmask: the kernel head-pair mask (see ``xkernel_qmask``).
+            group: rows per kernel group.
+        """
+        from vllm_neuron.functional.whisper_cross_attention import (
+            whisper_cross_attention_decode,
+        )
+
+        B = hc.shape[0]
+        h, d = self.num_heads, self.head_dim
+        q = (self.q_proj(hc) * self.scaling).view(B, h, d)
+        kp, vh = self.xkernel_dma
+        ctx = whisper_cross_attention_decode(
+            q, cross_k, cross_v, slots, qmask, group, k_pairs=kp, v_heads=vh
+        )
+        return self.out_proj(ctx.reshape(B, h * d))
 
     def _shape(self, x, seqlen, bsz):
         return x.view(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -579,7 +650,9 @@ class WhisperCrossKVEncoder(nn.Module):
         # [heads, CROSS_BLOCK, d], the same 4D layout as the paged self-KV.
         self.mqa = cross_mode() == "mqa"
         self.blocked = cross_mode() in ("kernel", "mqa")
-        self.kt = cross_k_transposed() and not self.blocked
+        # xkernel: K^T [slots, h, d, 1536] and V [slots, h, 1536, d], zero pad.
+        self.xkernel = cross_mode() == "xkernel"
+        self.kt = (cross_k_transposed() and not self.blocked) or self.xkernel
         self.n_heads_local = n_heads_local
         if self.mqa:
             # One KV head: each slot holds `groups` spans of g x 1536 positions,
@@ -591,6 +664,9 @@ class WhisperCrossKVEncoder(nn.Module):
             shape = (num_slots * self.mqa_groups * 128, 1, self.mqa_block, head_dim)
         elif self.blocked:
             shape = (num_slots * CROSS_BLOCKS_PER_SLOT, n_heads_local, CROSS_BLOCK, head_dim)
+        elif self.xkernel:
+            n_ctx = CROSS_CTX
+            shape = (num_slots, n_heads_local, n_ctx, head_dim)
         else:
             shape = (num_slots, n_heads_local, n_ctx, head_dim)
         k_shape = (num_slots, n_heads_local, head_dim, n_ctx) if self.kt else shape
@@ -599,6 +675,37 @@ class WhisperCrossKVEncoder(nn.Module):
                 self.register_buffer(
                     f"cross_{kind}_{i}", torch.zeros(shp, dtype=dtype), persistent=False
                 )
+        self.kv_fused = cross_kv_fused()
+        if self.kv_fused:
+            hidden = encoder.conv2.out_channels
+            local = n_heads_local * head_dim
+            self.register_buffer(
+                "kv_weight_fused", torch.zeros(hidden, n_layers * 2 * local, dtype=dtype),
+                persistent=False,
+            )
+            self.register_buffer(
+                "kv_bias_fused", torch.zeros(n_layers * 2 * local, dtype=dtype), persistent=False
+            )
+
+    @torch.no_grad()
+    def finalize_weights(self) -> None:
+        """Build the fused cross K|V weight (``WHISPER_CROSS_KV_FUSED=1``) from the loaded weights.
+
+        Columns ``[2 i L, (2 i + 1) L)`` are the k_proj of layer i and the next L
+        columns its v_proj (``L = H_local``). k_proj has no bias.
+        """
+        if not self.kv_fused:
+            return
+        local = self.n_heads_local * self.cross_attns[0].head_dim
+        for i, ca in enumerate(self.cross_attns):
+            for j, lin in enumerate((ca.k_proj, ca.v_proj)):
+                w = lin.weight if getattr(lin, "weight_layout", "out_in") == "in_out" else lin.weight.t()
+                cols = slice((2 * i + j) * local, (2 * i + j + 1) * local)
+                self.kv_weight_fused[:, cols].copy_(w)
+                if lin.bias is not None:
+                    self.kv_bias_fused[cols].copy_(lin.bias)
+                else:
+                    self.kv_bias_fused[cols].zero_()
 
     def forward(self, input_features, encoder_cache_buffer=None, write_block_ids=None):
         encoder_hidden = self.encoder(input_features)
@@ -612,8 +719,17 @@ class WhisperCrossKVEncoder(nn.Module):
             rows = (
                 slots.view(-1, 1) * nb + torch.arange(nb, device=slots.device, dtype=slots.dtype)
             ).view(-1)
+        if self.kv_fused:
+            n, t, _ = encoder_hidden.shape
+            hl, d = self.n_heads_local, self.cross_attns[0].head_dim
+            kv_all = torch.matmul(encoder_hidden, self.kv_weight_fused) + self.kv_bias_fused
+            # [n, t, layers, 2, h, d] -> [layers, 2, n, h, t, d]
+            kv_all = kv_all.view(n, t, self.n_layers, 2, hl, d).permute(2, 3, 0, 4, 1, 5)
         for i in range(self.n_layers):
-            k, v = self.cross_attns[i].project_kv(encoder_hidden)
+            if self.kv_fused:
+                k, v = kv_all[i, 0], kv_all[i, 1]
+            else:
+                k, v = self.cross_attns[i].project_kv(encoder_hidden)
             if self.mqa:
                 k, v = self._to_mqa_blocks(k), self._to_mqa_blocks(v)
                 getattr(self, f"cross_k_{i}").index_put_((rows,), k)
@@ -623,6 +739,9 @@ class WhisperCrossKVEncoder(nn.Module):
                 getattr(self, f"cross_k_{i}").index_put_((rows,), k)
                 getattr(self, f"cross_v_{i}").index_put_((rows,), v)
             else:
+                if self.xkernel:
+                    pad = CROSS_CTX - k.shape[2]
+                    k, v = F.pad(k, (0, 0, 0, pad)), F.pad(v, (0, 0, 0, pad))
                 if self.kt:
                     k = k.transpose(-1, -2).contiguous()
                 getattr(self, f"cross_k_{i}").index_put_((slots,), k)
@@ -669,7 +788,10 @@ class CrossAttention(nn.Module):
         self.out_proj = RowParallelLinearFP32Bias(embed_dim, embed_dim, dtype, tp_group)
         self.tp_group = tp_group
         self.tp = tp
-        self.kt = cross_k_transposed() and cross_mode() != "kernel"
+        self.xkernel = cross_mode() == "xkernel"
+        # xkernel keeps K^T, so its prefill (attn_cached) reads K^T too.
+        self.kt = (cross_k_transposed() and cross_mode() != "kernel") or self.xkernel
+        self.xkernel_dma = xkernel_dma() if self.xkernel else None
         # Kernel mode: the kernel projects Q, K and V of the decoder token. Only
         # Q is used, so the K and V columns are zero. The active key is masked.
         self.kernel = cross_mode() in ("kernel", "mqa")
@@ -917,7 +1039,7 @@ class DecoderSelfAttention(nn.Module):
         # (NCC_ILTO901, Task 024). The last slot is the scratch slot (pad rows and
         # pad tokens). Read the flags one time (see DecoderLayer.__init__).
         self.slot_kv = self_kv_mode() == "slot"
-        self.slot_ctx = cfg.max_target_positions
+        self.slot_ctx = slot_ctx(cfg.max_target_positions) if self.slot_kv else cfg.max_target_positions
         self.num_slots = cfg.max_num_seqs + 1
         self.slot_write_where = self.slot_kv and self_kv_write() == "where"
         if self.slot_kv:
@@ -1301,7 +1423,11 @@ class DecoderLayer(nn.Module):
             # Timing only: skip the cross-attention (the output is wrong).
             x = x + self.mlp(self.final_layer_norm(x))
             return x
-        if cross_meta is not None:
+        if cross_meta is not None and cross_meta[0] == "xkernel":
+            _, xslots, qmask, group = cross_meta
+            hc = self.encoder_attn_layer_norm(x)
+            ca = self.encoder_attn.attn_xkernel(hc, cross_k, cross_v, xslots, qmask, group)
+        elif cross_meta is not None:
             table, mask = cross_meta
             num_rows = table.shape[0]
             hc = self.encoder_attn_layer_norm(x).view(num_rows, tokens // num_rows, hidden)
@@ -1368,7 +1494,10 @@ class WhisperDecoder(nn.Module):
         # Prefill has one row, so it always uses the gather.
         mode = self.cross_mode
         blocked = owner.blocked
-        if owner.mqa:
+        if owner.xkernel:
+            # Prefill gathers the rows' slots and uses the plain attention, as "gather".
+            mode = "xgather" if is_prefill else "xkernel"
+        elif owner.mqa:
             mode = "mqagather" if is_prefill else "mqa"
         elif blocked:
             # Decode uses the kernel with a block table. Prefill has up to 128
@@ -1383,6 +1512,26 @@ class WhisperDecoder(nn.Module):
             cross_meta = self._cross_kernel_inputs(x, slots, meta, owner)
         elif mode == "mqa":
             cross_meta = self._cross_mqa_inputs(x, slots, meta, owner)
+        elif mode == "xkernel":
+            rows = meta["block_table_tensor"].shape[0]
+            xslots = (
+                torch.zeros(rows, dtype=torch.int32, device=x.device) if slots is None else slots
+            )
+            from vllm_neuron._kernels.whisper.cross_attention_decode import (
+                xkernel_group,
+                xkernel_qmask,
+            )
+
+            group = xkernel_group(owner.n_heads_local, rows)
+            qmask = xkernel_qmask(owner.n_heads_local, group).to(
+                device=x.device, dtype=self.embed_tokens.weight.dtype
+            )
+            cross_meta = ("xkernel", xslots.to(torch.int32), qmask, group)
+        if mode == "xgather":
+            rows = meta["block_table_tensor"].shape[0]
+            xslots = (
+                torch.zeros(rows, dtype=torch.int64, device=x.device) if slots is None else slots
+            ).to(torch.int64)
         if mode == "mqagather":
             rows = meta["block_table_tensor"].shape[0]
             row_slots = (
@@ -1417,8 +1566,12 @@ class WhisperDecoder(nn.Module):
         for i, layer in enumerate(self.layers):
             cross_k = getattr(owner, f"cross_k_{i}")
             cross_v = getattr(owner, f"cross_v_{i}")
-            if mode in ("kernel", "mqa"):
+            if mode in ("kernel", "mqa", "xkernel"):
                 pass
+            elif mode == "xgather":
+                # [rows, h, d, 1536] -> [rows, h, d, 1500]; the K^T layout (kt) of attn_cached.
+                cross_k = cross_k.index_select(0, xslots)[..., :WHISPER_ENCODER_TOKENS]
+                cross_v = cross_v.index_select(0, xslots)[:, :, :WHISPER_ENCODER_TOKENS]
             elif mode == "mqagather":
                 # The blocks of a slot are contiguous, so gather one slot per row
                 # instead of nbm blocks per row. A 512-block gather does not finish
@@ -1896,6 +2049,7 @@ class WhisperForConditionalGeneration(nn.Module):
             layer.self_attn.finalize_weights()
             layer.encoder_attn.finalize_weights()
             layer.mlp.finalize_weights()
+        self.audio_tower.finalize_weights()
 
         problems = enc_missing + enc_unexpected + dec_missing + dec_unexpected
         logger.info(

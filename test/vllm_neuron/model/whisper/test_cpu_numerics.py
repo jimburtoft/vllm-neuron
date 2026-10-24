@@ -367,7 +367,8 @@ def test_fused_decode_matches_torch_path(hf_checkpoint, monkeypatch):
 @pytest.mark.parametrize(
     "mode,fused,kt",
     [("kernel", "0", "0"), ("kernel", "1", "0"), ("perm", "1", "0"), ("perm", "1", "1"),
-     ("mask", "1", "1"), ("perm-active", "1", "1"), ("mqa", "0", "0"), ("mqa", "1", "0"), ("mqa2", "1", "0"), ("mqa4pad", "1", "0")],
+     ("mask", "1", "1"), ("perm-active", "1", "1"), ("mqa", "0", "0"), ("mqa", "1", "0"), ("mqa2", "1", "0"), ("mqa4pad", "1", "0"),
+     ("xkernel", "0", "0"), ("xkernel", "1", "0")],
 )
 def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
     """WHISPER_CROSS_MODE=kernel (blocked cross-KV, attention_decode) and perm give the HF tokens.
@@ -407,6 +408,10 @@ def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
     groups = getattr(model.audio_tower, "mqa_groups", 1)
     expect = {"kernel": 4 * CROSS_BLOCKS_PER_SLOT, "mqa": 4 * 128 * groups}.get(mode, 4)
     assert model.audio_tower.cross_k_0.shape[0] == expect
+    if mode == "xkernel":
+        # K^T [slots, h, d, 1536] and V [slots, h, 1536, d].
+        assert model.audio_tower.cross_k_0.shape[1:] == (HEADS, D_MODEL // HEADS, 1536)
+        assert model.audio_tower.cross_v_0.shape[1:] == (HEADS, 1536, D_MODEL // HEADS)
 
     torch.manual_seed(2)
     mels = [torch.randn(1, 128, 3000), torch.randn(1, 128, 3000)]
@@ -466,7 +471,8 @@ def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
 @pytest.mark.parametrize(
     "write,cross,in_out",
     [("index", "mask", "decoder,lm_head"), ("where", "mask", "decoder,lm_head"),
-     ("index", "mqa", "decoder,lm_head,encoder"), ("where", "mqa", "none")],
+     ("index", "mqa", "decoder,lm_head,encoder"), ("where", "mqa", "none"),
+     ("index", "xkernel", "decoder,lm_head")],
 )
 def test_slot_self_kv_batched(hf_checkpoint, monkeypatch, write, cross, in_out):
     """WHISPER_SELF_KV=slot (model-owned contiguous self-KV) gives the HF greedy tokens.
@@ -574,3 +580,28 @@ def test_encoder_nf_matches_plain(hf_checkpoint, monkeypatch):
         with torch.no_grad():
             outs.append(model.encoder(mel))
     torch.testing.assert_close(outs[0], outs[1], atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.parametrize("cross", ["mask", "mqa", "xkernel"])
+def test_cross_kv_fused_matches_per_layer(hf_checkpoint, monkeypatch, cross):
+    """WHISPER_CROSS_KV_FUSED=1 (one K|V GEMM for all layers) writes the same cross-KV."""
+    from vllm_neuron.functional.attention import attention_decode as _ad
+
+    if cross == "mqa" and not hasattr(_ad, "_fold_gqa_block_kv_mask"):
+        pytest.skip("The MQA cross mode needs the GQA decode-mask fold (#4817).")
+    path, _ = hf_checkpoint
+    monkeypatch.setenv("WHISPER_CROSS_MODE", cross)
+    torch.manual_seed(3)
+    mel = torch.randn(1, 128, 3000)
+    bufs = {}
+    for fused in ("0", "1"):
+        monkeypatch.setenv("WHISPER_CROSS_KV_FUSED", fused)
+        model = _build_native(path, max_num_seqs=3)
+        model.embed_multimodal(
+            input_features=mel, encoder_cache=_FakeEncoderCache(), mm_hashes=["c"],
+            request_slots=[1],
+        )
+        bufs[fused] = [getattr(model.audio_tower, f"cross_{k}_{i}").clone()
+                       for i in range(LAYERS) for k in ("k", "v")]
+    for a, b in zip(bufs["0"], bufs["1"]):
+        torch.testing.assert_close(a, b, atol=2e-2, rtol=2e-2)
