@@ -6,7 +6,8 @@ attends over the 1500 encoder positions of its own request slot. The cross-KV do
 not change during decode, so the kernel reads the K and V of each row one time, in
 large contiguous DMAs, with the slot offset from a runtime scalar.
 
-Layouts (H = heads per rank, S = slots, C = 1536 positions, of which 1500 are valid):
+Layouts (H = heads per rank, even; S = slots, C = 1536 positions, of which 1500 are valid).
+An odd head count (TP4: 5) is padded to the next even count by the caller (zero q, K, V).
   q_t     [128, B*H/2] bf16. Column c holds the q of heads (2c, 2c+1) of the
           flattened (row, head) list: the even head on partitions 0-63, the odd
           head on 64-127. The caller applies the softmax scale to q.
@@ -35,6 +36,9 @@ Parameters:
   VB  units per PV block (PV=1; divides H and VH; 64 VB <= 512).
   HW  1: the K and V loads use hardware DGE (descriptors from the Sync / Scalar
       sequencers). 0: the compiler picks (software DGE on GpSimd for a runtime offset).
+
+LNC: the launch grid is the LNC degree. With 2 programs, program i runs the groups
+g = i, i + 2, ... (each group is independent and writes its own output rows).
 """
 import nki
 import nki.isa as nisa
@@ -58,7 +62,8 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
     HP = H // 2
     F4 = U // 4
     NB = U // VB
-    kernel_assert(U <= 128 and U % 4 == 0, "whisper_xattn_decode: G * H must be a multiple of 4 up to 128")
+    kernel_assert(H % 2 == 0, "whisper_xattn_decode: H must be even (pad odd head counts)")
+    kernel_assert(U <= 128 and (PV == 1 or U % 4 == 0), "whisper_xattn_decode: G * H up to 128 (a multiple of 4 for PV=0)")
     kernel_assert(NG * G == B, "whisper_xattn_decode: G must divide the batch")
     kernel_assert(HP % KP == 0 and H % VH == 0, "whisper_xattn_decode: KP must divide H / 2 and VH must divide H")
     kernel_assert(PV == 0 or (VH % VB == 0 and VB * 64 <= 512), "whisper_xattn_decode: VB must divide VH, 64 VB <= 512")
@@ -85,7 +90,9 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
     mask_sb = nl.ndarray((128, NP, U), dtype=q_t.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=mask_sb.reshape((128, NP * U)), src=qmask[0:128, 0:NP * U])
 
-    for g in range(NG):
+    n_prg = nl.num_programs(axes=0) if nl.program_ndim() != 0 else 1
+    prg = nl.program_id(axis=0) if nl.program_ndim() != 0 else 0
+    for g in range(prg, NG, n_prg):
         qs = nl.ndarray((128, NP), dtype=q_t.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=qs, src=q_t[0:128, g * NP:(g + 1) * NP])
         qm = nl.ndarray((128, NP, U), dtype=q_t.dtype, buffer=nl.sbuf)
@@ -208,16 +215,46 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
     return out
 
 
-def xkernel_group(heads: int, rows: int) -> int:
+def xkernel_heads(heads: int) -> int:
+    """Return the head count the kernel runs: ``heads`` padded to an even count (TP4: 5 -> 6)."""
+    return heads + heads % 2
+
+
+def xkernel_group(heads: int, rows: int, lnc: int = 1, unit_mult: int = 2) -> int:
     """Return the rows of one kernel group: the most rows with ``rows * heads <= 128``.
 
-    The group must divide the batch and keep a multiple of 4 units. 20 heads give 4 rows
-    (80 units) for a batch that is a multiple of 4.
+    The group must divide the batch and keep a multiple of ``unit_mult`` units (2 for the
+    blocked PV, 4 for PV=0). 20 heads give 4 rows (80 units) for a batch that is a
+    multiple of 4. With ``lnc`` 2, a group size that gives an even group count is
+    preferred, so that both programs get the same work.
     """
-    g = max(1, 128 // heads)
-    while g > 1 and (rows % g != 0 or (g * heads) % 4 != 0):
-        g -= 1
-    return g
+    def ok(g):
+        return rows % g == 0 and (g * heads) % unit_mult == 0
+
+    top = max(1, 128 // heads)
+    cands = [g for g in range(top, 0, -1) if ok(g)] or [1]
+    if lnc > 1:
+        even = [g for g in cands if (rows // g) % lnc == 0]
+        if even and even[0] * 2 >= cands[0]:
+            return even[0]
+    return cands[0]
+
+
+def xkernel_fit_dma(heads: int, kp: int, vh: int, vb: int) -> tuple[int, int, int]:
+    """Fit the DMA chunking to ``heads`` (the defaults ``5,10,5`` are for 20 or 10 heads).
+
+    Each value becomes its largest divisor-compatible value not above the request:
+    KP divides ``heads / 2``, VB divides ``heads`` with ``64 VB <= 512``, VH is a multiple
+    of VB that divides ``heads``. ``vb == 0`` (one-column PV) is kept.
+    """
+    hp = heads // 2
+    kp = max(d for d in range(1, hp + 1) if hp % d == 0 and d <= max(kp, 1))
+    if vb > 0:
+        vb = max(d for d in range(1, 9) if heads % d == 0 and d <= vb)
+        vh = max(d for d in range(vb, heads + 1, vb) if heads % d == 0 and d <= max(vh, vb))
+    else:
+        vh = max(d for d in range(1, heads + 1) if heads % d == 0 and d <= max(vh, 1))
+    return kp, vh, vb
 
 
 def xkernel_qmask(heads: int, group: int, device=None, dtype=None):

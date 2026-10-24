@@ -5,10 +5,12 @@ import torch
 
 from vllm_neuron._kernels.whisper.cross_attention_decode import (
     whisper_xattn_decode,
+    xkernel_fit_dma,
     whisper_xattn_decode_torch,
     xkernel_dmask,
     xkernel_group,
 )
+from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 
@@ -53,6 +55,7 @@ def whisper_cross_attention_decode(
 
     B, H, D = q.shape
     S = k_cache.shape[0]
+    k_pairs, v_heads, pv_block = xkernel_fit_dma(H, k_pairs, v_heads, pv_block)
     units = group * H
     # Column c of q_t holds the units (2c, 2c + 1): the even unit on partitions 0-63.
     q_t = q.reshape(B * H // 2, 2 * D).t().contiguous()
@@ -60,7 +63,8 @@ def whisper_cross_attention_decode(
     vb = pv_block if pv_block > 0 else 5
     if dmask is None:
         dmask = xkernel_dmask(H, group, vb, device=q.device)
-    out = wrap_nki(whisper_xattn_decode)[1](
+    # The grid must match the compile LNC (the kernel splits its row groups over the programs).
+    out = wrap_nki(whisper_xattn_decode)[get_logical_nc_config()](
         q_t=q_t,
         k_cache=k_cache.reshape(S, -1),
         v_cache=v_cache.reshape(S, -1),

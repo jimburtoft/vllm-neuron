@@ -725,11 +725,15 @@ class WhisperCrossKVEncoder(nn.Module):
         elif self.blocked:
             shape = (num_slots * CROSS_BLOCKS_PER_SLOT, n_heads_local, CROSS_BLOCK, head_dim)
         elif self.xkernel:
+            from vllm_neuron._kernels.whisper.cross_attention_decode import xkernel_heads
+
+            # The kernel pairs heads: an odd head count (TP4: 5) gets one zero head.
             n_ctx = CROSS_CTX
-            shape = (num_slots, n_heads_local, n_ctx, head_dim)
+            self.xk_heads = xkernel_heads(n_heads_local)
+            shape = (num_slots, self.xk_heads, n_ctx, head_dim)
         else:
             shape = (num_slots, n_heads_local, n_ctx, head_dim)
-        k_shape = (num_slots, n_heads_local, head_dim, n_ctx) if self.kt else shape
+        k_shape = (num_slots, shape[1], head_dim, n_ctx) if self.kt else shape
         for i in range(n_layers):
             for kind, shp in (("k", k_shape), ("v", shape)):
                 self.register_buffer(
@@ -801,7 +805,8 @@ class WhisperCrossKVEncoder(nn.Module):
             else:
                 if self.xkernel:
                     pad = CROSS_CTX - k.shape[2]
-                    k, v = F.pad(k, (0, 0, 0, pad)), F.pad(v, (0, 0, 0, pad))
+                    hpad = self.xk_heads - k.shape[1]
+                    k, v = F.pad(k, (0, 0, 0, pad, 0, hpad)), F.pad(v, (0, 0, 0, pad, 0, hpad))
                 if self.kt:
                     k = k.transpose(-1, -2).contiguous()
                 getattr(self, f"cross_k_{i}").index_put_((slots,), k)
@@ -972,12 +977,16 @@ class CrossAttention(nn.Module):
         B = hc.shape[0]
         h, d = self.num_heads, self.head_dim
         q = (self.q_proj(hc) * self.scaling).view(B, h, d)
+        hk = cross_k.shape[1]
+        if hk != h:
+            # Odd heads per rank: the zero pad head of the buffers gets a zero q.
+            q = F.pad(q, (0, 0, 0, hk - h))
         kp, vh, vb, hw = self.xkernel_dma
         ctx = whisper_cross_attention_decode(
             q, cross_k, cross_v, slots, qmask, group, k_pairs=kp, v_heads=vh, pv_block=vb,
             hw_dge=hw,
         )
-        return self.out_proj(ctx.reshape(B, h * d))
+        return self.out_proj(ctx[:, :h].reshape(B, h * d))
 
     def _shape(self, x, seqlen, bsz):
         return x.view(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -1607,9 +1616,11 @@ class WhisperDecoder(nn.Module):
                 xkernel_qmask,
             )
 
-            group = xkernel_group(owner.n_heads_local, rows)
+            from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+            group = xkernel_group(owner.xk_heads, rows, lnc=get_logical_nc_config())
             qmask = xkernel_qmask(
-                owner.n_heads_local, group, device=x.device, dtype=self.embed_tokens.weight.dtype
+                owner.xk_heads, group, device=x.device, dtype=self.embed_tokens.weight.dtype
             )
             cross_meta = ("xkernel", xslots.to(torch.int32), qmask, group)
         if mode == "xgather":
@@ -1655,8 +1666,9 @@ class WhisperDecoder(nn.Module):
                 pass
             elif mode == "xgather":
                 # [rows, h, d, 1536] -> [rows, h, d, 1500]; the K^T layout (kt) of attn_cached.
-                cross_k = cross_k.index_select(0, xslots)[..., :WHISPER_ENCODER_TOKENS]
-                cross_v = cross_v.index_select(0, xslots)[:, :, :WHISPER_ENCODER_TOKENS]
+                hl = owner.n_heads_local
+                cross_k = cross_k.index_select(0, xslots)[:, :hl, :, :WHISPER_ENCODER_TOKENS]
+                cross_v = cross_v.index_select(0, xslots)[:, :hl, :WHISPER_ENCODER_TOKENS]
             elif mode == "mqagather":
                 # The blocks of a slot are contiguous, so gather one slot per row
                 # instead of nbm blocks per row. A 512-block gather does not finish
