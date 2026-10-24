@@ -30,7 +30,16 @@ from vllm_neuron.model.neuron_config import NeuronConfig, EncoderNeuronConfig
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.parallel.neuron_parallel_state import shard_select
+from vllm_neuron.functional.attention.attention_decode import (
+    _swizzle_packed_k,
+    _unswizzle_packed_k,
+    packed_fp8_viable_for_bucket,
+)
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+from vllm_neuron.utils.dtype_utils import (
+    FP8_CLAMP_MAX,
+    validate_fp8_segmented_supported,
+)
 from vllm_neuron.utils.weight_loader import (
     fused_qkv_weight_loader,
     set_weight_loader,
@@ -51,6 +60,78 @@ logger = logging.getLogger(__name__)
 # and its head under `thinker.lm_head.*`
 HF_TEXT_PREFIX = "thinker.model"
 HF_LM_HEAD_KEY = "thinker.lm_head.weight"
+
+
+_FP8_KV_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _write_packed_k_pairs(
+    k_cache: torch.Tensor,
+    k_new: torch.Tensor,
+    block_indices: torch.Tensor,
+    position_indices: torch.Tensor,
+) -> None:
+    """Write new K rows into the packed FP8 K cache, one token pair per row.
+
+    The packed K cache is ``[num_blocks, kv_heads, block_size // 2, d, 2]``.
+    Lane ``p % 2`` of packed row ``p // 2`` holds the token at in-block
+    position ``p``. A per-token scatter into one lane does not lower on Neuron,
+    so each new token writes its whole ``[d, 2]`` pair instead:
+
+    * its own lane holds the new token;
+    * the other lane holds the partner token (position ``p ^ 1``) when that
+      token is written in the same call, else the stored value.
+
+    Both tokens of a pair then write identical bytes, so the duplicate indices
+    in the ``index_put_`` are harmless. vLLM gives the tokens of one sequence
+    consecutive rows and consecutive slots, so the partner of a row, if
+    present, is the row just before or after it. This needs no pair-aligned
+    row count, unlike ``scatter_packed_k``, and touches only the new tokens'
+    pairs, unlike the whole-cache un-swizzle/re-swizzle round trip.
+
+    Args:
+        k_cache: packed K cache, fp8 ``[nb, nkh, block_size // 2, d, 2]``.
+        k_new: new K ``[nkh, T, d]`` in the compute dtype, already rounded
+            to the cache dtype (quantized, then cast back).
+        block_indices: ``[T]`` block of each token (null block for padding).
+        position_indices: ``[T]`` in-block position of each token.
+    """
+    nkh, T, d = k_new.shape
+    slots = block_indices * (2 * k_cache.shape[2]) + position_indices
+    lane = position_indices % 2  # [T]
+
+    # Partner of row t: row t+1 when t is lane 0 and slot+1 follows, row t-1
+    # when t is lane 1 and slot-1 precedes. The shifted copies repeat the edge
+    # row, which never matches slot +/- 1. Pad rows all map to the same null
+    # slot, so they never pair either.
+    nxt = torch.cat([slots[1:], slots[-1:]])
+    prv = torch.cat([slots[:1], slots[:-1]])
+    has_next = (lane == 0) & (nxt == slots + 1)
+    has_prev = (lane == 1) & (prv == slots - 1)
+
+    k_next = torch.cat([k_new[:, 1:], k_new[:, -1:]], dim=1)
+    k_prev = torch.cat([k_new[:, :1], k_new[:, :-1]], dim=1)
+
+    head_idx = torch.arange(nkh, dtype=torch.long, device=slots.device)
+    head_idx = head_idx.repeat_interleave(T)
+    blk = block_indices.repeat(nkh)
+    outer = (position_indices // 2).repeat(nkh)
+    index = (blk, head_idx, outer)
+
+    # Only the gather and the scatter touch fp8 (the scatter_packed_k pattern).
+    # The merge runs in the compute dtype; fp8 -> bf16 -> fp8 is exact.
+    stored = k_cache[index].to(k_new.dtype).view(nkh, T, d, 2)  # [nkh, T, d, 2]
+    lane_b = lane.view(1, T, 1)
+    stored_other = torch.where(lane_b == 0, stored[..., 1], stored[..., 0])
+    other = torch.where(
+        has_next.view(1, T, 1),
+        k_next,
+        torch.where(has_prev.view(1, T, 1), k_prev, stored_other),
+    )
+    lane0 = torch.where(lane_b == 0, k_new, other)
+    lane1 = torch.where(lane_b == 0, other, k_new)
+    pairs = torch.stack([lane0, lane1], dim=-1).reshape(nkh * T, d, 2)
+    k_cache.index_put_(index, pairs.to(k_cache.dtype).contiguous())
 
 
 # =============================================================================
@@ -189,7 +270,52 @@ class Qwen3ASRTextAttention(nn.Module):
         self.k_cache_3d = None
         self.v_cache_3d = None
 
+        # Packed FP8 K cache layout. bind_kv_cache sets it from the cache rank
+        # (packed K is one dim larger than V). Off for a bf16 cache.
+        self.fp8_packed = False
+
+        # FP8 KV quantization scales (quantize as tensor * scale). The
+        # checkpoint has none, so they stay 1.0: bf16 -> fp8 directly, clamped
+        # to +/-FP8_CLAMP_MAX. The tensors are created in bind_kv_cache, on the
+        # cache device, only for an FP8 cache. The floats fold the dequant into
+        # the softmax scale and W_out at trace time.
+        self.register_buffer("k_scale", None, persistent=False)
+        self.register_buffer("v_scale", None, persistent=False)
+        self.k_scale_float = 1.0
+        self.v_scale_float = 1.0
+
         self._setup_weight_loaders()
+
+    @property
+    def kv_is_fp8(self) -> bool:
+        return self.k_cache is not None and self.k_cache.dtype in _FP8_KV_DTYPES
+
+    def _quantize_kv(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """bf16 -> fp8 cache dtype: (x * scale), clamped to the fp8 range."""
+        return (x * scale).clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX).to(self.k_cache.dtype)
+
+    def _packed_viable(self, B: int, S_decode: int, S_ctx: int) -> bool:
+        """Whether the packed FP8 decode kernel can run at this bucket.
+
+        The kernel folds the KV heads into the batch, so check the resize at
+        both the folded and the unfolded batch: the mask helper sees the
+        unfolded one. Both must keep block_len >= 2.
+        """
+        nkh = self.num_key_value_heads_per_rank
+        block_len = self.v_cache.shape[-2] if self.v_cache is not None else 0
+        return packed_fp8_viable_for_bucket(
+            block_len=block_len,
+            bs=B,
+            q_head=self.num_attention_heads_per_rank,
+            s_active=S_decode,
+            s_prior=S_ctx,
+        ) and packed_fp8_viable_for_bucket(
+            block_len=block_len,
+            bs=B * nkh,
+            q_head=self.num_key_value_groups,
+            s_active=S_decode,
+            s_prior=S_ctx,
+        )
 
     def _setup_weight_loaders(self):
         """>>> PARALLELISM: TP sharding of QKV and O-proj weights. <<<
@@ -314,8 +440,18 @@ class Qwen3ASRTextAttention(nn.Module):
             slot_mapping, block_size, self.k_cache.shape[0]
         )
 
-        k_flat = k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
-        v_flat = v.reshape(-1, self.head_dim).to(self.v_cache.dtype)
+        kv_is_fp8 = self.kv_is_fp8
+        if kv_segment_size:
+            # attention_segmented_cte reads an FP8 K cache only in the packed
+            # layout; fail fast on a standard-layout FP8 cache.
+            validate_fp8_segmented_supported(kv_is_fp8, self.fp8_packed)
+
+        if kv_is_fp8:
+            k_flat = self._quantize_kv(k.reshape(-1, self.head_dim), self.k_scale)
+            v_flat = self._quantize_kv(v.reshape(-1, self.head_dim), self.v_scale)
+        else:
+            k_flat = k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
+            v_flat = v.reshape(-1, self.head_dim).to(self.v_cache.dtype)
 
         head_indices_for_put = torch.arange(
             self.num_key_value_heads_per_rank,
@@ -327,10 +463,23 @@ class Qwen3ASRTextAttention(nn.Module):
             self.num_key_value_heads_per_rank
         )
 
-        self.k_cache.index_put_(
-            (block_indices_for_put, head_indices_for_put, position_indices_for_put),
-            k_flat,
-        )
+        if self.fp8_packed:
+            # Packed K [nb, nkh, block_size // 2, Dh, 2]: write whole token pairs.
+            # The helper merges in the compute dtype; k_flat is already
+            # fp8-rounded, so the round trip through bf16 is exact.
+            _write_packed_k_pairs(
+                self.k_cache,
+                k_flat.to(self.dtype).view(
+                    self.num_key_value_heads_per_rank, -1, self.head_dim
+                ),
+                block_indices,
+                position_indices,
+            )
+        else:
+            self.k_cache.index_put_(
+                (block_indices_for_put, head_indices_for_put, position_indices_for_put),
+                k_flat,
+            )
         self.v_cache.index_put_(
             (block_indices_for_put, head_indices_for_put, position_indices_for_put),
             v_flat,
@@ -338,6 +487,8 @@ class Qwen3ASRTextAttention(nn.Module):
 
         # Step 4: Attention — no sinks, no sliding window
         if kv_segment_size:
+            # Reads the FP8 cache; the K dequant folds into the softmax scale and
+            # the V dequant is undone after attention (no-ops at scale 1.0).
             attn_output = NF.segmented_attention(
                 q,
                 k_cache=self.k_cache,
@@ -346,11 +497,15 @@ class Qwen3ASRTextAttention(nn.Module):
                 prior_tokens=cached_seq_len,
                 block_size=block_size,
                 kv_segment_size=kv_segment_size,
-                scale=self.scaling,
+                scale=self.scaling / self.k_scale_float,
                 tp_q=True,
                 tp_out=True,
+                fp8_packed=self.fp8_packed,
             )
+            if self.v_scale_float != 1.0:
+                attn_output = attn_output / self.v_scale_float
         else:
+            # Full prefill attends the local bf16 K/V, not the cache.
             k = k.repeat_interleave(self.num_key_value_groups, dim=0)
             v = v.repeat_interleave(self.num_key_value_groups, dim=0)
 
@@ -463,6 +618,28 @@ class Qwen3ASRTextAttention(nn.Module):
             slot_mapping, block_size, nkh, B
         ).to(torch.uint32)
 
+        # FP8 KV: the kernel quantizes the new K/V (x * scale, clamped) when it
+        # gets both scales, and writes K in the packed layout when fp8_packed.
+        # The dequant folds into the softmax scale (K) and W_out (V); at the
+        # unit scales both stay the bf16 graph's values. All Python-level, so
+        # a bf16 cache traces the same graph as before.
+        kv_is_fp8 = self.kv_is_fp8
+        k_scale = self.k_scale if kv_is_fp8 else None
+        v_scale = self.v_scale if kv_is_fp8 else None
+        softmax_scale = self.scaling
+        W_out = self.o_proj_weight
+        if kv_is_fp8 and self.k_scale_float != 1.0:
+            softmax_scale = self.scaling / self.k_scale_float
+        if kv_is_fp8 and self.v_scale_float != 1.0:
+            W_out = self.o_proj_weight / self.v_scale_float
+
+        # Packed K needs the kernel's resized block_len >= 2. Every bucket of
+        # the shipped configs passes (block 32, decode context >= 256). A
+        # bucket that fails un-swizzles the cache for the unpacked kernel and
+        # re-swizzles its returned K, as gpt_oss does. Static per decode NEFF.
+        use_packed_kernel = self.fp8_packed and self._packed_viable(B, S_decode, S_ctx)
+        needs_k_back = self.fp8_packed and not use_packed_kernel
+
         if nkh > 1:
             active_blocks_table = build_per_head_block_table(block_table, nkh).to(
                 torch.int32
@@ -486,14 +663,19 @@ class Qwen3ASRTextAttention(nn.Module):
                 rope_contiguous_layout=True,
                 K_cache_transposed=False,
                 active_blocks_table=active_blocks_table,
-                K_cache=self.k_cache,
+                K_cache=self.k_cache
+                if not needs_k_back
+                else _unswizzle_packed_k(self.k_cache),
                 V_cache=self.v_cache,
                 attention_mask=attention_mask,
-                softmax_scale=self.scaling,
+                softmax_scale=softmax_scale,
                 sink=None,
                 update_cache=True,
                 kv_cache_update_idx=kv_cache_update_idx,
-                W_out=self.o_proj_weight,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                fp8_packed=use_packed_kernel,
+                W_out=W_out,
                 bias_out=None,
                 transposed_out=False,
                 out_in_sb=False,
@@ -501,7 +683,11 @@ class Qwen3ASRTextAttention(nn.Module):
                 attention_dp_group=None,
                 attention_dp_rank=0,
                 kv_needs_a2a=False,
+                return_updated_kv=needs_k_back,
             )
+            if needs_k_back:
+                output, k_updated, _ = output
+                self.k_cache.copy_(_swizzle_packed_k(k_updated))
 
             if self.world_size > 1:
                 self.tp_group.all_reduce(output)
@@ -510,8 +696,10 @@ class Qwen3ASRTextAttention(nn.Module):
 
         # nkh == 1 (TP >= num_kv_heads): the kernel takes a 3D
         # [num_blocks, block_len, d_head] cache + a 2D [B, num_blocks] table.
+        # A packed K view is [num_blocks, block_len // 2, d_head, 2].
         k_cache = self.k_cache_3d if self.k_cache_3d is not None else self.k_cache
         v_cache = self.v_cache_3d if self.v_cache_3d is not None else self.v_cache
+        k_cache_arg = k_cache if not needs_k_back else _unswizzle_packed_k(k_cache)
 
         active_blocks_table = block_table.to(torch.int32)
 
@@ -535,14 +723,17 @@ class Qwen3ASRTextAttention(nn.Module):
             rope_contiguous_layout=True,
             K_cache_transposed=False,
             active_blocks_table=active_blocks_table,
-            K_cache=k_cache,
+            K_cache=k_cache_arg,
             V_cache=v_cache,
             attention_mask=attention_mask,
-            softmax_scale=self.scaling,
+            softmax_scale=softmax_scale,
             sink=None,
             update_cache=True,
             kv_cache_update_idx=kv_cache_update_idx,
-            W_out=self.o_proj_weight,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            fp8_packed=use_packed_kernel,
+            W_out=W_out,
             bias_out=None,
             transposed_out=False,
             out_in_sb=False,
@@ -550,7 +741,11 @@ class Qwen3ASRTextAttention(nn.Module):
             attention_dp_group=None,
             attention_dp_rank=0,
             kv_needs_a2a=False,
+            return_updated_kv=needs_k_back,
         )
+        if needs_k_back:
+            output, k_updated, _ = output
+            k_cache.copy_(_swizzle_packed_k(k_updated))
 
         # >>> PARALLELISM: TP all-reduce <<<
         if self.world_size > 1:
@@ -1162,15 +1357,37 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 )
             k_cache = kv_caches[layer_name][0]
             v_cache = kv_caches[layer_name][1]
-            layer.self_attn.k_cache = k_cache
-            layer.self_attn.v_cache = v_cache
+            attn = layer.self_attn
+            attn.k_cache = k_cache
+            attn.v_cache = v_cache
+            # Packed FP8 K (neuron_config.fp8_packed_kv + --kv-cache-dtype
+            # fp8_e4m3) is [nb, nkh, block // 2, d, 2], one dim above V.
+            attn.fp8_packed = k_cache.dim() == v_cache.dim() + 1
+            if attn.fp8_packed and k_cache.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    f"{layer_name}: packed K cache must be float8_e4m3fn, "
+                    f"got {k_cache.dtype}"
+                )
+            if attn.kv_is_fp8:
+                # Unit scales: the checkpoint has no KV scales.
+                attn.k_scale = torch.ones(1, 1, dtype=attn.dtype, device=k_cache.device)
+                attn.v_scale = torch.ones(1, 1, dtype=attn.dtype, device=k_cache.device)
+                attn.k_scale_float = 1.0
+                attn.v_scale_float = 1.0
+            else:
+                attn.k_scale = None
+                attn.v_scale = None
             # Prefill keeps the 4D cache, because its index_put_ gives a head
             # index. Decode at nkh == 1 needs a 3D cache. Make that view here,
             # one time, so the decode graph gets a plain input and the in-place
-            # cache update needs no copy of the pool.
-            if k_cache.dim() == 4 and k_cache.shape[1] == 1:
-                layer.self_attn.k_cache_3d = k_cache.squeeze(1)
-                layer.self_attn.v_cache_3d = v_cache.squeeze(1)
+            # cache update needs no copy of the pool. A packed K squeezes to the
+            # kernel's 4D packed base [nb, block // 2, d, 2].
+            if v_cache.dim() == 4 and v_cache.shape[1] == 1:
+                attn.k_cache_3d = k_cache.squeeze(1)
+                attn.v_cache_3d = v_cache.squeeze(1)
+            else:
+                attn.k_cache_3d = None
+                attn.v_cache_3d = None
 
     # ------------------------------------------------------------------
     # Weight loading
