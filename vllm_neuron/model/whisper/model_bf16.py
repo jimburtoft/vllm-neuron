@@ -285,16 +285,15 @@ def cross_kv_fused() -> bool:
     return os.environ.get("WHISPER_CROSS_KV_FUSED", "0") == "1"
 
 
-def xkernel_dma() -> tuple[int, int, int]:
-    """Return ``WHISPER_XKERNEL_DMA=KP,VH[,VB]`` (default ``5,10,5``).
+def xkernel_dma() -> tuple[int, int, int, int]:
+    """Return ``WHISPER_XKERNEL_DMA=KP,VH[,VB[,HW]]`` (default ``5,10,5,0``).
 
     KP head pairs per K DMA, VH heads per V DMA, VB units per blocked-PV matmul
-    (0: one-column PV).
+    (0: one-column PV), HW 1 for hardware DGE on the K and V loads.
     """
-    parts = [int(x) for x in os.environ.get("WHISPER_XKERNEL_DMA", "5,10,5").split(",")]
-    if len(parts) == 2:
-        parts.append(5)
-    return parts[0], parts[1], parts[2]
+    parts = [int(x) for x in os.environ.get("WHISPER_XKERNEL_DMA", "5,10,5,0").split(",")]
+    parts += [5, 0][len(parts) - 2:] if len(parts) < 4 else []
+    return parts[0], parts[1], parts[2], parts[3]
 WHISPER_MEL_FRAMES = 3000
 
 
@@ -973,9 +972,10 @@ class CrossAttention(nn.Module):
         B = hc.shape[0]
         h, d = self.num_heads, self.head_dim
         q = (self.q_proj(hc) * self.scaling).view(B, h, d)
-        kp, vh, vb = self.xkernel_dma
+        kp, vh, vb, hw = self.xkernel_dma
         ctx = whisper_cross_attention_decode(
-            q, cross_k, cross_v, slots, qmask, group, k_pairs=kp, v_heads=vh, pv_block=vb
+            q, cross_k, cross_v, slots, qmask, group, k_pairs=kp, v_heads=vh, pv_block=vb,
+            hw_dge=hw,
         )
         return self.out_proj(ctx.reshape(B, h * d))
 

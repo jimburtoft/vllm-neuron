@@ -23,6 +23,7 @@ def whisper_cross_attention_decode(
     v_heads: int = 10,
     pv_block: int = 5,
     dmask: torch.Tensor | None = None,
+    hw_dge: int = 0,
 ) -> torch.Tensor:
     """Return the cross-attention context of B decode rows, ``[B, H, 64]``.
 
@@ -41,6 +42,7 @@ def whisper_cross_attention_decode(
         pv_block: units per blocked-PV matmul (divides ``v_heads``); 0 selects the
             one-column PV.
         dmask: the ``xkernel_dmask(H, group, pv_block)`` tensor on the device.
+        hw_dge: 1 loads K and V with hardware DGE.
 
     Example:
         >>> # ctx = whisper_cross_attention_decode(q, k, v, slots, qmask, 4)
@@ -70,6 +72,7 @@ def whisper_cross_attention_decode(
         VH=v_heads,
         PV=pv,
         VB=vb,
+        HW=hw_dge,
     )
     if isinstance(out, (tuple, list)):
         out = out[0]

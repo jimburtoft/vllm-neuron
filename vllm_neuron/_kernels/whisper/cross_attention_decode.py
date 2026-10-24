@@ -33,6 +33,8 @@ Parameters:
       unit u keeps column block u % VB (dmask), which is exact (the other blocks
       get p_u . V of a neighbour times 0). 0: one 1-column matmul per (unit, chunk).
   VB  units per PV block (PV=1; divides H and VH; 64 VB <= 512).
+  HW  1: the K and V loads use hardware DGE (descriptors from the Sync / Scalar
+      sequencers). 0: the compiler picks (software DGE on GpSimd for a runtime offset).
 """
 import nki
 import nki.isa as nisa
@@ -46,7 +48,7 @@ QK_W = 512
 
 
 @nki.jit
-def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, VH=10, PV=1, VB=5):
+def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, VH=10, PV=1, VB=5, HW=0):
     """See the module docstring."""
     B = slots.shape[1]
     H = 2 * q_t.shape[1] // B
@@ -105,6 +107,7 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
                     dst=kb,
                     src=k_cache.ap(pattern=[[C, 128], [128 * C, KP], [1, C]],
                                    offset=kc * KP * 128 * C, scalar_offset=sl[r], indirect_dim=0),
+                    dge_mode=nisa.dge_mode.hwdge if HW == 1 else nisa.dge_mode.unknown,
                 )
                 for pk in range(KP):
                     p = r * HP + kc * KP + pk
@@ -137,13 +140,18 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
         nisa.tensor_scalar(dst=pbf[0:U, 0:VALID], data=e[0:U, 0:VALID], op0=nl.multiply, operand0=rs)
 
         # p^T: position 12 k + j goes to partition k of chunk j, the layout of a V DMA row.
-        pt_ps = nl.ndarray((128, NCH, U), dtype=q_t.dtype, buffer=nl.psum)
+        # One PSUM tile per chunk: 12 x U bf16 does not fit one 2 KiB PSUM bank for U > 85.
+        pt = nl.ndarray((128, NCH, U), dtype=q_t.dtype, buffer=nl.sbuf)
         for j in range(NCH):
-            nisa.nc_transpose(dst=pt_ps[0:128, j, 0:U], data=pb[0:U, 0:128, j])
+            pt_ps = nl.ndarray((128, U), dtype=q_t.dtype, buffer=nl.psum)
+            nisa.nc_transpose(dst=pt_ps, data=pb[0:U, 0:128, j])
+            if PV == 1:
+                for b in range(NB):
+                    nisa.tensor_copy(dst=ptz[b][0:128, j, b * VB:(b + 1) * VB],
+                                     src=pt_ps[0:128, b * VB:(b + 1) * VB])
+            else:
+                nisa.tensor_copy(dst=pt[0:128, j, 0:U], src=pt_ps)
         if PV == 1:
-            for b in range(NB):
-                nisa.tensor_copy(dst=ptz[b][0:128, 0:NCH, b * VB:(b + 1) * VB],
-                                 src=pt_ps[0:128, 0:NCH, b * VB:(b + 1) * VB])
             o_ps = nl.ndarray((U, VB * 64), dtype=nl.float32, buffer=nl.psum)
             first = 1
             for r in range(G):
@@ -153,6 +161,7 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
                         dst=vb,
                         src=v_cache.ap(pattern=[[NCH * 64, 128], [C * 64, VH], [1, NCH * 64]],
                                        offset=vc * VH * C * 64, scalar_offset=sl[r], indirect_dim=0),
+                    dge_mode=nisa.dge_mode.hwdge if HW == 1 else nisa.dge_mode.unknown,
                     )
                     for bb in range(VH // VB):
                         b = (r * H + vc * VH) // VB + bb
@@ -169,8 +178,6 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
             nisa.dma_copy(dst=out[g * U:(g + 1) * U, 0:64], src=o_sb)
             continue
 
-        pt = nl.ndarray((128, NCH, U), dtype=q_t.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=pt, src=pt_ps)
 
         # PV: unit u = 4 f + qd accumulates on PSUM partition 32 qd, columns 64 f to
         # 64 f + 64. Column tiling runs the 4 partitions of one f at the same time.
@@ -182,6 +189,7 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
                     dst=vb,
                     src=v_cache.ap(pattern=[[NCH * 64, 128], [C * 64, VH], [1, NCH * 64]],
                                    offset=vc * VH * C * 64, scalar_offset=sl[r], indirect_dim=0),
+                    dge_mode=nisa.dge_mode.hwdge if HW == 1 else nisa.dge_mode.unknown,
                 )
                 for vk in range(VH):
                     u = r * H + vc * VH + vk
