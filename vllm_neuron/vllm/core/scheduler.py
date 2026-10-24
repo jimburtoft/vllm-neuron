@@ -154,6 +154,28 @@ class NeuronScheduler(Scheduler):
         self.max_model_len = vllm_config.model_config.max_model_len
         self.model_name = vllm_config.model_config.model
 
+        # VLLM_NEURON_SWA_RING: replace each plain SlidingWindowManager with the
+        # ring manager before the first request. It keeps the first
+        # cdiv(window, block) + 1 blocks of a request and frees none of them
+        # before the request ends (remove_skipped_blocks becomes a no-op), so
+        # neither vLLM nor the early-free hook frees a ring block.
+        self._swa_ring = False
+        if envs.VLLM_NEURON_SWA_RING:
+            from vllm_neuron.vllm.core import swa_ring
+
+            if getattr(vllm_config.cache_config, "enable_prefix_caching", False):
+                raise ValueError(
+                    "VLLM_NEURON_SWA_RING=1 does not support prefix caching. "
+                    "Start with --no-enable-prefix-caching."
+                )
+            n_ring = swa_ring.install_ring_managers(self.kv_cache_manager)
+            self._swa_ring = n_ring > 0
+            logger.info(
+                "SWA ring enabled on %d sliding-window KV groups: each request holds "
+                "a fixed ring per group; out-of-window blocks are not freed early.",
+                n_ring,
+            )
+
         self._instrument_encoder_cache_manager()
         self._cap_encoder_budget_to_bucket(vllm_config)
         self._align_token_budget_to_kv_blocks(kv_cache_config)
@@ -794,6 +816,11 @@ class NeuronScheduler(Scheduler):
             # Exact types only: subclasses (R-SWA, sink, chunked-local, ...) free
             # blocks differently, so they fall back to the worst-case cap.
             if type(spec) in (SlidingWindowSpec, SlidingWindowMLASpec):
+                ring_hold = 0
+                if self._swa_ring and type(spec) is SlidingWindowSpec:
+                    from vllm_neuron.vllm.core import swa_ring
+
+                    ring_hold = swa_ring.hold_blocks(spec.sliding_window, spec.block_size)
                 groups.append(
                     kv_admission.GroupDesc(
                         kind="swa",
@@ -801,6 +828,7 @@ class NeuronScheduler(Scheduler):
                         upstream_blocks=upstream,
                         sliding_window=spec.sliding_window,
                         extra_retained_tokens=spec.extra_retained_tokens,
+                        ring_blocks=ring_hold,
                     )
                 )
             elif type(spec) in (FullAttentionSpec, MLAAttentionSpec):

@@ -54,6 +54,9 @@ if TYPE_CHECKING:
     # a request's prefill output is processed, then charge it only its decode-phase
     # peak. Off by default; ignored unless VLLM_NEURON_SWA_REAL_ADMISSION=1.
     VLLM_NEURON_SWA_EARLY_FREE: bool = False
+    # Keep each sliding-window KV group in a fixed per-request ring of
+    # cdiv(window, block) blocks (vllm_neuron/vllm/core/swa_ring.py). Off by default.
+    VLLM_NEURON_SWA_RING: bool = False
     VLLM_NEURON_WORKER_TERMINATION_TIMEOUT: int = 5
     VLLM_NEURON_NIXL_PROGRESS_THREAD_DELAY_US: int = 0
     # Build the NIXL agent with reader-writer thread sync. On by default; 0 keeps NIXL's NONE.
@@ -351,6 +354,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_NEURON_SWA_REAL_ADMISSION=1; off: unchanged.
     "VLLM_NEURON_SWA_EARLY_FREE": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_SWA_EARLY_FREE")) or False
+    ),
+    # SWA ring buffer: the scheduler keeps the first cdiv(window, block) + 1 SWA
+    # blocks of a request and never frees them early; the runner maps every SWA
+    # position p to ring slot p % (ring slots - 1). Off: unchanged.
+    "VLLM_NEURON_SWA_RING": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_SWA_RING")) or False
     ),
     # Local cache directory for model checkpoints
     "VLLM_NEURON_CHECKPOINT_CACHE": lambda: os.getenv(

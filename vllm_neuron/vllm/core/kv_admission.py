@@ -57,6 +57,9 @@ class GroupDesc:
     upstream_blocks: vLLM's per-request block charge for the group
         (``cdiv(spec.max_memory_usage_bytes(cfg), spec.page_size_bytes)``); the real
         bound is clamped to it, so it can never exceed the upstream charge.
+    ring_blocks: VLLM_NEURON_SWA_RING only (0 = off). A "swa" group then holds at
+        most this many blocks in every phase (``swa_ring.hold_blocks``) and frees
+        none before the request ends.
     """
 
     kind: str
@@ -64,6 +67,7 @@ class GroupDesc:
     upstream_blocks: int
     sliding_window: int = 0
     extra_retained_tokens: int = 0
+    ring_blocks: int = 0
 
 
 @dataclass(frozen=True)
@@ -113,14 +117,23 @@ def _in_flight(p: AdmissionParams) -> int:
 
 def prefill_phase_blocks(p: AdmissionParams, prefill_len: int) -> int:
     tokens = min(prefill_len + _in_flight(p), p.max_model_len)
-    return sum(min(cdiv(tokens, g.block_size), g.upstream_blocks) for g in p.groups)
+    total = 0
+    for g in p.groups:
+        blocks = cdiv(tokens, g.block_size)
+        if g.kind == "swa" and g.ring_blocks:
+            blocks = min(blocks, g.ring_blocks)
+        total += min(blocks, g.upstream_blocks)
+    return total
 
 
 def decode_phase_blocks(p: AdmissionParams, final_len: int) -> int:
     full_tokens = min(final_len + _in_flight(p), p.max_model_len)
     total = 0
     for g in p.groups:
-        if g.kind == "swa":
+        if g.kind == "swa" and g.ring_blocks:
+            # Ring: the group holds its first ring_blocks blocks to the end.
+            blocks = min(cdiv(full_tokens, g.block_size), g.ring_blocks)
+        elif g.kind == "swa":
             swa_tokens = min(
                 g.sliding_window - 1 + g.extra_retained_tokens + _in_flight(p),
                 full_tokens,
