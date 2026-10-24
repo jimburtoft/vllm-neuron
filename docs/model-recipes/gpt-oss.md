@@ -137,6 +137,40 @@ variable (`GPTOSS_KV_WRITE=kernel`, `GPTOSS_PREFILL_IMPL=shard_on_block`,
 native route `-O2` decode is already as fast, so the hook has no measurable effect there.
 An explicit `--optimization-level` turns the per-graph hook off.
 
+## Trn3 performance options
+
+On Trn3 the model runs the published MXFP4 checkpoint natively (`model_mxfp4.py`, MX
+matmul kernels); no `quantization` setting is needed. Use `tensor_parallel_size=8`: the
+MXFP4 weight loaders reject TP=4 (per-rank intermediate size 768 is not a multiple of 512).
+
+Changes on this branch for the MXFP4 path:
+- segmented prefill writes only the new token slots into the paged KV cache
+  (`GPTOSS_MX_KV_WRITE=kernel` restores the in-kernel write, whose wrapper copies the
+  whole cache per layer); this is worth about 4x on time to first token;
+- prefill padding tokens get no MoE blocks (`GPTOSS_MASK_PAD_ROUTE`);
+- decode compiles at `-O3` (`GPTOSS_DECODE_OPT`); no measurable effect on the native route.
+
+Recommended starting point (one Trn3 instance, 8 logical cores at LNC=2):
+
+```python
+LLM(model="openai/gpt-oss-20b", tensor_parallel_size=8, max_model_len=8192,
+    block_size=128, max_num_batched_tokens=2048, enable_prefix_caching=False,
+    additional_config={"neuron_config": {
+        "num_batched_tokens_buckets": [128, 256, 512, 1024, 2048],
+        "decode_context_length_buckets": [1024, 2048, 4096, 7168],
+        "on_device_sampling_config": {"all_greedy": True}}})
+```
+
+`num_batched_tokens_buckets` compiles smaller prefill graphs, so short prompts do not pay
+for the full 2048-token chunk (time to first token 19 ms at 128 tokens instead of 37 ms,
+with 82 ms at 4096 tokens unchanged). Without it every prefill chunk is padded to
+`max_num_batched_tokens`. Each entry must be a multiple of 128 and the last must equal
+`max_num_batched_tokens`.
+
+Leave `VLLM_NEURON_BACKEND` unset and do not pass `--optimization-level`: the default
+(native) route at `-O2` matched the XLA route and `-O3` within about 1% on prefill and
+decode, and compiled 2.5x faster than the XLA route. `-O1` made decode about 25% slower.
+
 ## Known issues
 
 - **Intermittent HTTP 500 errors with an FP8 KV cache on Trn3.** A race
