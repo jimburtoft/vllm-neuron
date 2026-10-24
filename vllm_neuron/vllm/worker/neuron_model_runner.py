@@ -5506,10 +5506,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             from vllm_neuron.vllm.core import swa_ring
 
             R = swa_ring.ring_modulus(sliding_window, block_size)
-            gather_index = np.broadcast_to(
-                np.arange(num_swa_blocks, dtype=np.int64), (padded_num_reqs, num_swa_blocks)
+            gather_index = np.ascontiguousarray(
+                np.broadcast_to(
+                    np.arange(num_swa_blocks, dtype=np.int64),
+                    (padded_num_reqs, num_swa_blocks),
+                )
             )
-            pos_offset = np.clip(ctx_lens.astype(np.int64) - R, 0, None)
+            # Keep the offset int32 on the host. A combined dtype + device copy
+            # fails on the Neuron device.
+            pos_offset = np.clip(ctx_lens.astype(np.int64) - R, 0, None).astype(np.int32)
         else:
             start_blocks = np.clip(
                 (ctx_lens + query_len - 1) // block_size - num_swa_blocks + 1, 0, None
