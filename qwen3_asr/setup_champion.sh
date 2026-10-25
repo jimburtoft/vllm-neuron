@@ -28,12 +28,17 @@ export NKI_COMPILE_CACHE_URL=${NKI_COMPILE_CACHE_URL:-$HOME/.cache/qwen3-asr-cha
 export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$HOME/.cache/qwen3-asr-champion/$REV/vllm}
 mkdir -p "$NKI_TRACE_CACHE_URL" "$NKI_COMPILE_CACHE_URL" "$VLLM_CACHE_ROOT"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}   # required on trn2.3xlarge (12 vCPU)
+# FP8 KV (opt-in at serve time: --kv-cache-dtype fp8_e4m3 + "fp8_packed_kv": true) needs this on trn2 so NKI maps
+# torch.float8_e4m3fn to the trn2 fp8 type. It only affects FP8 tensors, so it is safe to set for bf16 KV as well.
+export UNSAFE_FP8FNCAST=${UNSAFE_FP8FNCAST:-1}
 python - <<PY
 import nkilib, vllm_neuron
 assert nkilib.__file__.startswith("$NKI_DIR"), f"nkilib resolves to {nkilib.__file__}, not the champion"
 assert vllm_neuron.__file__.startswith("$HERE"), f"vllm_neuron resolves to {vllm_neuron.__file__}"
 import nkilib.core.qkv.qkv_tkg as q, nkilib.core.mlp.mlp_tkg.mlp_tkg as m
 assert "_qkv_projection_weight_stationary_b1" in dir(q) and "_use_b1_down_column_tiling" in dir(m), "champion kernels missing"
+import nkilib.core.attention.attention_tkg as at
+assert "fp8st" in at._CR17_FLAGS and "dt4" in at._CR17_FLAGS, f"batched-decode flags {at._CR17_FLAGS}"
 print("champion OK: vllm_neuron", vllm_neuron.__file__, "| nkilib", nkilib.__file__, "| rev $REV")
 PY
 set +e
