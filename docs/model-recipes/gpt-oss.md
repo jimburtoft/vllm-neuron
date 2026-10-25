@@ -102,14 +102,19 @@ Recommended starting point on trn2.3xlarge:
 
 ```python
 LLM(model="openai/gpt-oss-20b", tensor_parallel_size=4, max_model_len=8192,
-    block_size=128, max_num_batched_tokens=512, enable_prefix_caching=False,
+    block_size=128, max_num_batched_tokens=2048, enable_prefix_caching=False,
     additional_config={"neuron_config": {
         "quantization": "fp8",
+        "num_batched_tokens_buckets": [128, 256, 512, 1024, 2048],
         "decode_context_length_buckets": [1024, 2048, 4096, 7168],
         "on_device_sampling_config": {"all_greedy": True}}})
 ```
 
-Use `max_num_batched_tokens=2048` when most prompts are longer than about 500 tokens.
+`num_batched_tokens_buckets` compiles smaller prefill graphs, so short prompts do not pay for the full
+2048-token chunk: time to first token 44 ms at 128 tokens (77 ms without the buckets), and 130 / 254 ms at
+2048 / 4096 tokens (197 / 406 ms with `max_num_batched_tokens=512`). Each entry must be a multiple of 128 and
+the last must equal `max_num_batched_tokens`. `max_num_batched_tokens=512` without buckets keeps about 30 %
+more KV cache, which is 7 % faster for short prompts only at 64 concurrent requests.
 
 Use the default compile route and optimization level: leave `VLLM_NEURON_BACKEND` unset
 and do not pass `--optimization-level`. With these changes the default (native) route at
