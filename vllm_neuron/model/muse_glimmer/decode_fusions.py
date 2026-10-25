@@ -40,6 +40,14 @@ def decode_fuse_flags() -> frozenset:
     return flags
 
 
+GATE_MIN_BS_ENV = "MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS"
+
+
+def gate_min_bs() -> int:
+    """Smallest decode batch bucket that takes the in-kernel gate (Task 022: +3 % at B=1, -5..-15 % at 16..64)."""
+    return int(os.environ.get(GATE_MIN_BS_ENV, "16"))
+
+
 def centered_gamma(norm) -> torch.Tensor:
     """fp32 ``[1, H]`` gamma = 1 + w for a MuseGlimmerCenteredRMSNorm (traced: one tiny elementwise op)."""
     return (1.0 + norm.weight.to(torch.float32)).reshape(1, -1)

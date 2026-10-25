@@ -722,8 +722,9 @@ class MuseGlimmerAttention(nn.Module):
 
         on_kernel = can_run_kernel(X) and not _decode_torch_forced()
         # Task 022: gate + o_proj inside the megakernel (bf16 attention weights, single B*S tile).
+        # Only for decode batch buckets >= MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS (slower at B=1 on trn2).
         use_gate = ("gate" in self.fuse and not self.fp8 and tokens <= 128 and not _decode_torch_forced()
-                    and (nkh == 1 or on_kernel))
+                    and B >= _df.gate_min_bs() and (nkh == 1 or on_kernel))
         # Task 018a: fold the input norm into the kernel (gamma = 1 + w in fp32). Without the in-kernel
         # gate the torch gate still needs the normed input, so the norm is computed in torch as well.
         norm_kw = {}
