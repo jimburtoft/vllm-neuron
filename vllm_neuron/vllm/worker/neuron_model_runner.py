@@ -5380,6 +5380,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         block_size: int,
         kv_cache_group_id: int,
         query_len: int = 1,
+        num_blocks: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """For a SWA decode step, compute:
         - the block_table_tensor trimmed to the window-relevant blocks, so
@@ -5387,10 +5388,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         - the per-seq `swa_kv_pos_offset` tensor (= start_block * block_size),
           which the model subtracts from pos_ids so the causal mask is
           computed in the trimmed frame.
+
+        ``num_blocks`` overrides the trimmed width (a decode ctx bucket narrower
+        than the window). The caller guarantees every context fits it.
         """
         num_swa_blocks = self._compute_swa_num_blocks(
             sliding_window, block_size, padded_num_reqs
         )
+        if num_blocks is not None:
+            num_swa_blocks = min(num_swa_blocks, num_blocks)
         # Build the index in numpy. The gather below is a numpy operation, and the cache
         # compares numpy arrays, so a torch build would add nine host dispatches for each
         # step and then convert the result back.
@@ -5645,7 +5651,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 num_swa_blocks = self._compute_swa_num_blocks(
                     spec.sliding_window, block_size, padded_num_reqs
                 )
-                if num_swa_blocks < blk_table_tensor.shape[1]:
+                # With decode_context_length_buckets, warmup sizes the SWA table as
+                # min(num_swa_blocks, bucket_blocks) (see _build_warmup_attention_metadata).
+                # A ctx bucket below the trimmed window must give the same width here, or
+                # the (bucket, SWA) shape was never warmed and fail_on_recompile trips.
+                # Every context fits the bucket (the bucket is picked from the max context
+                # plus headroom), so the gather starts at block 0 and the offset is 0.
+                swa_width = num_swa_blocks
+                if self.neuron_config.decode_context_length_buckets is not None:
+                    swa_width = min(
+                        num_swa_blocks,
+                        self._decode_ctx_blocks_from_max_decode_ctx_len(
+                            max_decode_ctx_len=max_decode_ctx_len,
+                            block_size=block_size,
+                            max_num_draft_tokens=max_num_draft_tokens,
+                        ),
+                    )
+                if swa_width < blk_table_tensor.shape[1]:
                     blk_table_tensor, swa_kv_pos_offset = (
                         self._compute_swa_decode_tensors(
                             blk_table,
@@ -5654,6 +5676,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                             block_size,
                             kv_cache_group_id,
                             query_len=max_query_len,
+                            num_blocks=swa_width,
                         )
                     )
                 else:
