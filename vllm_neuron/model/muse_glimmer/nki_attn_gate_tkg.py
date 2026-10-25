@@ -733,6 +733,10 @@ def attention_block_tkg(
         kernel_assert(n_bxs_tiles == 1, "W_gate requires B*S_tkg <= 128")
         kernel_assert(d_head <= nl.tile_size.pmax, "W_gate requires d_head <= 128")
         kernel_assert(not is_KVDP and not is_CP, "W_gate does not support KVDP / CP")
+        # Distinct tensor names: the second qkv() call in one kernel would otherwise reuse the first call's
+        # SBUF op names ("duplicate op name 'qkv_w_sb_block_0'" at trace time; the simulator does not check).
+        _gate_prefix_prev = sbm.get_name_prefix()
+        sbm.set_name_prefix(f"{_gate_prefix_prev}gate_")
         G_out = qkv(
             input=X,
             fused_qkv_weights=W_gate,
@@ -755,6 +759,7 @@ def attention_block_tkg(
             is_h_dim_4h_transposed=False,
             dtype_mode=dtype_mode,
         )
+        sbm.set_name_prefix(_gate_prefix_prev)
         G_out = G_out.reshape((B * S_tkg, q_heads * d_head))  # [B*S, N*d] @ SBUF (both cores hold the sum)
         gate_sb = sbm.alloc_stack((d_head, B * q_heads * S_tkg), dtype=X.dtype, buffer=nl.sbuf)
         gate_4d = gate_sb.reshape((d_head, B, q_heads, S_tkg))
