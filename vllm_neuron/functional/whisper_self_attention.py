@@ -5,8 +5,6 @@ import torch
 
 from vllm_neuron._kernels.whisper.cross_attention_decode import xkernel_dmask
 from vllm_neuron._kernels.whisper.self_attention_decode import (
-    self_attn_col_pos,
-    self_attn_m,
     self_attn_vb,
     whisper_self_attn_decode,
     whisper_self_attn_decode_torch,
@@ -18,10 +16,10 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 def self_attn_mask_bias(positions: torch.Tensor, heads: int, ctx: int) -> torch.Tensor:
     """Return the ``[B * heads, ctx]`` fp32 additive mask of the kernel (0 valid, -1e30 masked).
 
-    The columns are in the kernel order (``self_attn_col_pos``). Build it one time per step.
+    Build it one time per step.
     """
     B = positions.shape[0]
-    col = self_attn_col_pos(ctx, device=positions.device)
+    col = torch.arange(ctx, device=positions.device)
     valid = col.view(1, ctx) <= positions.to(torch.int64).view(B, 1)
     zero = torch.zeros((), dtype=torch.float32, device=positions.device)
     neg = torch.full((), -1e30, dtype=torch.float32, device=positions.device)
@@ -80,7 +78,6 @@ def whisper_self_attention_decode(
         maskb=maskb,
         G=group,
         VB=vb,
-        M=self_attn_m(ctx),
     )
     if isinstance(out, (tuple, list)):
         out = out[0]
