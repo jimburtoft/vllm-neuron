@@ -180,6 +180,23 @@ def slot_ctx(max_target_positions: int) -> int:
     return ctx
 
 
+def self_attn_kernel() -> bool:
+    """Return True when ``WHISPER_SELF_ATTN=kernel`` runs the decode self-attention as one NKI kernel.
+
+    Needs ``WHISPER_SELF_KV=slot``. The slot self-KV is then position-major,
+    ``[slots, 448, heads * d]`` (all heads of one position side by side, odd head counts
+    padded with one zero head). The decode write then moves one row of ``heads * d``
+    for each batch row. The default ``torch`` keeps the ``[slots * heads, 448, d]``
+    layout and the torch attention.
+    """
+    mode = os.environ.get("WHISPER_SELF_ATTN", "torch")
+    if mode not in ("torch", "kernel"):
+        raise ValueError(f"WHISPER_SELF_ATTN={mode!r}: use torch or kernel.")
+    if mode == "kernel" and self_kv_mode() != "slot":
+        raise ValueError("WHISPER_SELF_ATTN=kernel needs WHISPER_SELF_KV=slot.")
+    return mode == "kernel"
+
+
 def self_kv_write() -> str:
     """Return ``WHISPER_SELF_WRITE``: how slot mode writes the new K/V (``index`` or ``where``).
 
@@ -526,6 +543,22 @@ class EncoderSelfAttention(nn.Module):
         )
         out = out.view(bsz, self.num_heads, seqlen, self.head_dim).transpose(1, 2)
         return self.out_proj(out.reshape(bsz, seqlen, self.num_heads * self.head_dim))
+
+
+def lm_head_mode() -> str:
+    """Return ``WHISPER_LM_HEAD``: how the LM head stores its weight and runs its GEMM.
+
+    * ``fp32`` (default): fp32 weight, fp32 GEMM.
+    * ``bf16w``: bf16 weight, upcast to fp32 in the graph, fp32 GEMM. The weight is tied to
+      the bf16 ``embed_tokens``, so the stored values are the same as with ``fp32``. Only
+      the HBM bytes halve.
+    * ``bf16``: bf16 weight and a bf16 GEMM (fp32 accumulation, bf16 logits). This is a
+      precision change: gate it on the 18-clip set and WER.
+    """
+    mode = os.environ.get("WHISPER_LM_HEAD", "fp32")
+    if mode not in ("fp32", "bf16w", "bf16"):
+        raise ValueError(f"WHISPER_LM_HEAD={mode!r}: use fp32, bf16w or bf16.")
+    return mode
 
 
 FP8_MAX = 240.0  # trn2 nkilib float8_e4m3; a value <= 240 has the same bits in float8_e4m3fn
@@ -1137,7 +1170,17 @@ class DecoderSelfAttention(nn.Module):
         self.slot_ctx = slot_ctx(cfg.max_target_positions) if self.slot_kv else cfg.max_target_positions
         self.num_slots = cfg.max_num_seqs + 1
         self.slot_write_where = self.slot_kv and self_kv_write() == "where"
-        if self.slot_kv:
+        # WHISPER_SELF_ATTN=kernel: position-major slots [slots, 448, hk * d], where hk is
+        # the head count padded to even (the pad head stays zero).
+        self.self_kernel = self.slot_kv and self_attn_kernel()
+        self.kernel_heads = self.num_heads + self.num_heads % 2
+        if self.self_kernel and self.slot_write_where:
+            raise ValueError("WHISPER_SELF_ATTN=kernel needs WHISPER_SELF_WRITE=index.")
+        if self.self_kernel:
+            shp = (self.num_slots, self.slot_ctx, self.kernel_heads * self.head_dim)
+            self.register_buffer("slot_k", torch.zeros(shp, dtype=dtype), persistent=False)
+            self.register_buffer("slot_v", torch.zeros(shp, dtype=dtype), persistent=False)
+        elif self.slot_kv:
             shp = (self.num_slots * self.num_heads, self.slot_ctx, self.head_dim)
             self.register_buffer("slot_k", torch.zeros(shp, dtype=dtype), persistent=False)
             self.register_buffer("slot_v", torch.zeros(shp, dtype=dtype), persistent=False)
@@ -1167,6 +1210,15 @@ class DecoderSelfAttention(nn.Module):
         C = self.slot_ctx
         rows = meta["block_table_tensor"].shape[0]
         s = T // rows
+        if self.self_kernel:
+            # Position-major: the [448, hk * d] row of each slot.
+            slots = self._row_slots(meta, rows, k.device)
+            hk = self.kernel_heads
+            for buf, x in ((self.slot_k, k), (self.slot_v, v)):
+                val = x.view(h, rows, s, d).permute(1, 2, 0, 3)[:, : min(s, C)]
+                val = F.pad(val, (0, 0, 0, hk - h, 0, C - val.shape[1])).to(buf.dtype)
+                buf.index_put_((slots,), val.reshape(rows, C, hk * d))
+            return
         idx = self._slot_head_rows(self._row_slots(meta, rows, k.device))
         for buf, x in ((self.slot_k, k), (self.slot_v, v)):
             val = x.view(h, rows, s, d).transpose(0, 1)[:, :, : min(s, C)]
@@ -1182,6 +1234,14 @@ class DecoderSelfAttention(nn.Module):
         slots = self._row_slots(meta, B, k.device)
         scratch = torch.full_like(slots, self.num_slots - 1)
         slots = torch.where(meta["slot_mapping"].view(B) < 0, scratch, slots)
+        if self.self_kernel:
+            # One [hk * d] row for each batch row at (slot, position).
+            hk = self.kernel_heads
+            pos = positions.to(torch.int64).view(B)
+            for buf, x in ((self.slot_k, k), (self.slot_v, v)):
+                val = F.pad(x.transpose(0, 1), (0, 0, 0, hk - h)).reshape(B, hk * d)
+                buf.index_put_((slots, pos), val.to(buf.dtype))
+            return
         idx = self._slot_head_rows(slots)
         pos = positions.to(torch.int64).view(B, 1).expand(B, h).reshape(B * h)
         self.slot_k.index_put_((idx, pos), k.transpose(0, 1).reshape(B * h, d).to(self.slot_k.dtype))
@@ -1213,13 +1273,15 @@ class DecoderSelfAttention(nn.Module):
         self.slot_k.copy_(torch.where(mask, ks.to(self.slot_k.dtype), self.slot_k))
         self.slot_v.copy_(torch.where(mask, vs.to(self.slot_v.dtype), self.slot_v))
 
-    def forward_decode_slot(self, hidden_states, meta, positions):
+    def forward_decode_slot(self, hidden_states, meta, positions, self_meta=None):
         """Decode over the slot self-KV: read ``ctx`` positions of each row's slot and attend.
 
         ``ctx`` is the decode-context bucket: the block-table width times the block
         size, capped at 448. The runner picks the bucket from the largest position
         in the batch (``decode_context_length_buckets``), so every position of the
         batch is below ``ctx``. Positions after the query are masked.
+        ``self_meta`` is ``(qmask, maskb, group)`` of the self-attention kernel
+        (``WHISPER_SELF_ATTN=kernel``), built one time per step by the decoder.
         """
         B = meta["block_table_tensor"].shape[0]
         h, d, C = self.num_heads, self.head_dim, self.slot_ctx
@@ -1229,6 +1291,8 @@ class DecoderSelfAttention(nn.Module):
             self._slot_write_where(k, v, meta, positions)
         else:
             self._slot_write_decode(k, v, meta, positions)
+        if self.self_kernel:
+            return self._decode_slot_kernel(q, meta, positions, B, c, self_meta)
         idx = self._slot_head_rows(self._row_slots(meta, B, hidden_states.device))
         kc = self.slot_k[:, :c].index_select(0, idx).view(B, h, c, d)
         vc = self.slot_v[:, :c].index_select(0, idx).view(B, h, c, d)
@@ -1243,6 +1307,22 @@ class DecoderSelfAttention(nn.Module):
         attn = F.softmax(attn.to(torch.float32), dim=-1).to(vc.dtype)
         ctx = torch.matmul(attn, vc)  # [B, h, 1, d]
         return self.out_proj(ctx.reshape(B, h * d))
+
+    def _decode_slot_kernel(self, q, meta, positions, B, c, self_meta):
+        """Self-attention of B decode rows with the Whisper self-attention kernel.
+
+        ``q`` is ``[h, B, d]``, scaled. The K/V of this step are already in the slots.
+        """
+        from vllm_neuron.functional.whisper_self_attention import whisper_self_attention_decode
+
+        h, d, hk = self.num_heads, self.head_dim, self.kernel_heads
+        qmask, maskb, group = self_meta
+        qb = F.pad(q.transpose(0, 1), (0, 0, 0, hk - h))  # [B, hk, d]
+        slots = self._row_slots(meta, B, q.device)
+        ctx = whisper_self_attention_decode(
+            qb, self.slot_k, self.slot_v, slots, positions.view(B), c, qmask, maskb, group
+        )
+        return self.out_proj(ctx[:, :h].reshape(B, h * d))
 
     @torch.no_grad()
     def finalize_weights(self) -> None:
@@ -1497,7 +1577,7 @@ class DecoderLayer(nn.Module):
 
     def forward(
         self, x, cross_k, cross_v, meta, is_prefill, positions, slots=None, cross_meta=None,
-        perm=None,
+        perm=None, self_meta=None,
     ):
         # x is token-flat, [T, H]. cross_k and cross_v are [B, h, 1500, d], one
         # row for each request in the batch. When slots is set, they hold all
@@ -1506,7 +1586,7 @@ class DecoderLayer(nn.Module):
         if is_prefill:
             sa = self.self_attn.forward_prefill(h, meta, positions)
         elif self.self_attn.slot_kv:
-            sa = self.self_attn.forward_decode_slot(h, meta, positions)
+            sa = self.self_attn.forward_decode_slot(h, meta, positions, self_meta)
         elif self.self_attn.fused and meta["block_table_tensor"].shape[0] <= self.fused_max_rows:
             sa = self.self_attn.forward_decode_fused(h, meta, positions)
         else:
@@ -1662,6 +1742,10 @@ class WhisperDecoder(nn.Module):
                 torch.arange(num_slots, device=slots.device, dtype=slots.dtype).view(1, -1)
                 == slots.view(-1, 1)
             ).to(self.embed_tokens.weight.dtype)
+        self_meta = None
+        sa0 = self.layers[0].self_attn
+        if sa0.self_kernel and not is_prefill:
+            self_meta = self._self_kernel_inputs(x, sa0, meta, positions)
         for i, layer in enumerate(self.layers):
             cross_k = getattr(owner, f"cross_k_{i}")
             cross_v = getattr(owner, f"cross_v_{i}")
@@ -1720,9 +1804,26 @@ class WhisperDecoder(nn.Module):
             x = layer(
                 x, cross_k, cross_v, meta, is_prefill, positions,
                 slots=slots if all_slots else None, cross_meta=cross_meta,
-                perm=onehot if mode == "perm" else None,
+                perm=onehot if mode == "perm" else None, self_meta=self_meta,
             )
         return self.layer_norm(x)
+
+    def _self_kernel_inputs(self, x, sa, meta, positions):
+        """Return ``(qmask, maskb, group)`` of the self-attention kernel, one time per decode step."""
+        from vllm_neuron._kernels.whisper.cross_attention_decode import (
+            xkernel_group,
+            xkernel_qmask,
+        )
+        from vllm_neuron.functional.whisper_self_attention import self_attn_mask_bias
+        from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+        rows = meta["block_table_tensor"].shape[0]
+        c = min(meta["block_table_tensor"].shape[1] * meta["block_size"], sa.slot_ctx)
+        hk = sa.kernel_heads
+        group = xkernel_group(hk, rows, lnc=get_logical_nc_config())
+        qmask = xkernel_qmask(hk, group, device=x.device, dtype=self.embed_tokens.weight.dtype)
+        maskb = self_attn_mask_bias(positions.view(rows), hk, c)
+        return qmask, maskb, group
 
     def _cross_kernel_inputs(self, x, slots, meta, owner):
         """Build the per-head block table and the mask of the kernel cross-attention.
@@ -1870,12 +1971,14 @@ class WhisperForConditionalGeneration(nn.Module):
         self.padded_vocab = vocab + pad
         self.vocab_pad = pad
         self.per_rank = self.padded_vocab // world
+        # Read the flag one time: a read in forward adds an os.environ guard.
+        self.lm_mode = lm_head_mode()
         self.lm_head = ColumnParallelLinear(
             config.d_model,
             self.padded_vocab,
             bias=False,
             gather_output=False,
-            dtype=torch.float32,
+            dtype=torch.float32 if self.lm_mode == "fp32" else torch.bfloat16,
             tp_group=tp_group,
         )
 
@@ -1954,7 +2057,16 @@ class WhisperForConditionalGeneration(nn.Module):
         return full[..., : self.config.vocab_size]
 
     def _logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(hidden_states.to(torch.float32))
+        """Return the fp32 logits of the local vocab slice (see ``lm_head_mode``)."""
+        if self.lm_mode == "fp32":
+            return self.lm_head(hidden_states.to(torch.float32))
+        if self.lm_mode == "bf16":
+            return self.lm_head(hidden_states.to(torch.bfloat16)).to(torch.float32)
+        w = self.lm_head.weight.to(torch.float32)
+        x = hidden_states.to(torch.float32)
+        if getattr(self.lm_head, "weight_layout", "out_in") == "in_out":
+            return torch.matmul(x, w)
+        return F.linear(x, w)
 
     def _mask_pad_local(self, local: torch.Tensor, rank) -> torch.Tensor:
         """Set the local logits of the pad columns to -inf.

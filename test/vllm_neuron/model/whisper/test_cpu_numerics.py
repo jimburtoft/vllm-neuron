@@ -469,12 +469,13 @@ def test_kernel_cross_mode_batched(hf_checkpoint, monkeypatch, mode, fused, kt):
 
 
 @pytest.mark.parametrize(
-    "write,cross,in_out",
-    [("index", "mask", "decoder,lm_head"), ("where", "mask", "decoder,lm_head"),
-     ("index", "mqa", "decoder,lm_head,encoder"), ("where", "mqa", "none"),
-     ("index", "xkernel", "decoder,lm_head")],
+    "write,cross,in_out,self_attn",
+    [("index", "mask", "decoder,lm_head", "torch"), ("where", "mask", "decoder,lm_head", "torch"),
+     ("index", "mqa", "decoder,lm_head,encoder", "torch"), ("where", "mqa", "none", "torch"),
+     ("index", "xkernel", "decoder,lm_head", "torch"), ("index", "xkernel", "decoder,lm_head", "kernel"),
+     ("index", "mask", "none", "kernel")],
 )
-def test_slot_self_kv_batched(hf_checkpoint, monkeypatch, write, cross, in_out):
+def test_slot_self_kv_batched(hf_checkpoint, monkeypatch, write, cross, in_out, self_attn):
     """WHISPER_SELF_KV=slot (model-owned contiguous self-KV) gives the HF greedy tokens.
 
     Two requests in slots 2 and 0: one prefill each, then batched decode in the
@@ -491,11 +492,15 @@ def test_slot_self_kv_batched(hf_checkpoint, monkeypatch, write, cross, in_out):
     monkeypatch.setenv("WHISPER_SELF_WRITE", write)
     monkeypatch.setenv("WHISPER_CROSS_MODE", cross)
     monkeypatch.setenv("WHISPER_IN_OUT", in_out)
+    monkeypatch.setenv("WHISPER_SELF_ATTN", self_attn)
     model = _build_native(path, max_num_seqs=3)
     sa = model.decoder.layers[0].self_attn
     # The runner builds on meta and load_weights calls to_empty: the slots must be zero.
     assert all(int(lyr.self_attn.slot_k.abs().sum()) == 0 for lyr in model.decoder.layers)
-    assert sa.slot_kv and sa.slot_k.shape == (4 * HEADS, 448, D_MODEL // HEADS)
+    if self_attn == "kernel":
+        assert sa.self_kernel and sa.slot_k.shape == (4, 448, sa.kernel_heads * (D_MODEL // HEADS))
+    else:
+        assert sa.slot_kv and sa.slot_k.shape == (4 * HEADS, 448, D_MODEL // HEADS)
     if "decoder" in in_out:
         assert model.decoder.layers[0].mlp.fc1.weight_layout == "in_out"
     torch.manual_seed(2)
@@ -632,3 +637,22 @@ def test_fp8_decoder_mlp_close_to_bf16(hf_checkpoint, monkeypatch):
         logits[fp8] = out
     a, b = logits[""].float().flatten(), logits["decoder_mlp"].float().flatten()
     assert torch.nn.functional.cosine_similarity(a, b, dim=0) > 0.99
+
+
+@pytest.mark.parametrize("mode", ["bf16w", "bf16"])
+def test_lm_head_bf16(hf_checkpoint, monkeypatch, mode):
+    """WHISPER_LM_HEAD=bf16w stores the tied LM head in bf16 and runs an fp32 GEMM over it;
+    bf16 also runs the GEMM in bf16 (close logits)."""
+    path, _ = hf_checkpoint
+    ref = _build_native(path)
+    monkeypatch.setenv("WHISPER_LM_HEAD", mode)
+    m = _build_native(path)
+    assert m.lm_head.weight.dtype == torch.bfloat16
+    w = ref.lm_head.weight.to(torch.bfloat16).float()
+    assert torch.equal(m.lm_head.weight.float(), w)
+    x = torch.randn(3, D_MODEL).to(torch.bfloat16)
+    want = x.float() @ (w if m.lm_head.weight.shape[0] == D_MODEL else w.t())
+    got = m._logits_local(x)
+    assert got.dtype == torch.float32
+    tol = 1e-5 if mode == "bf16w" else 3e-2
+    torch.testing.assert_close(got, want, rtol=tol, atol=tol)
