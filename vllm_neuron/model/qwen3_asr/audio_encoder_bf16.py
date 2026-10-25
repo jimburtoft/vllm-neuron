@@ -54,14 +54,15 @@ from .weight_loader import (
 )
 
 
-# Encoder self-attention backend. "cte": NF.flash_attention (nkilib attention_cte with
-# bound masks, one 128x128 call per block and head). "fused": one block-local attention
-# kernel per layer that reads the fused QKV output and writes the o_proj layout directly.
+# Encoder self-attention backend. "fused" (default): one block-local attention kernel per
+# layer that reads the fused QKV output and writes the o_proj layout directly (trn2: -63 to
+# -74 % per layer call; encoder 29.9 -> 22.4 ms per 30 s clip at LNC1). "cte":
+# NF.flash_attention (nkilib attention_cte with bound masks, one 128x128 call per block and head).
 _ENC_ATTN_BACKENDS = ("cte", "fused")
 
 
 def get_encoder_attention_backend() -> str:
-    v = os.environ.get("VLLM_NEURON_QWEN3_ASR_ENC_ATTN", "cte").strip().lower()
+    v = os.environ.get("VLLM_NEURON_QWEN3_ASR_ENC_ATTN", "fused").strip().lower()
     if v not in _ENC_ATTN_BACKENDS:
         raise ValueError(
             f"VLLM_NEURON_QWEN3_ASR_ENC_ATTN={v!r}; use one of {_ENC_ATTN_BACKENDS}."

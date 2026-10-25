@@ -127,7 +127,7 @@ def test_backend_env(monkeypatch):
     from vllm_neuron.model.qwen3_asr.audio_encoder_bf16 import get_encoder_attention_backend
 
     monkeypatch.delenv("VLLM_NEURON_QWEN3_ASR_ENC_ATTN", raising=False)
-    assert get_encoder_attention_backend() == "cte"
+    assert get_encoder_attention_backend() == "fused"
     monkeypatch.setenv("VLLM_NEURON_QWEN3_ASR_ENC_ATTN", "Fused")
     assert get_encoder_attention_backend() == "fused"
     monkeypatch.setenv("VLLM_NEURON_QWEN3_ASR_ENC_ATTN", "nope")
