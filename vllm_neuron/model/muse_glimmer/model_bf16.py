@@ -74,6 +74,7 @@ from vllm_neuron.model.qwen3_vl.utils.vision_block_packing import (
     select_vision_bucket,
 )
 
+from . import decode_fusions as _df
 from . import fp8 as _fp8
 from . import kv_fp8 as _kv_fp8
 from .config import MuseGlimmerConfig, MuseGlimmerTextConfig
@@ -433,6 +434,8 @@ class MuseGlimmerAttention(nn.Module):
                 setattr(self, f"{name}_w_scale",
                         nn.Parameter(torch.empty(_fp8.PMAX, n, dtype=torch.float32), requires_grad=False))
 
+        # Tasks 018/022: decode fusion flags (read once; MUSE_GLIMMER_DECODE_FUSE).
+        self.fuse = _df.decode_fuse_flags()
         self.k_cache = None
         self.v_cache = None
         # Task 028: FP8 KV state, set in bind_kv_cache by kv_fp8.setup (outside the trace).
@@ -518,12 +521,16 @@ class MuseGlimmerAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
         attn_metadata: dict,
         kv_writeback: list | None = None,
+        in_norm: nn.Module | None = None,
     ) -> torch.Tensor:
+        """``in_norm`` (Task 018a): the input norm was NOT applied by the caller; fold it into the kernel."""
         meta = attn_metadata[self.layer_name]
         if meta["max_query_len"] <= meta["decode_token_threshold"]:
             return self.forward_decode(
-                hidden_states, positions, position_embeddings, attn_metadata, kv_writeback
+                hidden_states, positions, position_embeddings, attn_metadata, kv_writeback, in_norm
             )
+        if in_norm is not None:
+            hidden_states = in_norm(hidden_states)
         # >>> PARALLELISM: SP all-gather before attention <<<
         if self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
@@ -668,6 +675,7 @@ class MuseGlimmerAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
         attn_metadata: dict,
         kv_writeback: list | None = None,
+        in_norm: nn.Module | None = None,
     ) -> torch.Tensor:
         meta = attn_metadata[self.layer_name]
         slot_mapping = meta["slot_mapping"]
@@ -713,6 +721,24 @@ class MuseGlimmerAttention(nn.Module):
             table = build_per_head_block_table(block_table, nkh)
 
         on_kernel = can_run_kernel(X) and not _decode_torch_forced()
+        # Task 022: gate + o_proj inside the megakernel (bf16 attention weights, single B*S tile).
+        use_gate = ("gate" in self.fuse and not self.fp8 and tokens <= 128 and not _decode_torch_forced()
+                    and (nkh == 1 or on_kernel))
+        # Task 018a: fold the input norm into the kernel (gamma = 1 + w in fp32). Without the in-kernel
+        # gate the torch gate still needs the normed input, so the norm is computed in torch as well.
+        norm_kw = {}
+        if in_norm is not None:
+            norm_kw = dict(rmsnorm_X_enabled=True, rmsnorm_X_eps=in_norm.eps,
+                           rmsnorm_X_gamma=_df.centered_gamma(in_norm))
+            if not use_gate:
+                hidden_states = in_norm(hidden_states)
+                if not on_kernel:  # torch fallback: plain normed input, no fold
+                    X = hidden_states.view(B, S, hidden)
+                    norm_kw = {}
+        early_gate = None
+        if "early_gate" in self.fuse and not use_gate:
+            # Task 022 cheap version: issue the gate projection before the megakernel (weight DMA overlap).
+            early_gate = self._gate(hidden_states)
         qkv_w, qkv_q = self._qkv_args(on_kernel)
         # Task 028: FP8 KV. The kernel quantizes the active K/V with k_scale / v_scale
         # (returns them in fp8) and reads the fp8 cache; the K dequant folds into the
@@ -725,7 +751,7 @@ class MuseGlimmerAttention(nn.Module):
         decode_kwargs = dict(
             X=X,
             W_qkv=qkv_w,
-            rmsnorm_X_enabled=False,  # input norm applied by the decoder layer
+            rmsnorm_X_enabled=False,  # input norm applied by the decoder layer (unless folded, norm_kw)
             rmsnorm_QK_pre_rope_enabled=True,
             rmsnorm_QK_pre_rope_eps=self.qk_norm_eps,
             rmsnorm_QK_pre_rope_W_Q=None,
@@ -741,6 +767,10 @@ class MuseGlimmerAttention(nn.Module):
             W_out=None,  # gate must be applied before o_proj
             **kv_q,
         )
+        decode_kwargs.update(norm_kw)
+        if use_gate:
+            return self._forward_decode_gated(decode_kwargs, qkv_q, attn_metadata, pos, swa_start, B, S, table,
+                                              block_size, slot_mapping, kv_writeback)
         if _decode_torch_forced():
             from vllm_neuron.functional.attention.attention_decode import (
                 _torch_attention_decode_impl,
@@ -784,7 +814,7 @@ class MuseGlimmerAttention(nn.Module):
 
         # output: [B, Nq, d, S] -> [B*S, Nq*d]
         attn = output.permute(0, 3, 1, 2).reshape(B * S, self.q_size)
-        gate = self._gate(hidden_states)
+        gate = early_gate if early_gate is not None else self._gate(hidden_states)
         if self.kv_fp8:
             gate = gate * self.kv_v_dq  # Task 028: V dequant before the gate (cannot fold into W_out)
         attn = (attn * gate).to(self.dtype)
@@ -801,6 +831,38 @@ class MuseGlimmerAttention(nn.Module):
             self._write_paged_kv(k_new, v_new, slot_mapping, block_size)
 
         # >>> PARALLELISM: TP all-reduce of o_proj partials <<<
+        if self.world_size > 1:
+            self.tp_group.all_reduce(out)
+        return out
+
+
+    def _forward_decode_gated(self, kw, qkv_q, attn_metadata, pos, swa_start, B, S, table, block_size,
+                              slot_mapping, kv_writeback):
+        """Task 022: megakernel with the sigmoid gate and o_proj in SBUF (``gate_decode``)."""
+        from .gate_decode import gated_attention_decode
+
+        mask_kw = dict(pos_ids=pos, swa_start_pos_ids=swa_start)
+        if self.kv_fp8 and not _kv_fp8.fused_mask_allowed():
+            mask_kw = dict(attention_mask=self._fp8_decode_mask(
+                attn_metadata, pos, swa_start, B, S, table.shape[-1] * block_size, block_size))
+        out, K_new, V_new = gated_attention_decode(
+            X=kw["X"], W_qkv=kw["W_qkv"], W_gate=self.gate_proj_weight, W_out=self.o_proj_weight,
+            K_cache=kw["K_cache"], V_cache=kw["V_cache"], active_blocks_table=table,
+            softmax_scale=kw["softmax_scale"], qk_norm_eps=self.qk_norm_eps, cos=kw["cos"], sin=kw["sin"],
+            rmsnorm_X_enabled=kw["rmsnorm_X_enabled"], rmsnorm_X_eps=kw.get("rmsnorm_X_eps"),
+            rmsnorm_X_gamma=kw.get("rmsnorm_X_gamma"), k_scale=kw.get("k_scale"), v_scale=kw.get("v_scale"),
+            # FP8 KV: V dequant folded into the gate (compile-time float; the NEFF then depends on the
+            # calibration, unlike the shipping path that reads the kv_v_dq buffer).
+            gate_dq=self.v_dq if self.kv_fp8 else 1.0,
+            force_torch=_decode_torch_forced(), **mask_kw, **qkv_q)
+        nkh, d = self.num_key_value_heads_per_rank, self.head_dim
+        k_new = K_new.reshape(d, B, nkh, S).permute(2, 1, 3, 0).reshape(nkh, B * S, d)
+        v_new = V_new.reshape(B, nkh, S, d).permute(1, 0, 2, 3).reshape(nkh, B * S, d)
+        if kv_writeback is not None:
+            kv_writeback.append((self.layer_idx, self, k_new, v_new, slot_mapping, block_size))
+        else:
+            self._write_paged_kv(k_new, v_new, slot_mapping, block_size)
+        out = out.reshape(B * S, self.hidden_size)
         if self.world_size > 1:
             self.tp_group.all_reduce(out)
         return out
@@ -887,6 +949,23 @@ class MuseGlimmerMLP(nn.Module):
             down_w_scale=self.down_w_scale, output_dtype=self.out_dtype_name,
         )
 
+    def forward_fused_decode(self, residual: torch.Tensor, attn_out: torch.Tensor, norm) -> tuple:
+        """Task 018b: (residual + attn_out) -> centered RMSNorm (gamma = 1 + w, fp32) -> MLP, in one NF.mlp
+        call (TKG fused add + norm). Returns ``(mlp_out, residual + attn_out)``; mlp_out is all-reduced."""
+        kw = dict(eps=norm.eps, ln_w=_df.centered_gamma(norm), norm_type=NormType.RMS_NORM,
+                  fused_add_tensor=attn_out, store_fused_add_result=True)
+        if self.fp8:
+            out, hsum = NF.mlp(
+                residual, self.gate_proj_weight, self.up_proj_weight, self.down_proj_weight,
+                quantization_type=QuantizationType.ROW, gate_w_scale=self.gate_w_scale,
+                up_w_scale=self.up_w_scale, down_w_scale=self.down_w_scale,
+                output_dtype=self.out_dtype_name, **kw)
+        else:
+            out, hsum = NF.mlp(residual, self.gate_proj_weight, self.up_proj_weight, self.down_proj_weight, **kw)
+        if self.world_size > 1:
+            self.tp_group.all_reduce(out)
+        return out, hsum.to(residual.dtype)
+
     def forward(self, hidden_states: torch.Tensor, is_prefill: bool) -> torch.Tensor:
         if is_prefill and self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
@@ -923,15 +1002,24 @@ class MuseGlimmerDecoderLayer(nn.Module):
 
     def forward(self, hidden_states, positions, position_embeddings, attn_metadata, is_prefill,
                 kv_writeback=None):
+        fuse = self.self_attn.fuse if not is_prefill else ()
+        T = hidden_states.shape[0]
         residual = hidden_states
-        h = self.input_layernorm(hidden_states)
-        h = self.self_attn(h, positions, position_embeddings, attn_metadata, kv_writeback)
+        if "norm" in fuse:  # Task 018a: input norm folded into the decode megakernel
+            h = self.self_attn(hidden_states, positions, position_embeddings, attn_metadata, kv_writeback,
+                               in_norm=self.input_layernorm)
+        else:
+            h = self.self_attn(self.input_layernorm(hidden_states), positions, position_embeddings,
+                               attn_metadata, kv_writeback)
         h = self.post_attention_layernorm(h)
-        hidden_states = residual + h
 
-        residual = hidden_states
-        h = self.pre_feedforward_layernorm(hidden_states)
-        h = self.mlp(h, is_prefill=is_prefill)
+        if "ffn" in fuse and T <= _MLP_TKG_MAX_T:  # Task 018b: residual add + pre-FFN norm inside NF.mlp
+            h, residual = self.mlp.forward_fused_decode(residual, h, self.pre_feedforward_layernorm)
+        else:
+            hidden_states = residual + h
+            residual = hidden_states
+            h = self.pre_feedforward_layernorm(hidden_states)
+            h = self.mlp(h, is_prefill=is_prefill)
         h = self.post_feedforward_layernorm(h)
         return residual + h
 
