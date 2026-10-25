@@ -31,7 +31,7 @@ def decode_fuse_flags() -> frozenset:
     v = os.environ.get(DECODE_FUSE_ENV, "").strip().lower()
     if v in ("", "0", "off", "none"):
         return frozenset()
-    flags = frozenset(x.strip() for x in v.split(",") if x.strip())
+    flags = frozenset(x.strip() for x in v.replace("+", ",").split(",") if x.strip())
     bad = flags - _VALID
     if bad:
         raise ValueError(f"{DECODE_FUSE_ENV}: unknown {sorted(bad)} (valid: {sorted(_VALID)})")
