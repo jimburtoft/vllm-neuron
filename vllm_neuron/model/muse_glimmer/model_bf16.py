@@ -880,6 +880,43 @@ _MLP_TKG_MAX_T = 96
 # scales), so prefill is split into row chunks; the result is bit-exact with the
 # un-chunked nkilib 2.32 kernel (simulator, T=1024). 0 disables chunking.
 _MLP_CTE_ROW_CHUNK = int(os.environ.get("MUSE_GLIMMER_FP8_CTE_CHUNK", "512") or 0)
+# Task 019: root cause of the stack failure above. For T > 512 nkilib picks a 1024-row BxS
+# tile (8 subtiles of 128) and allocates one [128, I] fp32 |x| scratch per subtile on the stack
+# (``row_quant_reduction_res``); at I=2560 per core that is 8 x 10 KB and the stack is 1.3 KB
+# short. The |x| output is a discarded destination of tensor_scalar_reduce (only its
+# reduce_res, the row absmax, is used), so one scratch shared by all subtiles is exact.
+# MUSE_GLIMMER_FP8_CTE_SHARED_ABS=1 installs that allocation (kernel output torch.equal to
+# chunk 512: simulator T=1024/1536/2048, trn2 T=1024/2048/4096) so the kernel validates
+# without row chunking, and MUSE_GLIMMER_FP8_CTE_CHUNK is then ignored.
+_FP8_CTE_SHARED_ABS_ENV = "MUSE_GLIMMER_FP8_CTE_SHARED_ABS"
+_CTE_SHARED_ABS = [False]  # set once the patched allocation is installed
+
+
+def _install_cte_shared_abs() -> bool:
+    if os.environ.get(_FP8_CTE_SHARED_ABS_ENV, "0") != "1":
+        return False
+    from nkilib.core.mlp.mlp_cte.basic import mlp_cte_basic_quantization as _q
+    from nkilib.core.mlp.mlp_cte.basic.mlp_cte_basic_tile_info import (
+        get_intermediate_tile_tensor_info,
+    )
+
+    orig = _q.allocate_intermediate_tensor_tile
+    if getattr(orig, "_mg_shared_abs", False):
+        _CTE_SHARED_ABS[0] = True
+        return True
+
+    def alloc(mlp_params, tile_info, constants, indices, name, dtype, out_list, alloc_fn):
+        if name != "row_quant_reduction_res":
+            return orig(mlp_params, tile_info, constants, indices, name, dtype, out_list, alloc_fn)
+        shape, _ = get_intermediate_tile_tensor_info(mlp_params, constants, tile_info.bxs_dim_tile)
+        t = alloc_fn(shape, dtype=dtype, name=indices.get_tensor_name(name, "shared"))
+        out_list.extend([t] * tile_info.bxs_dim_tile.subtile_dim_info.tile_count)
+
+    alloc._mg_shared_abs = True
+    _q.allocate_intermediate_tensor_tile = alloc
+    _CTE_SHARED_ABS[0] = True
+    logger.info("MuseGlimmer: nkilib CTE ROW shares one row-quant |x| scratch (%s=1)", _FP8_CTE_SHARED_ABS_ENV)
+    return True
 
 
 class MuseGlimmerMLP(nn.Module):
@@ -897,6 +934,7 @@ class MuseGlimmerMLP(nn.Module):
         # Task 021: FP8 (ROW: per-output-channel weight scales, dynamic per-token activations).
         self.fp8 = "mlp" in _fp8.fp8_modules()
         if self.fp8:
+            _install_cte_shared_abs()
             ip = _fp8.round_up(inter, _fp8.FP8_I_ALIGN)  # zero-padded intermediate (see fp8.py)
             f8 = _fp8.FP8_DTYPE
             self.gate_proj_weight = nn.Parameter(torch.empty(H, ip, dtype=f8), requires_grad=False)
@@ -936,7 +974,9 @@ class MuseGlimmerMLP(nn.Module):
                 x, ones, None, quantization_type=QuantizationType.ROW,
                 norm_type=NormType.NO_NORM,
             )
-            C = _MLP_CTE_ROW_CHUNK
+            # Task 019: with the shared |x| scratch the kernel validates at any T, so no chunking
+            # (one 1024-row BxS tile instead of 512-row chunks: -15 % MLP time on one core).
+            C = 0 if _CTE_SHARED_ABS[0] else _MLP_CTE_ROW_CHUNK
             if C and x.shape[0] > C and x.shape[0] % C == 0:
                 return torch.cat([self._mlp_fp8_call(c) for c in torch.split(x, C)], dim=0)
         return self._mlp_fp8_call(x)
