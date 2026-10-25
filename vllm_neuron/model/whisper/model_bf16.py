@@ -321,11 +321,17 @@ def cross_fp8() -> bool:
 def xkernel_dma() -> tuple[int, int, int, int]:
     """Return ``WHISPER_XKERNEL_DMA=KP,VH[,VB[,HW]]`` (default ``5,10,5,0``).
 
-    KP head pairs per K DMA, VH heads per V DMA, VB units per blocked-PV matmul
-    (0: one-column PV), HW 1 for hardware DGE on the K and V loads.
+    KP head pairs per K DMA, VH heads per V DMA, VB units per blocked-PV matmul,
+    HW 1 for hardware DGE on the K and V loads. VB=0 (the kernel's one-column PV)
+    is rejected: it gives wrong rows on trn2 hardware at B=16 / 32.
     """
     parts = [int(x) for x in os.environ.get("WHISPER_XKERNEL_DMA", "5,10,5,0").split(",")]
     parts += [5, 0][len(parts) - 2:] if len(parts) < 4 else []
+    if parts[2] < 1:
+        raise ValueError(
+            f"WHISPER_XKERNEL_DMA={','.join(map(str, parts))}: VB must be >= 1. The one-column "
+            "PV (VB=0) gives wrong output on trn2 hardware and is not supported."
+        )
     return parts[0], parts[1], parts[2], parts[3]
 WHISPER_MEL_FRAMES = 3000
 

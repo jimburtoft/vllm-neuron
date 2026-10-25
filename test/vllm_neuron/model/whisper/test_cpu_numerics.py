@@ -713,3 +713,16 @@ def test_cross_fp8_xkernel_close_to_bf16(hf_checkpoint, monkeypatch):
         outs.append(out[0].float())
     cos = torch.nn.functional.cosine_similarity(outs[0], outs[1], dim=-1).min()
     assert cos > 0.99
+
+
+def test_xkernel_dma_rejects_one_column_pv(monkeypatch):
+    """VB=0 (one-column PV) is wrong on trn2 hardware, so the config rejects it at load."""
+    from vllm_neuron.model.whisper import model_bf16
+
+    monkeypatch.delenv("WHISPER_XKERNEL_DMA", raising=False)
+    assert model_bf16.xkernel_dma() == (5, 10, 5, 0)
+    monkeypatch.setenv("WHISPER_XKERNEL_DMA", "5,10,0")
+    with pytest.raises(ValueError, match="VB must be >= 1"):
+        model_bf16.xkernel_dma()
+    monkeypatch.setenv("WHISPER_XKERNEL_DMA", "5,10,5,1")
+    assert model_bf16.xkernel_dma() == (5, 10, 5, 1)
