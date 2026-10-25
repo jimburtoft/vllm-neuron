@@ -656,3 +656,60 @@ def test_lm_head_bf16(hf_checkpoint, monkeypatch, mode):
     assert got.dtype == torch.float32
     tol = 1e-5 if mode == "bf16w" else 3e-2
     torch.testing.assert_close(got, want, rtol=tol, atol=tol)
+
+
+def test_fp8_e4m3_codes_round_trip():
+    """fp8_e4m3_encode gives the trn2 e4m3 codes (round to nearest even, clamp 240); decode inverts it."""
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    import numpy as np
+
+    from vllm_neuron._kernels.whisper.cross_attention_decode import (
+        fp8_e4m3_codes,
+        fp8_e4m3_decode,
+        fp8_e4m3_encode,
+        fp8_e4m3_values,
+    )
+
+    torch.manual_seed(0)
+    x = torch.cat([torch.randn(20000) * s for s in (0.003, 0.05, 1.0, 8.0, 60.0)]
+                  + [torch.tensor([0.0, 240.0, -240.0, 300.0, -1000.0, 2**-9, 2**-10, 15.5])])
+    x = x.to(torch.bfloat16)
+    want = np.clip(x.float().numpy(), -240, 240).astype(ml_dtypes.float8_e4m3).view(np.uint8)
+    got = fp8_e4m3_codes(x).numpy()
+    assert ((got == want) | ((want == 0x80) & (got == 0))).all()
+    dec = fp8_e4m3_values(torch.from_numpy(want), torch.float32).numpy()
+    assert np.array_equal(dec, want.view(ml_dtypes.float8_e4m3).astype(np.float32))
+    # Packed: two codes per bf16 element; decode inverts encode.
+    xp = x[: x.numel() // 2 * 2].view(-1, 2)
+    packed = fp8_e4m3_encode(xp)
+    assert packed.dtype == torch.bfloat16 and packed.shape == (xp.shape[0], 1)
+    assert torch.equal(fp8_e4m3_decode(packed, torch.float32), fp8_e4m3_values(fp8_e4m3_codes(xp), torch.float32))
+
+
+def test_cross_fp8_xkernel_close_to_bf16(hf_checkpoint, monkeypatch):
+    """WHISPER_CROSS_FP8=1 stores the xkernel cross-KV as e4m3 codes; the batched decode logits stay close."""
+    path, _ = hf_checkpoint
+    monkeypatch.setenv("WHISPER_SELF_KV", "slot")
+    monkeypatch.setenv("WHISPER_CROSS_MODE", "xkernel")
+    outs = []
+    for fp8 in ("0", "1"):
+        monkeypatch.setenv("WHISPER_CROSS_FP8", fp8)
+        model = _build_native(path, max_num_seqs=3)
+        k0 = model.audio_tower.cross_k_0
+        assert k0.shape[-1] == (768 if fp8 == "1" else 1536)
+        torch.manual_seed(2)
+        mel = torch.randn(1, 128, 3000)
+        model.embed_multimodal(input_features=mel, encoder_cache=_FakeEncoderCache(), mm_hashes=["c"],
+                               request_slots=[1])
+        n = len(PROMPT)
+        table = torch.full((1, MAX_BLOCKS_PER_SEQ), -1, dtype=torch.int32)
+        out = model(
+            input_ids=torch.tensor(PROMPT + [0] * 4, dtype=torch.int32),
+            positions=torch.tensor(list(range(n)) + [n - 1] * 4, dtype=torch.int32),
+            attn_metadata=_metadata(model, torch.tensor(list(range(n)) + [-1] * 4), table, n + 4,
+                                    request_slots=[1]),
+            sampling_positions=torch.tensor([n - 1]),
+        )
+        outs.append(out[0].float())
+    cos = torch.nn.functional.cosine_similarity(outs[0], outs[1], dim=-1).min()
+    assert cos > 0.99

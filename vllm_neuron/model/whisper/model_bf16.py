@@ -302,6 +302,22 @@ def cross_kv_fused() -> bool:
     return os.environ.get("WHISPER_CROSS_KV_FUSED", "0") == "1"
 
 
+def cross_fp8() -> bool:
+    """Return True when ``WHISPER_CROSS_FP8=1``: the xkernel cross-KV is stored as float8 e4m3.
+
+    The encoder graph writes the trn2 e4m3 codes (unit scale: the cross K/V of
+    whisper-large-v3 stay below 22 in absolute value on real audio, far under the
+    e4m3 limit of 240), two per bf16 element (the last buffer dim halves), and the
+    xkernel reads them as fp8. This halves the cross-KV bytes. It is a precision
+    change: gate it on WER.
+    Needs ``WHISPER_CROSS_MODE=xkernel``.
+    """
+    on = os.environ.get("WHISPER_CROSS_FP8", "0") == "1"
+    if on and cross_mode() != "xkernel":
+        raise ValueError("WHISPER_CROSS_FP8=1 needs WHISPER_CROSS_MODE=xkernel.")
+    return on
+
+
 def xkernel_dma() -> tuple[int, int, int, int]:
     """Return ``WHISPER_XKERNEL_DMA=KP,VH[,VB[,HW]]`` (default ``5,10,5,0``).
 
@@ -768,10 +784,15 @@ class WhisperCrossKVEncoder(nn.Module):
         else:
             shape = (num_slots, n_heads_local, n_ctx, head_dim)
         k_shape = (num_slots, shape[1], head_dim, n_ctx) if self.kt else shape
+        self.fp8 = cross_fp8()
         for i in range(n_layers):
             for kind, shp in (("k", k_shape), ("v", shape)):
+                if self.fp8:
+                    shp = (*shp[:-1], shp[-1] // 2)
                 self.register_buffer(
-                    f"cross_{kind}_{i}", torch.zeros(shp, dtype=dtype), persistent=False
+                    f"cross_{kind}_{i}",
+                    torch.zeros(shp, dtype=torch.bfloat16 if self.fp8 else dtype),
+                    persistent=False,
                 )
         self.kv_fused = cross_kv_fused()
         if self.kv_fused:
@@ -843,6 +864,10 @@ class WhisperCrossKVEncoder(nn.Module):
                     k, v = F.pad(k, (0, 0, 0, pad, 0, hpad)), F.pad(v, (0, 0, 0, pad, 0, hpad))
                 if self.kt:
                     k = k.transpose(-1, -2).contiguous()
+                if self.fp8:
+                    from vllm_neuron._kernels.whisper.cross_attention_decode import fp8_e4m3_encode
+
+                    k, v = fp8_e4m3_encode(k), fp8_e4m3_encode(v)
                 getattr(self, f"cross_k_{i}").index_put_((slots,), k)
                 getattr(self, f"cross_v_{i}").index_put_((slots,), v)
         # Return a tensor, so that the warmup trace has an output.
@@ -891,6 +916,7 @@ class CrossAttention(nn.Module):
         # xkernel keeps K^T, so its prefill (attn_cached) reads K^T too.
         self.kt = (cross_k_transposed() and cross_mode() != "kernel") or self.xkernel
         self.xkernel_dma = xkernel_dma() if self.xkernel else None
+        self.cross_fp8 = self.xkernel and cross_fp8()
         # Kernel mode: the kernel projects Q, K and V of the decoder token. Only
         # Q is used, so the K and V columns are zero. The active key is masked.
         self.kernel = cross_mode() in ("kernel", "mqa")
@@ -1018,7 +1044,7 @@ class CrossAttention(nn.Module):
         kp, vh, vb, hw = self.xkernel_dma
         ctx = whisper_cross_attention_decode(
             q, cross_k, cross_v, slots, qmask, group, k_pairs=kp, v_heads=vh, pv_block=vb,
-            hw_dge=hw,
+            hw_dge=hw, fp8=self.cross_fp8,
         )
         return self.out_proj(ctx[:, :h].reshape(B, h * d))
 
@@ -1754,8 +1780,15 @@ class WhisperDecoder(nn.Module):
             elif mode == "xgather":
                 # [rows, h, d, 1536] -> [rows, h, d, 1500]; the K^T layout (kt) of attn_cached.
                 hl = owner.n_heads_local
-                cross_k = cross_k.index_select(0, xslots)[:, :hl, :, :WHISPER_ENCODER_TOKENS]
-                cross_v = cross_v.index_select(0, xslots)[:, :hl, :WHISPER_ENCODER_TOKENS]
+                cross_k = cross_k.index_select(0, xslots)
+                cross_v = cross_v.index_select(0, xslots)
+                if owner.fp8:
+                    from vllm_neuron._kernels.whisper.cross_attention_decode import fp8_e4m3_decode
+
+                    dt = self.embed_tokens.weight.dtype
+                    cross_k, cross_v = fp8_e4m3_decode(cross_k, dt), fp8_e4m3_decode(cross_v, dt)
+                cross_k = cross_k[:, :hl, :, :WHISPER_ENCODER_TOKENS]
+                cross_v = cross_v[:, :hl, :WHISPER_ENCODER_TOKENS]
             elif mode == "mqagather":
                 # The blocks of a slot are contiguous, so gather one slot per row
                 # instead of nbm blocks per row. A 512-block gather does not finish

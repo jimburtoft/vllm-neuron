@@ -26,6 +26,7 @@ def whisper_cross_attention_decode(
     pv_block: int = 5,
     dmask: torch.Tensor | None = None,
     hw_dge: int = 0,
+    fp8: bool = False,
 ) -> torch.Tensor:
     """Return the cross-attention context of B decode rows, ``[B, H, 64]``.
 
@@ -34,8 +35,9 @@ def whisper_cross_attention_decode(
 
     Args:
         q: ``[B, H, 64]``, scaled by ``head_dim ** -0.5``.
-        k_cache: ``[S, H, 64, 1536]`` cross K^T of all slots.
-        v_cache: ``[S, H, 1536, 64]`` cross V of all slots.
+        k_cache: ``[S, H, 64, 1536]`` cross K^T of all slots (bf16), or with ``fp8`` the
+            packed float8 e4m3 codes ``[S, H, 64, 768]`` (``fp8_e4m3_encode``).
+        v_cache: ``[S, H, 1536, 64]`` cross V of all slots, or ``[S, H, 1536, 32]`` packed.
         slots: ``[B]`` int32, the slot of each row.
         qmask: the ``xkernel_qmask(H, group)`` tensor on the device (kernel only).
         group: rows per kernel group (``xkernel_group``).
@@ -45,6 +47,7 @@ def whisper_cross_attention_decode(
             one-column PV.
         dmask: the ``xkernel_dmask(H, group, pv_block)`` tensor on the device.
         hw_dge: 1 loads K and V with hardware DGE.
+        fp8: the cross-KV holds packed float8 e4m3 codes.
 
     Example:
         >>> # ctx = whisper_cross_attention_decode(q, k, v, slots, qmask, 4)
@@ -77,6 +80,7 @@ def whisper_cross_attention_decode(
         PV=pv,
         VB=vb,
         HW=hw_dge,
+        FP8=1 if fp8 else 0,
     )
     if isinstance(out, (tuple, list)):
         out = out[0]

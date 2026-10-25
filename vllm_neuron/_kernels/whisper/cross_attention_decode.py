@@ -37,6 +37,11 @@ Parameters:
   HW  1: the K and V loads use hardware DGE (descriptors from the Sync / Scalar
       sequencers). 0: the compiler picks (software DGE on GpSimd for a runtime offset).
 
+FP8 1: k_cache and v_cache hold float8 e4m3 codes (trn2 e4m3, |x| <= 240, unit scale), two
+    codes per bf16 element (``fp8_e4m3_encode``): a [S, X] tensor holds 2 X codes per slot.
+    The loads read them as float8_e4m3 and the matmuls take them as the moving operand as
+    they are (fp32 accumulation), which halves the cross-KV bytes. 0: bf16.
+
 LNC: the launch grid is the LNC degree. With 2 programs, program i runs the groups
 g = i, i + 2, ... (each group is independent and writes its own output rows).
 """
@@ -52,7 +57,7 @@ QK_W = 512
 
 
 @nki.jit
-def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, VH=10, PV=1, VB=5, HW=0):
+def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, VH=10, PV=1, VB=5, HW=0, FP8=0):
     """See the module docstring."""
     B = slots.shape[1]
     H = 2 * q_t.shape[1] // B
@@ -62,6 +67,8 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
     HP = H // 2
     F4 = U // 4
     NB = U // VB
+    kv_dt = nl.float8_e4m3 if FP8 == 1 else k_cache.dtype
+    kv_ap = {"dtype": nl.float8_e4m3} if FP8 == 1 else {}
     kernel_assert(H % 2 == 0, "whisper_xattn_decode: H must be even (pad odd head counts)")
     kernel_assert(U <= 128 and (PV == 1 or U % 4 == 0), "whisper_xattn_decode: G * H up to 128 (a multiple of 4 for PV=0)")
     kernel_assert(NG * G == B, "whisper_xattn_decode: G must divide the batch")
@@ -109,11 +116,11 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
             sc.append(nl.ndarray((U, QK_W), dtype=nl.float32, buffer=nl.psum))
         for r in range(G):
             for kc in range(HP // KP):
-                kb = nl.ndarray((128, KP, C), dtype=k_cache.dtype, buffer=nl.sbuf)
+                kb = nl.ndarray((128, KP, C), dtype=kv_dt, buffer=nl.sbuf)
                 nisa.dma_copy(
                     dst=kb,
                     src=k_cache.ap(pattern=[[C, 128], [128 * C, KP], [1, C]],
-                                   offset=kc * KP * 128 * C, scalar_offset=sl[r], indirect_dim=0),
+                                   offset=kc * KP * 128 * C, scalar_offset=sl[r], indirect_dim=0, **kv_ap),
                     dge_mode=nisa.dge_mode.hwdge if HW == 1 else nisa.dge_mode.unknown,
                 )
                 for pk in range(KP):
@@ -163,11 +170,11 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
             first = 1
             for r in range(G):
                 for vc in range(H // VH):
-                    vb = nl.ndarray((128, VH, NCH * 64), dtype=v_cache.dtype, buffer=nl.sbuf)
+                    vb = nl.ndarray((128, VH, NCH * 64), dtype=kv_dt, buffer=nl.sbuf)
                     nisa.dma_copy(
                         dst=vb,
                         src=v_cache.ap(pattern=[[NCH * 64, 128], [C * 64, VH], [1, NCH * 64]],
-                                       offset=vc * VH * C * 64, scalar_offset=sl[r], indirect_dim=0),
+                                       offset=vc * VH * C * 64, scalar_offset=sl[r], indirect_dim=0, **kv_ap),
                     dge_mode=nisa.dge_mode.hwdge if HW == 1 else nisa.dge_mode.unknown,
                     )
                     for bb in range(VH // VB):
@@ -191,11 +198,11 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
         o_ps = nl.ndarray((128, F4 * 64), dtype=nl.float32, buffer=nl.psum)
         for r in range(G):
             for vc in range(H // VH):
-                vb = nl.ndarray((128, VH, NCH * 64), dtype=v_cache.dtype, buffer=nl.sbuf)
+                vb = nl.ndarray((128, VH, NCH * 64), dtype=kv_dt, buffer=nl.sbuf)
                 nisa.dma_copy(
                     dst=vb,
                     src=v_cache.ap(pattern=[[NCH * 64, 128], [C * 64, VH], [1, NCH * 64]],
-                                   offset=vc * VH * C * 64, scalar_offset=sl[r], indirect_dim=0),
+                                   offset=vc * VH * C * 64, scalar_offset=sl[r], indirect_dim=0, **kv_ap),
                     dge_mode=nisa.dge_mode.hwdge if HW == 1 else nisa.dge_mode.unknown,
                 )
                 for vk in range(VH):
@@ -295,8 +302,138 @@ def whisper_xattn_decode_torch(q, k_cache, v_cache, slots):
     """
     import torch
 
+    if k_cache.shape[-1] * 2 == C or v_cache.shape[-1] * 2 == 64:
+        # Packed fp8 codes (two per element).
+        k_cache, v_cache = fp8_e4m3_decode(k_cache, q.dtype), fp8_e4m3_decode(v_cache, q.dtype)
     k = k_cache.index_select(0, slots.to(torch.int64))[..., :VALID]  # [B, H, 64, 1500]
     v = v_cache.index_select(0, slots.to(torch.int64))[:, :, :VALID]  # [B, H, 1500, 64]
     s = torch.einsum("bhd,bhdt->bht", q.float(), k.float())
     p = torch.softmax(s, dim=-1).to(v.dtype)
     return torch.einsum("bht,bhtd->bhd", p.float(), v.float()).to(q.dtype)
+
+
+FP8_CHUNK = 4096
+
+
+@nki.jit
+def whisper_fp8_encode(x):
+    """Return the float8 e4m3 codes of ``x`` [128, F] (F even), two per bf16 element: [128, F / 2].
+
+    One cast per chunk of ``FP8_CHUNK`` columns (round to nearest even). The values must be
+    within +/-240. LNC: program i casts the chunks i, i + n_programs, ...
+    """
+    R, F = x.shape
+    kernel_assert(R == 128 and F % 2 == 0, "whisper_fp8_encode: x must be [128, F] with F even")
+    out = nl.ndarray((R, F // 2), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    n_prg = nl.num_programs(axes=0) if nl.program_ndim() != 0 else 1
+    prg = nl.program_id(axis=0) if nl.program_ndim() != 0 else 0
+    nch = (F + FP8_CHUNK - 1) // FP8_CHUNK
+    for t in range(prg, nch, n_prg):
+        w = min(FP8_CHUNK, F - t * FP8_CHUNK)
+        xs = nl.ndarray((128, FP8_CHUNK), dtype=x.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=xs[0:128, 0:w], src=x[0:128, t * FP8_CHUNK:t * FP8_CHUNK + w])
+        q = nl.ndarray((128, FP8_CHUNK), dtype=nl.float8_e4m3, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=q[0:128, 0:w], src=xs[0:128, 0:w])
+        nisa.dma_copy(dst=out.ap(pattern=[[F, 128], [1, w]], offset=t * FP8_CHUNK, dtype=nl.float8_e4m3),
+                      src=q[0:128, 0:w])
+    return out
+
+
+@nki.jit
+def whisper_fp8_decode(xp):
+    """Return the bf16 values [128, 2 F] of the packed float8 e4m3 codes ``xp`` [128, F] (bf16)."""
+    R, F2 = xp.shape
+    F = 2 * F2
+    kernel_assert(R == 128, "whisper_fp8_decode: xp must have 128 rows")
+    out = nl.ndarray((R, F), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    n_prg = nl.num_programs(axes=0) if nl.program_ndim() != 0 else 1
+    prg = nl.program_id(axis=0) if nl.program_ndim() != 0 else 0
+    nch = (F + FP8_CHUNK - 1) // FP8_CHUNK
+    for t in range(prg, nch, n_prg):
+        w = min(FP8_CHUNK, F - t * FP8_CHUNK)
+        q = nl.ndarray((128, FP8_CHUNK), dtype=nl.float8_e4m3, buffer=nl.sbuf)
+        nisa.dma_copy(dst=q[0:128, 0:w],
+                      src=xp.ap(pattern=[[F, 128], [1, w]], offset=t * FP8_CHUNK, dtype=nl.float8_e4m3))
+        xs = nl.ndarray((128, FP8_CHUNK), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=xs[0:128, 0:w], src=q[0:128, 0:w])
+        nisa.dma_copy(dst=out[0:128, t * FP8_CHUNK:t * FP8_CHUNK + w], src=xs[0:128, 0:w])
+    return out
+
+
+def _run_flat(kernel, x):
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+    out = wrap_nki(kernel)[get_logical_nc_config()](x.reshape(128, -1))
+    return out[0] if isinstance(out, (tuple, list)) else out
+
+
+def fp8_e4m3_encode(x):
+    """Return the trn2 float8 e4m3 codes of ``x``, two per bf16 element (the last dim halves).
+
+    Round to nearest even; |x| is clamped to 240 on CPU and must be within 240 on device.
+    On a Neuron device this runs ``whisper_fp8_encode``. The CPU path (the reference) builds
+    the codes with float math and packs them with ``view``. The trn2 e4m3 format has bias
+    7, 3 mantissa bits, subnormals below 2^-6 and a largest finite value of 240; for
+    |x| <= 240 its codes are the same as float8_e4m3fn.
+    """
+    import torch
+
+    from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+    shape = (*x.shape[:-1], x.shape[-1] // 2)
+    if can_run_kernel(x):
+        return _run_flat(whisper_fp8_encode, x.to(torch.bfloat16).contiguous()).view(shape)
+    return fp8_e4m3_codes(x).contiguous().view(torch.bfloat16).view(shape)
+
+
+def fp8_e4m3_decode(xp, dtype=None):
+    """Return the values (``dtype``, default bf16) of the packed codes ``xp`` (the last dim doubles)."""
+    import torch
+
+    from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+    shape = (*xp.shape[:-1], xp.shape[-1] * 2)
+    if can_run_kernel(xp):
+        return _run_flat(whisper_fp8_decode, xp.contiguous()).view(shape).to(dtype or torch.bfloat16)
+    return fp8_e4m3_values(xp.contiguous().view(torch.uint8).view(shape), dtype)
+
+
+def fp8_e4m3_codes(x):
+    """Return the trn2 float8 e4m3 codes of ``x`` as ``uint8`` (CPU reference, float math).
+
+    With e the exponent of |x| (at least -6) and q the value rounded to a step of
+    2^(e - 3), the code magnitude is 8 (e + 7) + 8 (q 2^-e - 1), and q * 512 for a
+    subnormal.
+    """
+    import torch
+
+    xf = x.to(torch.float32)
+    a = xf.abs().clamp(max=240.0)
+    e = torch.floor(torch.log2(a.clamp(min=2.0**-6)))
+    # log2 can be off by one ulp next to a power of two: correct e against 2^e.
+    e = e + (a >= torch.exp2(e + 1)).to(e.dtype) - (a < torch.exp2(e)).to(e.dtype)
+    e = e.clamp(min=-6.0)
+    q = torch.round(a * torch.exp2(3.0 - e)) * torch.exp2(e - 3.0)
+    # Rounding up to 2^(e + 1) moves to the next exponent.
+    e = e + (q >= torch.exp2(e + 1)).to(e.dtype)
+    mag = 8.0 * (e + 7.0) + 8.0 * (q * torch.exp2(-e) - 1.0)
+    mag = torch.where(q > 0, mag, torch.zeros_like(mag))
+    code = mag + torch.where((xf < 0) & (mag > 0), torch.full_like(mag, 128.0), torch.zeros_like(mag))
+    return code.to(torch.uint8)
+
+
+def fp8_e4m3_values(u, dtype=None):
+    """Return the values of the trn2 float8 e4m3 codes ``u`` (``uint8``) as ``dtype`` (default bf16)."""
+    import torch
+
+    c = u.to(torch.float32)
+    neg = c >= 128.0
+    m = c - 128.0 * neg.to(c.dtype)
+    e = torch.floor(m * 0.125)
+    mant = m - 8.0 * e
+    normal = (1.0 + mant * 0.125) * torch.exp2(e - 7.0)
+    sub = mant * (1.0 / 512.0)
+    v = torch.where(e > 0, normal, sub)
+    return torch.where(neg, -v, v).to(dtype or torch.bfloat16)
