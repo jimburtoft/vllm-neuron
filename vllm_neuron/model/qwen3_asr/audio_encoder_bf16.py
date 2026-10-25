@@ -28,9 +28,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import os
+
 import numpy as np
 
 import vllm_neuron.functional as NF
+from vllm_neuron.functional.attention.encoder_window_attention import (
+    build_segment_factors,
+    encoder_window_attention,
+)
 from nkilib.core.utils.common_types import NormType
 from vllm_neuron.parallel.neuron_parallel_state import (
     get_neuron_encoder_tp_group,
@@ -46,6 +52,21 @@ from .weight_loader import (
     audio_qkv_bias_loader,
     audio_qkv_weight_loader,
 )
+
+
+# Encoder self-attention backend. "cte": NF.flash_attention (nkilib attention_cte with
+# bound masks, one 128x128 call per block and head). "fused": one block-local attention
+# kernel per layer that reads the fused QKV output and writes the o_proj layout directly.
+_ENC_ATTN_BACKENDS = ("cte", "fused")
+
+
+def get_encoder_attention_backend() -> str:
+    v = os.environ.get("VLLM_NEURON_QWEN3_ASR_ENC_ATTN", "cte").strip().lower()
+    if v not in _ENC_ATTN_BACKENDS:
+        raise ValueError(
+            f"VLLM_NEURON_QWEN3_ASR_ENC_ATTN={v!r}; use one of {_ENC_ATTN_BACKENDS}."
+        )
+    return v
 
 
 @allow_in_graph_cacheable
@@ -306,6 +327,7 @@ class Qwen3ASRAudioAttention(nn.Module):
         hidden_states: torch.Tensor,
         bound_min: torch.Tensor,
         bound_max: torch.Tensor,
+        seg_factors: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Attention forward with per-block bounds masking.
 
@@ -317,6 +339,9 @@ class Qwen3ASRAudioAttention(nn.Module):
             hidden_states: ``[num_blocks, block_size, d_model]``.
             bound_min: ``[num_blocks, block_size, 1]`` int32 — inclusive lower bound.
             bound_max: ``[num_blocks, block_size, 1]`` int32 — exclusive upper bound.
+            seg_factors: optional ``(seg_q, seg_k)`` from ``build_segment_factors``. When given
+                (encoder attention backend "fused"), attention runs as one block-local kernel
+                on the fused QKV output; the bounds are then unused here.
 
         Returns:
             ``[num_blocks, block_size, d_model]``
@@ -336,6 +361,16 @@ class Qwen3ASRAudioAttention(nn.Module):
             bias=self.qkv_bias.unsqueeze(0),
             norm_b=self.norm.bias.unsqueeze(0),
         )
+
+        if seg_factors is not None:
+            # [num_blocks, heads_per_rank, head_dim, block_size] (BNdS), read natively by o_proj
+            attn_output = encoder_window_attention(
+                qkv, seg_factors[0], seg_factors[1], self.scale, self.num_heads_per_rank
+            )
+            output = NF.o_proj(attn_output, self.proj_weight)
+            if self.world_size > 1:
+                self.tp_group.all_reduce(output)
+            return output + self.proj_bias
 
         hd = self.num_heads_per_rank * self.head_dim
         q = qkv[:, :, :hd]
@@ -420,6 +455,7 @@ class Qwen3ASRAudioEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         bound_min: torch.Tensor,
         bound_max: torch.Tensor,
+        seg_factors: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Block forward with pre-norm residual connections.
 
@@ -431,7 +467,9 @@ class Qwen3ASRAudioEncoderLayer(nn.Module):
         Returns:
             ``[num_blocks, block_size, d_model]``
         """
-        hidden_states = hidden_states + self.attn(hidden_states, bound_min, bound_max)
+        hidden_states = hidden_states + self.attn(
+            hidden_states, bound_min, bound_max, seg_factors
+        )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
 
         # skip fp16 clamp as not needed for bf16
@@ -484,6 +522,7 @@ class Qwen3ASREncoder(nn.Module):
         self.dp_size = self.dp_group.world_size if self.dp_group else 1
 
         self.n_window = config.n_window
+        self.attention_backend = get_encoder_attention_backend()
         self.positional_embedding = SinusoidsPositionEmbedding(
             config.max_position_embeddings,  # 13
             config.d_model,
@@ -754,8 +793,12 @@ class Qwen3ASREncoder(nn.Module):
             x = F.pad(x, (0, 0, 0, seq_pad))
 
         # Step 4: Transformer layers
+        seg_factors = None
+        if self.attention_backend == "fused":
+            # Rank-16 block-local mask factors, built once for all layers.
+            seg_factors = build_segment_factors(bound_min, bound_max, dtype=x.dtype)
         for layer in self.layers:
-            x = layer(x, bound_min, bound_max)
+            x = layer(x, bound_min, bound_max, seg_factors)
 
         # Step 5: Final norm, then output projector. ln_post keeps d_model (1024).
         # The projector then maps d_model -> output_dim (2048 == text hidden_size).
