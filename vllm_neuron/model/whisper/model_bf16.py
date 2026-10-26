@@ -201,7 +201,7 @@ def self_kv_write() -> str:
     """Return ``WHISPER_SELF_WRITE``: how slot mode writes the new K/V (``index`` or ``where``).
 
     * ``index`` (default): ``index_put_`` of one row for each token and head.
-    * ``where``: a one-hot ``torch.where`` over the whole buffer (intern-whisper style).
+    * ``where``: a one-hot ``torch.where`` over the whole buffer.
       It reads and writes the full buffer on each step.
     """
     mode = os.environ.get("WHISPER_SELF_WRITE", "index")
@@ -575,7 +575,7 @@ def lm_head_mode() -> str:
       the bf16 ``embed_tokens``, so the stored values are the same as with ``fp32``. Only
       the HBM bytes halve.
     * ``bf16``: bf16 weight and a bf16 GEMM (fp32 accumulation, bf16 logits). This is a
-      precision change: gate it on the 18-clip set and WER.
+      precision change: gate it on WER.
     """
     mode = os.environ.get("WHISPER_LM_HEAD", "fp32")
     if mode not in ("fp32", "bf16w", "bf16"):
