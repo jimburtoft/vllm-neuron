@@ -43,6 +43,13 @@ def _kassert(c, msg=""):
     assert c, msg
 
 
+def _programs():
+    """``(n_programs, program_id)`` on grid axis 0; ``(1, 0)`` without a grid."""
+    if nl.program_ndim() == 0:
+        return 1, 0
+    return nl.num_programs(axes=0), nl.program_id(axis=0)
+
+
 @nki.jit
 def sparse_decode_attn(
     q_all,  # [B, H, D] fp32 or bf16, same column order as the attended cache slice
@@ -55,9 +62,16 @@ def sparse_decode_attn(
     lat_dim=512,  # value width
     rope_off=512,  # rope offset inside the slice
     rope_dim=64,
-    tg=0,  # tokens per group (0 = auto: PSUM_F32 // H, reduced to divide B)
+    tg=0,  # tokens per group (0 = auto: PSUM_F32 // heads per program, reduced to divide B)
 ):
-    B, H, D = q_all.shape
+    B, H_all, D = q_all.shape
+    # Launched at the logical NC config (LNC=2: two programs). Heads are split
+    # across programs: each attends every key for its H heads and writes its
+    # own head slice of m/den/num, so no cross-program reduction is needed.
+    n_prg, prg = _programs()
+    _kassert(H_all % n_prg == 0, "n_heads must divide by the number of programs")
+    H = H_all // n_prg
+    h0 = prg * H
     W = kv_cache.shape[-1]
     n_rows = 1
     for d in kv_cache.shape[:-1]:
@@ -65,7 +79,7 @@ def sparse_decode_attn(
     cache = kv_cache.reshape((n_rows, W))
     n_keys = rows.shape[1]
     L = lat_dim
-    _kassert(H <= P_MAX, "n_heads must be <= 128")
+    _kassert(H <= P_MAX, "heads per program must be <= 128")
     _kassert(L % P_MAX == 0 and L <= 512, "latent must be a multiple of 128 and <= 512")
     _kassert(rope_dim <= P_MAX, "rope_dim must be <= 128")
     _kassert(L + rope_dim == D, "query width must be latent + rope")
@@ -87,9 +101,9 @@ def sparse_decode_attn(
     # against the bf16 keys. The value product is bf16 either way.
     qk_dt = q_all.dtype
 
-    m_out = nl.ndarray((B, H), dtype=nl.float32, buffer=nl.shared_hbm)
-    den_out = nl.ndarray((B, H), dtype=nl.float32, buffer=nl.shared_hbm)
-    num_out = nl.ndarray((B, H, L), dtype=nl.float32, buffer=nl.shared_hbm)
+    m_out = nl.ndarray((B, H_all), dtype=nl.float32, buffer=nl.shared_hbm)
+    den_out = nl.ndarray((B, H_all), dtype=nl.float32, buffer=nl.shared_hbm)
+    num_out = nl.ndarray((B, H_all, L), dtype=nl.float32, buffer=nl.shared_hbm)
 
     ones_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=ones_row, value=1.0)
@@ -102,7 +116,7 @@ def sparse_decode_attn(
         qT = nl.ndarray((P_MAX, n_lat + 1, TH), dtype=qk_dt, buffer=nl.sbuf)
         for t in nl.static_range(TG):
             q_sb = nl.ndarray((H, D), dtype=qk_dt, buffer=nl.sbuf)
-            nisa.dma_copy(dst=q_sb, src=q_all[b0 + t, 0:H, 0:D])
+            nisa.dma_copy(dst=q_sb, src=q_all[b0 + t, h0 : h0 + H, 0:D])
             for c in nl.static_range(n_lat):
                 tp = nl.ndarray((P_MAX, H), dtype=qk_dt, buffer=nl.psum)
                 nisa.nc_transpose(
@@ -200,7 +214,8 @@ def sparse_decode_attn(
             mrp = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.psum)
             nisa.nc_transpose(dst=mrp[0:1, 0:cw], data=mcol[0:cw, 0:1])
             nisa.tensor_copy(dst=mrow[0:1, c0 : c0 + cw], src=mrp[0:1, 0:cw])
-        nisa.dma_copy(dst=m_out[b0 : b0 + TG].reshape((1, TH)), src=mrow[0:1, 0:TH])
+        for t in nl.static_range(TG):
+            nisa.dma_copy(dst=m_out[b0 + t : b0 + t + 1, h0 : h0 + H], src=mrow[0:1, t * H : (t + 1) * H])
         negrow = nl.ndarray((1, TH), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=negrow[0:1, 0:TH], data=mrow[0:1, 0:TH], op0=nl.multiply, operand0=-1.0)
         negm_p = nl.ndarray((KS, TH), dtype=nl.float32, buffer=nl.psum)
@@ -222,7 +237,8 @@ def sparse_decode_attn(
         nisa.nc_matmul(dst=den_p[0:1, 0:TH], stationary=ones_col[0:KS, 0:1], moving=psum_k[0:KS, 0:TH])
         den_sb = nl.ndarray((1, TH), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=den_sb[0:1, 0:TH], src=den_p[0:1, 0:TH])
-        nisa.dma_copy(dst=den_out[b0 : b0 + TG].reshape((1, TH)), src=den_sb[0:1, 0:TH])
+        for t in nl.static_range(TG):
+            nisa.dma_copy(dst=den_out[b0 + t : b0 + t + 1, h0 : h0 + H], src=den_sb[0:1, t * H : (t + 1) * H])
 
         # ---- num per token: [H, L] = p[:, t]^T @ latent ----
         for t in nl.static_range(TG):
@@ -236,7 +252,7 @@ def sparse_decode_attn(
                 )
             num_sb = nl.ndarray((H, L), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=num_sb[0:H, 0:L], src=num_p[0:H, 0:L])
-            nisa.dma_copy(dst=num_out[b0 + t], src=num_sb[0:H, 0:L])
+            nisa.dma_copy(dst=num_out[b0 + t, h0 : h0 + H, 0:L], src=num_sb[0:H, 0:L])
 
     return m_out, den_out, num_out
 
@@ -257,11 +273,20 @@ def gather_rows_cols(
     _kassert(col_off + width <= W, "column slice exceeds the cache row")
     _kassert(n % P_MAX == 0 or n <= P_MAX, "n must be <=128 or a multiple of 128")
     KT = (n + P_MAX - 1) // P_MAX
-    KS = min(n, P_MAX)
+    KS_all = min(n, P_MAX)
+    # Launched at the logical NC config: each program gathers its own
+    # KS = KS_all / n_programs keys of every 128-key tile (disjoint output rows).
+    n_prg, prg = _programs()
+    _kassert(KS_all % n_prg == 0, "keys per tile must divide by the number of programs")
+    KS = KS_all // n_prg
+    k0 = prg * KS
     out = nl.ndarray((R, n, width), dtype=kv_cache.dtype, buffer=nl.shared_hbm)
     for r in nl.sequential_range(R):
         idx = nl.ndarray((KS, KT), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=idx[0:KS, 0:KT], src=rows[r].reshape((KT, KS)).ap(pattern=[[1, KS], [KS, KT]], offset=0))
+        nisa.dma_copy(
+            dst=idx[0:KS, 0:KT],
+            src=rows[r].reshape((KT, KS_all)).ap(pattern=[[1, KS], [KS_all, KT]], offset=k0),
+        )
         for kt in nl.static_range(KT):
             t = nl.ndarray((KS, width), dtype=kv_cache.dtype, buffer=nl.sbuf)
             nisa.memset(dst=t, value=0.0)
@@ -275,5 +300,6 @@ def gather_rows_cols(
                 ),
                 oob_mode=nisa.oob_mode.skip,
             )
-            nisa.dma_copy(dst=out[r, kt * KS : (kt + 1) * KS, 0:width], src=t[0:KS, 0:width])
+            row0 = kt * KS_all + k0
+            nisa.dma_copy(dst=out[r, row0 : row0 + KS, 0:width], src=t[0:KS, 0:width])
     return out

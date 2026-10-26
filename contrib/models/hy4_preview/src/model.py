@@ -399,6 +399,18 @@ def _sparse_kernels():
     return _SPARSE_KERNELS
 
 
+def _sparse_grid() -> int:
+    """Launch grid of the sparse kernels: the logical NC config the graph compiles at
+    (neuronx-cc rejects a kernel launched at another degree, NCC_EVRF066)."""
+    try:
+        from vllm_neuron.utils.hardware_config import get_logical_nc_config
+    except ImportError:  # CPU unit tests without vLLM
+        return 1
+    from vllm_neuron import envs
+
+    return 1 if envs.VLLM_NEURON_CPU_MODE else get_logical_nc_config()
+
+
 def _use_sparse_kernels(t: torch.Tensor) -> bool:
     """The plugin's rule (Neuron device, or CPU mode with ``NKI_SIMULATOR=1``)."""
     try:
@@ -668,6 +680,8 @@ class HYV4Attention(nn.Module):
                 "sinks", torch.full((nh,), -1.0e30, device="cpu"), persistent=False
             )
         self.kv_pages: torch.Tensor | None = None
+        # Read once here, not in the traced forward.
+        self.sparse_grid = _sparse_grid() if DEC_SPARSE_NKI else 1
 
         set_weight_loader(self.q_a_proj_weight, _replicated_transposed())
         set_weight_loader(self.kv_a_proj_weight, _replicated_transposed())
@@ -1237,7 +1251,7 @@ class HYV4Attention(nn.Module):
         """``[R, n]`` flat rows -> ``[R, n, width]`` columns ``col_off:`` of each entry."""
         if _use_sparse_kernels(rows):
             gather = _sparse_kernels()[1]
-            return gather[1](kv_cache=self.kv_pages, rows=rows, col_off=col_off, width=width)
+            return gather[self.sparse_grid](kv_cache=self.kv_pages, rows=rows, col_off=col_off, width=width)
         return gather_rows_cols_ref(self.kv_pages, rows, col_off, width)
 
     def _cp_sparse_rows(
@@ -1294,7 +1308,7 @@ class HYV4Attention(nn.Module):
         col_off = self.latent_slice.start
         if _use_sparse_kernels(q_all):
             attn = _sparse_kernels()[0]
-            return attn[1](
+            return attn[self.sparse_grid](
                 q_all=q_all.contiguous(), kv_cache=self.kv_pages, rows=rows.contiguous(),
                 bound=bound.contiguous(), scale=float(self.scaling), col_off=col_off,
                 lat_off=0, lat_dim=self.kv_lora_rank, rope_off=self.kv_lora_rank,

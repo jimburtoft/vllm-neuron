@@ -3,7 +3,10 @@
 
 SIMULATOR ONLY: a pass here is a development milestone, not device evidence.
 
-    NEURON_PLATFORM_TARGET_OVERRIDE=trn2 python test/sim/sim_sparse_decode.py [B NK ...]
+    NEURON_PLATFORM_TARGET_OVERRIDE=trn2 GRID=2 python test/sim/sim_sparse_decode.py [B NK ...]
+
+``GRID`` (default 1) is the launch grid; the model launches at the logical NC
+config (2 on trn2/trn3 under vllm-neuron).
 
 Hy4 shapes: cache [pages, 1, 32, 704] bf16 with row = [index 128 | latent 512 |
 rope 64], H = 64 heads, attended slice = columns 128:704, value = 128:640.
@@ -15,7 +18,8 @@ import sys
 import time
 
 os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
-os.environ.setdefault("NEURON_LOGICAL_NC_CONFIG", "1")
+GRID = int(os.environ.get("GRID", "1"))
+os.environ.setdefault("NEURON_LOGICAL_NC_CONFIG", str(GRID))
 import ml_dtypes  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -64,7 +68,7 @@ def case(B, NK, q_dtype, empty_req, seed=0):
 
     qin = q.numpy().astype(np.float32) if q_dtype == "fp32" else bf(q)
     t0 = time.time()
-    km, kd, kn = nki.simulate(sparse_decode_attn)(
+    km, kd, kn = nki.simulate(sparse_decode_attn)[GRID](
         qin, bf(cache), rows.numpy(), bound.numpy(), scale=SCALE, col_off=IDX,
         lat_off=0, lat_dim=L, rope_off=L, rope_dim=R,
     )
@@ -72,7 +76,7 @@ def case(B, NK, q_dtype, empty_req, seed=0):
     km, kd, kn = [torch.as_tensor(np.asarray(x, dtype=np.float32)) for x in (km, kd, kn)]
 
     t0 = time.time()
-    gk = nki.simulate(gather_rows_cols)(bf(cache), rows.numpy(), col_off=0, width=IDX)
+    gk = nki.simulate(gather_rows_cols)[GRID](bf(cache), rows.numpy(), col_off=0, width=IDX)
     t_gather = time.time() - t0
     gk = torch.as_tensor(np.asarray(gk, dtype=np.float32))
 
@@ -106,7 +110,7 @@ if __name__ == "__main__":
             good = (r["m_abs"] < 1e-3 and r["den_rel"] < 1e-4 and r["num_rel"] < 1e-2
                     and r["num_cos"] > 0.9999 and r["gather_exact"] and not r["nan"])
             ok &= good
-            print(f"B={B} NK={NK} q={qd}: {'PASS' if good else 'FAIL'} (simulator only) "
+            print(f"grid={GRID} B={B} NK={NK} q={qd}: {'PASS' if good else 'FAIL'} (simulator only) "
                   + " ".join(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}" for k, v in r.items()),
                   flush=True)
     sys.exit(0 if ok else 1)
