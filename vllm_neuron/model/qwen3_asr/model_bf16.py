@@ -15,6 +15,7 @@ ANNOTATION GUIDE:
 from __future__ import annotations
 
 import logging
+import os
 import time as _time
 
 import torch
@@ -53,6 +54,7 @@ from .audio_encoder_bf16 import Qwen3ASREncoder
 from .config import Qwen3ASRConfig, Qwen3ASRTextConfig
 from .utils.audio_preprocessing import plan_audio_blocks
 from .utils.merge_audio_embeds import merge_audio_embeddings
+from vllm_neuron.functional.lmhead_argmax import lmhead_argmax
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,21 @@ HF_LM_HEAD_KEY = "thinker.lm_head.weight"
 
 
 _FP8_KV_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+# lm_head + greedy sampling backend. "stock" (default): lm_head matmul -> [B, V] logits -> Sampler
+# (argmax). "fused": one NKI kernel streams the lm_head weight once and returns the argmax token ids
+# without writing the logits. Fused is used only where it is exactly the stock math: TP1, on-device
+# all-greedy sampling, no logits gather (logprobs / debug dump), no logit_mask; otherwise stock runs.
+_LMHEAD_BACKENDS = ("stock", "fused")
+
+
+def get_lmhead_backend() -> str:
+    v = os.environ.get("VLLM_NEURON_QWEN3_ASR_LMHEAD", "stock").strip().lower()
+    if v not in _LMHEAD_BACKENDS:
+        raise ValueError(
+            f"VLLM_NEURON_QWEN3_ASR_LMHEAD={v!r}; use one of {_LMHEAD_BACKENDS}."
+        )
+    return v
 
 
 def _write_packed_k_pairs(
@@ -1159,6 +1176,26 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 ),
             )
 
+            # >>> fused lm_head + greedy argmax (TP1 all-greedy only, see get_lmhead_backend) <<<
+            self._fused_lmhead = (
+                get_lmhead_backend() == "fused"
+                and self.world_size == 1
+                and self.on_device_sampling_config is not None
+                and bool(self.on_device_sampling_config.all_greedy)
+                and not self._gather_logits
+                and self.lm_head.weight_layout == "in_out"
+                and self.lm_head.bias is None
+            )
+            logger.info(
+                "qwen3_asr lm_head backend: %s (requested %s, tp=%d, all_greedy=%s, gather_logits=%s)",
+                "fused" if self._fused_lmhead else "stock",
+                get_lmhead_backend(),
+                self.world_size,
+                bool(self.on_device_sampling_config is not None
+                     and self.on_device_sampling_config.all_greedy),
+                self._gather_logits,
+            )
+
             if self.on_device_sampling_config is not None:
                 self.sampler = Sampler(
                     self.on_device_sampling_config,
@@ -1169,6 +1206,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         else:
             self.lm_head = None
             self.sampler = None
+            self._fused_lmhead = False
 
     # ------------------------------------------------------------------
     # Compiler arguments (per-graph neuronx-cc policy)
@@ -1308,6 +1346,10 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         hidden_states_for_logits = torch.index_select(
             hidden_states, dim=0, index=sampling_positions
         )
+        if self._fused_lmhead and logit_mask is None:
+            # greedy token ids straight from the hidden states; the [B, V] logits never exist
+            sampled_tokens = lmhead_argmax(hidden_states_for_logits, self.lm_head.weight)
+            return sampled_tokens, None
         logits = self.lm_head(hidden_states_for_logits)
 
         gathered_logits = None
