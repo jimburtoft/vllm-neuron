@@ -8,7 +8,7 @@ trn2.3xlarge at TP=4 / LNC=2, or in vllm-neuron CPU mode
 
 Usage (trn2):
     NEURON_SKIP_EFA_AFFINITY=1 python examples/vllm_neuron/models/muse_glimmer/run.py \
-        --model /home/ubuntu/models/Muse-Glimmer-30B --tp 4 --max-model-len 8192
+        --model meta-models/Muse-Glimmer-30B --tp 4 --max-model-len 8192
 
 Arguments may also come from the environment: MUSE_GLIMMER_MODEL, MUSE_GLIMMER_TP,
 MUSE_GLIMMER_MAX_MODEL_LEN, MUSE_GLIMMER_MAX_NUM_SEQS.
@@ -56,7 +56,7 @@ def build_chat_prompts(model_path: str, prompts: list[str]) -> list[str]:
 def main():
     env = os.environ.get
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=env("MUSE_GLIMMER_MODEL", "/home/ubuntu/models/Muse-Glimmer-30B"))
+    ap.add_argument("--model", default=env("MUSE_GLIMMER_MODEL", "meta-models/Muse-Glimmer-30B"))
     ap.add_argument("--tp", type=int, default=int(env("MUSE_GLIMMER_TP", "4")))
     ap.add_argument("--max-model-len", type=int, default=int(env("MUSE_GLIMMER_MAX_MODEL_LEN", "8192")))
     ap.add_argument("--max-num-seqs", type=int, default=int(env("MUSE_GLIMMER_MAX_NUM_SEQS", "4")))

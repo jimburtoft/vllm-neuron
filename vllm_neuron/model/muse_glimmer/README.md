@@ -200,10 +200,10 @@ in `VLLM_NEURON_CPU_MODE=1` on a truncated checkpoint against HF fp32.
 ```bash
 # trn2.3xlarge, TP=4, LNC=2 (text only)
 NEURON_SKIP_EFA_AFFINITY=1 VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.12 python examples/vllm_neuron/models/muse_glimmer/run.py \
-    --model /home/ubuntu/models/Muse-Glimmer-30B --tp 4 --max-model-len 8192
+    --model meta-models/Muse-Glimmer-30B --tp 4 --max-model-len 8192
 # one image (vision DP; add --vision-tp 4 for vision TP). --vision-block = max patches per image
 NEURON_SKIP_EFA_AFFINITY=1 VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.12 python examples/vllm_neuron/models/muse_glimmer/run.py \
-    --model /home/ubuntu/models/Muse-Glimmer-30B --tp 4 --max-model-len 8192 \
+    --model meta-models/Muse-Glimmer-30B --tp 4 --max-model-len 8192 \
     --image cat.jpg --vision-block 4096
 ```
 
