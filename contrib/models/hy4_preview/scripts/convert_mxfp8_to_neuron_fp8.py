@@ -39,7 +39,8 @@ experts per layer) so that cost is a number, not a guess.
 path), so there the routed experts need no requantisation: ``gate_up_proj``,
 ``gate_up_proj_scale``, ``down_proj`` and ``down_proj_scale`` are copied through
 unchanged (OCP ``e4m3fn`` + ``e8m0``, ``down_proj`` not transposed) and the
-model tiles them at load time. Every other MXFP8 tensor is dequantised to bf16
+model slices them at load time (and, with ``HY4_MX_BACKEND=kernel``, tiles them
+for ``moe_tkg``; the default torch backend dequantises them in the graph). Every other MXFP8 tensor is dequantised to bf16
 exactly as in the default mode, and ``neuron_quantization.format`` is
 ``mxfp8_experts`` instead of ``fp8_row_experts``. Without the flag the output is
 unchanged.

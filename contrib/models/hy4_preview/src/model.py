@@ -47,6 +47,7 @@ the full width.
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -152,9 +153,15 @@ from .moe import (
     FORMAT_FP8_ROW,
     FORMAT_MXFP8,
     HYV4MLP,
+    MX_BACKEND_ENV,
+    MX_BACKEND_KERNEL,
+    MX_BACKEND_TORCH,
     HYV4MoE,
+    mx_backend,
     require_mx_platform,
 )
+
+logger = logging.getLogger(__name__)
 
 HF_PREFIX = "model"
 
@@ -1569,9 +1576,18 @@ class HYV4ForCausalLM(nn.Module):
         quant = config.neuron_quantization or {}
         fmt = quant.get("format")
         if fmt == FORMAT_MXFP8:
-            # Native MXFP8 experts run nkilib MX moe_tkg, which is Trn3-only.
-            # Checked once here, outside any traced region.
-            require_mx_platform()
+            if mx_backend() == MX_BACKEND_KERNEL:
+                # nkilib MX moe_tkg is Trn3-only. Checked once here, outside
+                # any traced region.
+                require_mx_platform()
+            else:
+                logger.info(
+                    "neuron_quantization.format=%s: routed experts dequantised in "
+                    "the graph (%s=%s); this format is intended for Trn3 (set "
+                    "%s=%s for nkilib MX moe_tkg)",
+                    FORMAT_MXFP8, MX_BACKEND_ENV, MX_BACKEND_TORCH,
+                    MX_BACKEND_ENV, MX_BACKEND_KERNEL,
+                )
         elif fmt != FORMAT_FP8_ROW:
             raise ValueError(
                 "HYV4ForCausalLM on Neuron loads the Trn2 fp8 checkpoint written by "

@@ -40,15 +40,22 @@ expert and the dense layer-0 MLP are not.
 
 **Trn3: native MXFP8 experts** (``neuron_quantization.format == "mxfp8_experts"``,
 written by ``convert_mxfp8_to_neuron_fp8.py --keep-mx-experts``). The published
-OCP e4m3fn + e8m0 expert tensors are loaded without requantisation, tiled at load
-time into nkilib ``moe_tkg``'s MX layouts (``mx_experts.py``), and run through
-``NF.moe_tkg``: selective over the top-k at decode, all-expert dynamic at prefill.
-Same TP-over-I layout as above. Trn3 only (the MX kernels need gen4); the two
-fp8-row paths above are what Trn2 runs.
+OCP e4m3fn + e8m0 expert tensors are loaded without requantisation, in the same
+TP-over-I layout as above. ``HY4_MX_BACKEND`` picks how they are run:
+
+* ``torch`` (default): the fp8-row paths' layout and compute (selective gather at
+  decode, dense over experts at prefill), with each MX block dequantised in the
+  graph as ``fp8.to(bf16) * 2**(e - 127)``. The power of two is built from its
+  bf16 exponent bits, so the dequantised weight is exactly the checkpoint value
+  (see ``_e8m0_to_bf16``). Pure torch: runs on any platform.
+* ``kernel``: tiled at load time into nkilib ``moe_tkg``'s MX layouts
+  (``mx_experts.py``) and run through ``NF.moe_tkg``: selective over the top-k at
+  decode, all-expert dynamic at prefill. Trn3 only (the MX kernels need gen4).
 """
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -70,8 +77,25 @@ FP8 = torch.float8_e4m3fn
 # ``config.neuron_quantization["format"]`` values (written by the converter).
 FORMAT_FP8_ROW = "fp8_row_experts"
 FORMAT_MXFP8 = "mxfp8_experts"
-# Testing only: skip the Trn3 platform check for the MXFP8 expert format.
+# Testing only: skip the Trn3 platform check for the MXFP8 expert kernel backend.
 MX_FORCE_ENV = "HY4_MX_EXPERTS_FORCE"
+# How ``mxfp8_experts`` checkpoints are run: in-graph dequant + torch, or moe_tkg.
+MX_BACKEND_ENV = "HY4_MX_BACKEND"
+MX_BACKEND_TORCH = "torch"
+MX_BACKEND_KERNEL = "kernel"
+
+logger = logging.getLogger(__name__)
+
+
+def mx_backend() -> str:
+    """``$HY4_MX_BACKEND`` (default ``torch``); read at model construction."""
+    backend = os.environ.get(MX_BACKEND_ENV, MX_BACKEND_TORCH)
+    if backend not in (MX_BACKEND_TORCH, MX_BACKEND_KERNEL):
+        raise ValueError(
+            f"{MX_BACKEND_ENV} must be {MX_BACKEND_TORCH!r} or {MX_BACKEND_KERNEL!r}, "
+            f"got {backend!r}"
+        )
+    return backend
 
 
 def _as_bytes(t: torch.Tensor) -> torch.Tensor:
@@ -219,8 +243,161 @@ def mx_down_scale_loader(intermediate: int, shard: int) -> SafetensorsWeightLoad
     return SafetensorsWeightLoader(transform=transform)
 
 
+# ── OCP MXFP8 experts for the torch backend (``HY4_MX_BACKEND=torch``) ─────────
+#
+# Same TP-over-I slicing as the kernel loaders above, laid out like the fp8-row
+# path (expert-major, H second) so one expert is one contiguous read. Bytes and
+# exponents are only permuted; dequantisation happens in the graph.
+
+# e8m0 255 is NaN (OCP MX spec). Above MX_E8M0_MAX_FINITE the largest e4m3fn
+# value (448 = 1.75 * 2**8) times 2**(e - 127) exceeds the bf16 range (largest
+# finite ~1.99 * 2**127); below MX_E8M0_EXACT_MIN the product of the smallest
+# e4m3fn subnormal (2**-9) with the scale falls below the smallest normal bf16
+# (2**-126) and may round.
+MX_E8M0_MAX_FINITE = 127 + 127 - 8
+MX_E8M0_EXACT_MIN = 127 - 126 + 9
+
+
+def check_e8m0(scale: torch.Tensor, what: str, rank: int) -> None:
+    """Raise if any exponent is NaN (255) or can overflow bf16; log the range at rank 0."""
+    lo, hi = int(scale.min()), int(scale.max())
+    if hi > MX_E8M0_MAX_FINITE:
+        raise ValueError(
+            f"{what}: e8m0 exponent {hi} (255 = NaN) can overflow bf16; "
+            f"expected <= {MX_E8M0_MAX_FINITE}"
+        )
+    if rank == 0:
+        logger.info(
+            "%s: e8m0 exponents in [%d, %d] (scale 2^%d .. 2^%d)",
+            what, lo, hi, lo - 127, hi - 127,
+        )
+    if lo < MX_E8M0_EXACT_MIN:
+        logger.warning(
+            "%s: e8m0 exponent %d < %d: tiny products may round in bf16%s",
+            what, lo, MX_E8M0_EXACT_MIN,
+            " (e=0 decodes as scale 0, not 2^-127)" if lo == 0 else "",
+        )
+
+
+def _gate_up_expert_major(source, intermediate: int, shard: int, rank: int, what: str):
+    """``[E, 2I, X]`` -> this rank's uint8 ``[E, X, 2, I_r]`` (gate rows, then up rows)."""
+    rows = _mx_gate_up_rows(source, intermediate, shard, rank, what)  # [E, 2 I_r, X]
+    num_experts, _, width = rows.shape
+    return rows.view(num_experts, 2, shard, width).permute(0, 3, 1, 2).contiguous()
+
+
+def mx_torch_gate_up_loader(intermediate: int, shard: int) -> SafetensorsWeightLoader:
+    """``gate_up_proj [E, 2I, H]`` e4m3fn -> e4m3fn ``[E, H, 2, I_r]``."""
+
+    def transform(slices: list, rank: int) -> torch.Tensor:
+        (source,) = slices
+        return _gate_up_expert_major(
+            source, intermediate, shard, rank, "gate_up_proj"
+        ).view(FP8)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def mx_torch_gate_up_scale_loader(
+    intermediate: int, shard: int
+) -> SafetensorsWeightLoader:
+    """``gate_up_proj_scale [E, 2I, H/32]`` e8m0 -> uint8 ``[E, H/32, 2, I_r]``.
+
+    ``[e, j, g, c]`` is the exponent of input block ``j`` (H ``32j .. 32j+31``)
+    of output column ``c`` of half ``g`` (0 gate, 1 up).
+    """
+
+    def transform(slices: list, rank: int) -> torch.Tensor:
+        (source,) = slices
+        out = _gate_up_expert_major(
+            source, intermediate, shard, rank, "gate_up_proj_scale"
+        )
+        check_e8m0(out, "gate_up_proj_scale", rank)
+        return e8m0_to_bf16_host(out)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def _check_down_cols(source, cols: int, what: str) -> None:
+    if source.get_shape()[-1] != cols:
+        raise ValueError(f"{what} has {source.get_shape()[-1]} columns, expected {cols}")
+
+
+def mx_torch_down_loader(intermediate: int, shard: int) -> SafetensorsWeightLoader:
+    """``down_proj [E, H, I]`` e4m3fn -> e4m3fn ``[E, I_r, H]`` (like ``down_proj_t``)."""
+
+    def transform(slices: list, rank: int) -> torch.Tensor:
+        (source,) = slices
+        _check_down_cols(source, intermediate, "down_proj")
+        start = rank * shard
+        part = _as_bytes(source[:, :, start : start + shard])
+        return part.transpose(1, 2).contiguous().view(FP8)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def mx_torch_down_scale_loader(
+    intermediate: int, shard: int
+) -> SafetensorsWeightLoader:
+    """``down_proj_scale [E, H, I/32]`` e8m0 -> uint8 ``[E, I_r/32, H]``."""
+    if shard % mx.MX_BLOCK:
+        raise ValueError(f"per-rank I={shard} does not split the 32-wide MX blocks")
+
+    def transform(slices: list, rank: int) -> torch.Tensor:
+        (source,) = slices
+        _check_down_cols(source, intermediate // mx.MX_BLOCK, "down_proj_scale")
+        lo = rank * shard // mx.MX_BLOCK
+        part = source[:, :, lo : lo + shard // mx.MX_BLOCK]
+        out = part.transpose(1, 2).contiguous()
+        check_e8m0(out, "down_proj_scale", rank)
+        return e8m0_to_bf16_host(out)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def e8m0_to_bf16_host(scale: torch.Tensor) -> torch.Tensor:
+    """Load-time: uint8 e8m0 ``e`` -> bf16 ``2**(e - 127)`` (exact for 1 <= e <= 254).
+
+    The torch backend keeps its scales as bf16 powers of two on device, so the
+    graph never operates on uint8 tensors (a uint8 operand in this graph
+    crashed the device runtime at warmup).
+    """
+    return torch.exp2(scale.to(torch.float32) - 127.0).to(torch.bfloat16)
+
+
+def _e8m0_to_bf16(scale: torch.Tensor) -> torch.Tensor:
+    """uint8 e8m0 ``e`` -> bf16 ``2**(e - 127)``, exactly, for ``1 <= e <= 254``.
+
+    Computed as ``exp2(e - 127)`` in fp32 and cast: every power of two in that
+    range is exact in fp32 and bf16. (A bit-cast of ``e << 7`` to bf16 is also
+    exact but the XLA tracer rejects the int16 -> bf16 view.) ``e = 0`` is
+    warned about at load.
+    """
+    return torch.exp2(scale.to(torch.float32) - 127.0).to(torch.bfloat16)
+
+
+def mx_dequant(w8: torch.Tensor, scale: torch.Tensor, dim: int) -> torch.Tensor:
+    """fp8 ``w8`` * 2**(scale - 127), in bf16, with one exponent per 32 along ``dim``.
+
+    ``scale`` has ``w8``'s shape with ``dim`` divided by 32. A value of e4m3fn
+    (4 significant bits) times a power of two is exact in bf16 within the range
+    ``check_e8m0`` allows, so this equals the fp32 dequantisation cast to bf16.
+    """
+    if dim < 0:
+        dim += w8.ndim
+    shape = list(w8.shape)
+    blocked = shape[:dim] + [shape[dim] // mx.MX_BLOCK, mx.MX_BLOCK] + shape[dim + 1 :]
+    s_shape = shape[:dim] + [shape[dim] // mx.MX_BLOCK, 1] + shape[dim + 1 :]
+    if scale.dtype == torch.uint8:
+        scale = _e8m0_to_bf16(scale)
+    out = w8.to(torch.bfloat16).view(blocked) * scale.to(torch.bfloat16).view(s_shape)
+    return out.view(shape)
+
+
 def require_mx_platform() -> None:
     """Raise unless this host targets Trn3 (the MX ``moe_tkg`` kernels are gen4-only).
+
+    Applies to ``HY4_MX_BACKEND=kernel`` only; the torch backend runs anywhere.
 
     Evaluated once, at model construction, never inside a traced forward
     (``get_platform_target()`` builds a torchbind object; see
@@ -244,8 +421,9 @@ def require_mx_platform() -> None:
         raise RuntimeError(
             f"neuron_quantization.format={FORMAT_MXFP8!r} (native MXFP8 experts, "
             f"nkilib MX moe_tkg) runs on Trn3 only, but the platform target is "
-            f"{target!r}. On Trn2 convert the checkpoint without --keep-mx-experts "
-            f"(format {FORMAT_FP8_ROW!r})."
+            f"{target!r}. Unset {MX_BACKEND_ENV} (or set it to {MX_BACKEND_TORCH!r}) "
+            f"for the in-graph dequant backend, or on Trn2 convert the checkpoint "
+            f"without --keep-mx-experts (format {FORMAT_FP8_ROW!r})."
         )
 
 
@@ -399,7 +577,8 @@ class HYV4MoE(nn.Module):
 
     Takes the *normed* hidden states and returns this rank's partial sum.
     With ``neuron_quantization.format == "mxfp8_experts"`` (Trn3) the routed
-    experts are the published MXFP8 tensors run by nkilib ``moe_tkg`` instead.
+    experts are the published MXFP8 tensors, dequantised in the graph
+    (``HY4_MX_BACKEND=torch``, default) or run by nkilib ``moe_tkg`` (``kernel``).
     """
 
     def __init__(self, config: HYV4Config):
@@ -425,8 +604,12 @@ class HYV4MoE(nn.Module):
         if fmt not in (FORMAT_FP8_ROW, FORMAT_MXFP8):
             raise ValueError(f"unknown neuron_quantization.format {fmt!r}")
         self.mx_experts = fmt == FORMAT_MXFP8
-        if self.mx_experts:
+        # "kernel": nkilib MX moe_tkg; "torch": in-graph dequant (default); None: fp8 row.
+        self.mx_backend = mx_backend() if self.mx_experts else None
+        if self.mx_backend == MX_BACKEND_KERNEL:
             self._init_mx_experts(intermediate)
+        elif self.mx_backend == MX_BACKEND_TORCH:
+            self._init_mx_torch_experts(intermediate)
         else:
             self._init_fp8_row_experts(intermediate)
 
@@ -508,11 +691,52 @@ class HYV4MoE(nn.Module):
             self.experts_down_scale, mx_down_scale_loader(intermediate, i_r)
         )
 
+    def _init_mx_torch_experts(self, intermediate: int) -> None:
+        """OCP MXFP8, fp8-row-path layout, dequantised in the graph (``HY4_MX_BACKEND=torch``)."""
+        h, e, i_r = self.hidden_size, self.num_experts, self.inter_per_rank
+        blk = mx.MX_BLOCK
+        if h % blk or i_r % blk:
+            raise ValueError(
+                f"MX experts need hidden_size and the per-rank intermediate size to "
+                f"be multiples of {blk} (MX blocks are not split); got H={h}, I_r={i_r}"
+            )
+        self.experts_gate_up_weight = nn.Parameter(
+            torch.empty(e, h, 2, i_r, dtype=FP8), requires_grad=False
+        )
+        self.experts_gate_up_scale = nn.Parameter(
+            torch.empty(e, h // blk, 2, i_r, dtype=torch.bfloat16), requires_grad=False
+        )
+        self.experts_down_weight = nn.Parameter(
+            torch.empty(e, i_r, h, dtype=FP8), requires_grad=False
+        )
+        self.experts_down_scale = nn.Parameter(
+            torch.empty(e, i_r // blk, h, dtype=torch.bfloat16), requires_grad=False
+        )
+        set_weight_loader(
+            self.experts_gate_up_weight, mx_torch_gate_up_loader(intermediate, i_r)
+        )
+        set_weight_loader(
+            self.experts_gate_up_scale, mx_torch_gate_up_scale_loader(intermediate, i_r)
+        )
+        set_weight_loader(
+            self.experts_down_weight, mx_torch_down_loader(intermediate, i_r)
+        )
+        set_weight_loader(
+            self.experts_down_scale, mx_torch_down_scale_loader(intermediate, i_r)
+        )
+
     def forward(self, normed: torch.Tensor) -> torch.Tensor:
         normed = normed.to(self.dtype)
-        if self.mx_experts:
+        selective = normed.shape[0] <= SELECTIVE_MOE_MAX_TOKENS
+        if self.mx_backend == MX_BACKEND_KERNEL:
             out = self._forward_mx(normed)
-        elif normed.shape[0] <= SELECTIVE_MOE_MAX_TOKENS:
+        elif self.mx_backend == MX_BACKEND_TORCH:
+            out = (
+                self._forward_selected_mx(normed)
+                if selective
+                else self._forward_dense_mx(normed)
+            )
+        elif selective:
             out = self._forward_selected(normed)
         else:
             out = self._forward_dense(normed)
@@ -688,4 +912,69 @@ class HYV4MoE(nn.Module):
         )
         return act.to(self.dtype).reshape(tokens, e * i_r) @ down.view(
             e * i_r, self.hidden_size
+        )
+
+    def _forward_selected_mx(self, normed: torch.Tensor) -> torch.Tensor:
+        """``_forward_selected`` on MXFP8 experts (``HY4_MX_BACKEND=torch``).
+
+        The selected experts' fp8 weights and e8m0 exponents are gathered, the
+        weights dequantised exactly in bf16 (one exponent per 32 H of gate/up,
+        per 32 I of down), and multiplied per (token, selected expert) pair.
+        MX scales vary along the contraction dim, so unlike the row scales they
+        cannot be applied to the matmul output.
+        """
+        tokens = normed.shape[0]
+        h, i_r, k = self.hidden_size, self.inter_per_rank, self.top_k
+        idx, weights = route_topk(
+            normed,
+            self.router_weight,
+            self.e_score_correction_bias,
+            k,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )  # [T, K], [T, K] fp32
+        flat = idx.reshape(-1).to(torch.long)  # [T*K]
+        pairs = flat.shape[0]
+
+        w_gu = torch.index_select(self.experts_gate_up_weight, 0, flat)  # [P, H, 2, I_r]
+        s_gu = torch.index_select(self.experts_gate_up_scale, 0, flat)  # [P, H/32, 2, I_r]
+        w_gu = mx_dequant(w_gu, s_gu, dim=1).to(self.dtype)
+        x = normed.repeat_interleave(k, dim=0)  # [P, H]
+        gate_up = torch.einsum("ph,phc->pc", x, w_gu.view(pairs, h, 2 * i_r))
+        gate_up = gate_up.float().view(pairs, 2, i_r)
+        act = self._act(gate_up[:, 0, :], gate_up[:, 1, :])
+        act = act * weights.reshape(pairs, 1)  # [P, I_r] fp32
+
+        w_d = torch.index_select(self.experts_down_weight, 0, flat)  # [P, I_r, H]
+        s_d = torch.index_select(self.experts_down_scale, 0, flat)  # [P, I_r/32, H]
+        w_d = mx_dequant(w_d, s_d, dim=1).to(self.dtype)
+        down = torch.einsum("pi,pih->ph", act.to(self.dtype), w_d)
+        return down.float().view(tokens, k, h).sum(dim=1).to(self.dtype)
+
+    def _forward_dense_mx(self, normed: torch.Tensor) -> torch.Tensor:
+        """``_forward_dense`` on MXFP8 experts: every local expert dequantised in the graph."""
+        tokens = normed.shape[0]
+        e, h, i_r = self.num_experts, self.hidden_size, self.inter_per_rank
+
+        affinities = route(
+            normed,
+            self.router_weight,
+            self.e_score_correction_bias,
+            self.top_k,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )  # [T, E] fp32
+
+        w_gu = mx_dequant(self.experts_gate_up_weight, self.experts_gate_up_scale, dim=1)
+        gate_up = torch.einsum("th,ehc->tec", normed, w_gu.to(self.dtype).view(e, h, 2 * i_r))
+        gate_up = gate_up.float().view(tokens, e, 2, i_r)
+        gate, up = gate_up[:, :, 0, :], gate_up[:, :, 1, :]
+        if self.swiglu_limit > 0:
+            gate = gate.clamp(max=self.swiglu_limit)
+            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        act = F.silu(gate) * up * affinities.unsqueeze(-1)  # [T, E, I_r]
+
+        down = mx_dequant(self.experts_down_weight, self.experts_down_scale, dim=1)
+        return act.to(self.dtype).reshape(tokens, e * i_r) @ down.to(self.dtype).view(
+            e * i_r, h
         )

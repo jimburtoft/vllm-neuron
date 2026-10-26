@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Trn3 native MXFP8 experts (``mxfp8_experts``) on CPU.
+"""Trn3 native MXFP8 experts (``mxfp8_experts``), kernel backend, on CPU.
 
 * ``mx_experts`` tiling: decoding the kernel layouts back (indexing of nkilib's
   MX torch reference) gives the checkpoint bytes, bit for bit;
@@ -113,6 +113,7 @@ def test_layouts_bit_exact(E, H, I):
 @pytest.fixture
 def forced(monkeypatch):
     monkeypatch.setenv(moe.MX_FORCE_ENV, "1")
+    monkeypatch.setenv(moe.MX_BACKEND_ENV, moe.MX_BACKEND_KERNEL)
 
 
 NAMES = {
@@ -126,7 +127,7 @@ NAMES = {
 def build(world, rank, ckpt, router, bias):
     set_group(type("G", (Group,), {"world_size": world, "rank_in_group": rank})())
     m = moe.HYV4MoE(Cfg())
-    assert m.mx_experts
+    assert m.mx_experts and m.mx_backend == moe.MX_BACKEND_KERNEL
     want = mx.convert_rank_experts(*mx.shard_experts_tp(*ckpt, rank=rank, tp=world))
     for i, (name, key) in enumerate(NAMES.items()):
         p = getattr(m, name)

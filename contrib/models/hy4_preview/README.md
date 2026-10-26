@@ -118,8 +118,16 @@ takes `MAX_NUM_SEQS` (4) and `SEQ_BUCKETS` (`[1, 4]`).
 
 Trn3: an optional native-MXFP8 expert path is included
 (`convert_mxfp8_to_neuron_fp8.py --keep-mx-experts`, `neuron_quantization.format`
-`mxfp8_experts`, routed experts through nkilib's MX `moe_tkg`; `src/mx_experts.py`).
-It refuses to load on any other platform. Only its CPU unit tests are reported here.
+`mxfp8_experts`). The published OCP e4m3fn weights and e8m0 exponents are loaded
+unchanged. By default (`HY4_MX_BACKEND=torch`) the routed experts run the same
+torch selective/dense paths as the fp8-row checkpoint, with each 32-element MX
+block dequantised in the graph as `fp8 * 2^(e-127)` in bf16 -- exact, since an
+e4m3 value times a power of two is representable in bf16 (the load checks the
+exponent range and logs it). This backend is pure torch and loads on any
+platform, though the format is intended for Trn3. `HY4_MX_BACKEND=kernel`
+instead tiles the experts into nkilib's MX `moe_tkg` layouts (`src/mx_experts.py`)
+and runs that kernel; it refuses to load on any platform but Trn3. Only the CPU
+unit tests of both backends are reported here.
 
 ## Example Checkpoints
 
@@ -149,7 +157,9 @@ pytest contrib/models/hy4_preview/test/unit
 They cover the selective decode MoE against the dense path and an fp32
 reference, key-sharded decode attention against the replicated one (2/4/8 ranks,
 shuffled all-gather order), the kv-segment prefill bound (bitwise identical),
-the uint8 selection all-gather, and the MXFP8 expert layouts and loaders. The template's logit validation is
+the uint8 selection all-gather, the MXFP8 kernel-backend layouts and loaders, and
+the MXFP8 torch backend (loaders, bit-exact in-graph dequantisation, selective and
+dense outputs against an fp32 reference at 1 and 2 ranks). The template's logit validation is
 not used: its transformers reference would need the 770B model in fp32 on the
 host.
 
