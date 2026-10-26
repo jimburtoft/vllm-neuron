@@ -107,7 +107,7 @@ def fused_decode_max_rows() -> int:
 
     ``WHISPER_FUSED_DECODE_MAX_B`` (default: no limit). The kernel folds the
     5 MHA heads of a rank into the batch, so its cost grows with the rows.
-    The torch path is faster from about 64 rows at TP4 (Task 013).
+    The torch path is faster from about 64 rows at TP4.
     """
     return int(os.environ.get("WHISPER_FUSED_DECODE_MAX_B", "1000000"))
 
@@ -120,7 +120,7 @@ def in_out_parts() -> set[str]:
     ``decoder,lm_head``. ``none`` stores all weights as ``[out, in]``.
 
     With ``[out, in]`` weights, the compiler adds one PE transpose for each 128 x 128
-    weight tile on every decode step (Task 022: 30.4 k transposes, 2.6 ms at B=16).
+    weight tile on every decode step (30.4 k transposes, 2.6 ms at B=16).
     ``[in, out]`` weights give the same values: the matmul reads the same products
     in the same order.
     """
@@ -261,8 +261,8 @@ def mqa_span(group: int) -> int:
 
     ``WHISPER_CROSS_MQA_PAD=1`` (default) pads a span above 8192 positions to a
     multiple of 8192. The decode kernel's flash tiling fails on a partial last
-    tile (10 heads: 15360 positions), and runs a padded span (16384) correctly
-    (Task 025). The pad positions are masked. ``WHISPER_CROSS_MQA_PAD=0`` keeps the
+    tile (10 heads: 15360 positions), and runs a padded span (16384) correctly.
+    The pad positions are masked. ``WHISPER_CROSS_MQA_PAD=0`` keeps the
     unpadded span.
     """
     span = group * CROSS_CTX
@@ -286,7 +286,7 @@ def cross_mode() -> str:
     * ``xkernel``: the Whisper cross-attention decode kernel
       (``vllm_neuron/_kernels/whisper``). Each slot keeps K^T ``[h, d, 1536]`` and
       V ``[h, 1536, d]``; the kernel reads the K and V of each row in large DMAs
-      and runs the 1500-position softmax in fp32 (Task 034).
+      and runs the 1500-position softmax in fp32.
     * ``onehot`` / ``gather``: older modes, kept for comparison.
     """
     return os.environ.get("WHISPER_CROSS_MODE", "mask")
@@ -296,7 +296,7 @@ def cross_kv_fused() -> bool:
     """Return True when ``WHISPER_CROSS_KV_FUSED=1``: one GEMM projects the cross K|V of all layers.
 
     The encoder graph then runs one ``[T, H] x [H, layers * 2 * H_local]`` matmul
-    instead of ``2 x layers`` matmuls of ``[H, H_local]`` (Task 033). The weights are
+    instead of ``2 x layers`` matmuls of ``[H, H_local]``. The weights are
     a concatenated copy, ``[H, layers * 2 * H_local]`` (about 210 MB at TP1).
     """
     return os.environ.get("WHISPER_CROSS_KV_FUSED", "0") == "1"
@@ -1196,7 +1196,7 @@ class DecoderSelfAttention(nn.Module):
         # each (request slot, head), as a 3D [slots * heads, 448, d] buffer. The
         # writes and reads index only dim 0 (and the position for a decode write):
         # neuronx-cc fails on index_put_ into a reshaped view of a flat buffer
-        # (NCC_ILTO901, Task 024). The last slot is the scratch slot (pad rows and
+        # (NCC_ILTO901). The last slot is the scratch slot (pad rows and
         # pad tokens). Read the flags one time (see DecoderLayer.__init__).
         self.slot_kv = self_kv_mode() == "slot"
         self.slot_ctx = slot_ctx(cfg.max_target_positions) if self.slot_kv else cfg.max_target_positions
