@@ -898,14 +898,17 @@ class NeuronPlatform(Platform):
         """Cap gpu_memory_utilization for GPT-OSS FP8 with the BF16 prefill copy.
 
         Applies only with the default fractional KV sizing (no explicit KV
-        headroom) and only when the BF16 prefill copy is kept
-        (GPTOSS_HYBRID_PREFILL is not "0"). Set GPTOSS_HYBRID_PREFILL=0 to drop
-        the copy and keep the full memory budget, or set
-        VLLM_NEURON_RESERVED_HEADROOM_GIB to size the KV cache explicitly.
+        headroom) and only when the BF16 prefill copy is kept (see
+        vllm_neuron/model/gpt_oss/fp8_prefill.py: neuron_config
+        "gpt_oss_fp8_prefill", default "auto"). Set it to "fp8" to drop the copy
+        and keep the full memory budget, or set VLLM_NEURON_RESERVED_HEADROOM_GIB
+        to size the KV cache explicitly.
         """
         if neuron_config.get("quantization") != "fp8":
             return
-        if os.environ.get("GPTOSS_HYBRID_PREFILL", "1") == "0":
+        from vllm_neuron.model.gpt_oss.fp8_prefill import keep_bf16_prefill_copy
+
+        if not keep_bf16_prefill_copy(neuron_config):
             return
         if envs.get_kv_headroom_env() is not None:
             return
@@ -916,9 +919,10 @@ class NeuronPlatform(Platform):
         logger.warning(
             "GPT-OSS quantization=fp8 keeps a BF16 copy of the expert weights "
             "for prefill. gpu_memory_utilization is reduced from %.2f to %.2f "
-            "so the device keeps room for compiled graphs. Set "
-            "GPTOSS_HYBRID_PREFILL=0 to drop the copy, or set "
-            "VLLM_NEURON_RESERVED_HEADROOM_GIB to size the KV cache explicitly.",
+            "so the device keeps room for compiled graphs. Set neuron_config "
+            "gpt_oss_fp8_prefill='fp8' to drop the copy (needs an NKI Library "
+            "with FP8 prefill), or set VLLM_NEURON_RESERVED_HEADROOM_GIB to size "
+            "the KV cache explicitly.",
             cache_config.gpu_memory_utilization,
             cap,
         )

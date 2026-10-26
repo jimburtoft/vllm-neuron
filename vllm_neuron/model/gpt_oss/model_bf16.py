@@ -85,11 +85,12 @@ DECODE_RSAG_TOKEN_THRESHOLD = 128
 #     Prefill MoE kernel for the BF16 path when GPTOSS_PREFILL_NSB resolves to -1.
 #     shard_on_i gives ~1.2-1.5x lower TTFT than shard_on_block. FP8 prefill
 #     never uses shard_on_block (it discards the FP8 dequant scales).
-# GPTOSS_HYBRID_PREFILL  "1" (default) | "0"
-#     FP8 only: keep a BF16 copy of the expert weights for prefill and use FP8
-#     for decode. Prefill is compute-bound and bwmm_shard_on_I upcasts every FP8
-#     weight tile to bf16, which adds TTFT; decode is DMA-bound and keeps the FP8
-#     win. Costs extra HBM for the BF16 copy (smaller KV cache).
+# GPTOSS_HYBRID_PREFILL  unset (default) | "1" | "0"
+#     Legacy switch for the BF16 prefill copy with quantization="fp8" ("1" = keep
+#     it, "0" = drop it). Prefer neuron_config "gpt_oss_fp8_prefill" ("auto"
+#     default, "fp8", "bf16_copy"); see vllm_neuron/model/gpt_oss/fp8_prefill.py.
+#     "auto" drops the copy when the installed NKI Library runs FP8 prefill at
+#     BF16 speed, which gives 2x the KV cache.
 # GPTOSS_DECODE_ATTN     "kernel" (default) | "torch"
 #     GQA decode attention via the NKI attention_block_tkg kernel, or the
 #     PyTorch fallback.
@@ -128,7 +129,6 @@ _GPTOSS_PREFILL_IMPL = (
     else MoECTEImplementation.shard_on_i
 )
 
-_GPTOSS_HYBRID_PREFILL = os.environ.get("GPTOSS_HYBRID_PREFILL", "1") == "1"
 
 _GPTOSS_GQA_DECODE_KERNEL = os.environ.get("GPTOSS_DECODE_ATTN", "kernel") != "torch"
 
@@ -190,6 +190,7 @@ _GPTOSS_GU_MAJOR_NOCOPY = _GPTOSS_GU_MAJOR and _gptoss_prefill_reads_gu_major()
 # ── Weight Loaders ────────────────────────────────────────────────────────────
 # Reuse existing weight loaders. These handle checkpoint format transformations
 # (MXFP4 dequantization, TP sharding, hidden dim padding).
+from vllm_neuron.model.gpt_oss.fp8_prefill import keep_bf16_prefill_copy
 from vllm_neuron.model.gpt_oss.quantization_fp8 import (
     FP8_TRN2_DTYPE,
     quantize_expert_state_dict,
@@ -2814,6 +2815,12 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
         _fp8_experts = bool(
             getattr(self.model.layers[0].mlp.experts, "fp8_experts", False)
         )
+        _keep_bf16 = _fp8_experts and keep_bf16_prefill_copy(self.config.neuron_config)
+        if _fp8_experts:
+            logger.info(
+                "GPT-OSS FP8 prefill: %s",
+                "BF16 copy of the experts" if _keep_bf16 else "FP8 experts (no BF16 copy)",
+            )
 
         rank_sharded_checkpoint = checkpoint.load_sharded_pipelined(
             tp_rank, tp_size, self, mappings, device
@@ -2831,8 +2838,8 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
         _fp8_scales = {}
         if _fp8_experts:
             rank_sharded_checkpoint, _fp8_scales = quantize_expert_state_dict(
-                rank_sharded_checkpoint, self, keep_bf16=_GPTOSS_HYBRID_PREFILL,
-                gate_up_major=_GPTOSS_GU_MAJOR and (_GPTOSS_HYBRID_PREFILL or _GPTOSS_GU_MAJOR_NOCOPY),
+                rank_sharded_checkpoint, self, keep_bf16=_keep_bf16,
+                gate_up_major=_GPTOSS_GU_MAJOR and (_keep_bf16 or _GPTOSS_GU_MAJOR_NOCOPY),
             )
 
         self.load_state_dict(rank_sharded_checkpoint, strict=False, assign=True)

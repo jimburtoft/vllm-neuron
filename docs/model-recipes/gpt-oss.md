@@ -79,7 +79,8 @@ does not enable segmented prefill, default prefix caching is turned off with a w
 
 | `neuron_config` option | Effect on Trn2 |
 |---|---|
-| `"quantization": "fp8"` | Requantizes the MXFP4 expert weights to FP8 E4M3 (row scales, power-of-two, exact). Decode reads half the expert bytes. By default a BF16 copy of the experts is kept for prefill, and `gpu_memory_utilization` is capped at 0.80 so compiled graphs still fit (`GPTOSS_HYBRID_PREFILL=0` drops the copy and the cap). |
+| `"quantization": "fp8"` | Requantizes the MXFP4 expert weights to FP8 E4M3 (row scales, power-of-two, exact). Decode reads half the expert bytes. Prefill uses the same FP8 weights when the installed NKI Library supports it (the companion branch below); otherwise a BF16 copy of the experts is kept for prefill and `gpu_memory_utilization` is capped at 0.80. |
+| `"gpt_oss_fp8_prefill": "auto"` (default) \| `"fp8"` \| `"bf16_copy"` | With `quantization: "fp8"`: `"auto"` drops the BF16 prefill copy when the NKI Library has FP8 prefill (`bwmm_shard_on_I.FP8_DIRECT_MATMUL` and `SUPPORTS_GATE_UP_MAJOR`), else keeps it. `"bf16_copy"` always keeps the copy (1-3 % faster served throughput at 4-32 concurrent requests, half the KV cache). The legacy `GPTOSS_HYBRID_PREFILL=1/0` is honoured when this key is not set. |
 | `"quantization": "bf16"` (default) | MXFP4 dequantized to BF16 |
 | `"decode_context_length_buckets": [1024, 2048, 4096, 7168]` | Compiles decode at several context lengths, so short requests do not pay for `max_model_len` on every step |
 | `"on_device_sampling_config": {"all_greedy": true}` | Greedy-only serving skips the general sampler |
@@ -96,10 +97,10 @@ With the companion NKI Library branch
 (`pip install "git+https://github.com/jimburtoft/nki-library.git@gptoss-trn2-perf-2.33"`,
 then `rm -rf ~/.cache/neuron_libtorch`), the model also uses a gate/up-major FP8 decode
 weight layout and the hybrid static/dynamic prefill MoE kernel, which skips empty blocks.
-FP8 prefill without the BF16 expert copy (`GPTOSS_HYBRID_PREFILL=0`) then runs as fast as with
-it (time to first token 127.5 vs 129.0 ms at 2048 tokens, decode 5.20 vs 5.20 ms at batch 1) and keeps
-2.1x the KV cache (756K vs 353K tokens): use it at about 64 concurrent requests (+10-18 % served
-throughput) or when you need the KV cache; the default copy is 1-3 % faster at 4-32 concurrent requests.
+With it, FP8 runs prefill from the FP8 weights without a BF16 expert copy (the default,
+`gpt_oss_fp8_prefill: "auto"`): time to first token 127.5 ms at 2048 tokens (129.0 with the copy), decode
+5.20 ms at batch 1 (5.20), and 2.1x the KV cache (756K vs 353K tokens), so served throughput at about 64
+concurrent requests is 10-18 % higher. `"bf16_copy"` is 1-3 % faster at 4-32 concurrent requests.
 The model detects the installed kernels, and works unchanged with the bundled NKI Library.
 
 Recommended starting point on trn2.3xlarge:
@@ -130,7 +131,7 @@ attention change above avoids that.)
 Every component can be switched back to the original path with an environment
 variable (`GPTOSS_KV_WRITE=kernel`, `GPTOSS_PREFILL_IMPL=shard_on_block`,
 `GPTOSS_DECODE_ATTN=torch`, `GPTOSS_PREFILL_NSB=-1`, `GPTOSS_MASK_PAD_ROUTE=0`,
-`GPTOSS_GU_MAJOR=0`, `GPTOSS_DECODE_OPT=base`); see the top of
+`GPTOSS_GU_MAJOR=0`, `GPTOSS_DECODE_OPT=base`, neuron_config `gpt_oss_fp8_prefill: "bf16_copy"`); see the top of
 `vllm_neuron/model/gpt_oss/model_bf16.py`. Decode graphs compile at `-O3` by default
 (`GPTOSS_DECODE_OPT`). On the XLA route this lifts the decode graph from `-O1`; on the
 native route `-O2` decode is already as fast, so the hook has no measurable effect there.

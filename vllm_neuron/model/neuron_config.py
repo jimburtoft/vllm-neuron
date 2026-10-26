@@ -197,6 +197,10 @@ class NeuronConfig:
     gpt_oss_tail_hops: tuple[int, ...] = (8, 16)
     # Decode SP: all-reduce -> reduce-scatter + all-gather on token shards; Qwen3-32B MXFP8, tokens % TP == 0 only.
     enable_decode_sequence_parallel: bool = False
+    # GPT-OSS quantization="fp8": run prefill from the FP8 experts ("fp8") or keep a BF16
+    # copy of the experts for prefill ("bf16_copy"). "auto" picks "fp8" when the installed
+    # NKI Library supports it. See vllm_neuron/model/gpt_oss/fp8_prefill.py.
+    gpt_oss_fp8_prefill: str | None = None
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "NeuronConfig":
@@ -283,6 +287,7 @@ class NeuronConfig:
             enable_decode_sequence_parallel=config_dict.get(
                 "enable_decode_sequence_parallel", False
             ),
+            gpt_oss_fp8_prefill=config_dict.get("gpt_oss_fp8_prefill"),
         )
 
     def __post_init__(self):
