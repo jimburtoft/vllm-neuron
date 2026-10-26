@@ -48,15 +48,29 @@
 > The recipe covers DFlash, batching and long-audio settings. Measured results on SDK 2.33:
 > - Earnings22 WER 7.80% (7.77% with the DFlash draft).
 > - LibriSpeech single-request p50 latency 203 ms, or 86 ms with the draft.
-> - With the draft on 48 LibriSpeech test-other clips (`--max-num-seqs 16`): 62x real time at 1
->   concurrent request and 110x at 16, with acceptance length 5.3 at every concurrency.
+> - Throughput on LibriSpeech test-other (64 clips, 2 passes, closed loop), public model + public draft:
 >
-> **Pick the layout by load** (TP=4 + draft, Poisson arrivals, ~14 s clips, one trn2.3xlarge):
-> - **Below about 3 requests/s:** the command above (LNC=2, one TP=4 replica). p50 150 ms at 1 req/s.
-> - **Above about 3 requests/s:** two TP=4 replicas at LNC=1. At 8 req/s, p50 319 ms and p90 625 ms,
->   against 481 ms and 920 ms at LNC=2. Add `export NEURON_LOGICAL_NC_CONFIG=1
->   NEURON_CC_FLAGS=--logical-nc-config=1` and `--data-parallel-size 2` to the command above, and use
->   a separate compile cache (`VLLM_CACHE_ROOT`) for each LNC setting.
+>   | Concurrent requests | 1 | 2 | 4 | 8 | 16 |
+>   |---|--:|--:|--:|--:|--:|
+>   | No draft, LNC=2 (RTFx) | 32x | 42x | 49x | 61x | 82x |
+>   | Draft, LNC=2, one TP=4 replica (RTFx / p50 ms) | 66x / 90 | 78x / 153 | 90x / 248 | 103x / 417 | 117x / 748 |
+>   | Draft, LNC=1, two TP=4 replicas (RTFx / p50 ms) | 50x / 120 | 94x / 128 | 103x / 225 | 120x / 372 | 127x / 639 |
+>
+>   Acceptance length 5.6-5.7 at every concurrency; WER 4.32-4.41% in every row.
+>
+> **Pick the layout by load** (TP=4 + draft, Poisson arrivals, same 64 clips, one trn2.3xlarge):
+>
+> | Requests/s | 1 | 2 | 4 | 6 | 8 | 12 |
+> |---|--:|--:|--:|--:|--:|--:|
+> | LNC=2, one replica: p50 / p90 (ms) | 91 / 138 | 94 / 153 | 106 / 198 | 129 / 323 | 158 / 380 | 276 / 600 |
+> | LNC=1, two replicas: p50 / p90 (ms) | 118 / 152 | 118 / 163 | 123 / 210 | 131 / 240 | 151 / 311 | 207 / 397 |
+>
+> - **Up to about 6 requests/s:** the command above (LNC=2, one TP=4 replica) has the lower p50.
+> - **Above that, or when p90 matters from about 6 requests/s:** two TP=4 replicas at LNC=1. Add `export
+>   NEURON_LOGICAL_NC_CONFIG=1 NEURON_CC_FLAGS=--logical-nc-config=1` and `--data-parallel-size 2` to the
+>   command above, and use a separate compile cache (`VLLM_CACHE_ROOT`) for each LNC setting.
+> - The crossover moves to a lower rate with longer clips (these average 6.2 s). Details:
+>   [recipe](docs/model-recipes/voxtral.md).
 
 The vLLM Neuron plugin is the recommended serving solution for large language models on AWS Trainium. It extends [vLLM](https://docs.vllm.ai/) with a Neuron backend, providing the same vLLM APIs and configuration you are already familiar with.
 

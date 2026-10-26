@@ -141,17 +141,28 @@ WER is 5.71% / 5.58-5.71% without / with the draft at every level.
 At higher request rates, two TP=4 replicas at LNC=1 serve more than one TP=4
 replica at LNC=2 on the same `trn2.3xlarge`. Set `NEURON_LOGICAL_NC_CONFIG=1`
 and `NEURON_CC_FLAGS=--logical-nc-config=1`, add `--data-parallel-size 2`, and
-keep a separate compile cache (`VLLM_CACHE_ROOT`) per LNC setting. With the
-draft, Poisson arrivals, and clips of 14 s on average:
+keep a separate compile cache (`VLLM_CACHE_ROOT`) per LNC setting. Measured with
+the public draft on the 64 LibriSpeech test-other clips (6.2 s on average),
+`--max-num-seqs 16` per LNC=2 replica and 8 per LNC=1 replica.
 
-| Requests/s | 1 | 2 | 3 | 4 | 6 | 8 | 10 |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| LNC=2, one replica: p50 / p90 (ms) | 150 / 271 | 182 / 342 | 189 / 424 | 224 / 511 | 308 / 697 | 481 / 920 | 790 / 1527 |
-| LNC=1, two replicas: p50 / p90 (ms) | 184 / 313 | 189 / 341 | 191 / 367 | 205 / 385 | 260 / 501 | 319 / 625 | 439 / 804 |
+Closed loop, fixed concurrency (2 passes):
 
-The p50 latency is equal at about 3 requests/s. Below that, one LNC=2 replica
-has the lower latency. The acceptance length is 4.4 in both layouts at every
-rate.
+| Concurrent requests | 1 | 2 | 4 | 8 | 16 |
+|---|--:|--:|--:|--:|--:|
+| LNC=2, one replica: RTFx / p50 (ms) | 66x / 90 | 78x / 153 | 90x / 248 | 103x / 417 | 117x / 748 |
+| LNC=1, two replicas: RTFx / p50 (ms) | 50x / 120 | 94x / 128 | 103x / 225 | 120x / 372 | 127x / 639 |
+
+Poisson arrivals (160 requests per rate):
+
+| Requests/s | 1 | 2 | 4 | 6 | 8 | 12 |
+|---|--:|--:|--:|--:|--:|--:|
+| LNC=2, one replica: p50 / p90 (ms) | 91 / 138 | 94 / 153 | 106 / 198 | 129 / 323 | 158 / 380 | 276 / 600 |
+| LNC=1, two replicas: p50 / p90 (ms) | 118 / 152 | 118 / 163 | 123 / 210 | 131 / 240 | 151 / 311 | 207 / 397 |
+
+One LNC=2 replica has the lower p50 up to about 6 requests/s. From there the two
+LNC=1 replicas have the lower p50 and p90. With longer clips the crossover moves
+to a lower request rate. The acceptance length is 5.6-5.8 in both layouts at
+every rate, and the WER is 4.32-4.41%.
 
 #### Long audio: skip the draft for long prompts
 
