@@ -42,7 +42,7 @@ These are for the full champion stack: this branch plus the champion nkilib. The
 | **champion**: TP1 × DP4, LNC=2, max_num_seqs 48, decode bucket [512] | **1,508–1,516** | **1,042–1,058** |
 | **champion**: TP1 × DP8, LNC=1, max_num_seqs 48, decode bucket [512] | **1,712–1,722** | **1,297** |
 | **champion + FP8 KV**: TP1 × DP8, LNC=1, max_num_seqs 48, decode bucket [512] | **1,825–1,845** (fused encoder attention; 1,784–1,792 before it) | — |
-| **champion + FP8 KV + `--max-logprobs 0`**: same | **1,891–1,908** (fused lm_head: 1,907–1,917) | — |
+| **champion + FP8 KV + `--max-logprobs 0`**: same | **1,891–1,908** (fused lm_head: 1,907–1,917; measured in a later session than the row above) | — |
 
 | single stream (TP4, LNC=2, 30 s clip, 256 requests) | TTFT p50 | ITL p50 | E2E p50 |
 |---|---|---|---|
@@ -67,7 +67,8 @@ vllm serve Qwen/Qwen3-ASR-1.7B --tensor-parallel-size 1 --data-parallel-size 4 -
 # Highest throughput: add FP8 KV: UNSAFE_FP8FNCAST=1, --kv-cache-dtype fp8_e4m3, and "fp8_packed_kv":true in neuron_config
 #   (TP1 x DP8 LNC1 MNS48: 1,825-1,845 RTFx with the default fused encoder attention, WER 5.97 %).
 # If clients never request logprobs, add --max-logprobs 0: vLLM's default (20) makes the model all-gather the full
-#   logits every step. Measured +3.8 % (1,891-1,908 RTFx). It is also required for VLLM_NEURON_QWEN3_ASR_LMHEAD=fused. Larger max_num_seqs (64/96) fit in the doubled KV but are not faster.
+#   logits every step. 1,891-1,908 RTFx with it (different session from the 1,825-1,845 row; same-session A/B pending).
+#   It is also required for VLLM_NEURON_QWEN3_ASR_LMHEAD=fused. Larger max_num_seqs (64/96) fit in the doubled KV but are not faster.
 # LNC=1, 8 replicas: NEURON_LOGICAL_NC_CONFIG=1 VLLM_NEURON_RESERVED_HEADROOM_GIB=2 VLLM_NEURON_DISABLE_PARALLEL_TRACE=1, --data-parallel-size 8
 ```
 
