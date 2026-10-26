@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MuseGlimmer decode fusions (Tasks 018 / 022). All knobs default off (shipping path unchanged).
+"""MuseGlimmer decode fusions (Tasks 018 / 022).
 
-``MUSE_GLIMMER_DECODE_FUSE`` = comma list of:
+``MUSE_GLIMMER_DECODE_FUSE`` = comma list of the knobs below. Unset = ``gate`` (the default since Task 022,
+used for decode batch buckets >= ``MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS``, default 16); ``off`` = the old path.
 
 - ``norm``  (018a): fold ``input_layernorm`` into the decode megakernel (``rmsnorm_X_enabled``). The centered
   weight is passed as ``gamma = 1 + w`` in **fp32** (``nkilib`` loads gamma in its own dtype and multiplies in
@@ -27,8 +28,11 @@ DECODE_FUSE_ENV = "MUSE_GLIMMER_DECODE_FUSE"
 _VALID = {"norm", "ffn", "gate", "early_gate"}
 
 
+DEFAULT_FLAGS = "gate"  # Tasks 018/022 result: in-kernel gate on by default (batch buckets >= gate_min_bs())
+
+
 def decode_fuse_flags() -> frozenset:
-    v = os.environ.get(DECODE_FUSE_ENV, "").strip().lower()
+    v = os.environ.get(DECODE_FUSE_ENV, DEFAULT_FLAGS).strip().lower()
     if v in ("", "0", "off", "none"):
         return frozenset()
     flags = frozenset(x.strip() for x in v.replace("+", ",").split(",") if x.strip())
