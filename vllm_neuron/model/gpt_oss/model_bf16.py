@@ -191,10 +191,26 @@ from vllm_neuron.utils.weight_loader import (
     scaled_bias_loader,
 )
 
-# Threshold for decode MoE kernel selection
-DEFAULT_SELECTIVE_LOADING_THRESHOLD = 1.0
+# Threshold for decode MoE kernel selection: selective-expert below it, all-expert at or above.
+# Compared against T * top_k / E_local. At 1.5 (measured on trn2, FP8 and BF16) the 20B model
+# (E_local 32) uses selective up to T=8 and the 120B model at TP4 (E_local 128) up to T=32;
+# both match the measured kernel crossover (20B: between T=8 and 16; 120B: between 32 and 64).
+DEFAULT_SELECTIVE_LOADING_THRESHOLD = 1.5
 
 logger = logging.getLogger(__name__)
+
+
+def use_all_experts_decode(
+    num_tokens: int, top_k: int, num_local_experts: int, ep_degree: int = 1
+) -> bool:
+    """Whether decode MoE runs the all-expert kernel (True) or selective-expert (False).
+
+    Expert parallelism always uses all-expert. Otherwise selective runs while
+    num_tokens * top_k / num_local_experts is below DEFAULT_SELECTIVE_LOADING_THRESHOLD.
+    """
+    if ep_degree > 1:
+        return True
+    return num_tokens * top_k / num_local_experts >= DEFAULT_SELECTIVE_LOADING_THRESHOLD
 
 
 # =============================================================================
@@ -1440,13 +1456,11 @@ class GptOssExperts(nn.Module):
         >>> PARALLELISM: use_all_experts and rank_id for EP <<<
         <-- MODEL-SPECIFIC: Activation, routing, clamping params
         """
-        total_tokens = hidden_states.shape[0]
-        perc_experts_loaded = (
-            total_tokens * self.num_experts_per_token / self.num_local_experts
-        )
-        use_all_experts = (
-            perc_experts_loaded >= DEFAULT_SELECTIVE_LOADING_THRESHOLD
-            or self.ep_degree > 1
+        use_all_experts = use_all_experts_decode(
+            hidden_states.shape[0],
+            self.num_experts_per_token,
+            self.num_local_experts,
+            self.ep_degree,
         )
         rank_id = None
         if use_all_experts:
