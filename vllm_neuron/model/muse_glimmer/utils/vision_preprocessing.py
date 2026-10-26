@@ -24,7 +24,7 @@ Inside its block, each frame of an item is laid out
 ``window (row-major) -> 2x2 merge block (row-major) -> in-block (row-major)``.
 Window edges are multiples of 32 (even), so every 2x2 block lies inside one
 window. Consequences (verified against the HF helpers in
-``harness/check_vision_ordering.py`` and the module tests):
+the module tests):
 
 1. every HF attention window is a contiguous run -> window attention is a
    plain ``[start, end)`` bound per token;
@@ -168,7 +168,7 @@ class PackedVisionInputs:
     window_bound_min: torch.Tensor  # [nb, bs, 1] int32 (window attention)
     window_bound_max: torch.Tensor
     merged_order: torch.Tensor  # [nb, bs // merge**2] int64, block-local gather index
-    # Task 020 window-chunk layout (only with ``win_chunks``): window layers attend in
+    # window-chunk layout (only with ``win_chunks``): window layers attend in
     # ``K = win_chunks`` sub-blocks of ``C = win_chunk`` rows per block.
     win_gather: torch.Tensor | None = None  # [nb, K*C] int64: chunk slot -> block-local row
     win_scatter: torch.Tensor | None = None  # [nb, bs] int64: block-local row -> chunk slot
@@ -180,7 +180,7 @@ class PackedVisionInputs:
 
 
 # ---------------------------------------------------------------------------
-# Task 020: window-chunk planning
+# window-chunk planning
 # ---------------------------------------------------------------------------
 
 
@@ -268,7 +268,7 @@ def pack_vision_inputs(
     ``rope_dtype``: round cos/sin through this dtype (HF casts them to the
     hidden-state dtype before the fp32 rotation), then keep fp32.
 
-    ``win_chunks`` (Task 020, ``MUSE_GLIMMER_VIS_WIN_SPLIT``): also build the
+    ``win_chunks`` (``MUSE_GLIMMER_VIS_WIN_SPLIT``): also build the
     window-chunk layout. Each block's windows are FFD-packed into ``win_chunks``
     chunks of ``win_chunk`` rows; ``win_gather`` lists, per chunk slot, the
     block-local row it holds (pad slots point at a pad row or row 0 and get
@@ -355,7 +355,7 @@ def pack_vision_inputs(
 
 
 def _window_chunk_layout(assignment, rows, wmin, wmax, K, C, bs, window) -> dict[str, torch.Tensor]:
-    """Task 020: per block, FFD the windows into ``K`` chunks of ``C`` rows (see pack_vision_inputs)."""
+    """per block, FFD the windows into ``K`` chunks of ``C`` rows (see pack_vision_inputs)."""
     if C > bs or bs > K * C:
         raise ValueError(f"window chunks: need C <= bs <= K*C, got C={C} bs={bs} K={K}")
     nb = assignment.num_blocks

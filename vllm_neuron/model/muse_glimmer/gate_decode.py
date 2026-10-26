@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Task 022: gated decode attention with the output projection inside the NKI megakernel.
+"""gated decode attention with the output projection inside the NKI megakernel.
 
 ``gated_attention_decode`` computes, per decode step and TP rank,
 

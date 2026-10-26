@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Load-time FP8 self-quantization for MuseGlimmer (Task 021).
+"""Load-time FP8 self-quantization for MuseGlimmer.
 
 ``MUSE_GLIMMER_FP8`` selects which linears are stored in FP8 (comma list):
 

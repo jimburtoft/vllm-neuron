@@ -98,7 +98,7 @@ def _decode_torch_forced() -> bool:
     return os.environ.get(DECODE_TORCH_ENV, "0").strip().lower() in ("1", "true", "yes")
 
 
-# Task 023: decode KV-write mode.
+# decode KV-write mode.
 #   0 = per-layer index_put_ inside the layer loop (old behaviour);
 #   1 = defer: the same per-layer index_put_ calls, issued after the layer loop;
 #   2 = defer + coalesce: one index_put_ per physical (k, v) buffer (default).
@@ -106,15 +106,15 @@ def _decode_torch_forced() -> bool:
 # FX pass rewrites in-place index_put_ to functional form, and with N layers on
 # one buffer only the last result of the chain is aliasable, so the N-1
 # intermediates become full-buffer HBM copies when other ops sit between the
-# writes (Task 014: 1.31 GB per step). See OpencodeDocs/steering/kv-write-coalescing.md.
+# writes (1.31 GB per step measured at batch 13).
 KV_DEFER_ENV = "MUSE_GLIMMER_KV_DEFER"
 
 
-# Task 029: neuronx-cc -O level for the plain decode graph only (runner per-graph policy,
+# neuronx-cc -O level for the plain decode graph only (runner per-graph policy,
 # ``compiler_args_for``). Default 3: -O3 disables neuronx-cc modular flow (as Qwen3-VL's
 # decode policy) and on trn2 / SDK 2.33 cuts the decode step 10-13 % at BS >= 32 (FP8 MLP,
 # BF16 and FP8 KV), is neutral at BS <= 16, and gives the same greedy tokens and logits
-# as -O2 (Task 029). "off" (or "0") keeps the engine level for every graph (0.29 native
+# as -O2. "off" (or "0") keeps the engine level for every graph (0.29 native
 # route: -O2). Prefill, the encoder and spec-verify graphs keep the engine level. An
 # explicit --optimization-level disables per-graph policies in the runner.
 DECODE_OPT_ENV = "MUSE_GLIMMER_DECODE_OPT"
@@ -129,13 +129,13 @@ def _decode_opt_level() -> int | None:
     return int(v)
 
 
-# Task 020: vision encoder graph shape knobs (see vision_encoder_bf16.py for the module knobs).
+# vision encoder graph shape knobs (see vision_encoder_bf16.py for the module knobs).
 VIS_SMALL_BLOCK_ENV = "MUSE_GLIMMER_VIS_SMALL_BLOCK"
 _VIS_TIMING_FILE = os.environ.get("MUSE_GLIMMER_VIS_TIMING_FILE", "")
 
 
 def _vis_timing() -> bool:
-    """Task 020 host/device split of each VE call (adds two device syncs; off by default).
+    """host/device split of each VE call (adds two device syncs; off by default).
 
     On when ``MUSE_GLIMMER_VIS_TIMING=1``, or when ``$MUSE_GLIMMER_VIS_TIMING_FILE.on``
     exists (toggle at run time without restarting a server).
@@ -262,7 +262,7 @@ def _issue_decode_kv_writes(writeback: list, group_of: list[int] | None) -> None
         p = torch.cat([i[2] for i in idx])
         d = attn0.head_dim
         kc, vc = attn0.k_cache, attn0.v_cache
-        # Task 028: FP8 KV -> per-layer quantization before the concat (scales differ per layer).
+        # FP8 KV -> per-layer quantization before the concat (scales differ per layer).
         kc.index_put_((b, h, p), torch.cat([_kv_fp8.to_cache(it[1], it[2].reshape(-1, d), "k", kc) for it in items]))
         vc.index_put_((b, h, p), torch.cat([_kv_fp8.to_cache(it[1], it[3].reshape(-1, d), "v", vc) for it in items]))
 
@@ -423,7 +423,7 @@ class MuseGlimmerAttention(nn.Module):
             torch.empty(q_size, self.hidden_size, dtype=self.dtype)
         )
 
-        # Task 021: FP8 ROW (per-output-channel weight scales, dynamic per-token activations).
+        # FP8 ROW (per-output-channel weight scales, dynamic per-token activations).
         self.fp8 = "attn" in _fp8.fp8_modules()
         if self.fp8:
             f8 = _fp8.FP8_DTYPE
@@ -434,11 +434,11 @@ class MuseGlimmerAttention(nn.Module):
                 setattr(self, f"{name}_w_scale",
                         nn.Parameter(torch.empty(_fp8.PMAX, n, dtype=torch.float32), requires_grad=False))
 
-        # Tasks 018/022: decode fusion flags (read once; MUSE_GLIMMER_DECODE_FUSE).
+        # decode fusion flags (read once; MUSE_GLIMMER_DECODE_FUSE).
         self.fuse = _df.decode_fuse_flags()
         self.k_cache = None
         self.v_cache = None
-        # Task 028: FP8 KV state, set in bind_kv_cache by kv_fp8.setup (outside the trace).
+        # FP8 KV state, set in bind_kv_cache by kv_fp8.setup (outside the trace).
         self.kv_fp8 = False
         self.k_dq = 1.0
         self.v_dq = 1.0
@@ -475,7 +475,7 @@ class MuseGlimmerAttention(nn.Module):
             else:
                 set_weight_loader(getattr(self, f"{name}_weight"), ld)
 
-    # ── FP8 helpers (Task 021) ──────────────────────────────────────────
+    # ── FP8 helpers ──────────────────────────────────────────
 
     def _qkv_args(self, on_kernel: bool) -> tuple[torch.Tensor, dict]:
         """QKV weight + quant kwargs for NF.qkv_proj (CPU: dequantized BF16 weight)."""
@@ -523,7 +523,7 @@ class MuseGlimmerAttention(nn.Module):
         kv_writeback: list | None = None,
         in_norm: nn.Module | None = None,
     ) -> torch.Tensor:
-        """``in_norm`` (Task 018a): the input norm was NOT applied by the caller; fold it into the kernel."""
+        """``in_norm``: the input norm was NOT applied by the caller; fold it into the kernel."""
         meta = attn_metadata[self.layer_name]
         if meta["max_query_len"] <= meta["decode_token_threshold"]:
             return self.forward_decode(
@@ -548,12 +548,12 @@ class MuseGlimmerAttention(nn.Module):
     def _write_paged_kv(self, k, v, slot_mapping, block_size):
         """k, v: [nkh, T, d] -> 4D paged cache [blocks, nkh, block, d]."""
         idx = self._paged_kv_indices(slot_mapping, block_size, k.device)
-        # Task 028: fp8 caches quantize (scale + clamp) here; already-fp8 values pass through.
+        # fp8 caches quantize (scale + clamp) here; already-fp8 values pass through.
         self.k_cache.index_put_(idx, _kv_fp8.to_cache(self, k.reshape(-1, self.head_dim), "k", self.k_cache))
         self.v_cache.index_put_(idx, _kv_fp8.to_cache(self, v.reshape(-1, self.head_dim), "v", self.v_cache))
 
     def _fp8_decode_mask(self, attn_metadata, pos, swa_start, B, S, s_prior, block_size):
-        """Task 028: full [s_prior, B, q_heads, S] decode mask for the FP8 path, cached per step.
+        """full [s_prior, B, q_heads, S] decode mask for the FP8 path, cached per step.
 
         The mask depends only on (sliding, s_prior) and the positions. Every SWA KV group
         gets the same ``swa_kv_pos_offset`` values (same context lengths, window and
@@ -630,7 +630,7 @@ class MuseGlimmerAttention(nn.Module):
                 prior_tokens=meta.get("cached_seq_len"),
                 block_size=meta["block_size"],
                 kv_segment_size=kv_segment_size,
-                # Task 028: FP8 cache read -> K dequant folded into the scale.
+                # FP8 cache read -> K dequant folded into the scale.
                 scale=self.scaling * self.k_dq if self.kv_fp8 else self.scaling,
                 sliding_window=self.sliding_window,
                 tp_q=True,
@@ -721,11 +721,11 @@ class MuseGlimmerAttention(nn.Module):
             table = build_per_head_block_table(block_table, nkh)
 
         on_kernel = can_run_kernel(X) and not _decode_torch_forced()
-        # Task 022: gate + o_proj inside the megakernel (bf16 attention weights, single B*S tile).
+        # gate + o_proj inside the megakernel (bf16 attention weights, single B*S tile).
         # Only for decode batch buckets >= MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS (slower at B=1 on trn2).
         use_gate = ("gate" in self.fuse and not self.fp8 and tokens <= 128 and not _decode_torch_forced()
                     and B >= _df.gate_min_bs() and (nkh == 1 or on_kernel))
-        # Task 018a: fold the input norm into the kernel (gamma = 1 + w in fp32). Without the in-kernel
+        # fold the input norm into the kernel (gamma = 1 + w in fp32). Without the in-kernel
         # gate the torch gate still needs the normed input, so the norm is computed in torch as well.
         norm_kw = {}
         if in_norm is not None:
@@ -738,10 +738,10 @@ class MuseGlimmerAttention(nn.Module):
                     norm_kw = {}
         early_gate = None
         if "early_gate" in self.fuse and not use_gate:
-            # Task 022 cheap version: issue the gate projection before the megakernel (weight DMA overlap).
+            # Cheap variant: issue the gate projection before the megakernel (weight DMA overlap).
             early_gate = self._gate(hidden_states)
         qkv_w, qkv_q = self._qkv_args(on_kernel)
-        # Task 028: FP8 KV. The kernel quantizes the active K/V with k_scale / v_scale
+        # FP8 KV. The kernel quantizes the active K/V with k_scale / v_scale
         # (returns them in fp8) and reads the fp8 cache; the K dequant folds into the
         # softmax scale, the V dequant multiplies the output before the gate.
         kv_q = {}
@@ -817,7 +817,7 @@ class MuseGlimmerAttention(nn.Module):
         attn = output.permute(0, 3, 1, 2).reshape(B * S, self.q_size)
         gate = early_gate if early_gate is not None else self._gate(hidden_states)
         if self.kv_fp8:
-            gate = gate * self.kv_v_dq  # Task 028: V dequant before the gate (cannot fold into W_out)
+            gate = gate * self.kv_v_dq  # V dequant before the gate (cannot fold into W_out)
         attn = (attn * gate).to(self.dtype)
         out = self._o_proj_tokens(attn)  # [B*S, H]
 
@@ -826,7 +826,7 @@ class MuseGlimmerAttention(nn.Module):
         k_new = K_new.reshape(d, B, nkh, S).permute(2, 1, 3, 0).reshape(nkh, B * S, d)
         v_new = V_new.reshape(B, nkh, S, d).permute(1, 0, 2, 3).reshape(nkh, B * S, d)
         if kv_writeback is not None:
-            # Task 023: defer the write past the layer loop (see _issue_decode_kv_writes).
+            # defer the write past the layer loop (see _issue_decode_kv_writes).
             kv_writeback.append((self.layer_idx, self, k_new, v_new, slot_mapping, block_size))
         else:
             self._write_paged_kv(k_new, v_new, slot_mapping, block_size)
@@ -839,7 +839,7 @@ class MuseGlimmerAttention(nn.Module):
 
     def _forward_decode_gated(self, kw, qkv_q, attn_metadata, pos, swa_start, B, S, table, block_size,
                               slot_mapping, kv_writeback):
-        """Task 022: megakernel with the sigmoid gate and o_proj in SBUF (``gate_decode``)."""
+        """megakernel with the sigmoid gate and o_proj in SBUF (``gate_decode``)."""
         from .gate_decode import gated_attention_decode
 
         mask_kw = dict(pos_ids=pos, swa_start_pos_ids=swa_start)
@@ -881,7 +881,7 @@ _MLP_TKG_MAX_T = 96
 # scales), so prefill is split into row chunks; the result is bit-exact with the
 # un-chunked nkilib 2.32 kernel (simulator, T=1024). 0 disables chunking.
 _MLP_CTE_ROW_CHUNK = int(os.environ.get("MUSE_GLIMMER_FP8_CTE_CHUNK", "512") or 0)
-# Task 019: root cause of the stack failure above. For T > 512 nkilib picks a 1024-row BxS
+# root cause of the stack failure above. For T > 512 nkilib picks a 1024-row BxS
 # tile (8 subtiles of 128) and allocates one [128, I] fp32 |x| scratch per subtile on the stack
 # (``row_quant_reduction_res``); at I=2560 per core that is 8 x 10 KB and the stack is 1.3 KB
 # short. The |x| output is a discarded destination of tensor_scalar_reduce (only its
@@ -932,7 +932,7 @@ class MuseGlimmerMLP(nn.Module):
         dt = config.torch_dtype
         # A str, not a torch.dtype attribute (Dynamo warm restore); wrap_nki takes it as is.
         self.out_dtype_name = str(dt).removeprefix("torch.")
-        # Task 021: FP8 (ROW: per-output-channel weight scales, dynamic per-token activations).
+        # FP8 (ROW: per-output-channel weight scales, dynamic per-token activations).
         self.fp8 = "mlp" in _fp8.fp8_modules()
         if self.fp8:
             _install_cte_shared_abs()
@@ -975,7 +975,7 @@ class MuseGlimmerMLP(nn.Module):
                 x, ones, None, quantization_type=QuantizationType.ROW,
                 norm_type=NormType.NO_NORM,
             )
-            # Task 019: with the shared |x| scratch the kernel validates at any T, so no chunking
+            # with the shared |x| scratch the kernel validates at any T, so no chunking
             # (one 1024-row BxS tile instead of 512-row chunks: -15 % MLP time on one core).
             C = 0 if _CTE_SHARED_ABS[0] else _MLP_CTE_ROW_CHUNK
             if C and x.shape[0] > C and x.shape[0] % C == 0:
@@ -991,7 +991,7 @@ class MuseGlimmerMLP(nn.Module):
         )
 
     def forward_fused_decode(self, residual: torch.Tensor, attn_out: torch.Tensor, norm) -> tuple:
-        """Task 018b: (residual + attn_out) -> centered RMSNorm (gamma = 1 + w, fp32) -> MLP, in one NF.mlp
+        """(residual + attn_out) -> centered RMSNorm (gamma = 1 + w, fp32) -> MLP, in one NF.mlp
         call (TKG fused add + norm). Returns ``(mlp_out, residual + attn_out)``; mlp_out is all-reduced."""
         kw = dict(eps=norm.eps, ln_w=_df.centered_gamma(norm), norm_type=NormType.RMS_NORM,
                   fused_add_tensor=attn_out, store_fused_add_result=True)
@@ -1046,7 +1046,7 @@ class MuseGlimmerDecoderLayer(nn.Module):
         fuse = self.self_attn.fuse if not is_prefill else ()
         T = hidden_states.shape[0]
         residual = hidden_states
-        if "norm" in fuse:  # Task 018a: input norm folded into the decode megakernel
+        if "norm" in fuse:  # input norm folded into the decode megakernel
             h = self.self_attn(hidden_states, positions, position_embeddings, attn_metadata, kv_writeback,
                                in_norm=self.input_layernorm)
         else:
@@ -1054,7 +1054,7 @@ class MuseGlimmerDecoderLayer(nn.Module):
                                attn_metadata, kv_writeback)
         h = self.post_attention_layernorm(h)
 
-        if "ffn" in fuse and T <= _MLP_TKG_MAX_T:  # Task 018b: residual add + pre-FFN norm inside NF.mlp
+        if "ffn" in fuse and T <= _MLP_TKG_MAX_T:  # residual add + pre-FFN norm inside NF.mlp
             h, residual = self.mlp.forward_fused_decode(residual, h, self.pre_feedforward_layernorm)
         else:
             hidden_states = residual + h
@@ -1105,7 +1105,7 @@ class MuseGlimmerTextModel(nn.Module):
             config.hidden_size, config.rms_norm_eps, config.torch_dtype, with_scale=True
         )
         self.rotary_emb = MuseGlimmerRotaryEmbedding(config)
-        # Task 023: read once (static Python int; no env read inside the trace).
+        # read once (static Python int; no env read inside the trace).
         self.kv_defer_mode = _kv_defer_mode()
         # layer_idx -> physical (k_ptr, v_ptr) group id, resolved in bind_kv_cache
         # (outside the trace). None -> per-layer deferred writes.
@@ -1149,7 +1149,7 @@ class MuseGlimmerTextModel(nn.Module):
 
         position_embeddings = self.rotary_emb(positions)
 
-        # Task 023: decode KV writes are deferred past the layer loop (mode >= 1).
+        # decode KV writes are deferred past the layer loop (mode >= 1).
         kv_writeback = [] if (not is_prefill and self.kv_defer_mode >= 1) else None
         # Spec decode (EAGLE3 / DFlash): capture the residual stream entering each
         # requested layer (= HF output_hidden_states of layer idx - 1).
@@ -1247,13 +1247,13 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
 
     @property
     def compiler_args_for(self):
-        """Task 029: per-graph neuronx-cc policy (decode graph -O, ``MUSE_GLIMMER_DECODE_OPT``).
+        """per-graph neuronx-cc policy (decode graph -O, ``MUSE_GLIMMER_DECODE_OPT``).
 
         The runner enables per-graph args when this attribute is not None. With
         ``MUSE_GLIMMER_DECODE_OPT=off`` it is None and every graph keeps the engine level.
         """
         level = _decode_opt_level()
-        vis = vision_opt_level()  # Task 020: encoder graph -O (MUSE_GLIMMER_VIS_OPT)
+        vis = vision_opt_level()  # encoder graph -O (MUSE_GLIMMER_VIS_OPT)
         if level is None and vis is None:
             return None
         from vllm_neuron.utils.compiler_args_ctx import with_optimization_level
@@ -1420,7 +1420,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
             max(sum(tokens), required_blocks * block_size),
             vnc.num_encoder_input_buckets, block_size, dp_size=vnc.dp_size,
         )
-        # Task 020 (MUSE_GLIMMER_VIS_SMALL_BLOCK): one-block requests run the smallest
+        # (MUSE_GLIMMER_VIS_SMALL_BLOCK): one-block requests run the smallest
         # bucket that holds them; a bucket below the block size is ONE block of `bucket` rows.
         blk_rows = block_size
         if required_blocks == 1 and _vis_small_block(vnc):
@@ -1452,7 +1452,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         write_dev = write_ids.to(device)
         timing = _vis_timing()
         sync = (lambda: torch.neuron.synchronize()) if device.type == "neuron" else (lambda: None)
-        if timing:  # Task 020: host / H2D / device split (synchronize so each part is real)
+        if timing:  # host / H2D / device split (synchronize so each part is real)
             sync()
             t_h2d = _time.perf_counter()
         with self._scoped_encoder_args():
@@ -1460,7 +1460,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         if timing:
             sync()
             t2 = _time.perf_counter()
-            # synchronize() can return before the native-backend graph finishes (Task 020 pod 1:
+            # synchronize() can return before the native-backend graph finishes (observed on trn2:
             # 3 ms for a 50-layer encode); a host read of the written cache row waits for it.
             try:
                 cache.buffer[int(write_ids[0])][:1].cpu()
@@ -1484,7 +1484,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         )
 
     def _scoped_encoder_args(self):
-        """Task 020: scope the "encoder" per-graph compiler args (MUSE_GLIMMER_VIS_OPT) for the VE call."""
+        """scope the "encoder" per-graph compiler args (MUSE_GLIMMER_VIS_OPT) for the VE call."""
         from contextlib import nullcontext
 
         base = getattr(self, "_neuron_base_compiler_args", None)
@@ -1510,7 +1510,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         z = lambda *shape, dtype: torch.zeros(*shape, dtype=dtype, device=device)  # noqa: E731
         win = {}
         K = _vis_win_chunks(bs)
-        if K:  # Task 020 window split: chunk gather/scatter + chunk-local bounds
+        if K:  # chunk gather/scatter + chunk-local bounds
             win = {
                 "win_gather": z(nb, K * WIN_CHUNK, dtype=torch.int64),
                 "win_scatter": z(nb, bs, dtype=torch.int64),
@@ -1575,9 +1575,9 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
                 raise Exception(f"KV cache for layer {name} not initialized")
             layer.self_attn.k_cache = kv_caches[name][0]
             layer.self_attn.v_cache = kv_caches[name][1]
-        # Task 023: resolve physical-buffer groups here, never inside the trace.
+        # resolve physical-buffer groups here, never inside the trace.
         lm = self.language_model
-        _kv_fp8.setup(lm.layers)  # Task 028: FP8 KV scales (no-op for a bf16 cache)
+        _kv_fp8.setup(lm.layers)  # FP8 KV scales (no-op for a bf16 cache)
         lm.kv_ptr_group_of = _resolve_kv_ptr_groups(lm.layers)
         if lm.kv_ptr_group_of is not None:
             groups: dict[int, list[int]] = {}
@@ -1604,7 +1604,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
             m[f"{ours}.self_attn.gate_proj_weight"] = f"{hf}.self_attn.gate_proj.weight"
             m[f"{ours}.self_attn.o_proj_weight"] = f"{hf}.self_attn.o_proj.weight"
             if self.language_model.layers[i].self_attn.fp8:
-                # Task 021: scales are derived from the same BF16 tensors at load time.
+                # scales are derived from the same BF16 tensors at load time.
                 for p in ("qkv_proj", "gate_proj", "o_proj"):
                     m[f"{ours}.self_attn.{p}_w_scale"] = m[f"{ours}.self_attn.{p}_weight"]
             for n in (
@@ -1617,7 +1617,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
             for p in ("gate_proj", "up_proj", "down_proj"):
                 m[f"{ours}.mlp.{p}_weight"] = f"{hf}.mlp.{p}.weight"
                 if self.language_model.layers[i].mlp.fp8:
-                    # Task 021: the scale is derived from the same BF16 tensor at load time.
+                    # the scale is derived from the same BF16 tensor at load time.
                     m[f"{ours}.mlp.{p.split('_')[0]}_w_scale"] = f"{hf}.mlp.{p}.weight"
         m["language_model.embed_tokens.weight"] = f"{HF_TEXT_PREFIX}.embed_tokens.weight"
         m["language_model.norm.weight"] = f"{HF_TEXT_PREFIX}.norm.weight"
@@ -1648,7 +1648,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         if missing:
             raise RuntimeError(f"MuseGlimmer: checkpoint did not provide: {missing}")
         self.load_state_dict(sd, strict=False, assign=True)
-        _kv_fp8.load_scales(self.language_model.layers)  # Task 028 (unused with a bf16 cache)
+        _kv_fp8.load_scales(self.language_model.layers)  # (unused with a bf16 cache)
         # Vision tower (model.vision_tower.*, vision_adapter, vision_projection) on the
         # vision TP group (DP: full copy per rank).
         if self.visual is not None:

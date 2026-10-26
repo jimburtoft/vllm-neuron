@@ -69,7 +69,7 @@ def vision_compute_dtype() -> torch.dtype:
     return getattr(torch, name)
 
 
-# Task 020: vision encoder knobs (read once at model build; all default to the Task 005 graph).
+# vision encoder knobs (read once at model build; all default to the original encoder graph).
 # MUSE_GLIMMER_VIS_OPT       neuronx-cc -O for the encoder graph (per-graph policy), off = engine level.
 # MUSE_GLIMMER_VIS_WIN_SPLIT 1: window layers attend in 1024-row sub-blocks ([nb*bs/1024, 1024]); the
 #                            CPU packer then keeps every 32x32 window inside one 1024-row chunk.
@@ -147,11 +147,11 @@ class MuseGlimmerVisionAttention(nn.Module):
         )
 
     def forward(self, x, cos, sin, bound_min, bound_max, ln=None, win=None):
-        """``ln``: optional ``(weight, bias, eps)`` LayerNorm fused into the QKV kernel (Task 020).
+        """``ln``: optional ``(weight, bias, eps)`` LayerNorm fused into the QKV kernel.
 
         ``win``: optional ``(gather [nb, K*C], scatter [nb, bs], K, C)``: attend in
         ``nb*K`` sub-blocks of ``C`` rows instead of ``nb`` blocks of ``bs`` rows; the
-        bounds are then the chunk-local ``[nb*K, C, 1]`` tensors (Task 020).
+        bounds are then the chunk-local ``[nb*K, C, 1]`` tensors.
         """
         nb, bs, _ = x.shape
         n, d = self.num_heads_per_rank, self.head_dim
@@ -170,7 +170,7 @@ class MuseGlimmerVisionAttention(nn.Module):
         v = qkv[:, :, 2 * hd :].reshape(nb, bs, n, d)
 
         # <-- MODEL-SPECIFIC: axial 2D RoPE applied in fp32 (HF upcasts q/k).
-        # MUSE_GLIMMER_VIS_ROPE=bf16 (Task 020): rotate in the compute dtype instead.
+        # MUSE_GLIMMER_VIS_ROPE=bf16: rotate in the compute dtype instead.
         rd = self.dtype if self.rope_mode == "bf16" else torch.float32
         c = cos.to(rd).unsqueeze(2)
         s = sin.to(rd).unsqueeze(2)
@@ -207,11 +207,11 @@ class MuseGlimmerVisionAttention(nn.Module):
 
 
 class MuseGlimmerVisionMLP(Qwen3VLVisionMLP):
-    """fc1 (+bias) -> GELU -> fc2 -> all-reduce -> + bias, with Task 020 variants.
+    """fc1 (+bias) -> GELU -> fc2 -> all-reduce -> + bias, with optional variants.
 
     ``MUSE_GLIMMER_VIS_MLP``:
       * ``torch`` (default): torch matmuls + erf GELU (= Qwen3VLVisionMLP).
-      * ``fp32gelu``: the erf GELU in fp32 (qwen3-asr Task 022: the bf16 erf form does
+      * ``fp32gelu``: the erf GELU in fp32 (observed on another encoder: the bf16 erf form does
         not fuse into the ScalarE GELU activation on neuronx-cc 2.28; the fp32 form does).
       * ``nki``: nkilib MLP kernel, ``skip_gate=True``, ``ActFnType.GELU`` (``nl.gelu``,
         exact erf) with the fc1 bias; fc2 bias stays outside (after the all-reduce).
@@ -391,7 +391,7 @@ class MuseGlimmerVisionModel(nn.Module):
     ) -> torch.Tensor:
         """Local blocks -> features ``[nb, bs / merge_unit, text_hidden]`` (HF merged order).
 
-        ``win_*`` (Task 020 window split): window layers attend in chunks; see
+        ``win_*`` ( window split): window layers attend in chunks; see
         ``pack_vision_inputs(win_chunks=...)``. Requires ``bs % 128 == 0`` (no in-graph pad).
         """
         nb, real_bs, _ = pixel_values.shape
@@ -496,7 +496,7 @@ class MuseGlimmerVisionModel(nn.Module):
         # >>> PARALLELISM: DP gather <<<
         if self.dp_size > 1:
             feats = self.dp_group.all_gather(feats, dim=0)
-        # Task 020 small buckets: a block of fewer rows than the cache block fills its head.
+        # a block of fewer rows than the cache block fills its head.
         cache_rows = encoder_cache_buffer.shape[1]
         if feats.shape[1] < cache_rows:
             feats = F.pad(feats, (0, 0, 0, cache_rows - feats.shape[1]))

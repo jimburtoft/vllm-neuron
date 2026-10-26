@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MuseGlimmer decode fusions (Tasks 018 / 022).
+"""MuseGlimmer decode fusions.
 
-``MUSE_GLIMMER_DECODE_FUSE`` = comma list of the knobs below. Unset = ``gate`` (the default since Task 022,
+``MUSE_GLIMMER_DECODE_FUSE`` = comma list of the knobs below. Unset = ``gate`` (the default,
 used for decode batch buckets >= ``MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS``, default 16); ``off`` = the old path.
 
 - ``norm``  (018a): fold ``input_layernorm`` into the decode megakernel (``rmsnorm_X_enabled``). The centered
@@ -28,7 +28,7 @@ DECODE_FUSE_ENV = "MUSE_GLIMMER_DECODE_FUSE"
 _VALID = {"norm", "ffn", "gate", "early_gate"}
 
 
-DEFAULT_FLAGS = "gate"  # Tasks 018/022 result: in-kernel gate on by default (batch buckets >= gate_min_bs())
+DEFAULT_FLAGS = "gate"  # in-kernel gate on by default (batch buckets >= gate_min_bs())
 
 
 def decode_fuse_flags() -> frozenset:
@@ -48,7 +48,7 @@ GATE_MIN_BS_ENV = "MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS"
 
 
 def gate_min_bs() -> int:
-    """Smallest decode batch bucket that takes the in-kernel gate (Task 022: +3 % at B=1, -5..-15 % at 16..64)."""
+    """Smallest decode batch bucket that takes the in-kernel gate (+3 % at B=1, -5..-15 % at 16..64 on trn2)."""
     return int(os.environ.get(GATE_MIN_BS_ENV, "16"))
 
 

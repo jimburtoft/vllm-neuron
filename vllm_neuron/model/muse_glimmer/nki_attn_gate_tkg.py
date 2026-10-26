@@ -1,4 +1,4 @@
-# Task 022 (MuseGlimmer): local copy of nkilib 0.7.0 (SDK 2.33)
+# MuseGlimmer: local copy of nkilib 0.7.0 (SDK 2.33)
 # nkilib/experimental/transformer/attention_block_tkg.py (md5 13a99e13eb373ae64c99b42a3a1b9314), patched to
 # apply the model's sigmoid output gate inside the kernel, before the in-kernel output projection:
 #   out = (attn * sigmoid(X_gate @ W_gate) [* gate_dq]) @ W_out
@@ -723,7 +723,7 @@ def attention_block_tkg(
             sbm,
         )
 
-    # ========== Task 022: output gate, sigmoid(X_norm @ W_gate) in the attention-output layout ==========
+    # ========== output gate, sigmoid(X_norm @ W_gate) in the attention-output layout ==========
     # Issued before attention so the gate weight DMA overlaps the KV traffic. Same input as the QKV
     # projection (fused rmsnorm_X when enabled). Result: gate_sb [d_head, B*q_heads*S_tkg] @ SBUF in the
     # (b, n, s) column order of attention_tkg's out_in_sb output, so the multiply is elementwise.
@@ -1096,7 +1096,7 @@ def attention_block_tkg(
     # Output: kernel_output layout depends on transposed_out and out_in_sb
     if do_out_proj:
         if gate_sb != None:
-            # Task 022: attn_out is [d_head, B*q_heads*S] @ SBUF (out_in_sb path, kv heads folded into batch
+            # attn_out is [d_head, B*q_heads*S] @ SBUF (out_in_sb path, kv heads folded into batch
             # in head order == (b, n, s) column order); apply the gate in place.
             nisa.tensor_tensor(attn_out, attn_out, gate_sb, op=nl.multiply)
         attn_for_proj = attn_out.reshape((d_head, B, q_heads, S_tkg))

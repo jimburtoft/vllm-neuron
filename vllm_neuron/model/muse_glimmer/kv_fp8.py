@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FP8 KV cache for MuseGlimmer (Task 028).
+"""FP8 KV cache for MuseGlimmer.
 
 Enabled by the vLLM cache dtype (``--kv-cache-dtype fp8``): the runner then
 allocates float8_e4m3fn K/V caches and ``bind_kv_cache`` calls :func:`setup`.
@@ -14,7 +14,7 @@ Scales (one scalar per layer, as the nkilib decode megakernel requires):
   ``softmax_scale`` (``scaling * k_dq``), so it is a compile-time constant that
   does not depend on calibration data.
 - **V: calibrated.** Per-layer ``v_absmax`` from a JSON file
-  (``MUSE_GLIMMER_KV_SCALES``, written by ``harness/t028_calib_kv.py``) times
+  (``MUSE_GLIMMER_KV_SCALES``, computed offline by a calibration pass over natural prompts) times
   ``MUSE_GLIMMER_KV_V_MARGIN`` (default 2.0). The V dequant multiplies the
   attention output before the output gate. The gate sits between attention and
   o_proj, so the V scale cannot fold into ``W_out`` as in llama3.
@@ -179,7 +179,7 @@ def setup(layers) -> bool:
     if src is None:
         logger.warning(
             "MuseGlimmer FP8 KV: %s was not set at weight load; V scale is 1.0 (values below "
-            "~2e-3 lose precision). Calibrate with harness/t028_calib_kv.py.", SCALES_ENV)
+            "~2e-3 lose precision). Calibrate the per-layer V absmax offline.", SCALES_ENV)
     for l in layers:
         l.self_attn.kv_fp8 = True
     logger.info(

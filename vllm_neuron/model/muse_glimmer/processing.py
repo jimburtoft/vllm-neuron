@@ -7,7 +7,7 @@ class with this processor in the front-end process (see
 architecture to the plugin class (``supports_multimodal=True``) instead of the
 generic ``TransformersMultiModalForCausalLM``.
 
-Image path (Task 005). The HF ``MuseGlimmerProcessor`` performs the prompt
+Image path. The HF ``MuseGlimmerProcessor`` performs the prompt
 expansion itself: the chat template renders one ``<|patch|>`` per image, and
 the processor replaces it with
 ``<|image_start|> + <|patch|> * (t*h*w / 4) + <|image_end|>``. vLLM then
@@ -18,7 +18,7 @@ and for raw prompts holding the HF-rendered chat text (with or without the
 leading ``<|begin_of_text|>``: vLLM tokenizes with ``add_special_tokens=True``
 and a doubled leading BOS is collapsed, see ``_postprocess_prompt``).
 
-Video path (Task 007). Same split: the chat template renders one
+Video path. Same split: the chat template renders one
 ``<|video|>`` per video and HF ``MuseGlimmerProcessor.replace_video_token``
 expands it to
 
