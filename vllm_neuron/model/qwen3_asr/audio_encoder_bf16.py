@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import logging
 import os
 
 import numpy as np
@@ -62,6 +63,8 @@ from .weight_loader import (
 # NF.flash_attention (nkilib attention_cte with bound masks, one 128x128 call per block and head).
 _ENC_ATTN_BACKENDS = ("cte", "fused")
 
+
+logger = logging.getLogger(__name__)
 
 # Conv frontend backend. "torch" (default): conv1 as patches + addmm, conv2d2 / conv2d3 as
 # nn.Conv2d, each followed by the fp32 GELU (compiler-lowered; the conv1 activation round-trips
@@ -564,6 +567,7 @@ class Qwen3ASREncoder(nn.Module):
         self.n_window = config.n_window
         self.attention_backend = get_encoder_attention_backend()
         self.conv_backend = get_encoder_conv_backend()
+        logger.info("qwen3_asr encoder conv frontend backend: %s", self.conv_backend)
         self.positional_embedding = SinusoidsPositionEmbedding(
             config.max_position_embeddings,  # 13
             config.d_model,
