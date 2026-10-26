@@ -36,6 +36,10 @@ python contrib/models/hy4_preview/scripts/convert_mxfp8_to_neuron_fp8.py \
 export VLLM_NEURON_BACKEND=vllm_neuron
 # 4. Recommended: key-sharded decode attention (see "Layout")
 export HY4_DEC_CP=1
+# 5. Optional, serving: the plugin sizes the KV cache to 30% of the budget by
+#    default; where HBM allows (e.g. Trn3), raising it lets max_num_seqs requests
+#    run together at max_model_len 32768 instead of in waves
+export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.5
 ```
 
 Recommended neuron_config additions (used for the "optimized" numbers under
