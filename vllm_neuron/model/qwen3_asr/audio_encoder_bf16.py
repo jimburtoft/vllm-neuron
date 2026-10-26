@@ -33,6 +33,7 @@ import os
 import numpy as np
 
 import vllm_neuron.functional as NF
+from vllm_neuron.functional.audio_conv_frontend import audio_conv_frontend
 from vllm_neuron.functional.attention.encoder_window_attention import (
     build_segment_factors,
     encoder_window_attention,
@@ -49,6 +50,7 @@ from .config import Qwen3ASRAudioConfig
 from .utils.audio_preprocessing import resolve_block_geometry
 from .weight_loader import (
     audio_conv1_weight_loader,
+    audio_conv3x3_packed_weight_loader,
     audio_qkv_bias_loader,
     audio_qkv_weight_loader,
 )
@@ -59,6 +61,22 @@ from .weight_loader import (
 # -74 % per layer call; encoder 29.9 -> 22.4 ms per 30 s clip at LNC1). "cte":
 # NF.flash_attention (nkilib attention_cte with bound masks, one 128x128 call per block and head).
 _ENC_ATTN_BACKENDS = ("cte", "fused")
+
+
+# Conv frontend backend. "torch" (default): conv1 as patches + addmm, conv2d2 / conv2d3 as
+# nn.Conv2d, each followed by the fp32 GELU (compiler-lowered; the conv1 activation round-trips
+# HBM). "nki": one fused NKI kernel for conv1 -> GELU -> conv2 -> GELU -> conv3 -> GELU that keeps
+# the intermediates in SBUF (functional/audio_conv_frontend.py).
+_ENC_CONV_BACKENDS = ("torch", "nki")
+
+
+def get_encoder_conv_backend() -> str:
+    v = os.environ.get("VLLM_NEURON_QWEN3_ASR_ENC_CONV", "torch").strip().lower()
+    if v not in _ENC_CONV_BACKENDS:
+        raise ValueError(
+            f"VLLM_NEURON_QWEN3_ASR_ENC_CONV={v!r}; use one of {_ENC_CONV_BACKENDS}."
+        )
+    return v
 
 
 def get_encoder_attention_backend() -> str:
@@ -498,6 +516,27 @@ class _Qwen3ASRPackedConv1(nn.Module):
         set_weight_loader(self.weight, audio_conv1_weight_loader())
 
 
+class _Qwen3ASRPackedConv3x3(nn.Module):
+    """3x3 / stride 2 / padding 1 conv whose weight is stored packed as ``[ci, 9, co]``.
+
+    Used by the fused conv frontend (``VLLM_NEURON_QWEN3_ASR_ENC_CONV=nki``); the checkpoint
+    ``[co, ci, 3, 3]`` weight is packed once at load time.
+    """
+
+    def __init__(self, channels: int, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.in_channels = channels
+        self.out_channels = channels
+        self.kernel_size = (3, 3)
+        self.stride = (2, 2)
+        self.padding = (1, 1)
+        self.dilation = (1, 1)
+        self.groups = 1
+        self.weight = nn.Parameter(torch.empty(channels, 9, channels, dtype=dtype))
+        self.bias = nn.Parameter(torch.empty(channels, dtype=dtype))
+        set_weight_loader(self.weight, audio_conv3x3_packed_weight_loader())
+
+
 class Qwen3ASREncoder(nn.Module):
     """Complete Qwen3-ASR audio encoder.
 
@@ -524,6 +563,7 @@ class Qwen3ASREncoder(nn.Module):
 
         self.n_window = config.n_window
         self.attention_backend = get_encoder_attention_backend()
+        self.conv_backend = get_encoder_conv_backend()
         self.positional_embedding = SinusoidsPositionEmbedding(
             config.max_position_embeddings,  # 13
             config.d_model,
@@ -541,22 +581,26 @@ class Qwen3ASREncoder(nn.Module):
             config.downsample_hidden_size,
             dtype,
         )
-        self.conv2d2 = nn.Conv2d(
-            config.downsample_hidden_size,
-            config.downsample_hidden_size,
-            3,
-            2,
-            padding=1,
-            dtype=dtype,
-        )
-        self.conv2d3 = nn.Conv2d(
-            config.downsample_hidden_size,
-            config.downsample_hidden_size,
-            3,
-            2,
-            padding=1,
-            dtype=dtype,
-        )
+        if self.conv_backend == "nki":
+            self.conv2d2 = _Qwen3ASRPackedConv3x3(config.downsample_hidden_size, dtype)
+            self.conv2d3 = _Qwen3ASRPackedConv3x3(config.downsample_hidden_size, dtype)
+        else:
+            self.conv2d2 = nn.Conv2d(
+                config.downsample_hidden_size,
+                config.downsample_hidden_size,
+                3,
+                2,
+                padding=1,
+                dtype=dtype,
+            )
+            self.conv2d3 = nn.Conv2d(
+                config.downsample_hidden_size,
+                config.downsample_hidden_size,
+                3,
+                2,
+                padding=1,
+                dtype=dtype,
+            )
         self.conv_out = nn.Linear(
             config.downsample_hidden_size
             * ((((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2),
@@ -619,6 +663,28 @@ class Qwen3ASREncoder(nn.Module):
             conv1.out_channels,
         )
         return output.permute(0, 3, 1, 2)
+
+    def _conv_frontend_fused(self, x: torch.Tensor) -> torch.Tensor:
+        """conv1 -> GELU -> conv2 -> GELU -> conv3 -> GELU in one fused kernel.
+
+        ``x [n, 1, mel, frames]`` -> ``[n, C, mel / 8, ceil(frames / 8)]``, the same result as the
+        torch path (up to bf16 rounding: the kernel keeps the pre-activation in fp32).
+        """
+        for conv in (self.conv2d2, self.conv2d3):
+            assert isinstance(conv, _Qwen3ASRPackedConv3x3), (
+                "the fused conv frontend needs packed conv weights; build the encoder with "
+                "VLLM_NEURON_QWEN3_ASR_ENC_CONV=nki"
+            )
+        n, _, height, width = x.shape
+        return audio_conv_frontend(
+            x.reshape(n, height, width),
+            self.conv2d1.weight,
+            self.conv2d1.bias,
+            self.conv2d2.weight,
+            self.conv2d2.bias,
+            self.conv2d3.weight,
+            self.conv2d3.bias,
+        )
 
     def forward(
         self,
@@ -761,9 +827,12 @@ class Qwen3ASREncoder(nn.Module):
 
         # Step 3: Conv frontend (3x s2p1 -> 8x downsample): [n, C, freq, time_steps],
         # where n is this rank's slots (DP > 1) or the base chunks (DP 1).
-        x = gelu(self._conv1_addmm(chunked))
-        x = gelu(self.conv2d2(x))
-        x = gelu(self.conv2d3(x))
+        if self.conv_backend == "nki":
+            x = self._conv_frontend_fused(chunked)
+        else:
+            x = gelu(self._conv1_addmm(chunked))
+            x = gelu(self.conv2d2(x))
+            x = gelu(self.conv2d3(x))
         n, conv_channels, freq_bins, time_steps = x.shape
         x = self.conv_out(
             x.permute(0, 3, 1, 2)

@@ -33,6 +33,23 @@ def audio_conv1_weight_loader() -> SafetensorsWeightLoader:
     return SafetensorsWeightLoader(transform=transform)
 
 
+def audio_conv3x3_packed_weight_loader() -> SafetensorsWeightLoader:
+    """Pack a 3x3 audio convolution weight ``[co, ci, 3, 3]`` as ``[ci, 9, co]`` (fused conv frontend)."""
+
+    def transform(slices, rank):
+        del rank
+        weight = slices[0][:]
+        out_channels, in_channels, kernel_height, kernel_width = weight.shape
+        assert kernel_height == 3 and kernel_width == 3
+        return (
+            weight.permute(1, 2, 3, 0)
+            .reshape(in_channels, kernel_height * kernel_width, out_channels)
+            .contiguous()
+        )
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
 def audio_qkv_weight_loader(
     num_heads_per_rank: int,
     head_dim: int,
