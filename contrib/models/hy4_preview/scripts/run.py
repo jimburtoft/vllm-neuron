@@ -173,7 +173,10 @@ def main() -> None:
         extra["num_gpu_blocks_override"] = args.num_gpu_blocks
 
     if args.profile_dir:
-        extra["profiler_config"] = {"profiler": "cuda"}
+        extra["profiler_config"] = {
+            "profiler": "cuda",
+            **json.loads(os.environ.get("HY4_PROFILER_CONFIG", "{}")),
+        }
     chunk = min(args.prefill_chunk, args.max_model_len)
     extra_nc = json.loads(args.extra_neuron_config) if args.extra_neuron_config else {}
     llm = LLM(
@@ -192,7 +195,10 @@ def main() -> None:
         enable_prefix_caching=False,
         additional_config={
             **(
-                {"neuron_profiler": {"output_dir": args.profile_dir}}
+                {"neuron_profiler": {
+                    "output_dir": args.profile_dir,
+                    **json.loads(os.environ.get("HY4_PROFILER_EXTRA", "{}")),
+                }}
                 if args.profile_dir
                 else {}
             ),
