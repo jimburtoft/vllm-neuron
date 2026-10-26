@@ -108,11 +108,13 @@ DECODE_RSAG_TOKEN_THRESHOLD = 128
 #     Zero the routing affinities of prefill padding tokens so they get no MoE
 #     blocks.
 # GPTOSS_GU_MAJOR        "auto" (default) | "1" | "0"
-#     FP8 hybrid only: store the decode gate/up weight as [E, 2, H, I] so each
+#     FP8: store the decode gate/up weight as [E, 2, H, I] so each
 #     moe_tkg weight DMA moves contiguous rows. Requires an nkilib moe_tkg that
 #     understands this layout (SUPPORTS_GATE_UP_MAJOR); stock nkilib would read
 #     it as [E, H, 2, I] and produce wrong output. "auto" enables it only if the
-#     installed nkilib advertises support.
+#     installed nkilib advertises support. Without the BF16 prefill copy
+#     (GPTOSS_HYBRID_PREFILL=0) the same tensor also feeds bwmm_shard_on_I, so it is
+#     also required that the installed bwmm_shard_on_I advertises SUPPORTS_GATE_UP_MAJOR.
 # GPTOSS_DECODE_OPT      "3" (default) | integer | "base"
 #     neuronx-cc optimization level for the decode graph (see
 #     GptOssForCausalLM.compiler_args_for). -O3 disables the modular flow, which
@@ -169,6 +171,21 @@ def _gptoss_gu_major_default() -> bool:
 
 
 _GPTOSS_GU_MAJOR = _gptoss_gu_major_default()
+
+
+def _gptoss_prefill_reads_gu_major() -> bool:
+    """True if the installed bwmm_shard_on_I accepts gate/up weights as [E, 2, H, I]."""
+    try:
+        from nkilib.core.moe.moe_cte import bwmm_shard_on_I as _bsi
+
+        return bool(getattr(_bsi, "SUPPORTS_GATE_UP_MAJOR", False))
+    except Exception:
+        return False
+
+
+# Without the BF16 prefill copy, the FP8 gate/up tensor feeds both decode (moe_tkg) and prefill (bwmm_shard_on_I),
+# so it can be stored gate/up-major only when both kernels read that layout.
+_GPTOSS_GU_MAJOR_NOCOPY = _GPTOSS_GU_MAJOR and _gptoss_prefill_reads_gu_major()
 
 # ── Weight Loaders ────────────────────────────────────────────────────────────
 # Reuse existing weight loaders. These handle checkpoint format transformations
@@ -1410,6 +1427,12 @@ class GptOssExperts(nn.Module):
         """Prefill runs FP8 only when FP8 is on AND no BF16 copy was retained."""
         return self.fp8_experts and not hasattr(self, "gate_up_proj_weight_bf16")
 
+    def _gate_up_is_major(self) -> bool:
+        """True if the FP8 gate/up weight was stored gate/up-major ([E, 2, H, I] data) at load."""
+        if not (_GPTOSS_GU_MAJOR and self.fp8_experts):
+            return False
+        return hasattr(self, "gate_up_proj_weight_bf16") or _GPTOSS_GU_MAJOR_NOCOPY
+
     def _prefill_gate_up_weight(self) -> torch.Tensor:
         return getattr(self, "gate_up_proj_weight_bf16", self.gate_up_proj_weight)
 
@@ -1478,7 +1501,7 @@ class GptOssExperts(nn.Module):
                     self.hidden_size,
                     self.intermediate_size_per_rank,
                 )
-                if (_GPTOSS_GU_MAJOR and self.fp8_experts and hasattr(self, "gate_up_proj_weight_bf16"))
+                if self._gate_up_is_major()
                 else self.gate_up_proj_weight.reshape(
                     self.num_local_experts,
                     self.hidden_size,
@@ -1671,11 +1694,20 @@ class GptOssExperts(nn.Module):
             conditions=conditions,
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
-            gate_up_proj_weight=self._prefill_gate_up_weight().reshape(
-                self.num_local_experts,
-                self.hidden_size,
-                2,
-                self.intermediate_size_per_rank,
+            gate_up_proj_weight=(
+                self._prefill_gate_up_weight().reshape(
+                    self.num_local_experts,
+                    2,
+                    self.hidden_size,
+                    self.intermediate_size_per_rank,
+                )
+                if self._prefill_uses_fp8() and self._gate_up_is_major()
+                else self._prefill_gate_up_weight().reshape(
+                    self.num_local_experts,
+                    self.hidden_size,
+                    2,
+                    self.intermediate_size_per_rank,
+                )
             ),
             down_proj_weight=self._prefill_down_weight(),
             gate_and_up_proj_bias=self.gate_up_proj_bias.reshape(
@@ -2800,7 +2832,7 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
         if _fp8_experts:
             rank_sharded_checkpoint, _fp8_scales = quantize_expert_state_dict(
                 rank_sharded_checkpoint, self, keep_bf16=_GPTOSS_HYBRID_PREFILL,
-                gate_up_major=_GPTOSS_GU_MAJOR,
+                gate_up_major=_GPTOSS_GU_MAJOR and (_GPTOSS_HYBRID_PREFILL or _GPTOSS_GU_MAJOR_NOCOPY),
             )
 
         self.load_state_dict(rank_sharded_checkpoint, strict=False, assign=True)

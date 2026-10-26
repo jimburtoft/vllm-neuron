@@ -207,11 +207,13 @@ def quantize_expert_state_dict(state_dict: dict, model=None, keep_bf16: bool = F
                 f"({int((deq != w).sum())} elements differ). MXFP4-sourced weights must "
                 f"round-trip exactly under a power-of-two scale.")
 
-        if keep_bf16 and gate_up_major and key.endswith("mlp.experts.gate_up_proj_weight"):
+        if gate_up_major and key.endswith("mlp.experts.gate_up_proj_weight"):
             # Decode-only FP8 copy in gate/up-major layout [E, 2, H, I], so each moe_tkg
             # weight-tile DMA reads contiguous rows instead of short rows interleaved at a
             # 2*I stride. Requires an nkilib moe_tkg with SUPPORTS_GATE_UP_MAJOR, which
-            # detects the layout from shape[1] == 2. Prefill uses the BF16 copy. Stored in
+            # detects the layout from shape[1] == 2. Prefill uses the BF16 copy, or (without
+            # the copy) this same tensor through a bwmm_shard_on_I that also reads the layout
+            # (the caller only asks for it then). Stored in
             # the declared [E, H, 2I] shape; the model reshapes it to [E, 2, H, I] at the
             # kernel call.
             E_, H_, I2_ = q.shape
