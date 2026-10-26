@@ -15,7 +15,12 @@
 >   a reduced draft vocabulary and mask embedding, more than 256 verification tokens, and
 >   an on-device argmax guard for batch 16 and above.
 > - `neuron_config.spec_decode_max_prompt_len`: skips speculation for long prompts (long audio).
-> - Fixes:
+> - Fixes and serving improvements:
+>   - the DFlash draft block mask built with torch ops (at LNC=2 with 2-8 requests per step, the
+>     kernel-built mask halved draft acceptance);
+>   - LNC-aware launch grids for 4 kernels, so the model runs at LNC=1 (two TP=4 replicas per
+>     trn2.3xlarge);
+>   - each API connection accepted on the least-loaded API server worker (multi-API-server setups);
 >   - the GQA decode mask layout for multi-token verify;
 >   - no split of a multimodal prompt when prefill is single-shot (wrong output with several long
 >     audio requests);
@@ -43,7 +48,15 @@
 > The recipe covers DFlash, batching and long-audio settings. Measured results on SDK 2.33:
 > - Earnings22 WER 7.80% (7.77% with the DFlash draft).
 > - LibriSpeech single-request p50 latency 203 ms, or 86 ms with the draft.
-> - 121x real-time at 32 concurrent requests with the draft.
+> - With the draft on 48 LibriSpeech test-other clips (`--max-num-seqs 16`): 62x real time at 1
+>   concurrent request and 110x at 16, with acceptance length 5.3 at every concurrency.
+>
+> **Pick the layout by load** (TP=4 + draft, Poisson arrivals, ~14 s clips, one trn2.3xlarge):
+> - **Below about 3 requests/s:** the command above (LNC=2, one TP=4 replica). p50 150 ms at 1 req/s.
+> - **Above about 3 requests/s:** two TP=4 replicas at LNC=1. At 8 req/s, p50 319 ms and p90 625 ms,
+>   against 481 ms and 920 ms at LNC=2. Add `export NEURON_LOGICAL_NC_CONFIG=1
+>   NEURON_CC_FLAGS=--logical-nc-config=1` and `--data-parallel-size 2` to the command above, and use
+>   a separate compile cache (`VLLM_CACHE_ROOT`) for each LNC setting.
 
 The vLLM Neuron plugin is the recommended serving solution for large language models on AWS Trainium. It extends [vLLM](https://docs.vllm.ai/) with a Neuron backend, providing the same vLLM APIs and configuration you are already familiar with.
 

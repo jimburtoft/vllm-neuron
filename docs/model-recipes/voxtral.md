@@ -136,6 +136,23 @@ LibriSpeech test-other clips (`--max-num-seqs 16`, `decode_context_length_bucket
 
 WER is 5.71% / 5.58-5.71% without / with the draft at every level.
 
+#### Two replicas per instance at LNC=1
+
+At higher request rates, two TP=4 replicas at LNC=1 serve more than one TP=4
+replica at LNC=2 on the same `trn2.3xlarge`. Set `NEURON_LOGICAL_NC_CONFIG=1`
+and `NEURON_CC_FLAGS=--logical-nc-config=1`, add `--data-parallel-size 2`, and
+keep a separate compile cache (`VLLM_CACHE_ROOT`) per LNC setting. With the
+draft, Poisson arrivals, and clips of 14 s on average:
+
+| Requests/s | 1 | 2 | 3 | 4 | 6 | 8 | 10 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| LNC=2, one replica: p50 / p90 (ms) | 150 / 271 | 182 / 342 | 189 / 424 | 224 / 511 | 308 / 697 | 481 / 920 | 790 / 1527 |
+| LNC=1, two replicas: p50 / p90 (ms) | 184 / 313 | 189 / 341 | 191 / 367 | 205 / 385 | 260 / 501 | 319 / 625 | 439 / 804 |
+
+The p50 latency is equal at about 3 requests/s. Below that, one LNC=2 replica
+has the lower latency. The acceptance length is 4.4 in both layouts at every
+rate.
+
 #### Long audio: skip the draft for long prompts
 
 A draft trained on short clips accepts fewer tokens on long contexts, and for
