@@ -23,6 +23,7 @@ Run inside an SDK 2.33 vLLM environment, either the DLAMI venv `/opt/aws_neuronx
 | Encoder shard order | At encoder DP > 1, shard the audio blocks across DP ranks before the conv frontend | +17 % (8 s) / +5 % (30 s) at encoder DP 2. Unchanged at DP 1 |
 | Encoder GELU in fp32 | Compute the encoder GELU in fp32 and cast back. The bf16 `1 + erf(x)` loses its digits for x < −2 | Fixes the LNC=1 encoder TP2 accuracy miss (BC 0.9896 → 0.9986). Encoder −7 % (LNC=1 25.6 → 23.7 ms, LNC=2 20.1 → 18.6 ms). WER unchanged |
 | Fused encoder attention | One block-local attention kernel per encoder layer (`encoder_window_attention_kernel.py`). It reads the fused QKV output, folds the segment mask into QKᵀ, and writes the o_proj layout. Default on; `VLLM_NEURON_QWEN3_ASR_ENC_ATTN=cte` restores the previous path | Encoder 29.9 → 22.4 ms per 30 s clip (LNC1); **+3.8 % RTFx** |
+| Fused lm_head + greedy argmax (opt-in) | `VLLM_NEURON_QWEN3_ASR_LMHEAD=fused`: one NKI kernel streams the lm_head weight and keeps a running argmax, so it never writes logits. TP1 all-greedy only, and needs `--max-logprobs 0` | +0.4 % RTFx (within noise; WER 5.98 %). Off by default |
 | FP8 KV cache (opt-in) | Packed FP8 KV for the text decoder: `--kv-cache-dtype fp8_e4m3` + `"fp8_packed_kv": true`. The prefill write quantizes, and K is stored in token pairs; decode passes the scales and packed layout to the kernel. Scale 1.0, since the checkpoint has none (`UNSAFE_FP8FNCAST=1` needed on trn2). | **1,784–1,792 RTFx** at TP1 × DP8 LNC1 with the champion nkilib (vs 1,717–1,721 bf16 KV), WER 6.07 %. KV capacity doubles |
 | API-server listeners | Each internal-DP API worker binds its own SO_REUSEPORT listener (`VLLM_NEURON_API_SERVER_REUSEPORT`, default on) | Removes the random up-to-30 % throughput drops where one API process took most connections |
 
@@ -41,13 +42,14 @@ These are for the full champion stack: this branch plus the champion nkilib. The
 | **champion**: TP1 × DP4, LNC=2, max_num_seqs 48, decode bucket [512] | **1,508–1,516** | **1,042–1,058** |
 | **champion**: TP1 × DP8, LNC=1, max_num_seqs 48, decode bucket [512] | **1,712–1,722** | **1,297** |
 | **champion + FP8 KV**: TP1 × DP8, LNC=1, max_num_seqs 48, decode bucket [512] | **1,825–1,845** (fused encoder attention; 1,784–1,792 before it) | — |
+| **champion + FP8 KV + `--max-logprobs 0`**: same | **1,891–1,908** (fused lm_head: 1,907–1,917) | — |
 
 | single stream (TP4, LNC=2, 30 s clip, 256 requests) | TTFT p50 | ITL p50 | E2E p50 |
 |---|---|---|---|
 | release, unpatched | 46–48 ms | 3.60 ms | 359–365 ms |
 | **champion** | **44.9–47.5 ms** | **3.13–3.14 ms** | **319–324 ms** (−11 %) |
 
-- **Earnings22 WER** (upstream `run_accuracy_asr`, 341 chunks): champion TP1 × DP4 **6.01 %** with the decode bucket [512] (5.99 % without). With FP8 KV: 6.01 % (TP1 × DP4), 6.07 % (TP1 × DP8 MNS48), 6.06 % (MNS96); with FP8 KV + fused encoder attention 5.97 % (TP1 × DP8 MNS48). Reference gate: 6.24 %.
+- **Earnings22 WER** (upstream `run_accuracy_asr`, 341 chunks): champion TP1 × DP4 **6.01 %** with the decode bucket [512] (5.99 % without). With FP8 KV: 6.01 % (TP1 × DP4), 6.07 % (TP1 × DP8 MNS48), 6.06 % (MNS96); with FP8 KV + fused encoder attention 5.97 % (TP1 × DP8 MNS48); with `--max-logprobs 0` and the fused lm_head 5.98 %. Reference gate: 6.24 %.
 - **API-server balance:** the largest per-worker request share was 0.26–0.29 with 4 servers and 0.15 with 8, so the load is even (fair share is 0.25 and 0.125).
 - **`decode_context_length_buckets`:** depends on the workload.
   - **Throughput:** use `[512]`. The champion nkilib keeps the fast K gather at the 512 bucket, giving +5.7 % (LNC2) / +8.4 % (LNC1) on 30 s clips.
@@ -63,7 +65,9 @@ vllm serve Qwen/Qwen3-ASR-1.7B --tensor-parallel-size 1 --data-parallel-size 4 -
   --additional-config '{"neuron_config":{"quantization":"bf16","num_batched_tokens_buckets":[128,256,512,1024],"num_seqs_buckets":[1,2,4,8,16,32,48],"decode_context_length_buckets":[512]},"encoder_neuron_config":{"num_encoder_input_buckets":[1,2,4],"encoder_attention_block_size":128,"dp_size":1}}'
 # Throughput: keep "decode_context_length_buckets":[512] (above). Single stream (TP4): remove it.
 # Highest throughput: add FP8 KV: UNSAFE_FP8FNCAST=1, --kv-cache-dtype fp8_e4m3, and "fp8_packed_kv":true in neuron_config
-#   (TP1 x DP8 LNC1 MNS48: 1,825-1,845 RTFx with the default fused encoder attention, WER 5.97 %). Larger max_num_seqs (64/96) fit in the doubled KV but are not faster.
+#   (TP1 x DP8 LNC1 MNS48: 1,825-1,845 RTFx with the default fused encoder attention, WER 5.97 %).
+# If clients never request logprobs, add --max-logprobs 0: vLLM's default (20) makes the model all-gather the full
+#   logits every step. Measured +3.8 % (1,891-1,908 RTFx). It is also required for VLLM_NEURON_QWEN3_ASR_LMHEAD=fused. Larger max_num_seqs (64/96) fit in the doubled KV but are not faster.
 # LNC=1, 8 replicas: NEURON_LOGICAL_NC_CONFIG=1 VLLM_NEURON_RESERVED_HEADROOM_GIB=2 VLLM_NEURON_DISABLE_PARALLEL_TRACE=1, --data-parallel-size 8
 ```
 
