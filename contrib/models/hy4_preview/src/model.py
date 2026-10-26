@@ -399,6 +399,15 @@ def _sparse_kernels():
     return _SPARSE_KERNELS
 
 
+def _sparse_kernels_or_none() -> tuple:
+    """The kernels where nki and the plugin's ``wrap_nki`` import; else ``(None, None)``
+    (CPU unit tests), in which case the torch references run."""
+    try:
+        return tuple(_sparse_kernels())
+    except ImportError:
+        return (None, None)
+
+
 def _sparse_grid() -> int:
     """Launch grid of the sparse kernels: the logical NC config the graph compiles at
     (neuronx-cc rejects a kernel launched at another degree, NCC_EVRF066)."""
@@ -682,6 +691,12 @@ class HYV4Attention(nn.Module):
         self.kv_pages: torch.Tensor | None = None
         # Read once here, not in the traced forward.
         self.sparse_grid = _sparse_grid() if DEC_SPARSE_NKI else 1
+        # Built here, never inside the traced forward: a lazy build there puts a
+        # guard on the module-level cache that flips after the first trace and
+        # forces a recompile at serving time.
+        self._sparse_attn_k, self._sparse_gather_k = (
+            _sparse_kernels_or_none() if DEC_SPARSE_NKI else (None, None)
+        )
 
         set_weight_loader(self.q_a_proj_weight, _replicated_transposed())
         set_weight_loader(self.kv_a_proj_weight, _replicated_transposed())
@@ -1249,8 +1264,8 @@ class HYV4Attention(nn.Module):
 
     def _gather_cols(self, rows: torch.Tensor, col_off: int, width: int) -> torch.Tensor:
         """``[R, n]`` flat rows -> ``[R, n, width]`` columns ``col_off:`` of each entry."""
-        if _use_sparse_kernels(rows):
-            gather = _sparse_kernels()[1]
+        if self._sparse_gather_k is not None and _use_sparse_kernels(rows):
+            gather = self._sparse_gather_k
             return gather[self.sparse_grid](kv_cache=self.kv_pages, rows=rows, col_off=col_off, width=width)
         return gather_rows_cols_ref(self.kv_pages, rows, col_off, width)
 
@@ -1306,8 +1321,8 @@ class HYV4Attention(nn.Module):
         """
         rows, bound = self._cp_sparse_rows(shard_rows, sel_ctx)
         col_off = self.latent_slice.start
-        if _use_sparse_kernels(q_all):
-            attn = _sparse_kernels()[0]
+        if self._sparse_attn_k is not None and _use_sparse_kernels(q_all):
+            attn = self._sparse_attn_k
             return attn[self.sparse_grid](
                 q_all=q_all.contiguous(), kv_cache=self.kv_pages, rows=rows.contiguous(),
                 bound=bound.contiguous(), scale=float(self.scaling), col_off=col_off,
