@@ -82,6 +82,24 @@ PERF_SKIP = {x for x in os.environ.get("HY4_PERF_SKIP", "").split(",") if x}
 # of replicated per head (``HYV4Attention.forward_decode_cp``). Off by default;
 # recommended on (see the README).
 DEC_CP = os.environ.get("HY4_DEC_CP", "0") == "1"
+# ``HY4_DEC_SPARSE_NKI=1`` (with HY4_DEC_CP=1): each rank reads only the indexer
+# keys of its shard plus the latent rows DSA selected, not whole entries for the
+# shard (``HYV4Attention._cp_sparse_local``). On Neuron the read and the local
+# attention are NKI kernels (``nki_sparse_decode.py``); on CPU the torch
+# references below implement the same contracts. Off by default.
+DEC_SPARSE_NKI = os.environ.get("HY4_DEC_SPARSE_NKI", "0") == "1"
+# Cap on the compacted per-rank key list. 0 (default) = the whole shard, which
+# is always exact. A smaller cap (rounded up to 128) is exact only while no
+# rank holds more selected keys than the cap: the global top-k holds 2048
+# keys, but keys tied with the k-th score can add a few more.
+SPARSE_KLOC = int(os.environ.get("HY4_SPARSE_KLOC", "0") or 0)
+# Row index of a key the sparse path must not read: "oob" (default) = one past
+# the last cache row, which the kernels' indirect DMA skips (``oob_mode.skip``,
+# destination pre-zeroed); "null" = the null block's first row, a valid finite
+# entry that is read and masked (a fallback should a skipped DMA misbehave).
+SPARSE_PAD_ROW = os.environ.get("HY4_SPARSE_PAD_ROW", "oob")
+if SPARSE_PAD_ROW not in ("oob", "null"):
+    raise ValueError(f"HY4_SPARSE_PAD_ROW must be oob or null, got {SPARSE_PAD_ROW!r}")
 
 # Prefill prefix bound from ``kv_segment_size`` (see ``prefill_span_bound``).
 # Inert unless neuron_config.kv_segment_size_buckets has more than one entry;
@@ -363,6 +381,74 @@ def topk_threshold(
         lo = torch.where(up, mid, lo)
         hi = torch.where(up, hi, mid)
     return lo
+
+
+_SPARSE_KERNELS: list = []
+
+
+def _sparse_kernels():
+    """``(attn, gather_cols)`` NKI kernels through the plugin's ``wrap_nki`` (lazy)."""
+    if not _SPARSE_KERNELS:
+        try:
+            from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+        except ImportError:  # source-tree layout
+            from vllm_neuron.nki.nki_hop import wrap_nki
+        from .nki_sparse_decode import gather_rows_cols, sparse_decode_attn
+
+        _SPARSE_KERNELS.extend((wrap_nki(sparse_decode_attn), wrap_nki(gather_rows_cols)))
+    return _SPARSE_KERNELS
+
+
+def _use_sparse_kernels(t: torch.Tensor) -> bool:
+    """The plugin's rule (Neuron device, or CPU mode with ``NKI_SIMULATOR=1``)."""
+    try:
+        from vllm_neuron.utils.neuron_utils import can_run_kernel
+    except ImportError:  # CPU unit tests without vLLM
+        return t.device.type != "cpu"
+    return can_run_kernel(t)
+
+
+def _flat_rows_ref(kv_pages: torch.Tensor) -> torch.Tensor:
+    return kv_pages.reshape(-1, kv_pages.shape[-1])
+
+
+def gather_rows_cols_ref(
+    kv_pages: torch.Tensor, rows: torch.Tensor, col_off: int, width: int
+) -> torch.Tensor:
+    """``nki_sparse_decode.gather_rows_cols``: ``out[r, k] = cache_row[rows[r, k]][col_off:+width]``;
+    out-of-range rows give zeros."""
+    flat = _flat_rows_ref(kv_pages)
+    n_rows = flat.shape[0]
+    ok = (rows >= 0) & (rows < n_rows)
+    safe = torch.where(ok, rows, torch.zeros_like(rows)).to(torch.long)
+    out = flat[safe][..., col_off : col_off + width]
+    return out * ok.unsqueeze(-1).to(out.dtype)
+
+
+def sparse_decode_ref(
+    q_all: torch.Tensor,
+    kv_pages: torch.Tensor,
+    rows: torch.Tensor,
+    bound: torch.Tensor,
+    scale: float,
+    col_off: int,
+    lat_dim: int,
+    value_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``nki_sparse_decode.sparse_decode_attn`` (``lat_off = 0``, rope after the latent).
+
+    ``s = min(scale * q . row[col_off:col_off+D], bound)``; -> unnormalised
+    ``m [B, H]``, ``den [B, H]``, ``num [B, H, lat_dim]``, all fp32.
+    """
+    width = q_all.shape[-1]
+    keys = gather_rows_cols_ref(kv_pages, rows, col_off, width)  # [B, n, D]
+    s = (q_all.float() @ keys.float().transpose(1, 2)) * scale  # [B, H, n]
+    s = torch.minimum(s, bound.unsqueeze(1))
+    m = s.amax(dim=-1)
+    p = torch.exp(s - m.unsqueeze(-1))
+    den = p.sum(dim=-1)
+    num = (p.to(value_dtype) @ keys[..., :lat_dim].to(value_dtype)).float()
+    return m, den, num
 
 
 def _zero_beyond(ctx: torch.Tensor, limit: torch.Tensor) -> torch.Tensor:
@@ -1114,6 +1200,110 @@ class HYV4Attention(nn.Module):
         eye = torch.eye(nh, dtype=torch.float32, device=dev)
         return (eye.view(nh, 1, nh) * at_me.view(1, world, 1)).reshape(nh, world * nh)
 
+    # ── sparse local attention (HY4_DEC_SPARSE_NKI=1) ──────────────────────
+
+    def _n_cache_rows(self) -> int:
+        return self._num_pages() * self._block_size()
+
+    def _pad_row(self) -> int:
+        """Row index for keys the sparse path does not attend (``HY4_SPARSE_PAD_ROW``)."""
+        if SPARSE_PAD_ROW == "null":
+            return self._NULL_BLOCK * self._block_size()
+        return self._n_cache_rows()
+
+    def _cp_shard_rows(
+        self, local_bt: torch.Tensor, live_rows: torch.Tensor, in_prefix: torch.Tensor
+    ) -> torch.Tensor:
+        """Flat cache row (``page * block + slot``) of each shard key, ``[reqs, shard]`` int32.
+
+        Dead rows and table padding map to the null block, as in ``_gather``; keys
+        past the prefix get ``_pad_row()`` (by default one past the last row, which
+        the kernels' indirect DMA skips: zeros, no read). Their indexer scores are
+        masked by ``in_prefix`` either way.
+        """
+        bs, num_pages = self._block_size(), self._num_pages()
+        bt = local_bt.to(torch.long)
+        blocks = torch.where(
+            live_rows & (bt > 0) & (bt < num_pages), bt, torch.full_like(bt, self._NULL_BLOCK)
+        )
+        shard = bt.shape[1] * bs
+        j = torch.arange(shard, device=bt.device)
+        page = torch.index_select(blocks, 1, j // bs)  # [reqs, shard]
+        flat = page * bs + (j % bs).view(1, shard)
+        pad = torch.full_like(flat, self._pad_row())
+        return torch.where(in_prefix, flat, pad).to(torch.int32)
+
+    def _gather_cols(self, rows: torch.Tensor, col_off: int, width: int) -> torch.Tensor:
+        """``[R, n]`` flat rows -> ``[R, n, width]`` columns ``col_off:`` of each entry."""
+        if _use_sparse_kernels(rows):
+            gather = _sparse_kernels()[1]
+            return gather[1](kv_cache=self.kv_pages, rows=rows, col_off=col_off, width=width)
+        return gather_rows_cols_ref(self.kv_pages, rows, col_off, width)
+
+    def _cp_sparse_rows(
+        self, shard_rows: torch.Tensor, sel_ctx: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Selected rows and their keep/drop bound, ``[reqs, K]`` each.
+
+        Unselected keys get ``_pad_row()`` and ``-BIG``. With
+        ``HY4_SPARSE_KLOC`` below the shard, the selected keys are compacted to
+        the front first: rank among the selected by a prefix-sum matmul, then a
+        one-hot placement (no sort, top-k, gather or scatter). Exact while no
+        rank holds more than K selected keys.
+        """
+        reqs, shard = sel_ctx.shape
+        dev = sel_ctx.device
+        n_rows = self._n_cache_rows()
+        pad_row = self._pad_row()
+        big = 1.0e30
+        k = shard
+        if 0 < SPARSE_KLOC < shard:
+            k = min(shard, -(-SPARSE_KLOC // 128) * 128)
+        if k == shard:
+            rows = torch.where(sel_ctx, shard_rows, torch.full_like(shard_rows, pad_row))
+        else:
+            if n_rows >= 1 << 24:
+                raise ValueError(f"{n_rows} cache rows: fp32 one-hot compaction is inexact")
+            sel = sel_ctx.to(torch.float32)
+            upper = torch.ones(shard, shard, device=dev).triu()  # [i, j] = i <= j
+            pos = sel @ upper - 1.0  # [reqs, shard], rank among the selected
+            slots = torch.arange(k, dtype=torch.float32, device=dev)
+            onehot = (pos.unsqueeze(-1) == slots.view(1, 1, k)).to(torch.float32) * sel.unsqueeze(-1)
+            filled = onehot.sum(dim=1) > 0.5  # [reqs, k]
+            placed = (onehot * shard_rows.to(torch.float32).unsqueeze(-1)).sum(dim=1)
+            pad = torch.full_like(placed, pad_row).to(torch.int32)
+            rows = torch.where(filled, placed.to(torch.int32), pad)
+            sel_ctx = filled
+        bound = torch.where(
+            sel_ctx,
+            torch.full(sel_ctx.shape, big, dtype=torch.float32, device=dev),
+            torch.full(sel_ctx.shape, -big, dtype=torch.float32, device=dev),
+        )
+        return rows.to(torch.int32), bound
+
+    def _cp_sparse_local(
+        self, q_all: torch.Tensor, shard_rows: torch.Tensor, sel_ctx: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Unnormalised local attention partials over the selected rows only.
+
+        -> ``m_loc [reqs, heads]`` (max over the selected keys, ``-BIG`` if none),
+        ``den [reqs, heads]`` and ``num [reqs, heads, 512]`` relative to ``m_loc``.
+        Reads the 576-wide ``[latent | rope]`` slice of the selected entries.
+        """
+        rows, bound = self._cp_sparse_rows(shard_rows, sel_ctx)
+        col_off = self.latent_slice.start
+        if _use_sparse_kernels(q_all):
+            attn = _sparse_kernels()[0]
+            return attn[1](
+                q_all=q_all.contiguous(), kv_cache=self.kv_pages, rows=rows.contiguous(),
+                bound=bound.contiguous(), scale=float(self.scaling), col_off=col_off,
+                lat_off=0, lat_dim=self.kv_lora_rank, rope_off=self.kv_lora_rank,
+                rope_dim=self.rope_dim,
+            )
+        return sparse_decode_ref(
+            q_all, self.kv_pages, rows, bound, self.scaling, col_off, self.kv_lora_rank, self.dtype
+        )
+
     def forward_decode_cp(
         self,
         x: torch.Tensor,
@@ -1166,16 +1356,26 @@ class HYV4Attention(nn.Module):
         cols = r * nb + torch.arange(nb, device=dev)
         local_bt = torch.index_select(block_table, 1, cols)
         live_rows = (metadata["slot_mapping"].view(num_reqs, -1)[:, 0] > 0).view(-1, 1)
-        ctx = self._gather(local_bt, live_rows)  # [reqs, shard, 704]
         key_pos = r * shard + torch.arange(shard, device=dev)  # [shard]
         limit = positions.view(num_reqs, 1)
         in_prefix = key_pos.view(1, shard) < limit  # [reqs, shard]
-        ctx = _zero_beyond_at(ctx, limit, key_pos)
-        own = entry.to(ctx.dtype)  # [reqs, 704], the same on every rank
+        # The kernels take <= 128 keys or a multiple of 128.
+        sparse = DEC_SPARSE_NKI and (shard <= 128 or shard % 128 == 0)
+        if sparse:
+            # Only the indexer keys of the shard; latent rows are read after the
+            # selection (_cp_sparse_local). Keys past the prefix read nothing.
+            shard_rows = self._cp_shard_rows(local_bt, live_rows, in_prefix)
+            ik_ctx = self._gather_cols(shard_rows, self.index_slice.start, self.index_dim)
+            ctx = None
+        else:
+            ctx = self._gather(local_bt, live_rows)  # [reqs, shard, 704]
+            ctx = _zero_beyond_at(ctx, limit, key_pos)
+            ik_ctx = ctx[..., self.index_slice]
+        own = entry.to(self.dtype)  # [reqs, 704], the same on every rank
 
         if self.indexer is not None:
             iq, iw = self.indexer.queries(q_resid, x, cos, sin)  # [reqs, 32, 128]
-            s_ctx = torch.relu((iq @ ctx[..., self.index_slice].transpose(1, 2)).float())
+            s_ctx = torch.relu((iq @ ik_ctx.transpose(1, 2)).float())
             idx_ctx = (iw.unsqueeze(1) @ s_ctx).squeeze(1)  # [reqs, shard]
             s_own = torch.relu(
                 torch.einsum("rhd,rd->rh", iq, own[:, self.index_slice]).float()
@@ -1192,25 +1392,34 @@ class HYV4Attention(nn.Module):
         q_all = _all_gather(self.tp_group, query.float(), 1, world)  # [reqs, heads, 576]
 
         # 3. local scores, global max.
-        lat = ctx[..., self.latent_slice]  # [reqs, shard, 576]
         own_lat = own[:, self.latent_slice]  # [reqs, 576]
-        scores = (q_all @ lat.float().transpose(1, 2)) * self.scaling  # [reqs, heads, shard]
         # A finite floor (see _attend_blocked): a rank may have no selected key.
         floor = -1.0e30
-        scores = scores.masked_fill(~sel_ctx.unsqueeze(1), floor)
+        rank_v = self.kv_lora_rank
+        if sparse:
+            # Local partials relative to the local max, over the selected rows only.
+            m_loc, den_l, num_l = self._cp_sparse_local(q_all, shard_rows, sel_ctx)
+        else:
+            lat = ctx[..., self.latent_slice]  # [reqs, shard, 576]
+            scores = (q_all @ lat.float().transpose(1, 2)) * self.scaling  # [reqs, heads, shard]
+            scores = scores.masked_fill(~sel_ctx.unsqueeze(1), floor)
+            m_loc = scores.amax(dim=-1)  # [reqs, heads]
         a = torch.einsum("rhc,rc->rh", q_all, own_lat.float()) * self.scaling
         a = a.masked_fill(~sel_own, floor)  # [reqs, heads]
-        m_loc = scores.amax(dim=-1)  # [reqs, heads]
         m_all = _all_gather(self.tp_group, m_loc.unsqueeze(0), 0, world).amax(dim=0)
         m = torch.maximum(m_all, a)
 
         # 4. unnormalised local partials, merged across ranks.
-        p = torch.exp(scores - m.unsqueeze(-1))
-        den = p.sum(dim=-1)  # [reqs, heads]
-        rank_v = self.kv_lora_rank
-        # Contract the whole 576-wide row and slice the small output, not the
-        # gathered latent (a strided view of it spills).
-        num = (p.to(self.dtype) @ lat).float()[..., :rank_v]  # [reqs, heads, 512]
+        if sparse:
+            corr = torch.exp(m_loc - m)  # 0 on a rank with no selected key
+            den = den_l * corr
+            num = num_l * corr.unsqueeze(-1)
+        else:
+            p = torch.exp(scores - m.unsqueeze(-1))
+            den = p.sum(dim=-1)  # [reqs, heads]
+            # Contract the whole 576-wide row and slice the small output, not the
+            # gathered latent (a strided view of it spills).
+            num = (p.to(self.dtype) @ lat).float()[..., :rank_v]  # [reqs, heads, 512]
         pa = torch.exp(a - m)  # [reqs, heads]; 0 when the own key is unselected
         own_v = own_lat[:, :rank_v].float()  # [reqs, 512]
         m_mine = torch.einsum("jh,rh->rj", pick, m)  # [reqs, nh]

@@ -338,6 +338,20 @@ numerators and denominators. The cache stays replicated; only the read is
 split. Requires the block-table width to divide by the TP degree, otherwise
 the replicated path runs.
 
+**Sparse key-sharded decode (`HY4_DEC_SPARSE_NKI=1`, with `HY4_DEC_CP=1`; opt-in,
+not yet run on device).** Each rank reads only the 128-wide indexer keys of its
+shard (`gather_rows_cols`), and after the global threshold only the 576-wide
+`[latent | rope]` slices of the keys DSA selected (`sparse_decode_attn`, adapted
+from the workspace's absorbed-MLA DCP decode kernel): unselected keys and keys
+past the prefix get an out-of-range row index that the indirect DMA skips, so
+their bytes are never read. The kernel returns unnormalised local `(m, den, num)`
+and the existing merge is unchanged. Both kernels are in `src/nki_sparse_decode.py`
+and run on Neuron only; on CPU, torch references with the same contracts run
+instead (`test_decode_cp_sparse_matches`). `test/sim/sim_sparse_decode.py`
+checks the kernels in the NKI simulator. By default the per-rank key list is the
+whole shard (always exact); `HY4_SPARSE_KLOC=<n>` compacts it to `n` (rounded
+up to 128) slots, which is exact only while no rank holds more selected keys.
+
 **Prefill prefix bound.** With more than one `kv_segment_size_buckets` entry,
 the plugin picks the smallest segment that holds the whole prefix, so a prefill
 graph compiled for a smaller segment knows `cached_seq_len <= kv_segment_size`

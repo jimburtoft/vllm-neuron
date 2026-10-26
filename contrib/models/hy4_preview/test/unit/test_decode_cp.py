@@ -210,3 +210,73 @@ def test_decode_cp_matches_split(monkeypatch, dtype, tol, world, order_seed):
             for r in range(world):
                 assert torch.equal(res[r][0][li], res[0][0][li]), "ranks disagree"
                 assert rel(res[r][0][li], ref_out[li]) < tol, (positions, li)
+
+
+@pytest.mark.parametrize("dtype,tol", [(torch.float32, 2e-5), (torch.bfloat16, 2e-2)])
+@pytest.mark.parametrize(
+    "world,order_seed,kloc,pad",
+    [(8, 1, 0, "oob"), (4, 2, 0, "oob"), (2, 3, 0, "null"), (2, 4, 128, "oob"), (4, 5, 64, "null")],
+)
+@torch.no_grad()
+def test_decode_cp_sparse_matches(monkeypatch, dtype, tol, world, order_seed, kloc, pad):
+    """``HY4_DEC_SPARSE_NKI`` (torch references of the kernels) == dense CP == split.
+
+    Same selection bit for bit; output against the split reference at ``tol`` and
+    against the dense key-sharded path. ``kloc`` > 0 exercises the compaction
+    (exact here: at most ``TOPK`` keys are selected, so no rank exceeds 64)."""
+    torch.set_num_threads(2)
+    cfg = make_config(dtype)
+    ref_layers = build_reference(cfg)
+    rope = model.HYV4RotaryEmbedding(cfg)
+    order = torch.randperm(world, generator=torch.Generator().manual_seed(order_seed)).tolist()
+    hub = Hub(world, order)
+    ranks = [[build_rank(cfg, a, world, r, hub) for a in ref_layers] for r in range(world)]
+    monkeypatch.setattr(model, "SPARSE_KLOC", kloc)
+    monkeypatch.setattr(model, "SPARSE_PAD_ROW", pad)
+    for ci, (positions, dead) in enumerate(CASES):
+        x, pos, meta = inputs(cfg, positions, dead, seed=100 + ci)
+        monkeypatch.setattr(model, "DEC_CP", False)
+        ref_out, ref_sel = run_reference(ref_layers, rope, x, pos, meta)
+        monkeypatch.setattr(model, "DEC_CP", True)
+        monkeypatch.setattr(model, "DEC_SPARSE_NKI", False)
+        dense = run_cp(ranks, rope, x, pos, meta, use_forward=False)
+        monkeypatch.setattr(model, "DEC_SPARSE_NKI", True)
+        res = run_cp(ranks, rope, x, pos, meta, use_forward=(ci == 0))
+        for li in range(2):
+            for r in range(world):
+                assert torch.equal(res[r][1][li][0], dense[r][1][li][0]), "selection differs"
+                assert torch.equal(res[r][1][li][1], dense[r][1][li][1]), "own bit differs"
+            local = [res[r][1][li] for r in range(world)]
+            sel = torch.cat([local[r][0] for r in range(world)] + [local[0][1]], dim=1)
+            assert torch.equal(sel, ref_sel[li]), (positions, li)
+            for r in range(world):
+                assert torch.equal(res[r][0][li], res[0][0][li]), "ranks disagree"
+                assert rel(res[r][0][li], ref_out[li]) < tol, (positions, li)
+                assert rel(res[r][0][li], dense[r][0][li]) < tol, (positions, li)
+
+
+def test_sparse_rows_compaction_exact():
+    """The one-hot compaction keeps every selected row, in order, and pads the rest."""
+    set_group(Group())
+    cfg = make_config(torch.float32)
+    a = model.HYV4Attention(cfg, 0)
+    a.kv_pages = torch.zeros(PAGES, 1, BLOCK, a.entry_dim)
+    g = torch.Generator().manual_seed(0)
+    reqs, shard = 3, 256
+    rows = torch.randint(0, PAGES * BLOCK, (reqs, shard), generator=g).to(torch.int32)
+    sel = torch.rand(reqs, shard, generator=g) < 0.3
+    sel[2] = False  # a request with nothing selected on this rank
+    old = model.SPARSE_KLOC
+    try:
+        model.SPARSE_KLOC = 100  # -> 128 slots
+        out, bound = a._cp_sparse_rows(rows, sel)
+    finally:
+        model.SPARSE_KLOC = old
+    assert out.shape == (reqs, 128)
+    for i in range(reqs):
+        want = rows[i][sel[i]]
+        n = want.numel()
+        assert n <= 128
+        assert torch.equal(out[i, :n], want)
+        assert (out[i, n:] == PAGES * BLOCK).all()
+        assert (bound[i, :n] > 0).all() and (bound[i, n:] < 0).all()
