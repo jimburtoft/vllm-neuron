@@ -92,6 +92,13 @@ then `rm -rf ~/.cache/neuron_libtorch`), the model also uses a gate/up-major FP8
 weight layout and the hybrid static/dynamic prefill MoE kernel, which skips empty blocks.
 The model detects the installed kernels, and works unchanged with the bundled NKI Library.
 
+**FP8 needs the NKI Library branch at 33 or more concurrent requests.** The bundled NKI
+Library applies the per-channel FP8 down-projection scales to the wrong columns in the
+decode MoE kernel when the batch rounds up to the 64-request decode graph, and the output
+is incoherent. The branch has the fix from `3397c4a` (2026-10-27) on; if you installed it
+earlier, reinstall it and run `rm -rf ~/.cache/neuron_libtorch`. With the bundled NKI
+Library, use FP8 only with `max_num_seqs=32` or lower. BF16 is not affected.
+
 Recommended starting point on trn2.3xlarge:
 
 ```python
