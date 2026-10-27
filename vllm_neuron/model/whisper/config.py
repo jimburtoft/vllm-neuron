@@ -47,6 +47,11 @@ class WhisperConfig:
     # Set to False only in unit tests that use small dimensions.
     check_dims: bool = True
 
+    # The prefix of the self-attention layer names (the KV-cache layer names).
+    # A speculative-decoding draft uses a different prefix, so that its KV-cache
+    # layers do not have the same names as the target layers.
+    layer_name_prefix: str = "decoder"
+
     def __post_init__(self):
         if not self.check_dims:
             return

@@ -95,6 +95,7 @@ from vllm_neuron.model.neuron_config import (
 from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.dflash import DFlashProposer
+from vllm_neuron.vllm.spec_decode.draft_model import DraftModelProposer
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
@@ -1216,9 +1217,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._transition_bonus_tensor: torch.Tensor | None = None
 
         # Set up speculative decoding.
-        self.drafter: EagleProposer | DFlashProposer | None = None
+        self.drafter: EagleProposer | DFlashProposer | DraftModelProposer | None = None
         self.is_eagle3_spec = False
         self.is_dflash_spec = False
+        self.is_draft_model_spec = False
         self._draft_token_ids = None
         # Async speculative decoding drafts rows by req_id. Only used at
         # batch-composition changes (e.g. prefills merging into bs-wide decode).
@@ -1237,6 +1239,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             elif self.speculative_config.method == "dflash":
                 self.is_dflash_spec = True
                 self.drafter = DFlashProposer(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
+            elif self.speculative_config.method == "draft_model":
+                self.is_draft_model_spec = True
+                self.drafter = DraftModelProposer(
                     self.vllm_config, self.device, self.on_device_sampling
                 )
             else:
@@ -1539,7 +1546,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     @property
     def is_spec_decode(self) -> bool:
-        return self.is_eagle3_spec or self.is_dflash_spec
+        return self.is_eagle3_spec or self.is_dflash_spec or self.is_draft_model_spec
+
+    def _uses_draft_kv(self) -> bool:
+        """Return True when the drafter has its own paged KV-cache layers."""
+        return self.speculative_config is not None and (
+            self.speculative_config.use_eagle() or self.is_draft_model_spec
+        )
 
     @property
     def cp_rank(self) -> int:
@@ -1833,6 +1846,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             draft_capture = getattr(self, "_draft_tensor_capture", None)
             if draft_capture is not None:
                 draft_capture.register_clear_hook(drafter.model)
+            if isinstance(drafter, DraftModelProposer):
+                drafter.cross_kv = torch.compile(
+                    getattr(drafter.cross_kv, "_orig_mod", drafter.cross_kv),
+                    **drafter.compile_kwargs,
+                )
+                drafter.attach_target(self.model)
 
     def load_model(self) -> None:
         """Load the NeuronModel."""
@@ -1992,7 +2011,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Explicit call to force all buffers to use meta.
             self.model = self.model.to("meta")
 
-        if self.is_spec_decode:
+        if self.is_spec_decode and not self.is_draft_model_spec:
             if _supports_aux_hidden_states(self.model):
                 if self.is_dflash_spec:
                     assert isinstance(self.drafter, DFlashProposer)
@@ -2254,7 +2273,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             logger.info("Spec decode enabled. Loading draft model ...")
             # TODO: model loading logic could be extracted
             # Pass target model's padded hidden_size to draft model
-            target_hidden_size = self.model.config.hidden_size
+            target_hidden_size = getattr(self.model.config, "hidden_size", None)
             # Layout of that padded hidden dim. A target that deinterleaves the
             # padded axis reports its group count; the default 1 means the
             # padding sits at the tail.
@@ -2265,6 +2284,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 target_hidden_pad_groups=target_hidden_pad_groups,
                 compile_options=self.compile_options,
             )
+            if isinstance(self.drafter, DraftModelProposer):
+                self.drafter.attach_target(self.model)
             logger.info("Draft model loading complete (moved to device and compiled)")
 
     def resolve_graph_compiler_args(self, graph_type):
@@ -10658,7 +10679,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         logits_indices: torch.Tensor | None = None,
         raw_sampled_token_ids: torch.Tensor | None = None,
     ) -> list[list[int]] | torch.Tensor:
-        assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
+        assert isinstance(self.drafter, (EagleProposer, DFlashProposer, DraftModelProposer))
 
         num_reqs = self.input_batch.num_reqs
 
@@ -11219,10 +11240,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
 
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
+        if self._uses_draft_kv():
+            assert isinstance(self.drafter, (EagleProposer, DFlashProposer, DraftModelProposer))
             assert self.drafter.model is not None
-            self.drafter.model.bind_kv_cache(kv_caches)
+            getattr(self.drafter.model, "_orig_mod", self.drafter.model).bind_kv_cache(kv_caches)
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
             if isinstance(self.drafter, DFlashProposer):
                 self.drafter.alias_target_weights(target_model=self.model)
@@ -11299,11 +11320,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             all_kv_cache_specs[layer_name] = spec
 
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
+        if self._uses_draft_kv():
+            assert isinstance(self.drafter, (EagleProposer, DFlashProposer, DraftModelProposer))
             assert self.drafter.model is not None
 
-            drafter_kv_spec = self.drafter.model.get_kv_spec()
+            drafter_kv_spec = getattr(self.drafter.model, "_orig_mod", self.drafter.model).get_kv_spec()
             for layer in drafter_kv_spec.layers:
                 layer_name = layer.name
                 all_kv_cache_specs[layer_name] = FullAttentionSpec(

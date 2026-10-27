@@ -372,6 +372,17 @@ def sinusoids(length: int, channels: int, max_timescale: float = 10000.0):
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
 
+def _current_spec_method() -> str | None:
+    """Return the speculative decoding method of the current vLLM config, or None."""
+    try:
+        from vllm.config import get_current_vllm_config
+
+        spec = get_current_vllm_config().speculative_config
+    except (AssertionError, AttributeError, RuntimeError, ImportError):
+        return None
+    return getattr(spec, "method", None) if spec is not None else None
+
+
 def tp_info() -> tuple[object | None, int, int]:
     """Return ``(device_group, world_size, rank)`` of the text TP group.
 
@@ -1153,7 +1164,7 @@ class DecoderSelfAttention(nn.Module):
     def __init__(self, cfg: WhisperConfig, layer_idx: int, dtype, tp_group, tp):
         super().__init__()
         self.layer_idx = layer_idx
-        self.layer_name = f"decoder.layers.{layer_idx}.self_attn"
+        self.layer_name = f"{cfg.layer_name_prefix}.layers.{layer_idx}.self_attn"
         d = cfg.d_model
         num_heads = cfg.decoder_attention_heads
         self.head_dim = d // num_heads
@@ -2030,6 +2041,15 @@ class WhisperForConditionalGeneration(nn.Module):
             # that shards the vocab. On a tie, the lowest global index wins,
             # the same as an argmax over the full vocab.
             self.sampler = Sampler(self.on_device_sampling_config, process_group=tp_group)
+        # Speculative decoding: the model is the target of a draft-model proposer.
+        # Read one time: a read in forward adds a guard.
+        self.spec_decode = _current_spec_method() == "draft_model" and config.layer_name_prefix == "decoder"
+        self.aux_hidden_state_layers = ()
+        object.__setattr__(self, "_draft_cross_kv", None)
+        # The runner sends the previous step's rejection output to a model with this
+        # marker (async scheduling). forward then corrects the positions on the device.
+        if self.spec_decode:
+            self._async_spec_decoded = True
 
     def compiler_args_for(self, graph_type, example_inputs, base):
         """Give each graph its own neuronx-cc arguments.
@@ -2219,7 +2239,22 @@ class WhisperForConditionalGeneration(nn.Module):
         # Neuron raises "Expected self.dtype() == dst.dtype()".
         mel = mel.to(dtype=self.dtype).to(device=device)
         slots = torch.tensor(request_slots, dtype=torch.int64).to(device=device)
-        self.audio_tower(mel, write_block_ids=slots)
+        hidden = self.audio_tower(mel, write_block_ids=slots)
+        if self._draft_cross_kv is not None:
+            # The draft has the same encoder: project its cross-KV from this output.
+            self._draft_cross_kv(hidden, slots)
+
+    def set_draft_cross_kv(self, module) -> None:
+        """Set the compiled draft cross-KV projection that runs after each encoder call."""
+        object.__setattr__(self, "_draft_cross_kv", module)
+
+    # ── speculative decoding (target side) ────────────────────────────────
+    def set_aux_hidden_state_layers(self, layers) -> None:
+        """The draft-model proposer reads no target hidden states. Accept and ignore the layers."""
+        self.aux_hidden_state_layers = tuple(layers or ())
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return ()
 
     # ── KV cache ──────────────────────────────────────────────────────────
     def get_kv_spec(self) -> KVSpec:
@@ -2346,6 +2381,7 @@ class WhisperForConditionalGeneration(nn.Module):
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        spec_decode_metadata=None,
         # The runner adds these prefill inputs for every multimodal model.
         # Whisper reads the cross-KV buffers instead, so it ignores them.
         encoder_embedding_buffer: torch.Tensor | None = None,
@@ -2354,6 +2390,27 @@ class WhisperForConditionalGeneration(nn.Module):
         **kwargs,
     ):
         positions = positions.to(torch.int32)
+        prev_sampled = kwargs.get("prev_sampled_token_ids")
+        if prev_sampled is not None:
+            # Async speculative decoding: the scheduler gave positions for full
+            # acceptance of the previous step. Subtract its rejected drafts.
+            from vllm_neuron import functional as NF
+
+            # Use the decode block table. The untrimmed table has a different width
+            # in warmup and at run time, and Whisper has no sliding window.
+            base = {
+                k: {kk: vv for kk, vv in m.items() if kk != "full_block_table_tensor"}
+                for k, m in attn_metadata.items()
+            }
+            positions, attn_metadata = NF.correct_spec_decode_positions_and_slot_mapping(
+                positions,
+                base,
+                prev_sampled,
+                kwargs["prev_num_draft_tokens"],
+                kwargs["req_indices_per_token"],
+                self.config.vocab_size,
+            )
+            positions = positions.to(torch.int32)
         meta = attn_metadata[self.decoder.layers[0].self_attn.layer_name]
         is_prefill = meta["max_query_len"] > meta["decode_token_threshold"]
 
@@ -2371,4 +2428,18 @@ class WhisperForConditionalGeneration(nn.Module):
             logit_mask=self._pad_logit_mask(logit_mask),
             tp_rank=rank,
         )
-        return sampled, None
+        if not self.spec_decode:
+            return sampled, None
+        # Speculative decoding target: the runner expects (tokens, aux hidden
+        # states, gathered logits). The draft reads no hidden states, so give a
+        # one-element placeholder.
+        aux = torch.zeros(1, dtype=torch.int32, device=sampled.device)
+        if spec_decode_metadata is not None:
+            from vllm_neuron.nn.rejection_sampler import rejection_sampler
+
+            from vllm_neuron.vllm.spec_decode.decorator import _extract_last_accepted_token
+
+            accepted = rejection_sampler(spec_decode_metadata, sampled)
+            last = _extract_last_accepted_token(accepted, self.config.vocab_size)
+            return accepted, aux, None, last
+        return sampled, aux, None
