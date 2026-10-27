@@ -345,7 +345,9 @@ def apply_rope_nocat(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> t
         cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
     x = x.float()
     half = x.shape[-1] // 2
-    sign = torch.tensor([-1.0, 1.0], device=x.device)
+    # [-1, +1] built from arange, not torch.tensor: a literal tensor created in
+    # the traced forward is not a fake tensor and breaks dynamo's tracing.
+    sign = torch.arange(2, dtype=torch.float32, device=x.device) * 2.0 - 1.0
     if ROPE_STYLE == "interleaved":
         pairs = x.view(*x.shape[:-1], half, 2)
         partner = pairs.flip(-1) * sign
