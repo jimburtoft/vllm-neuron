@@ -2815,7 +2815,10 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
         _fp8_experts = bool(
             getattr(self.model.layers[0].mlp.experts, "fp8_experts", False)
         )
-        _keep_bf16 = _fp8_experts and keep_bf16_prefill_copy(self.config.neuron_config)
+        _keep_bf16 = _fp8_experts and keep_bf16_prefill_copy(
+            self.config.neuron_config,
+            getattr(self.model.layers[0].mlp.experts, "intermediate_size_per_rank", None),
+        )
         if _fp8_experts:
             logger.info(
                 "GPT-OSS FP8 prefill: %s",

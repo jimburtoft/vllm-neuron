@@ -79,3 +79,26 @@ def test_neuron_config_object(monkeypatch):
     assert nc.gpt_oss_fp8_prefill == "fp8"
     assert fp8_prefill.keep_bf16_prefill_copy(nc) is False
     assert NeuronConfig.from_dict({}).gpt_oss_fp8_prefill is None
+
+
+@pytest.mark.parametrize(
+    "inter_per_rank, expected_copy",
+    [(None, False), (1440, False), (720, False), (719, True), (360, True), (45, True)],
+)
+def test_auto_keeps_copy_for_small_per_rank_intermediate(
+    monkeypatch, inter_per_rank, expected_copy
+):
+    # GPT-OSS: intermediate 2880 -> 720 per rank at TP=4 (FP8 prefill compiles), 360 at TP=8 (it does not).
+    _fake_bwmm(monkeypatch, True, True)
+    assert fp8_prefill.keep_bf16_prefill_copy({}, inter_per_rank) is expected_copy
+
+
+def test_explicit_fp8_ignores_per_rank_intermediate(monkeypatch):
+    _fake_bwmm(monkeypatch, True, True)
+    assert (
+        fp8_prefill.keep_bf16_prefill_copy({"gpt_oss_fp8_prefill": "fp8"}, 360) is False
+    )
+    assert (
+        fp8_prefill.keep_bf16_prefill_copy({"gpt_oss_fp8_prefill": "bf16_copy"}, 1440)
+        is True
+    )

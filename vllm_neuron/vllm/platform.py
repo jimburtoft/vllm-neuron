@@ -908,7 +908,11 @@ class NeuronPlatform(Platform):
             return
         from vllm_neuron.model.gpt_oss.fp8_prefill import keep_bf16_prefill_copy
 
-        if not keep_bf16_prefill_copy(neuron_config):
+        hf_config = vllm_config.model_config.hf_config
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        inter = getattr(hf_config, "intermediate_size", None)
+        inter_per_rank = inter // tp if isinstance(inter, int) and tp else None
+        if not keep_bf16_prefill_copy(neuron_config, inter_per_rank):
             return
         if envs.get_kv_headroom_env() is not None:
             return

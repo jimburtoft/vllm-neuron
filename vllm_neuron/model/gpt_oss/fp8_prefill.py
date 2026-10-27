@@ -12,8 +12,11 @@ Set it with ``additional_config={"neuron_config": {"gpt_oss_fp8_prefill": ...}}`
 ``"auto"`` (default)
     ``"fp8"`` when the installed NKI Library prefill kernel uses FP8 weights directly
     (``bwmm_shard_on_I.FP8_DIRECT_MATMUL``) and reads the gate/up-major layout that the
-    decode kernel uses (``bwmm_shard_on_I.SUPPORTS_GATE_UP_MAJOR``); ``"bf16_copy"``
-    otherwise (for example the bundled NKI Library).
+    decode kernel uses (``bwmm_shard_on_I.SUPPORTS_GATE_UP_MAJOR``), and the per-rank
+    expert intermediate size is at least ``MIN_FP8_PREFILL_INTERMEDIATE_PER_RANK`` (720:
+    GPT-OSS at TP <= 4); ``"bf16_copy"`` otherwise (for example the bundled NKI Library,
+    or TP=8). With the FP8 weights, the prefill MoE kernel does not compile at
+    TP=8 (per-rank intermediate 360), so ``auto`` keeps the copy there.
 ``"fp8"``
     No copy: 2x the KV cache, same prefill and decode speed with a capable NKI Library.
 ``"bf16_copy"``
@@ -32,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 CONFIG_KEY = "gpt_oss_fp8_prefill"
 _VALID = ("auto", "fp8", "bf16_copy")
+# Smallest per-rank expert intermediate size for which "auto" runs prefill from the FP8
+# weights. Measured: 720 (TP=4) compiles and runs; 360 (TP=8) fails to compile in the
+# shard_on_i_hybrid prefill kernel on trn2 and trn3.
+MIN_FP8_PREFILL_INTERMEDIATE_PER_RANK = 720
 
 
 def nkilib_supports_fp8_prefill() -> bool:
@@ -47,11 +54,15 @@ def nkilib_supports_fp8_prefill() -> bool:
     )
 
 
-def keep_bf16_prefill_copy(neuron_config) -> bool:
+def keep_bf16_prefill_copy(
+    neuron_config, intermediate_size_per_rank: int | None = None
+) -> bool:
     """Resolve whether GPT-OSS FP8 keeps a BF16 copy of the experts for prefill.
 
     Args:
         neuron_config: a dict (``additional_config["neuron_config"]``) or a NeuronConfig.
+        intermediate_size_per_rank: expert intermediate size per tensor-parallel rank, if
+            known. ``auto`` keeps the copy below ``MIN_FP8_PREFILL_INTERMEDIATE_PER_RANK``.
     """
     if isinstance(neuron_config, dict):
         mode = neuron_config.get(CONFIG_KEY)
@@ -67,5 +78,10 @@ def keep_bf16_prefill_copy(neuron_config) -> bool:
             f"neuron_config[{CONFIG_KEY!r}] must be one of {_VALID}, got {mode!r}"
         )
     if mode == "auto":
+        if (
+            intermediate_size_per_rank is not None
+            and intermediate_size_per_rank < MIN_FP8_PREFILL_INTERMEDIATE_PER_RANK
+        ):
+            return True
         return not nkilib_supports_fp8_prefill()
     return mode == "bf16_copy"
