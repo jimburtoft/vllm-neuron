@@ -1391,6 +1391,18 @@ class HYV4Attention(nn.Module):
         if self._sparse_attn_k is not None and _use_sparse_kernels(ql_loc):
             # Tokens per group bounded so the gathered rows (bf16, 576 wide)
             # stay a fraction of a partition's SBUF.
+            # Position tables over [prefix (P) | chunk (C)] for the kernel, built
+            # without concatenation: cache row for p < P (else out of range), own
+            # row p - P for p >= P (else out of range). No integer mod on device.
+            n_own = own_lat.shape[0]
+            pos = torch.arange(span + n_own, device=pos_map.device)
+            in_ctx = pos < span
+            pos_full = torch.where(
+                in_ctx,
+                torch.index_select(pos_map, 0, torch.clamp(pos, max=span - 1)),
+                torch.full_like(pos, self._n_cache_rows(), dtype=pos_map.dtype),
+            )
+            own_map = torch.where(in_ctx, torch.full_like(pos, n_own), pos - span).to(torch.int32)
             kt = -(-rows.shape[1] // 128)
             tg = max(1, min(8, 49152 // (kt * self.latent_dim * 2)))
             m, den, num = self._sparse_attn_k[self.sparse_grid](
@@ -1399,9 +1411,10 @@ class HYV4Attention(nn.Module):
                 scale=float(self.scaling), col_off=col_off, lat_off=0,
                 lat_dim=self.kv_lora_rank, rope_off=self.kv_lora_rank,
                 rope_dim=self.rope_dim, tg=tg,
-                pos_map=pos_map.view(span, 1).contiguous(),
+                pos_map=pos_full.view(span + n_own, 1).contiguous(),
                 own_lat=own_lat.contiguous(), own_rope=own_rope.contiguous(),
                 q_rope=qr_loc.contiguous(),
+                own_map=own_map.view(span + n_own, 1).contiguous(),
             )
         else:
             m, den, num = sparse_prefill_ref(

@@ -89,13 +89,19 @@ def case(Q, K, nsel, seed=0, cached_frac=0.75):
     p = torch.softmax(full, dim=-1)[..., :-1]
     ref = torch.einsum("qhk,kc->qhc", p, keys[:, :L])
 
+    C = own_lat.shape[0]
+    posr = torch.arange(P + C)
+    pos_full = torch.where(posr < P, pos_map.view(-1).to(torch.int32)[posr.clamp(max=P - 1)],
+                           torch.full((P + C,), n_rows, dtype=torch.int32)).to(torch.int32)
+    own_map = torch.where(posr < P, torch.full((P + C,), C), posr - P).to(torch.int32)
     tg = model_tg(KSEL)
     t0 = time.time()
     km, kd, kn = nki.simulate(sparse_decode_attn)[GRID](
         q[..., :L].contiguous().numpy().astype(np.float32), bf(cache), rows.numpy(), bound.numpy(),
         scale=SCALE, col_off=IDX, lat_off=0, lat_dim=L, rope_off=L, rope_dim=R, tg=tg,
-        pos_map=pos_map.view(P, 1).to(torch.int32).numpy(), own_lat=bf(own_lat), own_rope=bf(own_rope),
+        pos_map=pos_full.view(P + C, 1).numpy(), own_lat=bf(own_lat), own_rope=bf(own_rope),
         q_rope=q[..., L:].contiguous().numpy().astype(np.float32),
+        own_map=own_map.view(P + C, 1).numpy(),
     )
     t = time.time() - t0
     m, den, num = [torch.as_tensor(np.asarray(x, dtype=np.float32)) for x in (km, kd, kn)]

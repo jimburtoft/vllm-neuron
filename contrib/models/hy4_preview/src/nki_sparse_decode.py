@@ -68,10 +68,11 @@ def sparse_decode_attn(
     rope_off=512,  # rope offset inside the slice
     rope_dim=64,
     tg=0,  # tokens per group (0 = auto: PSUM_F32 // heads per program, reduced to divide B)
-    pos_map=None,  # [P, 1] int32: rows are POSITIONS; position p < P reads cache row pos_map[p]
+    pos_map=None,  # [P + C, 1] int32: rows are POSITIONS; p < P reads cache row pos_map[p] (else out of range)
     own_lat=None,  # [C, lat_dim] value/latent of positions P .. P + C - 1
     own_rope=None,  # [C, rope_dim] their rope keys (separate: no concatenated input)
     q_rope=None,  # [B, H, rope_dim]: then q_all is [B, H, lat_dim], the query's latent part
+    own_map=None,  # [P + C, 1] int32: position p -> own row p - P for chunk positions, else out of range
 ):
     B, H_all, D = q_all.shape
     split_q = q_rope is not None
@@ -103,11 +104,10 @@ def sparse_decode_attn(
     # Anything else (the pad P + C) is out of range for both and skipped.
     two_src = pos_map is not None
     if two_src:
-        _kassert(own_lat is not None and own_rope is not None, "position mode needs own_lat/own_rope")
+        _kassert(own_lat is not None and own_rope is not None and own_map is not None,
+                 "position mode needs own_lat/own_rope/own_map")
         _kassert(own_lat.shape[1] == lat_dim and own_rope.shape[1] == rope_dim, "own widths")
-        n_pos = pos_map.shape[0]
         n_own = own_lat.shape[0]
-        n_all = n_pos + n_own
     KT = (n_keys + P_MAX - 1) // P_MAX
     KS = min(n_keys, P_MAX)
     n_lat = L // P_MAX
@@ -196,12 +196,20 @@ def sparse_decode_attn(
                         ),
                         oob_mode=nisa.oob_mode.skip,
                     )
-                    # (p + C) mod (P + C): chunk positions -> 0 .. C-1, prefix
-                    # positions -> C .. P+C-1 and the pad -> C (out of range).
+                    # Own-row index through a second lookup table (``own_map``:
+                    # position p -> p - P for chunk positions, out of range
+                    # otherwise); the device has no integer ``mod`` for this.
                     oi = nl.ndarray((KS, 1), dtype=nl.int32, buffer=nl.sbuf)
-                    nisa.tensor_scalar(
-                        dst=oi[0:KS, 0:1], data=idx_g[0:KS, t, kt : kt + 1],
-                        op0=nl.add, operand0=float(n_own), op1=nl.mod, operand1=float(n_all),
+                    nisa.memset(dst=oi, value=n_own)
+                    nisa.dma_copy(
+                        dst=oi[0:KS, 0:1],
+                        src=own_map.ap(
+                            pattern=[[1, KS], [1, 1]],
+                            offset=0,
+                            vector_offset=idx_g.view(nl.uint32)[0:KS, t, kt : kt + 1],
+                            indirect_dim=0,
+                        ),
+                        oob_mode=nisa.oob_mode.skip,
                     )
                     nisa.dma_copy(
                         dst=kv_rows[0:KS, t, kt, lat_off : lat_off + L],
