@@ -71,10 +71,11 @@ def rows_to_mask(rows, n_keys):
     return mask[:, :n_keys]
 
 
+@pytest.mark.parametrize("backend", ["v1", "cte-skip", "cte-clamp"])
 @pytest.mark.parametrize("dtype,tol", [(torch.float32, 2e-5), (torch.bfloat16, 2e-2)])
 @pytest.mark.parametrize("world,order_seed", [(4, 2), (8, 1)])
 @torch.no_grad()
-def test_prefill_sparse_matches_dense(monkeypatch, dtype, tol, world, order_seed):
+def test_prefill_sparse_matches_dense(monkeypatch, dtype, tol, world, order_seed, backend):
     torch.set_num_threads(2)
     monkeypatch.setattr(model, "PREFILL_KSEL", 128)  # TOPK = 64 plus ties
     cfg = make_config(dtype)
@@ -83,6 +84,10 @@ def test_prefill_sparse_matches_dense(monkeypatch, dtype, tol, world, order_seed
     order = torch.randperm(world, generator=torch.Generator().manual_seed(order_seed)).tolist()
     hub = Hub(world, order)
     ranks = [[build_rank(cfg, a, world, r, hub) for a in ref_layers] for r in range(world)]
+    for layers in ranks:
+        for a in layers:
+            a.prefill_backend = backend.split("-")[0]
+            a.prefill_cte_oob = backend.split("-")[-1]
     per = CHUNK // world
     n_keys = WIDTH * BLOCK + CHUNK
     for ci, cached in enumerate([0, 40, 300, WIDTH * BLOCK - CHUNK]):
@@ -189,3 +194,59 @@ def test_apply_rope_nocat_bitwise(monkeypatch, style):
             ang = torch.randn(7, 32, generator=g) * 3
             cos, sin = ang.cos(), ang.sin()
             assert torch.equal(model.apply_rope_nocat(x, cos, sin), model.apply_rope(x, cos, sin))
+
+
+@pytest.mark.parametrize("oob", ["skip", "clamp"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.no_grad()
+def test_prefill_cte_matches_v1(oob, dtype):
+    """``_prefill_attn_cte`` (flat per-slot rows from the position tables, then the
+    ``sparse_prefill_attn`` contract) == ``sparse_prefill_ref`` (position mode):
+    prefix rows past the cached length, chunk rows, pads, a query with nothing
+    selected and one with chunk keys only."""
+    set_group(Group())
+    a = model.HYV4Attention(make_config(dtype), 0)
+    a.prefill_cte_oob = oob
+    g = torch.Generator().manual_seed(5)
+    a.kv_pages = torch.randn(PAGES, 1, BLOCK, a.entry_dim, generator=g).to(dtype)
+    pages, bs, width = a._num_pages(), a._block_size(), a.kv_pages.shape[-1]
+    span, chunk, q, ksel, nh = 4 * bs, 128, 6, 128, a.num_heads
+    table = (torch.randperm(pages - 1, generator=g)[: span // bs] + 1).view(1, -1).to(torch.int32)
+    prior = torch.tensor([[span - 7]])
+    pos_map = a._prefill_pos_map(table, prior)
+    n_keys = span + chunk
+    rows = torch.full((q, ksel), n_keys, dtype=torch.int32)
+    for i in range(q):
+        n = [0, 40, 128, 9, 77, 100][i]
+        pool = torch.arange(span, n_keys) if i == 4 else torch.arange(n_keys)
+        if oob == "clamp":  # the model never selects an unmapped prefix position (vis_ctx)
+            pool = pool[(pool < prior.item()) | (pool >= span)]
+        pick = pool[torch.randperm(pool.numel(), generator=g)[:n]].sort().values
+        rows[i, :n] = pick.to(torch.int32)
+    # Skip mode: prefix positions at or past ``prior`` may be selected (unmapped -> zeros, as v1).
+    bound = torch.where(rows < n_keys, torch.tensor(1e30), torch.tensor(-1e30)).float()
+    lat = a.kv_lora_rank
+    ql = torch.randn(q, nh, lat, generator=g)
+    qr = torch.randn(q, nh, a.rope_dim, generator=g)
+    own_lat = torch.randn(chunk, lat, generator=g).to(a.kv_pages.dtype)
+    own_rope = torch.randn(chunk, a.rope_dim, generator=g).to(a.kv_pages.dtype)
+    col = a.latent_slice.start
+    want = model.sparse_prefill_ref(
+        ql, qr, a.kv_pages, pos_map, own_lat, own_rope, rows, bound, a.scaling, col, a.dtype
+    )
+    got = a._prefill_attn_cte(ql, qr, pos_map, own_lat, own_rope, rows, bound, col)
+    sink = torch.randn(1, nh, generator=g)
+
+    def fold(m, den, num):  # forward_prefill_sparse's sink fold
+        m_f = torch.maximum(m, sink)
+        sc = torch.exp(m - m_f)
+        return num * sc.unsqueeze(-1) / (den * sc + torch.exp(sink - m_f)).unsqueeze(-1)
+
+    # Raw m/den/num agree wherever a query has a selected key; a query with none
+    # (all -BIG) differs raw in clamp mode (it sums row 0) but folds to zero.
+    live = (bound > 0).any(dim=1)
+    for w, x in zip(want, got):
+        assert torch.allclose(w[live], x[live], rtol=1e-5, atol=1e-5)
+    assert torch.allclose(fold(*want), fold(*got), rtol=1e-5, atol=1e-6)
+    assert not live[0] and fold(*got)[0].abs().max() == 0
+    assert width >= col + lat + a.rope_dim

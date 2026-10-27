@@ -120,6 +120,18 @@ DEC_SPARSE_NKI = _flag("HY4_DEC_SPARSE_NKI", False)
 # queries for every head over only the rows DSA selected, with the decode
 # kernel ``sparse_decode_attn`` on Neuron (torch reference on CPU).
 PREFILL_SPARSE_NKI = _flag("HY4_PREFILL_SPARSE_NKI", False)
+# ``HY4_PREFILL_SPARSE_BACKEND``: the sparse prefill attention kernel. "v1" =
+# ``sparse_decode_attn`` in position mode (per-128-key-tile indirect DMAs
+# through position tables); "cte" = ``nki_sparse_prefill.sparse_prefill_attn``
+# (per-slot flat rows built in torch, one batched indirect DMA per query and
+# source, after nkilib's ``mla_sparse_attention_cte``). Platform default: "cte"
+# on Trn3, "v1" elsewhere. CPU runs the matching torch reference.
+PREFILL_SPARSE_BACKEND = os.environ.get("HY4_PREFILL_SPARSE_BACKEND", "v1")
+# ``HY4_PREFILL_CTE_OOB`` (cte backend): "skip" (default) = a slot's unused
+# source row is out of range and skipped by the DMA (no read); "clamp" = every
+# gathered row is in range (unused ones read row 0, the source picked per slot,
+# pads masked by the bound) -- a fallback that reads both sources per slot.
+PREFILL_CTE_OOB = os.environ.get("HY4_PREFILL_CTE_OOB", "skip")
 
 
 def resolve_platform_defaults() -> str:
@@ -128,12 +140,15 @@ def resolve_platform_defaults() -> str:
     Called once from ``HYV4ForCausalLM.__init__``, before any layer is built
     (layers read these flags at construction).
     """
-    global DEC_CP, DEC_SPARSE_NKI, PREFILL_SPARSE_NKI
+    global DEC_CP, DEC_SPARSE_NKI, PREFILL_SPARSE_NKI, PREFILL_SPARSE_BACKEND
     target = _platform_target()
     on_neuron, on_trn2 = target.startswith("trn"), target.startswith("trn2")
     DEC_CP = _flag("HY4_DEC_CP", on_neuron)
     DEC_SPARSE_NKI = _flag("HY4_DEC_SPARSE_NKI", on_neuron)
     PREFILL_SPARSE_NKI = _flag("HY4_PREFILL_SPARSE_NKI", on_trn2)
+    PREFILL_SPARSE_BACKEND = os.environ.get(
+        "HY4_PREFILL_SPARSE_BACKEND", "cte" if target.startswith("trn3") else "v1"
+    )
     return target
 
 
@@ -496,17 +511,23 @@ _SPARSE_KERNELS: list = []
 
 
 def _sparse_kernels():
-    """``(attn, gather_cols, select_to_rows)`` NKI kernels through the plugin's ``wrap_nki`` (lazy)."""
+    """``(attn, gather_cols, select_to_rows, prefill_attn)`` NKI kernels through the
+    plugin's ``wrap_nki`` (lazy)."""
     if not _SPARSE_KERNELS:
         try:
             from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
         except ImportError:  # source-tree layout
             from vllm_neuron.nki.nki_hop import wrap_nki
         from .nki_sparse_decode import gather_rows_cols, sparse_decode_attn
-        from .nki_sparse_prefill import select_to_rows
+        from .nki_sparse_prefill import select_to_rows, sparse_prefill_attn
 
         _SPARSE_KERNELS.extend(
-            (wrap_nki(sparse_decode_attn), wrap_nki(gather_rows_cols), wrap_nki(select_to_rows))
+            (
+                wrap_nki(sparse_decode_attn),
+                wrap_nki(gather_rows_cols),
+                wrap_nki(select_to_rows),
+                wrap_nki(sparse_prefill_attn),
+            )
         )
     return _SPARSE_KERNELS
 
@@ -517,7 +538,7 @@ def _sparse_kernels_or_none() -> tuple:
     try:
         return tuple(_sparse_kernels())
     except ImportError:
-        return (None, None, None)
+        return (None, None, None, None)
 
 
 def _sparse_grid() -> int:
@@ -612,6 +633,47 @@ def sparse_prefill_ref(
     m_own = is_own.unsqueeze(-1).float()
     lat = ctx[..., :lat_dim] + own_lat.float()[oi] * m_own  # [B, n, L]
     rope = ctx[..., lat_dim:] + own_rope.float()[oi] * m_own
+    s = (q_lat.float() @ lat.transpose(1, 2) + q_rope.float() @ rope.transpose(1, 2)) * scale
+    s = torch.minimum(s, bound.unsqueeze(1))
+    m = s.amax(dim=-1)
+    p = torch.exp(s - m.unsqueeze(-1))
+    den = p.sum(dim=-1)
+    num = (p.to(value_dtype) @ lat.to(value_dtype)).float()
+    return m, den, num
+
+
+def sparse_prefill_cte_ref(
+    q_lat: torch.Tensor,
+    q_rope: torch.Tensor,
+    kv_pages: torch.Tensor,
+    rows_cache: torch.Tensor,
+    own_lat: torch.Tensor,
+    own_rope: torch.Tensor,
+    rows_own: torch.Tensor,
+    bound: torch.Tensor,
+    scale: float,
+    col_off: int,
+    value_dtype: torch.dtype,
+    src_sel: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``nki_sparse_prefill.sparse_prefill_attn`` (CPU): slot ``k`` reads cache row
+    ``rows_cache[q, k]`` and own row ``rows_own[q, k]`` (out of range = zeros),
+    summed; with ``src_sel`` (clamp mode, all rows in range) it picks the cache
+    row where 1, the own row where 0. -> ``m, den, num`` as ``sparse_decode_ref``."""
+    n_own = own_lat.shape[0]
+    lat_dim, rope_dim = own_lat.shape[1], own_rope.shape[1]
+    ctx = gather_rows_cols_ref(kv_pages, rows_cache, col_off, lat_dim + rope_dim).float()
+    ro = rows_own.to(torch.long)
+    ok = (ro >= 0) & (ro < n_own)
+    oi = torch.where(ok, ro, torch.zeros_like(ro))
+    m_own = ok.unsqueeze(-1).float()
+    own = torch.cat((own_lat.float()[oi], own_rope.float()[oi]), dim=-1) * m_own
+    if src_sel is not None:
+        w = src_sel.unsqueeze(-1).float()
+        keys = ctx * w + own * (1.0 - w)
+    else:
+        keys = ctx + own
+    lat, rope = keys[..., :lat_dim], keys[..., lat_dim:]
     s = (q_lat.float() @ lat.transpose(1, 2) + q_rope.float() @ rope.transpose(1, 2)) * scale
     s = torch.minimum(s, bound.unsqueeze(1))
     m = s.amax(dim=-1)
@@ -844,9 +906,11 @@ class HYV4Attention(nn.Module):
         # Built here, never inside the traced forward: a lazy build there puts a
         # guard on the module-level cache that flips after the first trace and
         # forces a recompile at serving time.
-        self._sparse_attn_k, self._sparse_gather_k, self._select_rows_k = (
-            _sparse_kernels_or_none() if use_kernels else (None, None, None)
+        self._sparse_attn_k, self._sparse_gather_k, self._select_rows_k, self._prefill_attn_k = (
+            _sparse_kernels_or_none() if use_kernels else (None, None, None, None)
         )
+        self.prefill_backend = PREFILL_SPARSE_BACKEND
+        self.prefill_cte_oob = PREFILL_CTE_OOB
 
         set_weight_loader(self.q_a_proj_weight, _replicated_transposed())
         set_weight_loader(self.kv_a_proj_weight, _replicated_transposed())
@@ -1437,7 +1501,11 @@ class HYV4Attention(nn.Module):
         own_lat = lat_own.to(self.kv_pages.dtype)
         own_rope = k_rope.to(self.kv_pages.dtype)
         col_off = self.latent_slice.start
-        if self._sparse_attn_k is not None and _use_sparse_kernels(ql_loc):
+        if self.prefill_backend == "cte":
+            m, den, num = self._prefill_attn_cte(
+                ql_loc, qr_loc, pos_map, own_lat, own_rope, rows, bound, col_off
+            )
+        elif self._sparse_attn_k is not None and _use_sparse_kernels(ql_loc):
             # Tokens per group bounded so the gathered rows (bf16, 576 wide)
             # stay a fraction of a partition's SBUF.
             # Position tables over [prefix (P) | chunk (C)] for the kernel, built
@@ -1487,6 +1555,70 @@ class HYV4Attention(nn.Module):
         out = self._finish(ordered.reshape(chunk, nh, rank_v), gate)
         _capture(self.layer_idx, "attn_out", out)
         return out, selected
+
+    def _prefill_attn_cte(
+        self,
+        ql_loc: torch.Tensor,
+        qr_loc: torch.Tensor,
+        pos_map: torch.Tensor,
+        own_lat: torch.Tensor,
+        own_rope: torch.Tensor,
+        rows: torch.Tensor,
+        bound: torch.Tensor,
+        col_off: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sparse prefill attention, ``cte`` backend: per-slot flat rows built here.
+
+        Lookup tables over positions ``[0, P + C]`` (the pad ``P + C`` included),
+        built with ``arange`` / ``where`` (no concatenation, no integer ``mod``),
+        then one ``index_select`` per table by the slot positions ``rows``:
+        ``rows_cache`` (prefix -> flat cache row), ``rows_own`` (chunk -> own row)
+        and, in clamp mode, ``src_sel`` (1 = the slot reads the cache). Clamp
+        mode puts every unused row on row 0 (in range; the slot is either read
+        from the other source or masked by its ``-BIG`` bound); skip mode leaves
+        them out of range for the DMA to skip. The two agree whenever no
+        selected slot is an unmapped prefix position (one at or past
+        ``cached_seq_len``), which the selection guarantees (``vis_ctx``).
+        """
+        span, n_own = pos_map.shape[0], own_lat.shape[0]
+        n_rows = self._n_cache_rows()
+        q, ksel = rows.shape
+        dev = pos_map.device
+        pos = torch.arange(span + n_own + 1, device=dev)
+        in_ctx = pos < span
+        in_own = (pos >= span) & (pos < span + n_own)
+        cache_row = torch.where(
+            in_ctx,
+            torch.index_select(pos_map, 0, torch.clamp(pos, max=span - 1)),
+            torch.full_like(pos, n_rows, dtype=pos_map.dtype),
+        )
+        # A tensor limit, not a Python int compare (see _zero_beyond).
+        has_ctx = cache_row < torch.full((1,), n_rows, dtype=cache_row.dtype, device=dev)
+        clamp = self.prefill_cte_oob != "skip"
+        if clamp:
+            cache_t = torch.where(has_ctx, cache_row, torch.zeros_like(cache_row))
+            own_t = torch.where(in_own, pos - span, torch.zeros_like(pos))
+        else:
+            cache_t = cache_row
+            own_t = torch.where(in_own, pos - span, torch.full_like(pos, n_own))
+        flat = rows.reshape(q * ksel).to(torch.long)
+        rows_cache = torch.index_select(cache_t.to(torch.int32), 0, flat).view(q, ksel)
+        rows_own = torch.index_select(own_t.to(torch.int32), 0, flat).view(q, ksel)
+        src_sel = (
+            torch.index_select(has_ctx.to(torch.float32), 0, flat).view(q, ksel) if clamp else None
+        )
+        if self._prefill_attn_k is not None and _use_sparse_kernels(ql_loc):
+            kw = {} if src_sel is None else {"src_sel": src_sel.contiguous()}
+            return self._prefill_attn_k[self.sparse_grid](
+                q_lat=ql_loc.contiguous(), q_rope=qr_loc.contiguous(), kv_cache=self.kv_pages,
+                rows_cache=rows_cache.contiguous(), own_lat=own_lat.contiguous(),
+                own_rope=own_rope.contiguous(), rows_own=rows_own.contiguous(),
+                bound=bound.contiguous(), scale=float(self.scaling), col_off=col_off, **kw,
+            )
+        return sparse_prefill_cte_ref(
+            ql_loc, qr_loc, self.kv_pages, rows_cache, own_lat, own_rope, rows_own, bound,
+            self.scaling, col_off, self.dtype, src_sel,
+        )
 
     def forward_decode(
         self,
@@ -1961,8 +2093,8 @@ class HYV4TextModel(nn.Module):
         target = resolve_platform_defaults()
         logger.info(
             "hy4_preview attention paths (platform %r): HY4_DEC_CP=%d "
-            "HY4_DEC_SPARSE_NKI=%d HY4_PREFILL_SPARSE_NKI=%d",
-            target, DEC_CP, DEC_SPARSE_NKI, PREFILL_SPARSE_NKI,
+            "HY4_DEC_SPARSE_NKI=%d HY4_PREFILL_SPARSE_NKI=%d HY4_PREFILL_SPARSE_BACKEND=%s",
+            target, DEC_CP, DEC_SPARSE_NKI, PREFILL_SPARSE_NKI, PREFILL_SPARSE_BACKEND,
         )
         self.config = config
         self.tp_group = get_tp_group()
