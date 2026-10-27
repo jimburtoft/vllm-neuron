@@ -18,6 +18,11 @@ slice and to Hy4's ``[latent | rope]`` order.
     den[b,h] = sum_k p
     num[b,h] = sum_k p[k, h] * cache[rows[b, k], col_off + lat_off : ... + L]   (fp32)
 
+Position mode (``pos_map`` given; the sparse prefill): ``rows`` hold key
+POSITIONS. Position ``p < P`` reads cache row ``pos_map[p]``; ``P <= p < P + C``
+reads ``own_lat`` / ``own_rope`` row ``p - P`` (the chunk's own keys, not yet
+readable from the cache in the same graph). No input is a concatenation.
+
 A row index ``>= cache.shape[0]`` is out of range: the DMA skips it
 (``oob_mode.skip``), so its bytes are never read; the zero-initialised tile
 stands in and its bound must be ``-BIG``. That is how unselected keys cost no
@@ -63,8 +68,15 @@ def sparse_decode_attn(
     rope_off=512,  # rope offset inside the slice
     rope_dim=64,
     tg=0,  # tokens per group (0 = auto: PSUM_F32 // heads per program, reduced to divide B)
+    pos_map=None,  # [P, 1] int32: rows are POSITIONS; position p < P reads cache row pos_map[p]
+    own_lat=None,  # [C, lat_dim] value/latent of positions P .. P + C - 1
+    own_rope=None,  # [C, rope_dim] their rope keys (separate: no concatenated input)
+    q_rope=None,  # [B, H, rope_dim]: then q_all is [B, H, lat_dim], the query's latent part
 ):
     B, H_all, D = q_all.shape
+    split_q = q_rope is not None
+    if split_q:
+        D = D + q_rope.shape[2]
     # Launched at the logical NC config (LNC=2: two programs). Heads are split
     # across programs: each attends every key for its H heads and writes its
     # own head slice of m/den/num, so no cross-program reduction is needed.
@@ -85,6 +97,17 @@ def sparse_decode_attn(
     _kassert(L + rope_dim == D, "query width must be latent + rope")
     _kassert(col_off + D <= W, "attended slice exceeds the cache row")
     _kassert(n_keys % P_MAX == 0 or n_keys <= P_MAX, "n_keys must be <=128 or a multiple of 128")
+    # Position mode (the sparse prefill): a position below P is a prefix key,
+    # read from the cache through ``pos_map`` (a two-step indirect DMA); a
+    # position in [P, P + C) is a key of the chunk itself, read from ``own``.
+    # Anything else (the pad P + C) is out of range for both and skipped.
+    two_src = pos_map is not None
+    if two_src:
+        _kassert(own_lat is not None and own_rope is not None, "position mode needs own_lat/own_rope")
+        _kassert(own_lat.shape[1] == lat_dim and own_rope.shape[1] == rope_dim, "own widths")
+        n_pos = pos_map.shape[0]
+        n_own = own_lat.shape[0]
+        n_all = n_pos + n_own
     KT = (n_keys + P_MAX - 1) // P_MAX
     KS = min(n_keys, P_MAX)
     n_lat = L // P_MAX
@@ -116,7 +139,14 @@ def sparse_decode_attn(
         qT = nl.ndarray((P_MAX, n_lat + 1, TH), dtype=qk_dt, buffer=nl.sbuf)
         for t in nl.static_range(TG):
             q_sb = nl.ndarray((H, D), dtype=qk_dt, buffer=nl.sbuf)
-            nisa.dma_copy(dst=q_sb, src=q_all[b0 + t, h0 : h0 + H, 0:D])
+            if split_q:
+                nisa.dma_copy(dst=q_sb[0:H, lat_off : lat_off + L], src=q_all[b0 + t, h0 : h0 + H, 0:L])
+                nisa.dma_copy(
+                    dst=q_sb[0:H, rope_off : rope_off + rope_dim],
+                    src=q_rope[b0 + t, h0 : h0 + H, 0:rope_dim],
+                )
+            else:
+                nisa.dma_copy(dst=q_sb, src=q_all[b0 + t, h0 : h0 + H, 0:D])
             for c in nl.static_range(n_lat):
                 tp = nl.ndarray((P_MAX, H), dtype=qk_dt, buffer=nl.psum)
                 nisa.nc_transpose(
@@ -143,16 +173,67 @@ def sparse_decode_attn(
                 src=bound[b0 + t].reshape((KT, KS)).ap(pattern=[[1, KS], [KS, KT]], offset=0),
             )
             for kt in nl.static_range(KT):
-                nisa.dma_copy(
-                    dst=kv_rows[0:KS, t, kt, 0:D],
-                    src=cache.ap(
-                        pattern=[[W, KS], [1, D]],
-                        offset=col_off,
-                        vector_offset=idx_g.view(nl.uint32)[0:KS, t, kt : kt + 1],
-                        indirect_dim=0,
-                    ),
-                    oob_mode=nisa.oob_mode.skip,
-                )
+                if two_src:
+                    flat = nl.ndarray((KS, 1), dtype=nl.int32, buffer=nl.sbuf)
+                    nisa.memset(dst=flat, value=n_rows)
+                    nisa.dma_copy(
+                        dst=flat[0:KS, 0:1],
+                        src=pos_map.ap(
+                            pattern=[[1, KS], [1, 1]],
+                            offset=0,
+                            vector_offset=idx_g.view(nl.uint32)[0:KS, t, kt : kt + 1],
+                            indirect_dim=0,
+                        ),
+                        oob_mode=nisa.oob_mode.skip,
+                    )
+                    nisa.dma_copy(
+                        dst=kv_rows[0:KS, t, kt, 0:D],
+                        src=cache.ap(
+                            pattern=[[W, KS], [1, D]],
+                            offset=col_off,
+                            vector_offset=flat.view(nl.uint32)[0:KS, 0:1],
+                            indirect_dim=0,
+                        ),
+                        oob_mode=nisa.oob_mode.skip,
+                    )
+                    # (p + C) mod (P + C): chunk positions -> 0 .. C-1, prefix
+                    # positions -> C .. P+C-1 and the pad -> C (out of range).
+                    oi = nl.ndarray((KS, 1), dtype=nl.int32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(
+                        dst=oi[0:KS, 0:1], data=idx_g[0:KS, t, kt : kt + 1],
+                        op0=nl.add, operand0=float(n_own), op1=nl.mod, operand1=float(n_all),
+                    )
+                    nisa.dma_copy(
+                        dst=kv_rows[0:KS, t, kt, lat_off : lat_off + L],
+                        src=own_lat.ap(
+                            pattern=[[L, KS], [1, L]],
+                            offset=0,
+                            vector_offset=oi.view(nl.uint32)[0:KS, 0:1],
+                            indirect_dim=0,
+                        ),
+                        oob_mode=nisa.oob_mode.skip,
+                    )
+                    nisa.dma_copy(
+                        dst=kv_rows[0:KS, t, kt, rope_off : rope_off + rope_dim],
+                        src=own_rope.ap(
+                            pattern=[[rope_dim, KS], [1, rope_dim]],
+                            offset=0,
+                            vector_offset=oi.view(nl.uint32)[0:KS, 0:1],
+                            indirect_dim=0,
+                        ),
+                        oob_mode=nisa.oob_mode.skip,
+                    )
+                else:
+                    nisa.dma_copy(
+                        dst=kv_rows[0:KS, t, kt, 0:D],
+                        src=cache.ap(
+                            pattern=[[W, KS], [1, D]],
+                            offset=col_off,
+                            vector_offset=idx_g.view(nl.uint32)[0:KS, t, kt : kt + 1],
+                            indirect_dim=0,
+                        ),
+                        oob_mode=nisa.oob_mode.skip,
+                    )
 
         # ---- scores key-major: s[k, kt, t*H + h] ----
         s_sb = nl.ndarray((KS, KT, TH), dtype=nl.float32, buffer=nl.sbuf)
@@ -303,81 +384,3 @@ def gather_rows_cols(
             row0 = kt * KS_all + k0
             nisa.dma_copy(dst=out[r, row0 : row0 + KS, 0:width], src=t[0:KS, 0:width])
     return out
-
-
-_GPSIMD_STRIDE = 16  # nonzero_with_count reads/writes partitions 0, 16, ..., 112 only
-_GPSIMD_CORES = 8
-
-
-@nki.jit
-def select_to_rows(
-    sel,  # [Q, K] fp32 0/1 selection
-    ksel=2176,  # slots per query that the caller keeps
-    chunk=2048,  # keys per nonzero_with_count call
-):
-    """``rows[q, :ksel]`` = the first ``ksel`` indices ``k`` with ``sel[q, k] != 0``,
-    ascending, then ``K`` (out of range for the attention kernel's DMA).
-
-    Output is ``[Q, ksel + chunk]``; the caller keeps ``[:, :ksel]`` (the tail
-    absorbs the chunk written at a count already clamped to ``ksel``).
-
-    The GpSimd ``nonzero_with_count`` compacts one query's chunk per GpSimd
-    core (8 queries per call, on partitions 0, 16, ..., 112), and each chunk's
-    indices are written into the query's output row at its running count,
-    clamped to ``ksel`` (the pattern of nkilib's ``find_nonzero_indices``).
-    Launched at the logical NC config: queries are split across programs.
-    """
-    Q, K = sel.shape
-    n_prg, prg = _programs()
-    _kassert(Q % n_prg == 0, "queries must divide by the number of programs")
-    QP = Q // n_prg
-    q_base = prg * QP
-    CH = min(chunk, K)
-    n_ch = (K + CH - 1) // CH
-    WS = ksel + CH
-    rows_out = nl.ndarray((Q, WS), dtype=nl.int32, buffer=nl.shared_hbm)
-
-    fill = nl.ndarray((QP, WS), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.memset(dst=fill, value=K)
-    nisa.dma_copy(dst=rows_out[q_base : q_base + QP, 0:WS], src=fill[0:QP, 0:WS])
-
-    n_rounds = (QP + _GPSIMD_CORES - 1) // _GPSIMD_CORES
-    for rd in nl.static_range(n_rounds):
-        q0 = q_base + rd * _GPSIMD_CORES
-        nq = min(_GPSIMD_CORES, QP - rd * _GPSIMD_CORES)
-        offs = nl.ndarray((1, _GPSIMD_CORES), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.memset(dst=offs, value=0)
-        for c in nl.static_range(n_ch):
-            c0 = c * CH
-            cw = min(CH, K - c0)
-            src = nl.ndarray((P_MAX, cw), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.memset(dst=src, value=0.0)
-            for j in nl.static_range(nq):
-                p = j * _GPSIMD_STRIDE
-                nisa.dma_copy(dst=src[p : p + 1, 0:cw], src=sel[q0 + j : q0 + j + 1, c0 : c0 + cw])
-            dst = nl.ndarray((P_MAX, cw + 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.nonzero_with_count(dst=dst, src=src, index_offset=c0, padding_val=K)
-            for j in nl.static_range(nq):
-                p = j * _GPSIMD_STRIDE
-                off_j = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=off_j, src=offs[0:1, j : j + 1])
-                nisa.dma_copy(
-                    dst=rows_out.ap(
-                        pattern=[[WS, 1], [1, cw]],
-                        offset=(q0 + j) * WS,
-                        scalar_offset=off_j,
-                        indirect_dim=1,
-                    ),
-                    src=dst[p : p + 1, 0:cw],
-                )
-                # Count to partition 0 by DMA, then off = min(off + n, ksel).
-                cnt = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-                nisa.dma_copy(dst=cnt, src=dst[p : p + 1, cw : cw + 1])
-                nisa.tensor_tensor(
-                    dst=offs[0:1, j : j + 1], data1=offs[0:1, j : j + 1], data2=cnt, op=nl.add
-                )
-                nisa.tensor_scalar(
-                    dst=offs[0:1, j : j + 1], data=offs[0:1, j : j + 1],
-                    op0=nl.minimum, operand0=float(ksel),
-                )
-    return rows_out

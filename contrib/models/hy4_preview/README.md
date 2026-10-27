@@ -355,20 +355,24 @@ up to 128) slots, which is exact only while no rank holds more selected keys.
 **Sparse prefill split by query (`HY4_PREFILL_SPARSE_NKI=1`; opt-in, not yet
 run on device).** Instead of each rank attending its own head over every query
 and every key under the DSA mask, each rank attends its `C / world` queries for
-all heads over only their selected keys. The rank's local selection becomes
-per-query row lists into the chunk's keys (`HY4_PREFILL_KSEL` slots, default
-2176, rounded up to 128; on Neuron by the NKI kernel `select_to_rows`, GpSimd
-nonzero compaction, and on CPU by a torch reference; a query with more selected
-keys than slots keeps its first ones),
-so the mask all-gather is gone. The absorbed queries are all-gathered over
-heads, `sparse_decode_attn` runs with the keys as its cache (each local query
-is one "request"), the sink is folded in, and the bf16 result is all-gathered
-so each rank takes its own heads back for `w_uv` / gate / `o_proj`. Shared
-layers reuse the row lists. Needs `C % world == 0` and the key count a multiple
-of 128, else the dense path runs. CPU check against the dense path:
-`test_prefill_sparse.py`; simulator checks at prefill shapes:
+all heads over only their selected keys. Full layers read only the 128-wide
+indexer keys of the prefix from the paged cache (`gather_rows_cols`), score
+the prefix and the chunk's own keys separately, and take the top-k threshold
+over both. The rank's local selection becomes per-query lists of key positions
+(`HY4_PREFILL_KSEL` slots, default 2176, rounded up to 128; on Neuron by the
+NKI kernel `select_to_rows` in `src/nki_sparse_prefill.py`, GpSimd nonzero
+compaction, and on CPU by a torch reference; a query with more selected keys
+than slots keeps its first ones), so the mask all-gather is gone. The absorbed
+queries are all-gathered over heads, and `sparse_decode_attn` in position mode
+reads prefix keys straight from the paged cache and the chunk's keys from this
+step's projections (each local query is one "request"). No concatenated tensor
+feeds a kernel. The sink is folded in, and the bf16 result is all-gathered so
+each rank takes its own heads back for `w_uv` / gate / `o_proj`. Shared layers
+reuse the position lists. Needs `C % world == 0` and the span and chunk in
+whole 128-key tiles, else the dense path runs. CPU check against the dense
+path: `test_prefill_sparse.py`; simulator checks at prefill shapes:
 `test/sim/sim_sparse_prefill.py` (attention) and `test/sim/sim_select_rows.py`
-(row lists vs the torch reference, including tie-heavy selections).
+(position lists vs the torch reference, including tie-heavy selections).
 
 **Prefill prefix bound.** With more than one `kv_segment_size_buckets` entry,
 the plugin picks the smallest segment that holds the whole prefix, so a prefill

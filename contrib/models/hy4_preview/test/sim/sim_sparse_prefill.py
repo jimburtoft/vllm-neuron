@@ -5,12 +5,13 @@ SIMULATOR ONLY: a pass here is a development milestone, not device evidence.
 
     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 GRID=2 python test/sim/sim_sparse_prefill.py [Q K NSEL ...]
 
-Prefill shapes (``HY4_PREFILL_SPARSE_NKI``): ``Q`` local queries (C / world)
-are the kernel's "requests"; the cache is the chunk's flat ``keys [K, 704]``
-(row = [index 128 | latent 512 | rope 64]); each query has ``KSEL`` slots
-(``HY4_PREFILL_KSEL``, 2176) holding its selected rows ascending, padded with
-``K`` (skipped by the DMA, bound -BIG). The query is fp32, ``tg`` as the model
-picks it. Also checks the sink fold against an fp32 dense reference.
+Prefill shapes (``HY4_PREFILL_SPARSE_NKI``), position mode: ``Q`` local
+queries (C / world) are the kernel's "requests"; ``K = P + C`` key positions,
+the prefix read from a paged cache ``[pages, 1, 32, 704]`` through ``pos_map``
+(positions past the cached length unmapped, skipped) and the 2048 chunk rows
+from separate latent / rope inputs; the query split into latent and rope. Each
+query has ``KSEL`` slots (2176) holding selected positions ascending, padded
+with ``K``. Checks the sink-folded output against an fp32 dense reference.
 """
 import os
 import sys
@@ -44,33 +45,57 @@ def model_tg(ksel):
     return max(1, min(8, 49152 // (kt * D * 2)))
 
 
-def case(Q, K, nsel, seed=0):
+def case(Q, K, nsel, seed=0, cached_frac=0.75):
+    """Position mode: P = K - C prefix positions from a paged cache through
+    ``pos_map`` (positions past ``cached`` unmapped), C = 2048 chunk rows from
+    separate latent / rope inputs; split query (latent, rope)."""
     g = torch.Generator().manual_seed(seed)
-    keys = (torch.randn(K, W, generator=g) * 0.5).to(torch.bfloat16)
+    C = 2048
+    P = K - C
+    BS = 32
+    pages = P // BS + 8
+    n_rows = pages * BS
+    cache = (torch.randn(pages, 1, BS, W, generator=g) * 0.5).to(torch.bfloat16)
+    cached = int(P * cached_frac)
+    perm = torch.randperm(pages - 1, generator=g)[: P // BS] + 1
+    flat_pos = (perm.view(-1, 1) * BS + torch.arange(BS).view(1, -1)).reshape(-1)
+    pos_map = torch.where(torch.arange(P) < cached, flat_pos, torch.full_like(flat_pos, n_rows))
+    own_lat = (torch.randn(C, L, generator=g) * 0.5).to(torch.bfloat16)
+    own_rope = (torch.randn(C, R, generator=g) * 0.5).to(torch.bfloat16)
     q = torch.randn(Q, H, D, generator=g) * 0.5
     sinks = torch.randn(H, generator=g)
+    vis = torch.cat((torch.arange(P) < cached, torch.ones(C, dtype=torch.bool)))
     rows = torch.full((Q, KSEL), K, dtype=torch.int32)
     sel = torch.zeros(Q, K, dtype=torch.bool)
+    cand = torch.nonzero(vis).flatten()
     for i in range(Q):
-        n = nsel if i % 3 else max(1, nsel // 7)  # some queries see few keys
-        n = min(n, KSEL, K)
-        pick = torch.randperm(K, generator=g)[:n].sort().values
-        rows[i, :n] = pick.to(torch.int32)
+        n = nsel if i % 3 else max(1, nsel // 7)
+        n = min(n, KSEL, cand.numel())
+        pick = cand[torch.randperm(cand.numel(), generator=g)[:n]].sort().values
+        if i == 0:  # chunk keys only
+            pick = torch.arange(P, P + min(n, C))
+        rows[i, : pick.numel()] = pick.to(torch.int32)
         sel[i, pick] = True
     bound = torch.where(rows < K, torch.tensor(BIG), torch.tensor(-BIG)).float()
 
-    kf = keys.float()
-    s = torch.einsum("qhd,kd->qhk", q, kf[:, IDX : IDX + D]) * SCALE
+    flat = cache.float().reshape(n_rows, W)
+    keys = torch.zeros(K, D)
+    keys[:cached] = flat[flat_pos[:cached]][:, IDX : IDX + D]
+    keys[P:, :L] = own_lat.float()
+    keys[P:, L:] = own_rope.float()
+    s = torch.einsum("qhd,kd->qhk", q, keys) * SCALE
     s = s.masked_fill(~sel[:, None, :], float("-inf"))
     full = torch.cat((s, sinks.view(1, H, 1).expand(Q, H, 1)), dim=-1)
     p = torch.softmax(full, dim=-1)[..., :-1]
-    ref = torch.einsum("qhk,kc->qhc", p, kf[:, IDX : IDX + L])
+    ref = torch.einsum("qhk,kc->qhc", p, keys[:, :L])
 
     tg = model_tg(KSEL)
     t0 = time.time()
     km, kd, kn = nki.simulate(sparse_decode_attn)[GRID](
-        q.numpy().astype(np.float32), bf(keys), rows.numpy(), bound.numpy(), scale=SCALE,
-        col_off=IDX, lat_off=0, lat_dim=L, rope_off=L, rope_dim=R, tg=tg,
+        q[..., :L].contiguous().numpy().astype(np.float32), bf(cache), rows.numpy(), bound.numpy(),
+        scale=SCALE, col_off=IDX, lat_off=0, lat_dim=L, rope_off=L, rope_dim=R, tg=tg,
+        pos_map=pos_map.view(P, 1).to(torch.int32).numpy(), own_lat=bf(own_lat), own_rope=bf(own_rope),
+        q_rope=q[..., L:].contiguous().numpy().astype(np.float32),
     )
     t = time.time() - t0
     m, den, num = [torch.as_tensor(np.asarray(x, dtype=np.float32)) for x in (km, kd, kn)]

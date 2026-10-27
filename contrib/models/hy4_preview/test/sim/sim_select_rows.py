@@ -11,6 +11,7 @@ random, tie-heavy (scores quantised to a few levels, so many keys tie with
 the threshold), and constant (every visible key ties). Some rows see fewer
 than 2048 keys. Checks: per query the same SET of rows (and the same order,
 ascending) and the same bound sign as the torch reference, ``ksel = 2176``.
+The kernel takes the prefix and chunk pieces as separate inputs.
 """
 import os
 import sys
@@ -34,7 +35,7 @@ except ImportError:  # the simulator venv: config.py only subclasses PretrainedC
 
     sys.modules["transformers"] = _types.SimpleNamespace(PretrainedConfig=object)
 from hy4_stubs import Group, model, set_group  # noqa: E402
-from nki_sparse_decode import select_to_rows  # noqa: E402
+from nki_sparse_prefill import select_to_rows  # noqa: E402
 
 KSEL, TOPK, CHUNK = 2176, 2048, 2048
 
@@ -65,7 +66,9 @@ def case(Q, K, pattern, seed, attn):
     sel = selection(Q, K, pattern, seed)
     ref_rows, ref_bound = attn._prefill_rows_ref(sel)
     t0 = time.time()
-    rows = np.asarray(nki.simulate(select_to_rows)[GRID](sel.float().numpy(), ksel=KSEL))
+    P = K - CHUNK
+    rows = np.asarray(nki.simulate(select_to_rows)[GRID](
+        sel[:, :P].float().contiguous().numpy(), sel[:, P:].float().contiguous().numpy(), ksel=KSEL))
     t = time.time() - t0
     rows = torch.as_tensor(rows.astype(np.int64))[:, :KSEL]
     bound_pos = rows < K

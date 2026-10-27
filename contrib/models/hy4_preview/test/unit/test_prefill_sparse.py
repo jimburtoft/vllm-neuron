@@ -126,7 +126,7 @@ def test_prefill_rows_exact():
     old = model.PREFILL_KSEL
     try:
         model.PREFILL_KSEL = 200  # -> 256 slots
-        rows, bound = a._prefill_rows(sel)
+        rows, bound = a._prefill_rows(sel[:, :768], sel[:, 768:])
     finally:
         model.PREFILL_KSEL = old
     assert rows.shape == (q, 256)
@@ -142,7 +142,8 @@ class _FakeSelectRows:
     """``select_to_rows``'s contract in torch: ``[Q, ksel + chunk]`` rows, pad ``K``."""
 
     def __getitem__(self, grid):
-        def run(sel, ksel, chunk=2048):
+        def run(sel, sel2, ksel, chunk=2048):
+            sel = torch.cat((sel, sel2), dim=1)
             q, k = sel.shape
             out = torch.full((q, ksel + min(chunk, k)), k, dtype=torch.int32)
             for i in range(q):
@@ -170,8 +171,20 @@ def test_prefill_rows_kernel_dispatch_same_set(monkeypatch):
     monkeypatch.setattr(model, "PREFILL_KSEL", 384)
     ref_rows, ref_bound = a._prefill_rows_ref(sel)
     monkeypatch.setattr(model, "_use_sparse_kernels", lambda t: True)
-    rows, bound = a._prefill_rows(sel)
+    rows, bound = a._prefill_rows(sel[:, :1536], sel[:, 1536:])
     assert rows.shape == ref_rows.shape and rows.dtype == torch.int32
     for i in range(q):
         assert set(rows[i][bound[i] > 0].tolist()) == set(ref_rows[i][ref_bound[i] > 0].tolist())
     assert torch.equal(bound > 0, ref_bound > 0)
+
+
+@pytest.mark.parametrize("style", ["interleaved", "neox"])
+def test_apply_rope_nocat_bitwise(monkeypatch, style):
+    monkeypatch.setattr(model, "ROPE_STYLE", style)
+    g = torch.Generator().manual_seed(1)
+    for shape in [(7, 64), (7, 3, 64)]:
+        for dt in (torch.float32, torch.bfloat16):
+            x = torch.randn(*shape, generator=g).to(dt)
+            ang = torch.randn(7, 32, generator=g) * 3
+            cos, sin = ang.cos(), ang.sin()
+            assert torch.equal(model.apply_rope_nocat(x, cos, sin), model.apply_rope(x, cos, sin))

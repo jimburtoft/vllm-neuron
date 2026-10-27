@@ -89,7 +89,7 @@ DEC_CP = os.environ.get("HY4_DEC_CP", "0") == "1"
 # references below implement the same contracts. Off by default.
 DEC_SPARSE_NKI = os.environ.get("HY4_DEC_SPARSE_NKI", "0") == "1"
 # ``HY4_PREFILL_SPARSE_NKI=1``: prefill attention split by QUERY instead of by
-# head (``HYV4Attention._prefill_sparse``): each rank attends its ``C / world``
+# head (``HYV4Attention.forward_prefill_sparse``): each rank attends its ``C / world``
 # queries for every head over only the rows DSA selected, with the decode
 # kernel ``sparse_decode_attn`` on Neuron (torch reference on CPU). Off by default.
 PREFILL_SPARSE_NKI = os.environ.get("HY4_PREFILL_SPARSE_NKI", "0") == "1"
@@ -332,6 +332,31 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1).to(dtype)
 
 
+def apply_rope_nocat(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """``apply_rope`` without ``torch.stack`` / ``torch.cat`` (bit-identical).
+
+    The rotation's partner of each element comes from a ``flip`` of its pair
+    (interleaved) or half (neox) axis, signed ``[-1, +1]``: ``a - b`` is
+    computed as ``a + (-b)``, which is exact. For tensors that feed an NKI
+    kernel, where a concatenation failed neuronx-cc (NCC_INIC902).
+    """
+    dtype = x.dtype
+    while cos.dim() < x.dim():
+        cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
+    x = x.float()
+    half = x.shape[-1] // 2
+    sign = torch.tensor([-1.0, 1.0], device=x.device)
+    if ROPE_STYLE == "interleaved":
+        pairs = x.view(*x.shape[:-1], half, 2)
+        partner = pairs.flip(-1) * sign
+        out = pairs * cos.unsqueeze(-1) + partner * sin.unsqueeze(-1)
+    else:
+        halves = x.view(*x.shape[:-1], 2, half)
+        partner = halves.flip(-2) * sign.view(2, 1)
+        out = halves * cos.unsqueeze(-2) + partner * sin.unsqueeze(-2)
+    return out.flatten(-2).to(dtype)
+
+
 # ── Attention ────────────────────────────────────────────────────────────
 
 # Bisection steps for the top-k threshold; see ``select_topk``. 24 halvings of
@@ -392,6 +417,31 @@ def topk_threshold(
     return lo
 
 
+def topk_threshold2(
+    s1: torch.Tensor, v1: torch.Tensor, s2: torch.Tensor, v2: torch.Tensor, k: int
+) -> torch.Tensor:
+    """``topk_threshold`` over the columns of ``[s1 | s2]`` without concatenating:
+    max, min and the (integer, exact in fp32) counts combine per piece, so the
+    result is bit-identical to the one over the concatenation."""
+    hi = torch.maximum(
+        s1.masked_fill(~v1, -_BIG).amax(dim=-1, keepdim=True),
+        s2.masked_fill(~v2, -_BIG).amax(dim=-1, keepdim=True),
+    )
+    lo = torch.minimum(
+        s1.masked_fill(~v1, _BIG).amin(dim=-1, keepdim=True),
+        s2.masked_fill(~v2, _BIG).amin(dim=-1, keepdim=True),
+    )
+    for _ in range(TOPK_BISECTION_STEPS):
+        mid = (lo + hi) * 0.5
+        count = ((s1 >= mid) & v1).float().sum(dim=-1, keepdim=True) + (
+            (s2 >= mid) & v2
+        ).float().sum(dim=-1, keepdim=True)
+        up = count >= k
+        lo = torch.where(up, mid, lo)
+        hi = torch.where(up, hi, mid)
+    return lo
+
+
 _SPARSE_KERNELS: list = []
 
 
@@ -402,7 +452,8 @@ def _sparse_kernels():
             from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
         except ImportError:  # source-tree layout
             from vllm_neuron.nki.nki_hop import wrap_nki
-        from .nki_sparse_decode import gather_rows_cols, select_to_rows, sparse_decode_attn
+        from .nki_sparse_decode import gather_rows_cols, sparse_decode_attn
+        from .nki_sparse_prefill import select_to_rows
 
         _SPARSE_KERNELS.extend(
             (wrap_nki(sparse_decode_attn), wrap_nki(gather_rows_cols), wrap_nki(select_to_rows))
@@ -480,6 +531,43 @@ def sparse_decode_ref(
     p = torch.exp(s - m.unsqueeze(-1))
     den = p.sum(dim=-1)
     num = (p.to(value_dtype) @ keys[..., :lat_dim].to(value_dtype)).float()
+    return m, den, num
+
+
+def sparse_prefill_ref(
+    q_lat: torch.Tensor,
+    q_rope: torch.Tensor,
+    kv_pages: torch.Tensor,
+    pos_map: torch.Tensor,
+    own_lat: torch.Tensor,
+    own_rope: torch.Tensor,
+    rows: torch.Tensor,
+    bound: torch.Tensor,
+    scale: float,
+    col_off: int,
+    value_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``sparse_decode_attn`` in position mode (CPU): ``rows`` are key positions,
+    ``p < P`` -> cache row ``pos_map[p]``, ``P <= p < P + C`` -> own row ``p - P``,
+    else zeros. -> ``m, den, num`` as ``sparse_decode_ref``."""
+    n_pos, n_own = pos_map.shape[0], own_lat.shape[0]
+    lat_dim, rope_dim = own_lat.shape[1], own_rope.shape[1]
+    r = rows.to(torch.long)
+    is_ctx = r < n_pos
+    is_own = (r >= n_pos) & (r < n_pos + n_own)
+    flat = pos_map.view(-1).to(torch.long)[torch.where(is_ctx, r, torch.zeros_like(r))]
+    flat = torch.where(is_ctx, flat, torch.full_like(flat, -1))
+    ctx = gather_rows_cols_ref(kv_pages, flat, col_off, lat_dim + rope_dim).float()
+    oi = torch.where(is_own, r - n_pos, torch.zeros_like(r))
+    m_own = is_own.unsqueeze(-1).float()
+    lat = ctx[..., :lat_dim] + own_lat.float()[oi] * m_own  # [B, n, L]
+    rope = ctx[..., lat_dim:] + own_rope.float()[oi] * m_own
+    s = (q_lat.float() @ lat.transpose(1, 2) + q_rope.float() @ rope.transpose(1, 2)) * scale
+    s = torch.minimum(s, bound.unsqueeze(1))
+    m = s.amax(dim=-1)
+    p = torch.exp(s - m.unsqueeze(-1))
+    den = p.sum(dim=-1)
+    num = (p.to(value_dtype) @ lat.to(value_dtype)).float()
     return m, den, num
 
 
@@ -775,27 +863,37 @@ class HYV4Attention(nn.Module):
         cached rope key. Concatenating both gives one 576-wide dot product.
         ``entry`` is what this token writes to the cache.
         """
+        q_lat, q_rope, index_key, c, k_rope, gate, q_resid = self._project_parts(x, cos, sin)
+        query = torch.cat((q_lat, q_rope), dim=-1)
+        entry = torch.cat((index_key.to(c.dtype), c, k_rope.to(c.dtype)), dim=-1)
+        return query, entry, gate, q_resid
+
+    def _project_parts(
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, nocat: bool = False
+    ) -> tuple:
+        """``_project`` before its two concatenations: (q_lat ``[T, nh, 512]``,
+        q_rope ``[T, nh, 64]``, index_key ``[T, 128]``, latent ``[T, 512]``,
+        k_rope ``[T, 64]``, gate, q_resid). ``nocat``: the ropes by
+        ``apply_rope_nocat`` (same values; they feed NKI kernels)."""
+        rope = apply_rope_nocat if nocat else apply_rope
         tokens = x.shape[0]
         q_resid = self.q_a_layernorm(x @ self.q_a_proj_weight)
         q = (q_resid @ self.q_b_proj_weight).view(tokens, self.num_heads, self.qk_dim)
         q_nope, q_rope = q[..., : self.nope_dim], q[..., self.nope_dim :]
-        q_rope = apply_rope(q_rope, cos, sin)
+        q_rope = rope(q_rope, cos, sin)
         q_lat = torch.einsum("tnd,ndc->tnc", q_nope, self.w_uk)
-        query = torch.cat((q_lat, q_rope), dim=-1)
 
         kv = x @ self.kv_a_proj_weight
         c = self.kv_a_layernorm(kv[:, : self.kv_lora_rank])
-        k_rope = apply_rope(kv[:, self.kv_lora_rank :], cos, sin)
+        k_rope = rope(kv[:, self.kv_lora_rank :], cos, sin)
         if self.indexer is not None:
             index_key = self.indexer.keys(x, cos, sin)
         else:
             index_key = torch.zeros(
                 tokens, self.index_dim, dtype=self.dtype, device=x.device
             )
-        entry = torch.cat((index_key.to(c.dtype), c, k_rope.to(c.dtype)), dim=-1)
-
         gate = x @ self.gate_proj_weight if self.gated else None
-        return query, entry, gate, q_resid
+        return q_lat, q_rope, index_key, c, k_rope, gate, q_resid
 
     def _finish(self, o_lat: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """``o_lat [T, nh, 512]`` -> value up-projection, gate, ``o_proj`` partial."""
@@ -962,8 +1060,7 @@ class HYV4Attention(nn.Module):
         ik: torch.Tensor,
         visible: torch.Tensor,
         rank: torch.Tensor | None,
-        sparse: bool = False,
-    ) -> torch.Tensor | tuple:
+    ) -> torch.Tensor:
         """DSA selection ``[C, K]`` for a prefill chunk, split by query across ranks.
 
         Every rank needs the whole selection (its head attends to every query's
@@ -975,14 +1072,12 @@ class HYV4Attention(nn.Module):
 
         ``rank`` is the runner's tensor, not ``rank_in_group``: a Python rank
         would bake into the trace and make 64 different graphs.
-
-        ``sparse`` (``HY4_PREFILL_SPARSE_NKI``; needs ``C % world == 0``): no
-        mask all-gather. Returns this rank's queries' selection as row indices
-        into ``keys`` instead, ``(rows, bound, sources)`` (see ``_prefill_rows``),
-        with the gathered ranks for the head pick.
         """
         chunk, world = iq.shape[0], self.world_size
-        if sparse or not (world == 1 or chunk % world):
+        if world == 1 or chunk % world:
+            rows = slice(None)
+            local_q, local_w, local_vis = iq, iw, visible
+        else:
             per_rank = chunk // world
             if rank is None:
                 rank = torch.tensor(self.tp_group.rank_in_group, device=iq.device)
@@ -992,9 +1087,6 @@ class HYV4Attention(nn.Module):
             local_q = torch.index_select(iq, 0, rows)
             local_w = torch.index_select(iw, 0, rows)
             local_vis = torch.index_select(visible, 0, rows)
-        else:
-            rows = slice(None)
-            local_q, local_w, local_vis = iq, iw, visible
         # A flat matmul, not ``einsum("qhd,kd->qhk")``: with the key-blocked
         # attention in the same graph, neuronx-cc 2.27 failed ISA validation on
         # the einsum's lowering ("Copy; inst failed assertion check:
@@ -1006,13 +1098,6 @@ class HYV4Attention(nn.Module):
         local = select_topk(scores, local_vis, self.index_topk)
         _capture(self.layer_idx, "index_scores_local", scores)
         _capture(self.layer_idx, "selected_local", local.to(torch.bfloat16))
-        if sparse:
-            if "collectives" in PERF_SKIP:
-                sources = torch.arange(world, dtype=torch.float32, device=iq.device)
-            else:
-                sources = self.tp_group.all_gather(rank.reshape(1).to(torch.float32), dim=0)
-            sel_rows, sel_bound = self._prefill_rows(local)
-            return sel_rows, sel_bound, sources
         if isinstance(rows, slice):
             return local
         # The all-gather's block order is the collective's, which on Trn2 is
@@ -1061,9 +1146,6 @@ class HYV4Attention(nn.Module):
         """
         cos, sin = position_embeddings
         chunk = x.shape[0]
-        x = x.to(self.dtype)
-        query, entry, gate, q_resid = self._project(x, cos, sin)
-        self._write_kv(entry, metadata)
 
         prior = metadata["cached_seq_len"].reshape(1, 1).to(torch.long)
         block_table = metadata["block_table_tensor"][:1]
@@ -1080,6 +1162,16 @@ class HYV4Attention(nn.Module):
             blocks = -(-bound // self._block_size())
             if blocks < block_table.shape[1]:
                 block_table = block_table[:, :blocks]
+        span = block_table.shape[1] * self._block_size()
+        if isinstance(selected, tuple) or (
+            self.indexer is not None and self.prefill_sparse_supported(chunk, span)
+        ):
+            return self.forward_prefill_sparse(
+                x, position_embeddings, metadata, selected, rank, block_table
+            )
+        x = x.to(self.dtype)
+        query, entry, gate, q_resid = self._project(x, cos, sin)
+        self._write_kv(entry, metadata)
         live = torch.ones(1, 1, dtype=torch.bool, device=x.device)
         ctx = self._gather(block_table, live)[0]  # [ctx_len, 704]
         ctx_len = ctx.shape[0]
@@ -1093,15 +1185,9 @@ class HYV4Attention(nn.Module):
         if self.indexer is not None:
             iq, iw = self.indexer.queries(q_resid, x, cos, sin)
             selected = self._select_prefill(
-                iq, iw, keys[:, self.index_slice], visible, rank,
-                sparse=self.prefill_sparse_supported(chunk, keys.shape[0]),
+                iq, iw, keys[:, self.index_slice], visible, rank
             )
 
-        if isinstance(selected, tuple):
-            o_lat = self._prefill_sparse(query, keys, selected, rank)
-            out = self._finish(o_lat, gate)
-            _capture(self.layer_idx, "attn_out", out)
-            return out, selected
         o_lat = self._attend_blocked(query.transpose(0, 1), keys, selected)
         out = self._finish(o_lat.transpose(0, 1), gate)
         _capture(self.layer_idx, "selected", selected.to(torch.bfloat16))
@@ -1110,32 +1196,60 @@ class HYV4Attention(nn.Module):
 
     # ── sparse prefill, split by query (HY4_PREFILL_SPARSE_NKI=1) ──────────
     #
-    # No torch.cat / torch.stack / torch.gather / topk / sort in this path.
+    # No torch.cat / torch.stack / torch.gather / topk / sort on any tensor
+    # that feeds a kernel here (a concatenation consumed by an NKI kernel
+    # failed neuronx-cc with NCC_INIC902 in "concatenate.*_pftranspose"). The
+    # prefix keys are read straight from the paged cache, the chunk's own
+    # keys from this step's projections, as separate inputs.
 
-    def prefill_sparse_supported(self, chunk: int, n_keys: int) -> bool:
-        """The query split needs ``C % world == 0``; the row lists, 128-key blocks."""
+    def prefill_sparse_supported(self, chunk: int, span: int) -> bool:
+        """The query split needs ``C % world == 0``; the kernels, the span and the
+        chunk in whole 128-key tiles."""
         return (
-            PREFILL_SPARSE_NKI and chunk % self.world_size == 0 and n_keys % 128 == 0
+            PREFILL_SPARSE_NKI
+            and chunk % self.world_size == 0
+            and span % 128 == 0
+            and chunk % 128 == 0
         )
 
     def _prefill_ksel(self, n_keys: int) -> int:
         return min(n_keys, -(-max(PREFILL_KSEL, 1) // 128) * 128)
 
-    def _prefill_rows(self, local: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Bool selection ``[Q, K]`` -> its first ``ksel`` selected key indices per
-        row, ascending, ``[Q, ksel]`` int32, and their bound (``+BIG`` / ``-BIG``).
+    def _prefill_pos_map(self, block_table: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
+        """Flat cache row of each prefix position ``[span]`` int32; positions at or
+        past ``cached_seq_len`` (and table padding) get one past the last row,
+        which the kernels' DMA skips (zeros, no read)."""
+        bs, num_pages = self._block_size(), self._num_pages()
+        bt = block_table[0].to(torch.long)
+        blocks = torch.where(
+            (bt > 0) & (bt < num_pages), bt, torch.full_like(bt, self._NULL_BLOCK)
+        )
+        span = bt.shape[0] * bs
+        j = torch.arange(span, device=bt.device)
+        flat = torch.index_select(blocks, 0, j // bs) * bs + j % bs
+        pad = torch.full_like(flat, self._n_cache_rows())
+        return torch.where(j < prior.reshape(1), flat, pad).to(torch.int32)
+
+    def _prefill_rows(
+        self, sel_ctx: torch.Tensor, sel_own: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Selection over ``[prefix (P) | chunk (C)]`` as two bool pieces -> the first
+        ``ksel`` selected positions per row, ascending, ``[Q, ksel]`` int32 (pad
+        ``P + C``), and their bound (``+BIG`` / ``-BIG``).
 
         On Neuron, the NKI kernel ``select_to_rows`` (GpSimd nonzero compaction)
-        builds the rows from the 0/1 mask, and the bound is ``rows < K``; the
-        torch formulation below (``_prefill_rows_ref``) runs on CPU. Its
-        ``[Q, ksel, K / 128]`` intermediates must not reach the device graph.
+        takes the two pieces as separate 0/1 inputs; on CPU the torch reference
+        ``_prefill_rows_ref`` runs (its ``[Q, ksel, K / 128]`` intermediates
+        must not reach the device graph).
         """
-        q, n_keys = local.shape
-        dev = local.device
+        n_keys = sel_ctx.shape[1] + sel_own.shape[1]
+        dev = sel_ctx.device
         ksel = self._prefill_ksel(n_keys)
-        if self._select_rows_k is not None and _use_sparse_kernels(local):
+        if self._select_rows_k is not None and _use_sparse_kernels(sel_ctx):
             rows = self._select_rows_k[self.sparse_grid](
-                sel=local.to(torch.float32).contiguous(), ksel=ksel
+                sel=sel_ctx.to(torch.float32).contiguous(),
+                sel2=sel_own.to(torch.float32).contiguous(),
+                ksel=ksel,
             )[:, :ksel]
             big = 1.0e30
             # A tensor limit, not a Python int compare (see _zero_beyond).
@@ -1146,7 +1260,8 @@ class HYV4Attention(nn.Module):
                 torch.full(filled.shape, -big, dtype=torch.float32, device=dev),
             )
             return rows, bound
-        return self._prefill_rows_ref(local)
+        # CPU only: the concatenation never reaches a device graph.
+        return self._prefill_rows_ref(torch.cat((sel_ctx, sel_own), dim=1))
 
     def _prefill_rows_ref(self, local: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Torch reference of ``_prefill_rows`` (CPU).
@@ -1190,57 +1305,106 @@ class HYV4Attention(nn.Module):
         )
         return rows, bound
 
-    def _prefill_sparse(
+    def forward_prefill_sparse(
         self,
-        query: torch.Tensor,
-        keys: torch.Tensor,
-        selected: tuple,
+        x: torch.Tensor,
+        position_embeddings: tuple,
+        metadata: dict,
+        selected: tuple | None,
         rank: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Prefill attention split by query: ``o_lat [C, nh, 512]`` for this rank's heads.
+        block_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple]:
+        """``forward_prefill`` split by query; same keys, same selection.
 
-        1. all-gather the absorbed queries over heads, ``[C, world * nh, 576]``
-           (heads in all-gather block order), and the sinks the same way; keep
-           this rank's ``C / world`` query rows;
-        2. attend those queries for every head over their selected rows of
-           ``keys`` only (``sparse_decode_attn`` with ``keys`` as the cache:
-           each local query is one "request" with its own row list), and fold
-           the sink in once per head;
-        3. all-gather the normalised ``[C / world, heads, 512]`` (bf16, the
-           dtype ``_finish`` casts to), take this rank's heads (``_pick_from``)
-           and put the query blocks in tp-rank order (0/1 matmul, as in
-           ``_select_prefill``).
+        Positions ``[0, P)`` are the cache span (``P = W * block_size``) and
+        ``[P, P + C)`` the chunk. Rank ``r`` owns queries
+        ``[r * Q, (r + 1) * Q)``, ``Q = C / world``:
+
+        1. full layers: indexer keys of the span read from the cache
+           (``gather_rows_cols``, prefix rows only); scores against the span and
+           against the chunk's own keys kept apart; the top-k threshold over
+           both (``topk_threshold2``, bit-identical to ``select_topk``); the
+           selection as row lists (``_prefill_rows``). Shared layers reuse
+           ``(rows, bound, sources)``;
+        2. all-gather the absorbed query parts (latent, rope) over heads;
+        3. ``sparse_decode_attn`` in position mode: prefix rows straight from
+           the paged cache, chunk rows from this step's latent / rope keys;
+           the sink is folded in once per head;
+        4. all-gather the bf16 ``[Q, heads, 512]``, take this rank's heads.
         """
-        rows, bound, sources = selected
-        chunk = query.shape[0]
+        cos, sin = position_embeddings
+        chunk = x.shape[0]
         world, nh = self.world_size, self.num_heads
         per_rank = chunk // world
-        dev = query.device
+        dev = x.device
+        x = x.to(self.dtype)
+        q_lat, q_rope, index_key, lat_own, k_rope, gate, q_resid = self._project_parts(
+            x, cos, sin, nocat=True
+        )
+        # The cache write alone takes the concatenated entry (index_put_, no kernel).
+        entry = torch.cat((index_key.to(lat_own.dtype), lat_own, k_rope.to(lat_own.dtype)), dim=-1)
+        self._write_kv(entry, metadata)
+
         if rank is None:
             rank = torch.tensor(self.tp_group.rank_in_group, device=dev)
         r = rank.reshape(1).to(torch.long)
-        q_all = _all_gather(self.tp_group, query, 1, world)  # [C, heads, 576]
-        mine = r * per_rank + torch.arange(per_rank, device=dev)
-        q_loc = torch.index_select(q_all, 0, mine).float()  # [Q, heads, 576]
-        sinks = _all_gather(self.tp_group, self.sinks.float(), 0, world)  # [heads]
+        mine = r * per_rank + torch.arange(per_rank, device=dev)  # this rank's queries
+        prior = metadata["cached_seq_len"].reshape(1, 1).to(torch.long)
+        pos_map = self._prefill_pos_map(block_table, prior)  # [P]
+        span = pos_map.shape[0]
 
+        if self.indexer is not None:
+            iq, iw = self.indexer.queries(q_resid, x, cos, sin)
+            local_q = torch.index_select(iq, 0, mine)
+            local_w = torch.index_select(iw, 0, mine)
+            ik_ctx = self._gather_cols(pos_map.view(1, span), self.index_slice.start, self.index_dim)[0]
+            rows_q, heads, dim = local_q.shape
+            flat_q = local_q.reshape(rows_q * heads, dim)
+            s_ctx = torch.relu((flat_q @ ik_ctx.t()).float()).view(rows_q, heads, span)
+            s_own = torch.relu((flat_q @ index_key.to(ik_ctx.dtype).t()).float()).view(rows_q, heads, chunk)
+            sc_ctx = (s_ctx * local_w.unsqueeze(-1)).sum(dim=1)  # [Q, P]
+            sc_own = (s_own * local_w.unsqueeze(-1)).sum(dim=1)  # [Q, C]
+            vis_ctx = (torch.arange(span, device=dev).view(1, span) < prior).expand(rows_q, span)
+            vis_own = torch.arange(chunk, device=dev).view(1, chunk) <= mine.view(rows_q, 1)
+            lo = topk_threshold2(sc_ctx, vis_ctx, sc_own, vis_own, self.index_topk)
+            sel_ctx = vis_ctx & (sc_ctx >= lo)
+            sel_own = vis_own & (sc_own >= lo)
+            _capture(self.layer_idx, "selected_local", sel_own.to(torch.bfloat16))
+            if "collectives" in PERF_SKIP:
+                sources = torch.arange(world, dtype=torch.float32, device=dev)
+            else:
+                sources = self.tp_group.all_gather(r.to(torch.float32), dim=0)
+            rows, bound = self._prefill_rows(sel_ctx, sel_own)
+            selected = (rows, bound, sources)
+        rows, bound, sources = selected
+
+        ql_all = _all_gather(self.tp_group, q_lat, 1, world)  # [C, heads, 512]
+        qr_all = _all_gather(self.tp_group, q_rope, 1, world)  # [C, heads, 64]
+        ql_loc = torch.index_select(ql_all, 0, mine).float()
+        qr_loc = torch.index_select(qr_all, 0, mine).float()
+        sinks = _all_gather(self.tp_group, self.sinks.float(), 0, world)  # [heads]
+        own_lat = lat_own.to(self.kv_pages.dtype)
+        own_rope = k_rope.to(self.kv_pages.dtype)
         col_off = self.latent_slice.start
-        if self._sparse_attn_k is not None and _use_sparse_kernels(q_loc):
+        if self._sparse_attn_k is not None and _use_sparse_kernels(ql_loc):
             # Tokens per group bounded so the gathered rows (bf16, 576 wide)
             # stay a fraction of a partition's SBUF.
             kt = -(-rows.shape[1] // 128)
             tg = max(1, min(8, 49152 // (kt * self.latent_dim * 2)))
             m, den, num = self._sparse_attn_k[self.sparse_grid](
-                q_all=q_loc.contiguous(), kv_cache=keys.contiguous(),
+                q_all=ql_loc.contiguous(), kv_cache=self.kv_pages,
                 rows=rows.contiguous(), bound=bound.contiguous(),
                 scale=float(self.scaling), col_off=col_off, lat_off=0,
                 lat_dim=self.kv_lora_rank, rope_off=self.kv_lora_rank,
                 rope_dim=self.rope_dim, tg=tg,
+                pos_map=pos_map.view(span, 1).contiguous(),
+                own_lat=own_lat.contiguous(), own_rope=own_rope.contiguous(),
+                q_rope=qr_loc.contiguous(),
             )
         else:
-            m, den, num = sparse_decode_ref(
-                q_loc, keys, rows, bound, self.scaling, col_off, self.kv_lora_rank,
-                self.dtype,
+            m, den, num = sparse_prefill_ref(
+                ql_loc, qr_loc, self.kv_pages, pos_map, own_lat, own_rope, rows, bound,
+                self.scaling, col_off, self.dtype,
             )
         sink = sinks.view(1, -1)
         m_f = torch.maximum(m, sink)
@@ -1252,11 +1416,13 @@ class HYV4Attention(nn.Module):
         rank_v = self.kv_lora_rank
         o_all = _all_gather(self.tp_group, o_loc.to(self.dtype), 0, world)  # [C, heads, 512]
         pick = self._pick_from(sources, r, dev).to(self.dtype)  # [nh, heads]
-        o_mine = torch.einsum("jh,qhc->qjc", pick, o_all)  # [C, nh, 512], blocks in gather order
+        o_mine = torch.einsum("jh,qhc->qjc", pick, o_all)  # blocks in gather order
         targets = torch.arange(world, dtype=torch.float32, device=dev)
         perm = (targets.view(world, 1) == sources.view(1, world)).to(self.dtype)
         ordered = perm @ o_mine.reshape(world, per_rank * nh * rank_v)
-        return ordered.reshape(chunk, nh, rank_v)
+        out = self._finish(ordered.reshape(chunk, nh, rank_v), gate)
+        _capture(self.layer_idx, "attn_out", out)
+        return out, selected
 
     def forward_decode(
         self,
