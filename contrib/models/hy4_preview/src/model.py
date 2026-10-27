@@ -78,21 +78,65 @@ DEBUG_LAYERS = {int(x) for x in os.environ.get("HY4_DEBUG_LAYERS", "0").split(",
 # DSA mask all-gather a local repeat; "attn"/"moe" replace that sub-block's
 # output with zeros (attention then writes no KV and selects nothing).
 PERF_SKIP = {x for x in os.environ.get("HY4_PERF_SKIP", "").split(",") if x}
-# ``HY4_DEC_CP=1``: decode attention sharded by KEY across the TP ranks instead
-# of replicated per head (``HYV4Attention.forward_decode_cp``). Off by default;
-# recommended on (see the README).
-DEC_CP = os.environ.get("HY4_DEC_CP", "0") == "1"
+def _platform_target() -> str:
+    """``trn2`` / ``trn3`` / ... for the default attention paths; ``""`` off device.
+
+    Read once, at model construction (``resolve_platform_defaults``), never
+    inside a traced forward.
+    """
+    target = os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE", "")
+    if target:
+        return target
+    try:
+        from libtorch_neuronx_lite.compile.platform import get_platform_target
+
+        return str(get_platform_target())
+    except Exception:  # no runtime (CPU tests)
+        return ""
+
+
+def _flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    return default if value is None else value == "1"
+
+
+# Defaults per platform, each overridable with its environment variable:
+#   ``HY4_DEC_CP`` (decode attention sharded by KEY across the TP ranks,
+#   ``HYV4Attention.forward_decode_cp``) and ``HY4_DEC_SPARSE_NKI``: on, on
+#   Trn2 and Trn3; ``HY4_PREFILL_SPARSE_NKI``: on for Trn2 only -- on Trn3 its
+#   kernels currently run slower than the dense blocked attention, so Trn3
+#   keeps the dense prefill. Off device (CPU tests) everything defaults off.
+# The values below are the environment-only defaults; the model sets the
+# platform defaults at construction (``resolve_platform_defaults``).
+DEC_CP = _flag("HY4_DEC_CP", False)
 # ``HY4_DEC_SPARSE_NKI=1`` (with HY4_DEC_CP=1): each rank reads only the indexer
 # keys of its shard plus the latent rows DSA selected, not whole entries for the
 # shard (``HYV4Attention._cp_sparse_local``). On Neuron the read and the local
 # attention are NKI kernels (``nki_sparse_decode.py``); on CPU the torch
-# references below implement the same contracts. Off by default.
-DEC_SPARSE_NKI = os.environ.get("HY4_DEC_SPARSE_NKI", "0") == "1"
+# references below implement the same contracts.
+DEC_SPARSE_NKI = _flag("HY4_DEC_SPARSE_NKI", False)
 # ``HY4_PREFILL_SPARSE_NKI=1``: prefill attention split by QUERY instead of by
 # head (``HYV4Attention.forward_prefill_sparse``): each rank attends its ``C / world``
 # queries for every head over only the rows DSA selected, with the decode
-# kernel ``sparse_decode_attn`` on Neuron (torch reference on CPU). Off by default.
-PREFILL_SPARSE_NKI = os.environ.get("HY4_PREFILL_SPARSE_NKI", "0") == "1"
+# kernel ``sparse_decode_attn`` on Neuron (torch reference on CPU).
+PREFILL_SPARSE_NKI = _flag("HY4_PREFILL_SPARSE_NKI", False)
+
+
+def resolve_platform_defaults() -> str:
+    """Set the attention-path defaults for this host's platform; -> the target.
+
+    Called once from ``HYV4ForCausalLM.__init__``, before any layer is built
+    (layers read these flags at construction).
+    """
+    global DEC_CP, DEC_SPARSE_NKI, PREFILL_SPARSE_NKI
+    target = _platform_target()
+    on_neuron, on_trn2 = target.startswith("trn"), target.startswith("trn2")
+    DEC_CP = _flag("HY4_DEC_CP", on_neuron)
+    DEC_SPARSE_NKI = _flag("HY4_DEC_SPARSE_NKI", on_neuron)
+    PREFILL_SPARSE_NKI = _flag("HY4_PREFILL_SPARSE_NKI", on_trn2)
+    return target
+
+
 # The sparse prefill runs for graphs whose prefix span (static per graph, from
 # the kv_segment bound) is at least this many keys; shorter spans keep the
 # dense blocked attention. Shared-indexer layers follow their full layer.
@@ -1914,6 +1958,12 @@ class HYV4DecoderLayer(nn.Module):
 class HYV4TextModel(nn.Module):
     def __init__(self, config: HYV4Config):
         super().__init__()
+        target = resolve_platform_defaults()
+        logger.info(
+            "hy4_preview attention paths (platform %r): HY4_DEC_CP=%d "
+            "HY4_DEC_SPARSE_NKI=%d HY4_PREFILL_SPARSE_NKI=%d",
+            target, DEC_CP, DEC_SPARSE_NKI, PREFILL_SPARSE_NKI,
+        )
         self.config = config
         self.tp_group = get_tp_group()
         self.embed_tokens = VocabDimShardedEmbedding(

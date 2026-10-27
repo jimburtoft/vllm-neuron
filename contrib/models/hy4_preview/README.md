@@ -34,8 +34,10 @@ python contrib/models/hy4_preview/scripts/convert_mxfp8_to_neuron_fp8.py \
 
 # 3. Use the XLA compile route (see "Known limitations")
 export VLLM_NEURON_BACKEND=vllm_neuron
-# 4. Recommended: key-sharded decode attention (see "Layout")
-export HY4_DEC_CP=1
+# 4. Attention paths are chosen per platform (see "Layout"): key-sharded
+#    decode (HY4_DEC_CP) and the sparse decode kernel (HY4_DEC_SPARSE_NKI) on
+#    Trn2 and Trn3; the sparse prefill (HY4_PREFILL_SPARSE_NKI) on Trn2 only.
+#    Each variable overrides its default (=1 on, =0 off).
 # 5. Optional, serving: the plugin sizes the KV cache to 30% of the budget by
 #    default; where HBM allows (e.g. Trn3), raising it lets max_num_seqs requests
 #    run together at max_model_len 32768 instead of in waves
@@ -249,6 +251,20 @@ Accuracy, before and after: GSM8K, first 200 test questions (chat template,
 greedy, 320 tokens) 0.735 both, identical predictions on 145 of 200; the pass
 key is found; the demo outputs below reproduce.
 
+With the sparse decode kernel and the sparse prefill (the Trn2 defaults;
+same flags, `run.py --bench`, one request, 256 output tokens, median of 3):
+
+| input tokens | TTFT | TPOT |
+|---|---|---|
+| 31,744 | 37.77 s | 39.2 ms |
+| 8,192 | 9.33 s | 38.5 ms |
+| 4,096 | 3.62 s | 38.5 ms |
+
+The 4,096 row is with the sparse decode only (below
+`HY4_PREFILL_SPARSE_MIN_SPAN` the dense prefill runs). GSM8K-200: 0.735 with the
+sparse decode, 0.720 with sparse decode and prefill (18 / 15 questions right in
+only one of base / sparse; McNemar p = 0.73); the pass key is found.
+
 ### Other
 
 Pass key at the start of 28,804 tokens (`--needle 30000`): found, 87.7 s end to end
@@ -338,8 +354,8 @@ numerators and denominators. The cache stays replicated; only the read is
 split. Requires the block-table width to divide by the TP degree, otherwise
 the replicated path runs.
 
-**Sparse key-sharded decode (`HY4_DEC_SPARSE_NKI=1`, with `HY4_DEC_CP=1`; opt-in,
-not yet run on device).** Each rank reads only the 128-wide indexer keys of its
+**Sparse key-sharded decode (`HY4_DEC_SPARSE_NKI`, with `HY4_DEC_CP`; default on
+on Trn2 and Trn3).** Each rank reads only the 128-wide indexer keys of its
 shard (`gather_rows_cols`), and after the global threshold only the 576-wide
 `[latent | rope]` slices of the keys DSA selected (`sparse_decode_attn`, adapted
 from the workspace's absorbed-MLA DCP decode kernel): unselected keys and keys
@@ -352,8 +368,10 @@ checks the kernels in the NKI simulator. By default the per-rank key list is the
 whole shard (always exact); `HY4_SPARSE_KLOC=<n>` compacts it to `n` (rounded
 up to 128) slots, which is exact only while no rank holds more selected keys.
 
-**Sparse prefill split by query (`HY4_PREFILL_SPARSE_NKI=1`; opt-in, not yet
-run on device).** Instead of each rank attending its own head over every query
+**Sparse prefill split by query (`HY4_PREFILL_SPARSE_NKI`; default on on Trn2,
+off on Trn3, where its kernels are currently slower than the dense blocked
+attention; graphs whose prefix span is below `HY4_PREFILL_SPARSE_MIN_SPAN`,
+default 4096, keep the dense path).** Instead of each rank attending its own head over every query
 and every key under the DSA mask, each rank attends its `C / world` queries for
 all heads over only their selected keys. Full layers read only the 128-wide
 indexer keys of the prefix from the paged cache (`gather_rows_cols`), score

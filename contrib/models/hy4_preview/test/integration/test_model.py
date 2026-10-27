@@ -33,7 +33,9 @@ if not MODEL_PATH:
 # Recorded on trn2.48xlarge, Neuron SDK 2.33, vllm-neuron 0.29.0.1.2.0 (and
 # identical on SDK 2.27 / vllm-neuron 0.24).
 EXPECTED = {
-    "The capital of France is": " __________.\nA. Sydney\nB. New York\nC. Paris\nD. Ottawa",
+    # The blank's underscore count is a greedy near-tie that differs between the
+    # dense and the sparse prefill attention; the options that follow are not.
+    "The capital of France is": ("_", ".\nA. Sydney\nB. New York\nC. Paris\nD. Ottawa"),
     "I am gonna keep counting forever, 1 2 3 4 5": " 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21",
     "def fibonacci(n):": '\n    """Return the nth value in the Fibonacci series."""\n    if n == 0:\n        return 0',
     "Once upon a time, there was a": " king who was very rich. He had a lot of gold and silver, but he was not happy.",
@@ -99,9 +101,14 @@ def test_demo_prompts(llm) -> None:
     for prompt, output in zip(prompts, outputs):
         text = output.outputs[0].text
         print(f"{prompt!r} -> {text!r}")
-        assert text.startswith(EXPECTED[prompt]), (
-            f"{prompt!r}: expected {EXPECTED[prompt]!r}..."
-        )
+        expected = EXPECTED[prompt]
+        if isinstance(expected, tuple):  # (repeated blank char, then the rest)
+            blank, rest = expected
+            body = text.lstrip()
+            ok = body.startswith(blank) and body.lstrip(blank).startswith(rest)
+        else:
+            ok = text.startswith(expected)
+        assert ok, f"{prompt!r}: expected {expected!r}..., got {text!r}"
 
 
 @pytest.mark.integration
