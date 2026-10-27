@@ -142,6 +142,9 @@ An explicit `--optimization-level` turns the per-graph hook off.
 On Trn3 the model runs the published MXFP4 checkpoint natively (`model_mxfp4.py`, MX
 matmul kernels); no `quantization` setting is needed. Use `tensor_parallel_size=8`: the
 MXFP4 weight loaders reject TP=4 (per-rank intermediate size 768 is not a multiple of 512).
+Don't set `quantization="fp8"` on Trn3: MXFP4 at TP=8 is faster (time to first token 19 vs
+29 ms at 128 tokens, decode 3.0 vs 3.9 ms at batch 1), and FP8 at TP=8 runs with the BF16
+prefill copy (see `gpt_oss_fp8_prefill` above).
 
 Changes on this branch for the MXFP4 path:
 - segmented prefill writes only the new token slots into the paged KV cache
