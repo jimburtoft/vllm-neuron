@@ -39,7 +39,7 @@ from vllm_neuron.functional.attention.encoder_window_attention import (
     build_segment_factors,
     encoder_window_attention,
 )
-from nkilib.core.utils.common_types import NormType
+from nkilib.core.utils.common_types import ActFnType, NormType
 from vllm_neuron.parallel.neuron_parallel_state import (
     get_neuron_encoder_tp_group,
     shard_select,
@@ -80,6 +80,33 @@ def get_encoder_conv_backend() -> str:
             f"VLLM_NEURON_QWEN3_ASR_ENC_CONV={v!r}; use one of {_ENC_CONV_BACKENDS}."
         )
     return v
+
+
+# Encoder norm2 + MLP + residual backend. "torch" (default): nn.LayerNorm, then up + bias, fp32 GELU,
+# down + bias (compiler-lowered), residual adds in torch. "nki": one nkilib MLP CTE call that fuses the
+# attention residual add, LayerNorm (norm2, with bias), up + bias, GELU (ACT LUT), down + bias; only the
+# final residual add stays in torch. TP 1 only (the kernel adds the down bias before any all-reduce).
+_ENC_MLP_BACKENDS = ("torch", "nki")
+
+# Encoder pre-attention LayerNorm + QKV projection backend. "nki" (default): nkilib qkv_cte
+# (NF.qkv_proj with fused LayerNorm and bias). "torch": F.layer_norm + matmul + bias, lowered by the
+# compiler.
+_ENC_QKV_BACKENDS = ("nki", "torch")
+
+
+def _env_choice(name: str, default: str, choices: tuple[str, ...]) -> str:
+    v = os.environ.get(name, default).strip().lower()
+    if v not in choices:
+        raise ValueError(f"{name}={v!r}; use one of {choices}.")
+    return v
+
+
+def get_encoder_mlp_backend() -> str:
+    return _env_choice("VLLM_NEURON_QWEN3_ASR_ENC_MLP", "torch", _ENC_MLP_BACKENDS)
+
+
+def get_encoder_qkv_backend() -> str:
+    return _env_choice("VLLM_NEURON_QWEN3_ASR_ENC_QKV", "nki", _ENC_QKV_BACKENDS)
 
 
 def get_encoder_attention_backend() -> str:
@@ -302,6 +329,7 @@ class Qwen3ASRAudioAttention(nn.Module):
         self.num_heads_per_rank: int = self.num_heads // self.world_size
 
         self.norm = nn.LayerNorm(self.d_model, dtype=self.dtype)
+        self.qkv_backend = get_encoder_qkv_backend()
 
         # >>> PARALLELISM: QKV weight shapes (per-rank sharded heads) <<<
         qkv_size_per_rank = 3 * self.num_heads_per_rank * self.head_dim
@@ -374,15 +402,28 @@ class Qwen3ASRAudioAttention(nn.Module):
         # >>> PARALLELISM: Each rank computes only its sharded Q/K/V heads <<<
         # qkv: [num_blocks, block_size, 3 * heads_per_rank * head_dim]
 
-        qkv = NF.qkv_proj(
-            hidden=hidden_states,
-            qkv_weights=self.qkv_weight,
-            norm_weights=self.norm.weight.unsqueeze(0),
-            eps=self.norm.eps,
-            norm_type=NormType.LAYER_NORM,
-            bias=self.qkv_bias.unsqueeze(0),
-            norm_b=self.norm.bias.unsqueeze(0),
-        )
+        if self.qkv_backend == "torch":
+            qkv = (
+                F.layer_norm(
+                    hidden_states,
+                    (self.d_model,),
+                    self.norm.weight,
+                    self.norm.bias,
+                    self.norm.eps,
+                )
+                @ self.qkv_weight
+                + self.qkv_bias
+            )
+        else:
+            qkv = NF.qkv_proj(
+                hidden=hidden_states,
+                qkv_weights=self.qkv_weight,
+                norm_weights=self.norm.weight.unsqueeze(0),
+                eps=self.norm.eps,
+                norm_type=NormType.LAYER_NORM,
+                bias=self.qkv_bias.unsqueeze(0),
+                norm_b=self.norm.bias.unsqueeze(0),
+            )
 
         if seg_factors is not None:
             # [num_blocks, heads_per_rank, head_dim, block_size] (BNdS), read natively by o_proj
@@ -471,6 +512,36 @@ class Qwen3ASRAudioEncoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(self.d_model, dtype=self.dtype)  # final_layer_norm
         self.attn = Qwen3ASRAudioAttention(config)
         self.mlp = Qwen3ASRAudioMLP(config)
+        self.mlp_backend = get_encoder_mlp_backend()
+        if self.mlp_backend == "nki" and self.mlp.world_size > 1:
+            logger.warning(
+                "VLLM_NEURON_QWEN3_ASR_ENC_MLP=nki needs encoder TP 1 (got %d); using torch.",
+                self.mlp.world_size,
+            )
+            self.mlp_backend = "torch"
+
+    def _fused_norm2_mlp(self, hidden_states: torch.Tensor, attn_out: torch.Tensor) -> torch.Tensor:
+        """x2 = x + attn_out; return x2 + MLP(norm2(x2)) through one nkilib MLP call (TP 1)."""
+        nb, s, h = hidden_states.shape
+        mlp = self.mlp
+        out = NF.mlp(
+            hidden=attn_out.reshape(nb * s, h),
+            gate_w=mlp.up_proj_weight,
+            up_w=mlp.up_proj_weight,
+            down_w=mlp.down_proj_weight,
+            eps=self.norm2.eps,
+            ln_w=self.norm2.weight.unsqueeze(0),
+            norm_b=self.norm2.bias.unsqueeze(0),
+            norm_type=NormType.LAYER_NORM,
+            skip_gate=True,
+            act_fn=ActFnType.GELU,
+            up_b=mlp.up_proj_bias.unsqueeze(0),
+            down_b=mlp.down_proj_bias.unsqueeze(0),
+            fused_add_tensor=hidden_states.reshape(nb * s, h),
+            store_fused_add_result=True,
+        )
+        mlp_out, x2 = out
+        return (x2 + mlp_out).view(nb, s, h)
 
     def forward(
         self,
@@ -489,9 +560,10 @@ class Qwen3ASRAudioEncoderLayer(nn.Module):
         Returns:
             ``[num_blocks, block_size, d_model]``
         """
-        hidden_states = hidden_states + self.attn(
-            hidden_states, bound_min, bound_max, seg_factors
-        )
+        attn_out = self.attn(hidden_states, bound_min, bound_max, seg_factors)
+        if self.mlp_backend == "nki":
+            return self._fused_norm2_mlp(hidden_states, attn_out)
+        hidden_states = hidden_states + attn_out
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
 
         # skip fp16 clamp as not needed for bf16
@@ -568,6 +640,11 @@ class Qwen3ASREncoder(nn.Module):
         self.attention_backend = get_encoder_attention_backend()
         self.conv_backend = get_encoder_conv_backend()
         logger.info("qwen3_asr encoder conv frontend backend: %s", self.conv_backend)
+        logger.info(
+            "qwen3_asr encoder mlp backend: %s, qkv backend: %s",
+            get_encoder_mlp_backend(),
+            get_encoder_qkv_backend(),
+        )
         self.positional_embedding = SinusoidsPositionEmbedding(
             config.max_position_embeddings,  # 13
             config.d_model,
