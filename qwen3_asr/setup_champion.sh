@@ -31,9 +31,11 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}   # required on trn2.3xlarge (12 vC
 # FP8 KV (opt-in at serve time: --kv-cache-dtype fp8_e4m3 + "fp8_packed_kv": true) needs this on trn2 so NKI maps
 # torch.float8_e4m3fn to the trn2 fp8 type. It only affects FP8 tensors, so it is safe to set for bf16 KV as well.
 export UNSAFE_FP8FNCAST=${UNSAFE_FP8FNCAST:-1}
-# Throughput serving on a small host (trn2.3xlarge, 8 replicas): turn off the runtime's low-latency completion
-# polling. Its per-worker polling thread uses ~0.64 vCPU each, and the 12-vCPU host was saturated. Measured +4.1 % RTFx,
-# TTFT p50 -65 %, WER unchanged. Single-stream latency effect not measured: unset it for latency serving.
+# Turn off the runtime's low-latency completion polling. Its per-worker polling thread uses ~0.64 vCPU each, and the
+# 12-vCPU trn2.3xlarge host was saturated at 8 replicas. Measured +4.1 % RTFx, TTFT p50 -65 %, WER unchanged; also
+# better single stream (TP4 C=1: E2E p50 322 -> 315 ms, ITL p99 5.4 -> 3.65 ms), so keep it for latency serving too.
+# The in-graph async decode reorder (+7.4 % RTFx, identical transcripts) is on by default in this branch;
+# VLLM_NEURON_MM_ASYNC_REORDER=0 turns it off.
 export NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=${NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION:-0}
 python - <<PY
 import nkilib, vllm_neuron
