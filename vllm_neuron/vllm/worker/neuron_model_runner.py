@@ -5408,13 +5408,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         With VLLM_NEURON_SWA_RING=1 the width is the fixed ring
         ``cdiv(sliding_window, block_size)`` (32 blocks, s_prior 1024 for Gemma3).
+        The width is rounded up to the kernel's 2 * P_MAX token alignment.
+        VLLM_NEURON_SWA_RING_TABLE_TOKENS widens the decode table to that many
+        tokens (e.g. 4096). The ring and its modulus do not change; the extra
+        columns are null blocks past R that the mask (s < min(p, R)) never
+        selects. The decode kernel re-tiles the cache into
+        gcd(block_size, s_prior / (n_prgs * 128)) token chunks, so a wider table
+        trades more masked reads for larger KV DMAs.
         """
         if getattr(self, "_swa_ring", False):
             from vllm_neuron.vllm.core import swa_ring
 
+            ring_n = swa_ring.ring_blocks(sliding_window, block_size)
+            table_tokens = int(
+                os.environ.get("VLLM_NEURON_SWA_RING_TABLE_TOKENS", "0") or 0
+            )
+            if table_tokens:
+                ring_n = max(ring_n, -(-table_tokens // block_size))
+            # Same P_MAX floor as the trimmed table: s_prior per program must be a
+            # multiple of 128 (2 * 128 tokens on LNC=2). The pad columns are masked.
+            per = max(1, (2 * 128) // block_size)
+            ring_n = -(-ring_n // per) * per
             dcp_block_size = block_size * max(self._dcp_size, 1)
             full_ctx_blocks = (self.max_model_len + dcp_block_size - 1) // dcp_block_size
-            return min(swa_ring.ring_blocks(sliding_window, block_size), full_ctx_blocks)
+            return min(ring_n, full_ctx_blocks)
         # Trimmed SWA kv block counts must produce S_ctx divisible by P_MAX
         # *per program*: on LNC=2 the decode kernel shards s_prior across 2
         # programs (attention_tkg "Sharded s_prior must be divisible by p_max"),

@@ -59,11 +59,11 @@ def _fake_runner(table, ctx, swa_spec, full_spec):
     return fake
 
 
-def _specs():
+def _specs(window=W):
     from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
     common = dict(block_size=BS, num_kv_heads=1, head_size=256, dtype=torch.bfloat16)
-    return SlidingWindowSpec(sliding_window=W, **common), FullAttentionSpec(**common)
+    return SlidingWindowSpec(sliding_window=window, **common), FullAttentionSpec(**common)
 
 
 def _mask_to_slots(mask, B, S_ctx):
@@ -81,13 +81,43 @@ def _mask_to_slots(mask, B, S_ctx):
     return m[:, 0, 0, :]
 
 
+def _swa_decode_mask(sliding_window, md, positions, q_heads, layer):
+    """SWA decode mask in the trimmed frame, as the model builds it.
+
+    Same arithmetic as gemma3 ``_precompute_decode_attn_masks`` and MuseGlimmer
+    ``forward_decode``: end = clamp(pos - offset, 0), start = clamp(end - W + 1, 0).
+    """
+    from vllm_neuron.functional.attention.attention_decode_mask import (
+        gen_attention_decode_mask,
+    )
+
+    m = md[layer]
+    B = m["block_table_tensor"].shape[0]
+    pos = positions.reshape(1, B)
+    pos = torch.clamp(pos - m["swa_kv_pos_offset"].reshape(1, B), min=0)
+    start = torch.clamp(pos - sliding_window + 1, min=0)
+    return gen_attention_decode_mask(
+        pos_ids=pos.to(torch.float32), bs=B, q_head=q_heads, s_active=1,
+        s_prior=m["max_blocks_per_seq"] * m["block_size"],
+        start_pos=start.to(torch.float32), block_len=m["block_size"],
+    )
+
+
+@pytest.mark.parametrize(
+    "W, table_tokens", [(1024, 0), (2048, 0), (2048, 4096)], ids=["w1024", "w2048", "w2048_t4096"]
+)
 @pytest.mark.parametrize("L", [100, 1023, 1024, 1025, 2048])
 @pytest.mark.parametrize("B", [2, 3])
-def test_runner_ring_decode_attention_set(monkeypatch, L, B):
-    from vllm_neuron.model.gemma3 import model as g3
-
+def test_runner_ring_decode_attention_set(monkeypatch, L, B, W, table_tokens):
+    if table_tokens:
+        monkeypatch.setenv("VLLM_NEURON_SWA_RING_TABLE_TOKENS", str(table_tokens))
+    else:
+        monkeypatch.delenv("VLLM_NEURON_SWA_RING_TABLE_TOKENS", raising=False)
+    ML = 8192 if W > 1024 else globals()["ML"]
+    monkeypatch.setitem(globals(), "ML", ML)
     R_cls = _runner_cls()
-    swa_spec, full_spec = _specs()
+    swa_spec, full_spec = _specs(W)
+    nb_exp = max(W, table_tokens) // BS
     rng = np.random.default_rng(L + B)
     width = ML // BS
     table = rng.permutation(np.arange(1, 1 + B * width)).reshape(B, width).astype(np.int32)
@@ -114,21 +144,20 @@ def test_runner_ring_decode_attention_set(monkeypatch, L, B):
     for b in range(B):
         write(np.arange(lens[b]), np.full(lens[b], b, dtype=np.int64))
     ctx[:] = lens
-    cfg = types.SimpleNamespace(sliding_window=W, num_hidden_layers=6, is_sliding=lambda i: i != 5)
     blk = types.SimpleNamespace(block_table=types.SimpleNamespace(np=table, cpu=torch.from_numpy(table)))
-    for step in range(1100):
+    for step in range(W + 76):
         p = ctx.astype(np.int64).copy()
         nb = fake._compute_swa_num_blocks(W, BS, B)
-        assert nb == 32
+        assert nb == nb_exp
         bt, off = R_cls._compute_swa_decode_tensors(fake, blk, B, W, BS, 0)
-        assert tuple(bt.shape) == (B, 32)
+        assert tuple(bt.shape) == (B, nb_exp)
         md = {
             "layers.0.self_attn": dict(block_size=BS, block_table_tensor=bt, max_blocks_per_seq=nb,
                                        swa_kv_pos_offset=off),
             "layers.5.self_attn": dict(block_size=BS, block_table_tensor=torch.from_numpy(table),
                                        max_blocks_per_seq=width),
         }
-        sm, _ = g3._precompute_decode_attn_masks(cfg, md, torch.from_numpy(p), 2, 0, 5)
+        sm = _swa_decode_mask(W, md, torch.from_numpy(p), 2, "layers.0.self_attn")
         valid = _mask_to_slots(sm, B, nb * BS).numpy() > 0
         for b in range(B):
             assert valid[b, nb * BS - 1], "the active slot must be valid"
