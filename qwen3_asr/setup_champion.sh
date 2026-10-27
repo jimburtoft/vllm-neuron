@@ -31,6 +31,10 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}   # required on trn2.3xlarge (12 vC
 # FP8 KV (opt-in at serve time: --kv-cache-dtype fp8_e4m3 + "fp8_packed_kv": true) needs this on trn2 so NKI maps
 # torch.float8_e4m3fn to the trn2 fp8 type. It only affects FP8 tensors, so it is safe to set for bf16 KV as well.
 export UNSAFE_FP8FNCAST=${UNSAFE_FP8FNCAST:-1}
+# Throughput serving on a small host (trn2.3xlarge, 8 replicas): turn off the runtime's low-latency completion
+# polling. Its per-worker polling thread uses ~0.64 vCPU each, and the 12-vCPU host was saturated. Measured +4.1 % RTFx,
+# TTFT p50 -65 %, WER unchanged. Single-stream latency effect not measured: unset it for latency serving.
+export NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=${NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION:-0}
 python - <<PY
 import nkilib, vllm_neuron
 assert nkilib.__file__.startswith("$NKI_DIR"), f"nkilib resolves to {nkilib.__file__}, not the champion"

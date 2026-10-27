@@ -43,6 +43,7 @@ These are for the full champion stack: this branch plus the champion nkilib. The
 | **champion**: TP1 × DP4, LNC=2, max_num_seqs 48, decode bucket [512] | **1,508–1,516** | **1,042–1,058** |
 | **champion**: TP1 × DP8, LNC=1, max_num_seqs 48, decode bucket [512] | **1,712–1,722** | **1,297** |
 | **champion + FP8 KV**: TP1 × DP8, LNC=1, max_num_seqs 48, decode bucket [512] | **1,825–1,845** (fused encoder attention; 1,784–1,792 before it) | — |
+| **champion + FP8 KV + `NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=0`**: same | **1,953–1,961** (same session without it: 1,815–1,883) | — |
 | **champion + FP8 KV**, later session (different instance): same | **1,864–1,917**; `--max-logprobs` 20 vs 0 makes no difference (same-session A/B); the fused lm_head adds ~0.4 % | — |
 
 | single stream (TP4, LNC=2, 30 s clip, 256 requests) | TTFT p50 | ITL p50 | E2E p50 |
@@ -60,6 +61,7 @@ These are for the full champion stack: this branch plus the champion nkilib. The
 ## Recommended settings
 ```bash
 export OMP_NUM_THREADS=1        # REQUIRED on trn2.3xlarge (12 vCPU): otherwise TTFT rises 5-10x
+export NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=0   # throughput serving: frees host CPU (+4.1 % RTFx, TTFT -65 %)
 # LNC=2 (default), 4 replicas:
 vllm serve Qwen/Qwen3-ASR-1.7B --tensor-parallel-size 1 --data-parallel-size 4 --max-num-seqs 48 \
   --max-model-len 1024 --max-num-batched-tokens 1024 --no-enable-prefix-caching --dtype bfloat16 \
