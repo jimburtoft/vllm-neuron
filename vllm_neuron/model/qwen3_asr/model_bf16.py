@@ -1116,7 +1116,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     supports_async_reorder_multimodal = True
     # The decode reorder may also read the previous prefill step's future (one row) through
     # async_reorder_future_ext, so the first decode after an admission needs no host read of the
-    # prefill token. Off unless VLLM_NEURON_ASYNC_PREFILL_REORDER=1.
+    # prefill token. Default on; VLLM_NEURON_ASYNC_PREFILL_REORDER=0 turns it off.
     supports_async_reorder_prefill = True
 
     def __init__(self, config: Qwen3ASRConfig):

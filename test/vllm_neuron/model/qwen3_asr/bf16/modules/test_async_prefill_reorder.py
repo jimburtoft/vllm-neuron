@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Async prefill reorder for Qwen3-ASR (``VLLM_NEURON_ASYNC_PREFILL_REORDER=1``).
+"""Async prefill reorder for Qwen3-ASR (default on; ``VLLM_NEURON_ASYNC_PREFILL_REORDER=0`` = off).
 
 The first decode step after a prefill used to read the prefill's sampled token back to the
 host, because the prefill future has one row and the decode bucket has many. With the opt-in
@@ -72,8 +72,8 @@ def test_model_declares_prefill_capability():
 
 @pytest.mark.parametrize(
     ("env", "flag", "expected"),
-    [("1", True, True), ("0", True, False), (None, True, False), ("1", False, False)],
-    ids=["on", "env-0", "env-unset-default-off", "model-no-flag"],
+    [("1", True, True), ("0", True, False), (None, True, True), (None, False, False)],
+    ids=["on", "env-0", "env-unset-default-on", "model-no-flag"],
 )
 def test_gate(monkeypatch, env, flag, expected):
     if env is None:
