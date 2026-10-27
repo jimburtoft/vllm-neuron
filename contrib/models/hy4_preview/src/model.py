@@ -1201,7 +1201,7 @@ class HYV4Attention(nn.Module):
             # Tokens per group bounded so the gathered rows (bf16, 576 wide)
             # stay a fraction of a partition's SBUF.
             kt = -(-rows.shape[1] // 128)
-            tg = max(1, min(8, 81920 // (kt * self.latent_dim * 2)))
+            tg = max(1, min(8, 49152 // (kt * self.latent_dim * 2)))
             m, den, num = self._sparse_attn_k[self.sparse_grid](
                 q_all=q_loc.contiguous(), kv_cache=keys.contiguous(),
                 rows=rows.contiguous(), bound=bound.contiguous(),
