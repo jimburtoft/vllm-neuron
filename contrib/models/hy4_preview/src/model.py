@@ -88,6 +88,15 @@ DEC_CP = os.environ.get("HY4_DEC_CP", "0") == "1"
 # attention are NKI kernels (``nki_sparse_decode.py``); on CPU the torch
 # references below implement the same contracts. Off by default.
 DEC_SPARSE_NKI = os.environ.get("HY4_DEC_SPARSE_NKI", "0") == "1"
+# ``HY4_PREFILL_SPARSE_NKI=1``: prefill attention split by QUERY instead of by
+# head (``HYV4Attention._prefill_sparse``): each rank attends its ``C / world``
+# queries for every head over only the rows DSA selected, with the decode
+# kernel ``sparse_decode_attn`` on Neuron (torch reference on CPU). Off by default.
+PREFILL_SPARSE_NKI = os.environ.get("HY4_PREFILL_SPARSE_NKI", "0") == "1"
+# Selected-row slots per query for the sparse prefill (rounded up to 128). It
+# must hold the top-k plus keys tied with the k-th score; a query with more
+# selected keys than slots drops the excess (inexact).
+PREFILL_KSEL = int(os.environ.get("HY4_PREFILL_KSEL", "2176") or 2176)
 # Cap on the compacted per-rank key list. 0 (default) = the whole shard, which
 # is always exact. A smaller cap (rounded up to 128) is exact only while no
 # rank holds more selected keys than the cap: the global top-k holds 2048
@@ -690,12 +699,13 @@ class HYV4Attention(nn.Module):
             )
         self.kv_pages: torch.Tensor | None = None
         # Read once here, not in the traced forward.
-        self.sparse_grid = _sparse_grid() if DEC_SPARSE_NKI else 1
+        use_kernels = DEC_SPARSE_NKI or PREFILL_SPARSE_NKI
+        self.sparse_grid = _sparse_grid() if use_kernels else 1
         # Built here, never inside the traced forward: a lazy build there puts a
         # guard on the module-level cache that flips after the first trace and
         # forces a recompile at serving time.
         self._sparse_attn_k, self._sparse_gather_k = (
-            _sparse_kernels_or_none() if DEC_SPARSE_NKI else (None, None)
+            _sparse_kernels_or_none() if use_kernels else (None, None)
         )
 
         set_weight_loader(self.q_a_proj_weight, _replicated_transposed())
@@ -950,7 +960,8 @@ class HYV4Attention(nn.Module):
         ik: torch.Tensor,
         visible: torch.Tensor,
         rank: torch.Tensor | None,
-    ) -> torch.Tensor:
+        sparse: bool = False,
+    ) -> torch.Tensor | tuple:
         """DSA selection ``[C, K]`` for a prefill chunk, split by query across ranks.
 
         Every rank needs the whole selection (its head attends to every query's
@@ -962,12 +973,14 @@ class HYV4Attention(nn.Module):
 
         ``rank`` is the runner's tensor, not ``rank_in_group``: a Python rank
         would bake into the trace and make 64 different graphs.
+
+        ``sparse`` (``HY4_PREFILL_SPARSE_NKI``; needs ``C % world == 0``): no
+        mask all-gather. Returns this rank's queries' selection as row indices
+        into ``keys`` instead, ``(rows, bound, sources)`` (see ``_prefill_rows``),
+        with the gathered ranks for the head pick.
         """
         chunk, world = iq.shape[0], self.world_size
-        if world == 1 or chunk % world:
-            rows = slice(None)
-            local_q, local_w, local_vis = iq, iw, visible
-        else:
+        if sparse or not (world == 1 or chunk % world):
             per_rank = chunk // world
             if rank is None:
                 rank = torch.tensor(self.tp_group.rank_in_group, device=iq.device)
@@ -977,6 +990,9 @@ class HYV4Attention(nn.Module):
             local_q = torch.index_select(iq, 0, rows)
             local_w = torch.index_select(iw, 0, rows)
             local_vis = torch.index_select(visible, 0, rows)
+        else:
+            rows = slice(None)
+            local_q, local_w, local_vis = iq, iw, visible
         # A flat matmul, not ``einsum("qhd,kd->qhk")``: with the key-blocked
         # attention in the same graph, neuronx-cc 2.27 failed ISA validation on
         # the einsum's lowering ("Copy; inst failed assertion check:
@@ -988,6 +1004,13 @@ class HYV4Attention(nn.Module):
         local = select_topk(scores, local_vis, self.index_topk)
         _capture(self.layer_idx, "index_scores_local", scores)
         _capture(self.layer_idx, "selected_local", local.to(torch.bfloat16))
+        if sparse:
+            if "collectives" in PERF_SKIP:
+                sources = torch.arange(world, dtype=torch.float32, device=iq.device)
+            else:
+                sources = self.tp_group.all_gather(rank.reshape(1).to(torch.float32), dim=0)
+            sel_rows, sel_bound = self._prefill_rows(local)
+            return sel_rows, sel_bound, sources
         if isinstance(rows, slice):
             return local
         # The all-gather's block order is the collective's, which on Trn2 is
@@ -1068,14 +1091,144 @@ class HYV4Attention(nn.Module):
         if self.indexer is not None:
             iq, iw = self.indexer.queries(q_resid, x, cos, sin)
             selected = self._select_prefill(
-                iq, iw, keys[:, self.index_slice], visible, rank
+                iq, iw, keys[:, self.index_slice], visible, rank,
+                sparse=self.prefill_sparse_supported(chunk, keys.shape[0]),
             )
 
+        if isinstance(selected, tuple):
+            o_lat = self._prefill_sparse(query, keys, selected, rank)
+            out = self._finish(o_lat, gate)
+            _capture(self.layer_idx, "attn_out", out)
+            return out, selected
         o_lat = self._attend_blocked(query.transpose(0, 1), keys, selected)
         out = self._finish(o_lat.transpose(0, 1), gate)
         _capture(self.layer_idx, "selected", selected.to(torch.bfloat16))
         _capture(self.layer_idx, "attn_out", out)
         return out, selected
+
+    # ── sparse prefill, split by query (HY4_PREFILL_SPARSE_NKI=1) ──────────
+    #
+    # No torch.cat / torch.stack / torch.gather / topk / sort in this path.
+
+    def prefill_sparse_supported(self, chunk: int, n_keys: int) -> bool:
+        """The query split needs ``C % world == 0``; the row lists, 128-key blocks."""
+        return (
+            PREFILL_SPARSE_NKI and chunk % self.world_size == 0 and n_keys % 128 == 0
+        )
+
+    def _prefill_ksel(self, n_keys: int) -> int:
+        return min(n_keys, -(-max(PREFILL_KSEL, 1) // 128) * 128)
+
+    def _prefill_rows(self, local: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Bool selection ``[Q, K]`` -> its first ``ksel`` selected key indices per
+        row, ascending, ``[Q, ksel]`` int32, and their bound (``+BIG`` / ``-BIG``).
+
+        Unfilled slots get ``K`` (out of range: the kernel's DMA skips it). The
+        ``j``-th selected key is the number of keys whose inclusive selected
+        count is ``<= j``. Counted per 128-key block: whole blocks before the one
+        holding it count 128 each, and inside that block (picked by a one-hot
+        matmul over the blocks' within-block prefix counts) the keys whose count
+        is ``<= j`` minus the block's offset. All counts are integers in fp32
+        (exact), all prefix sums are triangular matmuls.
+        """
+        q, n_keys = local.shape
+        dev = local.device
+        nb = n_keys // 128
+        ksel = self._prefill_ksel(n_keys)
+        sel = local.to(torch.float32).view(q, nb, 128)
+        tri = torch.ones(128, 128, device=dev).triu()  # [i, j] = i <= j
+        within = sel @ tri  # [Q, nb, 128] inclusive count inside the block
+        cnt = within[..., 127]  # [Q, nb]
+        strict = torch.ones(nb, nb, device=dev).triu(diagonal=1)  # [i, j] = i < j
+        excl = cnt @ strict  # [Q, nb] selected keys before the block
+        incl = excl + cnt
+        slots = torch.arange(ksel, dtype=torch.float32, device=dev).view(1, ksel, 1)
+        before = (incl.unsqueeze(1) <= slots).to(torch.float32)  # [Q, ksel, nb]
+        holds = (excl.unsqueeze(1) <= slots).to(torch.float32) - before  # boundary block
+        off = (holds * excl.unsqueeze(1)).sum(dim=-1)  # [Q, ksel]
+        w_b = holds @ within  # [Q, ksel, 128]
+        target = slots.view(1, ksel) - off
+        partial = (w_b <= target.unsqueeze(-1)).to(torch.float32).sum(dim=-1)
+        idx = before.sum(dim=-1) * 128.0 + partial  # [Q, ksel]
+        total = cnt.sum(dim=-1, keepdim=True)  # [Q, 1]
+        filled = slots.view(1, ksel) < total
+        pad = torch.full_like(idx, float(n_keys))
+        rows = torch.where(filled, idx, pad).to(torch.int32)
+        big = 1.0e30
+        bound = torch.where(
+            filled,
+            torch.full(filled.shape, big, dtype=torch.float32, device=dev),
+            torch.full(filled.shape, -big, dtype=torch.float32, device=dev),
+        )
+        return rows, bound
+
+    def _prefill_sparse(
+        self,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        selected: tuple,
+        rank: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Prefill attention split by query: ``o_lat [C, nh, 512]`` for this rank's heads.
+
+        1. all-gather the absorbed queries over heads, ``[C, world * nh, 576]``
+           (heads in all-gather block order), and the sinks the same way; keep
+           this rank's ``C / world`` query rows;
+        2. attend those queries for every head over their selected rows of
+           ``keys`` only (``sparse_decode_attn`` with ``keys`` as the cache:
+           each local query is one "request" with its own row list), and fold
+           the sink in once per head;
+        3. all-gather the normalised ``[C / world, heads, 512]`` (bf16, the
+           dtype ``_finish`` casts to), take this rank's heads (``_pick_from``)
+           and put the query blocks in tp-rank order (0/1 matmul, as in
+           ``_select_prefill``).
+        """
+        rows, bound, sources = selected
+        chunk = query.shape[0]
+        world, nh = self.world_size, self.num_heads
+        per_rank = chunk // world
+        dev = query.device
+        if rank is None:
+            rank = torch.tensor(self.tp_group.rank_in_group, device=dev)
+        r = rank.reshape(1).to(torch.long)
+        q_all = _all_gather(self.tp_group, query, 1, world)  # [C, heads, 576]
+        mine = r * per_rank + torch.arange(per_rank, device=dev)
+        q_loc = torch.index_select(q_all, 0, mine).float()  # [Q, heads, 576]
+        sinks = _all_gather(self.tp_group, self.sinks.float(), 0, world)  # [heads]
+
+        col_off = self.latent_slice.start
+        if self._sparse_attn_k is not None and _use_sparse_kernels(q_loc):
+            # Tokens per group bounded so the gathered rows (bf16, 576 wide)
+            # stay a fraction of a partition's SBUF.
+            kt = -(-rows.shape[1] // 128)
+            tg = max(1, min(8, 81920 // (kt * self.latent_dim * 2)))
+            m, den, num = self._sparse_attn_k[self.sparse_grid](
+                q_all=q_loc.contiguous(), kv_cache=keys.contiguous(),
+                rows=rows.contiguous(), bound=bound.contiguous(),
+                scale=float(self.scaling), col_off=col_off, lat_off=0,
+                lat_dim=self.kv_lora_rank, rope_off=self.kv_lora_rank,
+                rope_dim=self.rope_dim, tg=tg,
+            )
+        else:
+            m, den, num = sparse_decode_ref(
+                q_loc, keys, rows, bound, self.scaling, col_off, self.kv_lora_rank,
+                self.dtype,
+            )
+        sink = sinks.view(1, -1)
+        m_f = torch.maximum(m, sink)
+        scale = torch.exp(m - m_f)
+        o_loc = num * scale.unsqueeze(-1) / (
+            den * scale + torch.exp(sink - m_f)
+        ).unsqueeze(-1)  # [Q, heads, 512]
+
+        rank_v = self.kv_lora_rank
+        o_all = _all_gather(self.tp_group, o_loc.to(self.dtype), 0, world)  # [C, heads, 512]
+        pick = self._pick_from(sources, r, dev).to(self.dtype)  # [nh, heads]
+        o_mine = torch.einsum("jh,qhc->qjc", pick, o_all)  # [C, nh, 512], blocks in gather order
+        targets = torch.arange(world, dtype=torch.float32, device=dev)
+        perm = (targets.view(world, 1) == sources.view(1, world)).to(self.dtype)
+        ordered = perm @ o_mine.reshape(world, per_rank * nh * rank_v)
+        return ordered.reshape(chunk, nh, rank_v)
 
     def forward_decode(
         self,
@@ -1220,11 +1373,16 @@ class HYV4Attention(nn.Module):
         """``[nh, world * nh]`` 0/1 matrix taking this rank's heads out of a
         head axis in all-gather block order (not tp-rank order on Trn2; the
         ranks are gathered too, as in ``_select_prefill``)."""
-        world, nh = self.world_size, self.num_heads
+        world = self.world_size
         if "collectives" in PERF_SKIP:
             sources = torch.arange(world, dtype=torch.float32, device=dev)
         else:
             sources = self.tp_group.all_gather(r.reshape(1).to(torch.float32), dim=0)
+        return self._pick_from(sources, r, dev)
+
+    def _pick_from(self, sources: torch.Tensor, r: torch.Tensor, dev) -> torch.Tensor:
+        """``_cp_pick`` from already gathered ranks ``sources [world]`` (fp32)."""
+        world, nh = self.world_size, self.num_heads
         at_me = (sources.view(world) == r.reshape(1).to(torch.float32)).to(torch.float32)
         eye = torch.eye(nh, dtype=torch.float32, device=dev)
         return (eye.view(nh, 1, nh) * at_me.view(1, world, 1)).reshape(nh, world * nh)
