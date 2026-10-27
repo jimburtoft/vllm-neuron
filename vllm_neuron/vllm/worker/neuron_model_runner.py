@@ -350,6 +350,27 @@ def _supports_async_reorder(model: Any) -> bool:
     return getattr(model, "supports_async_reorder", False) is True
 
 
+def _supports_async_reorder_multimodal(model: Any) -> bool:
+    """Return True when a multimodal model may use the in-graph reorder.
+
+    The runner keeps every multimodal model on the host swap path unless the model also sets
+    ``supports_async_reorder_multimodal``. Only a model whose decode graph has no multimodal
+    inputs and plain 1-D positions (no M-RoPE / XD-RoPE) may set it: the reorder then changes
+    only the decode input_ids, and the encoder path runs on prefill steps, which never take the
+    reorder. The opt-in is off unless ``VLLM_NEURON_MM_ASYNC_REORDER`` is ``1``.
+
+    Args:
+        model: The loaded model, wrapped or unwrapped.
+
+    Returns:
+        True when the model opts in and the environment switch allows it.
+    """
+    if os.environ.get("VLLM_NEURON_MM_ASYNC_REORDER", "0").strip() != "1":
+        return False
+    model = getattr(model, "_orig_mod", model)
+    return getattr(model, "supports_async_reorder_multimodal", False) is True
+
+
 def _supports_aux_hidden_states(model: Any) -> bool:
     # vLLM 0.21.0 only exposes SupportsEagle3, but the capability DFlash needs
     # is generic auxiliary hidden-state capture.
@@ -784,6 +805,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     # first use, since a mutable class attribute would be shared between runners.
     _async_reorder_kwargs: dict | None = None
     _model_supports_async_reorder: bool | None = None
+    _mm_async_reorder_allowed: bool = False
     _block_table_groups: "dict[int, _BlockTableGroupState] | None" = None
     _constant_tensors: "dict[tuple, torch.Tensor] | None" = None
     _swa_groups: "dict[int, _SwaGroupState] | None" = None
@@ -7920,7 +7942,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         Four cases keep the earlier swap path: a model that does not consume the arguments, whose
         forward would raise or embed stale tokens; speculative decode, which has its own
         draft-NEFF handoff; multimodal, whose encoder path needs the materialized future; and
-        synchronous scheduling, where no cross-step future exists.
+        synchronous scheduling, where no cross-step future exists. A multimodal model leaves the
+        exclusion only when it sets ``supports_async_reorder_multimodal`` and
+        ``VLLM_NEURON_MM_ASYNC_REORDER=1`` (see ``_supports_async_reorder_multimodal``).
 
         Example:
             >>> runner._use_async_reorder()  # doctest: +SKIP
@@ -7932,16 +7956,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # A runner without a loaded model cannot consume the reorder, so fail closed.
             model = getattr(self, "model", None)
             self._model_supports_async_reorder = _supports_async_reorder(model)
+            self._mm_async_reorder_allowed = _supports_async_reorder_multimodal(model)
             logger.info(
-                "In-graph async reorder: the model %s the reorder arguments (%s).",
+                "In-graph async reorder: the model %s the reorder arguments (%s); "
+                "multimodal opt-in %s.",
                 "consumes" if self._model_supports_async_reorder else "ignores",
                 type(getattr(model, "_orig_mod", model)).__module__,
+                "on" if self._mm_async_reorder_allowed else "off",
             )
         return (
             self._model_supports_async_reorder is True
             and self.use_async_scheduling
             and not self.is_spec_decode
-            and not self.supports_mm_inputs
+            and (
+                not self.supports_mm_inputs
+                or getattr(self, "_mm_async_reorder_allowed", False) is True
+            )
         )
 
     @staticmethod

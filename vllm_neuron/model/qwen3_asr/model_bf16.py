@@ -1107,6 +1107,13 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     # class owns the prompt methods, so this class only advertises the task.
     supports_transcription: bool = True
     supports_transcription_only: bool = False
+    # The forward assembles the decode input_ids on the device, so the runner may send the
+    # in-graph reorder arguments. The second flag lifts the runner's multimodal exclusion: the
+    # audio enters only through the prefill graph (encoder cache gather by request), the decode
+    # graph has no encoder inputs and the positions are plain 1-D, so the decode reorder does not
+    # touch multimodal bookkeeping. Runtime switch: VLLM_NEURON_MM_ASYNC_REORDER.
+    supports_async_reorder = True
+    supports_async_reorder_multimodal = True
 
     def __init__(self, config: Qwen3ASRConfig):
         super().__init__()
@@ -1321,6 +1328,30 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             "decode_token_threshold"
         ]
         is_prefill = max_query_len > decode_token_threshold
+
+        # Assemble the decode input_ids on the device.
+        #
+        # The runner gives the device future of the previous step, plus a permutation and a
+        # mask that it builds on the host from the request ids. A request that continues takes
+        # the reordered future. A new request, a resumed request, a row that still prefills,
+        # and a padded slot take the host input_ids. The host therefore does not read the
+        # sampled tokens of the previous step back.
+        #
+        # The arguments are absent on a step that does not use the reorder, and this block is
+        # then a no-op. Remove all three arguments in every case, so a later consumer of
+        # ``**kwargs`` never sees a partial set.
+        #
+        # Keep this block identical in every model that declares supports_async_reorder.
+        # test_async_reorder.py compares them and fails on a divergence.
+        async_reorder_perm = kwargs.pop("async_reorder_perm", None)
+        async_reorder_future = kwargs.pop("async_reorder_future", None)
+        async_reorder_mask = kwargs.pop("async_reorder_mask", None)
+        if async_reorder_perm is not None:
+            input_ids = torch.where(
+                async_reorder_mask,
+                input_ids,
+                torch.index_select(async_reorder_future, 0, async_reorder_perm),
+            )
 
         T = input_ids.shape[0]
 
