@@ -35,7 +35,8 @@ export UNSAFE_FP8FNCAST=${UNSAFE_FP8FNCAST:-1}
 # 12-vCPU trn2.3xlarge host was saturated at 8 replicas. Measured +4.1 % RTFx, TTFT p50 -65 %, WER unchanged; also
 # better single stream (TP4 C=1: E2E p50 322 -> 315 ms, ITL p99 5.4 -> 3.65 ms), so keep it for latency serving too.
 # The in-graph async decode reorder (+7.4 % RTFx, identical transcripts) is on by default in this branch;
-# VLLM_NEURON_MM_ASYNC_REORDER=0 turns it off.
+# VLLM_NEURON_MM_ASYNC_REORDER=0 turns it off. The async prefill->decode reorder (+1.6 % RTFx, device ~99.8 % busy,
+# identical transcripts at C=1) is also on by default; VLLM_NEURON_ASYNC_PREFILL_REORDER=0 turns it off.
 export NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=${NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION:-0}
 python - <<PY
 import nkilib, vllm_neuron
