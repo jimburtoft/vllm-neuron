@@ -1114,6 +1114,10 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     # touch multimodal bookkeeping. VLLM_NEURON_MM_ASYNC_REORDER=0 turns it off (default on).
     supports_async_reorder = True
     supports_async_reorder_multimodal = True
+    # The decode reorder may also read the previous prefill step's future (one row) through
+    # async_reorder_future_ext, so the first decode after an admission needs no host read of the
+    # prefill token. Off unless VLLM_NEURON_ASYNC_PREFILL_REORDER=1.
+    supports_async_reorder_prefill = True
 
     def __init__(self, config: Qwen3ASRConfig):
         super().__init__()
@@ -1328,6 +1332,14 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             "decode_token_threshold"
         ]
         is_prefill = max_query_len > decode_token_threshold
+
+        # Prefill-future slot: the runner appends the previous prefill step's sampled ids after
+        # the decode future, and the permutation indexes past the decode rows to read them.
+        async_reorder_future_ext = kwargs.pop("async_reorder_future_ext", None)
+        if async_reorder_future_ext is not None and "async_reorder_future" in kwargs:
+            kwargs["async_reorder_future"] = torch.cat(
+                [kwargs["async_reorder_future"], async_reorder_future_ext]
+            )
 
         # Assemble the decode input_ids on the device.
         #

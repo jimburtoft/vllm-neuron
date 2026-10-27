@@ -372,6 +372,51 @@ def _supports_async_reorder_multimodal(model: Any) -> bool:
     return getattr(model, "supports_async_reorder_multimodal", False) is True
 
 
+# Rows of the prefill-step future that the decode reorder can read. The Neuron scheduler runs one
+# prefill per step (``max_prefills_per_batch = 1``), so the prefill future has one row.
+_ASYNC_PREFILL_REORDER_SLOTS = 1
+
+
+def _supports_async_prefill_reorder(model: Any) -> bool:
+    """Return True when the decode reorder may also read the previous prefill step's future.
+
+    Without it, the first decode step after a prefill reads the prefill's sampled token back to
+    the host, because the prefill future has the prefill row count, not the decode bucket. A model
+    that sets ``supports_async_reorder_prefill`` takes one more decode input,
+    ``async_reorder_future_ext`` (``_ASYNC_PREFILL_REORDER_SLOTS`` rows), and appends it to
+    ``async_reorder_future`` before the reorder block, so the permutation can index the prefill
+    row. ``VLLM_NEURON_ASYNC_PREFILL_REORDER=1`` turns it on (default off). It adds a decode-graph
+    input, so the decode graphs recompile.
+
+    Args:
+        model: The loaded model, wrapped or unwrapped.
+
+    Returns:
+        True when the model opts in and the environment switch allows it.
+    """
+    if os.environ.get("VLLM_NEURON_ASYNC_PREFILL_REORDER", "0").strip() != "1":
+        return False
+    model = getattr(model, "_orig_mod", model)
+    return getattr(model, "supports_async_reorder_prefill", False) is True
+
+
+def _async_prefill_ext_noop(
+    runner: Any, dtype: torch.dtype, device: torch.device
+) -> dict:
+    """Return the no-op prefill-future input of the decode graph, or {} when the opt-in is off.
+
+    Every decode-shape dispatch (warmup, idle rank, dummy batch, real step) must pass the same
+    inputs, so a step that does not read a prefill future still sends a zero slot.
+    """
+    if getattr(runner, "_prefill_async_reorder_allowed", False) is not True:
+        return {}
+    return {
+        "async_reorder_future_ext": torch.zeros(
+            _ASYNC_PREFILL_REORDER_SLOTS, dtype=dtype, device=device
+        )
+    }
+
+
 def _supports_aux_hidden_states(model: Any) -> bool:
     # vLLM 0.21.0 only exposes SupportsEagle3, but the capability DFlash needs
     # is generic auxiliary hidden-state capture.
@@ -807,6 +852,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     _async_reorder_kwargs: dict | None = None
     _model_supports_async_reorder: bool | None = None
     _mm_async_reorder_allowed: bool = False
+    _prefill_async_reorder_allowed: bool = False
+    _async_prefill_reorder_steps: int = 0
     _block_table_groups: "dict[int, _BlockTableGroupState] | None" = None
     _constant_tensors: "dict[tuple, torch.Tensor] | None" = None
     _swa_groups: "dict[int, _SwaGroupState] | None" = None
@@ -6403,6 +6450,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     input_ids.shape[0], input_ids.dtype, device
                 )
             )
+            decode_warmup_kwargs.update(
+                _async_prefill_ext_noop(self, input_ids.dtype, device)
+            )
 
         return decode_warmup_kwargs
 
@@ -6468,6 +6518,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     input_ids.shape[0], input_ids.dtype, device
                 )
             )
+            jf_kwargs.update(_async_prefill_ext_noop(self, input_ids.dtype, device))
         if self.enable_prompt_embeds and not self.supports_mm_inputs:
             jf_kwargs["inputs_embeds"] = torch.zeros(
                 jf_num_tokens,
@@ -6816,6 +6867,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         input_ids.shape[0], input_ids.dtype, device
                     )
                 )
+                jf_kwargs.update(_async_prefill_ext_noop(self, input_ids.dtype, device))
 
             compile_start = time.perf_counter()
             if self._tensor_replacer is not None:
@@ -7958,12 +8010,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             model = getattr(self, "model", None)
             self._model_supports_async_reorder = _supports_async_reorder(model)
             self._mm_async_reorder_allowed = _supports_async_reorder_multimodal(model)
+            self._prefill_async_reorder_allowed = _supports_async_prefill_reorder(model)
             logger.info(
                 "In-graph async reorder: the model %s the reorder arguments (%s); "
-                "multimodal opt-in %s.",
+                "multimodal opt-in %s; prefill future %s.",
                 "consumes" if self._model_supports_async_reorder else "ignores",
                 type(getattr(model, "_orig_mod", model)).__module__,
                 "on" if self._mm_async_reorder_allowed else "off",
+                "on" if self._prefill_async_reorder_allowed else "off",
             )
         return (
             self._model_supports_async_reorder is True
@@ -8037,6 +8091,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         num_slots = cpu_input_ids.shape[0]
         future = self.async_execution_buffer.get("futures_sampled_token_ids")
         previous_req_ids = self.async_execution_buffer.get("prev_req_ids_ordered")
+        ext_noop = _async_prefill_ext_noop(self, cpu_input_ids.dtype, self.device)
         usable = (
             isinstance(future, torch.Tensor)
             and future.ndim == 1
@@ -8046,15 +8101,38 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if usable:
             future = _reinterpret_uint32_as_int32(future, cpu_input_ids.dtype)
             usable = future.dtype == cpu_input_ids.dtype
+        # The previous step was a prefill: its future has the prefill row count, not this decode
+        # bucket. With the prefill opt-in the graph appends it after a zero main future, so the
+        # permutation reads prefill row i at num_slots + i and the host does not read it back.
+        prefill_ext = None
+        if (
+            not usable
+            and ext_noop
+            and isinstance(future, torch.Tensor)
+            and future.ndim == 1
+            and future.shape[0] == _ASYNC_PREFILL_REORDER_SLOTS
+            and previous_req_ids is not None
+            and len(previous_req_ids) <= _ASYNC_PREFILL_REORDER_SLOTS
+        ):
+            prefill_ext = _reinterpret_uint32_as_int32(future, cpu_input_ids.dtype)
+            if prefill_ext.dtype == cpu_input_ids.dtype:
+                usable = True
+            else:
+                prefill_ext = None
         if not usable:
-            return (
-                self._noop_async_reorder_kwargs(
-                    num_slots, cpu_input_ids.dtype, self.device
-                ),
-                False,
+            noop = self._noop_async_reorder_kwargs(
+                num_slots, cpu_input_ids.dtype, self.device
             )
+            noop.update(ext_noop)
+            return noop, False
 
-        previous_index = {req_id: i for i, req_id in enumerate(previous_req_ids)}
+        source_offset = 0
+        if prefill_ext is not None:
+            source_offset = num_slots
+            future = torch.zeros(num_slots, dtype=cpu_input_ids.dtype, device=self.device)
+        previous_index = {
+            req_id: source_offset + i for i, req_id in enumerate(previous_req_ids)
+        }
         num_reqs = self.input_batch.num_reqs
         req_ids = self.input_batch.req_ids
         # The mask defaults to True, meaning read the host input_ids, which is right for a
@@ -8071,16 +8149,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if source is not None and self._is_decode_row(slot):
                 permutation[slot] = source
                 mask[slot] = False
+        if prefill_ext is not None:
+            self._async_prefill_reorder_steps += 1
+            if self._async_prefill_reorder_steps in (1, 1000):
+                logger.info(
+                    "Async prefill reorder: %d decode step(s) read the prefill future on "
+                    "the device.",
+                    self._async_prefill_reorder_steps,
+                )
         # Build a new tensor on each step. The device copy can be asynchronous, so a
         # reused host buffer could change while an earlier copy still reads it.
-        return (
-            {
-                "async_reorder_future": future,
-                "async_reorder_perm": torch.from_numpy(permutation).to(self.device),
-                "async_reorder_mask": torch.from_numpy(mask).to(self.device),
-            },
-            True,
-        )
+        kwargs = {
+            "async_reorder_future": future,
+            "async_reorder_perm": torch.from_numpy(permutation).to(self.device),
+            "async_reorder_mask": torch.from_numpy(mask).to(self.device),
+        }
+        if ext_noop:
+            kwargs["async_reorder_future_ext"] = (
+                prefill_ext
+                if prefill_ext is not None
+                else ext_noop["async_reorder_future_ext"]
+            )
+        return kwargs, True
 
     def _maybe_swap_async_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Replace CPU-built ``input_ids`` with a device tensor built from
