@@ -103,6 +103,14 @@ With it, FP8 runs prefill from the FP8 weights without a BF16 expert copy (the d
 concurrent requests is 10-18 % higher. `"bf16_copy"` is 1-3 % faster at 4-32 concurrent requests.
 The model detects the installed kernels, and works unchanged with the bundled NKI Library.
 
+**FP8 needs the NKI Library branch at 33 or more concurrent requests.** The bundled NKI
+Library applies the per-channel FP8 down-projection scales to the wrong columns in the
+decode MoE kernel when the batch rounds up to the 64-request decode graph, and the output
+is incoherent (GSM8K 0.005 vs 0.880 at 64 concurrent requests). The branch has the fix
+from `fc5fec9` (2026-10-26) on; if you installed it earlier, reinstall it and run
+`rm -rf ~/.cache/neuron_libtorch`. With the bundled NKI Library, use FP8 only with
+`max_num_seqs=32` or lower. BF16 is not affected.
+
 Recommended starting point on trn2.3xlarge:
 
 ```python
