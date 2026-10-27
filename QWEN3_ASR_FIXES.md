@@ -27,9 +27,10 @@ Run inside an SDK 2.33 vLLM environment, either the DLAMI venv `/opt/aws_neuronx
 | Fused lm_head + greedy argmax (opt-in) | `VLLM_NEURON_QWEN3_ASR_LMHEAD=fused`: one NKI kernel streams the lm_head weight and keeps a running argmax, so it never writes logits. TP1 all-greedy only, and needs `--max-logprobs 0` | +0.4 % RTFx (within noise; WER 5.98 %). Off by default |
 | FP8 KV cache (opt-in) | Packed FP8 KV for the text decoder: `--kv-cache-dtype fp8_e4m3` + `"fp8_packed_kv": true`. The prefill write quantizes, and K is stored in token pairs; decode passes the scales and packed layout to the kernel. Scale 1.0, since the checkpoint has none (`UNSAFE_FP8FNCAST=1` needed on trn2). | **1,784–1,792 RTFx** at TP1 × DP8 LNC1 with the champion nkilib (vs 1,717–1,721 bf16 KV), WER 6.07 %. KV capacity doubles |
 | In-graph async decode reorder for Qwen3-ASR | The runner kept every multimodal model on the host swap path, so each admission/finish did a blocking device-to-host read of the previous step's sampled ids. Qwen3-ASR's decode graph has no encoder inputs and plain 1-D positions, so it now opts in (`supports_async_reorder` + `supports_async_reorder_multimodal`) and assembles the decode input_ids on device. Default on; `VLLM_NEURON_MM_ASYNC_REORDER=0` restores the host path | **+7.4 % RTFx** (2,106 vs 1,962, same session), TPOT p50 58.5 → 54.0 ms. WER 5.98 % both, 341/341 transcripts identical. Single stream neutral |
+| Async prefill→decode reorder for Qwen3-ASR | The first decode after an admission still read the prefill's sampled id back to the host: the prefill future has 1 row and the decode bucket has many, so the reorder declined, and the step did a blocking read plus a second input prep. The decode graph now takes one more input, `async_reorder_future_ext` (1 slot), which the forward appends after the decode future. The permutation points the admitted request at it, so no host read is needed. Default on; `VLLM_NEURON_ASYNC_PREFILL_REORDER=0` restores the host path | **+1.6 % RTFx** (2,152 vs 2,119, 6 interleaved reps); device busy 97.8 → **99.8 %**, PRE→DEC gap 5.4 → 0.075 ms; TPOT p50 −2 %, E2E p50 −1.6 %. WER 5.98 % both; 341/341 transcripts identical at concurrency 1 |
 | API-server listeners | Each internal-DP API worker binds its own SO_REUSEPORT listener (`VLLM_NEURON_API_SERVER_REUSEPORT`, default on) | Removes the random up-to-30 % throughput drops where one API process took most connections |
 
-Files: `vllm_neuron/functional/{argmax,merge_multimodal_embeddings}.py`, `vllm_neuron/vllm/worker/neuron_model_runner.py` (`_use_async_reorder`), `vllm_neuron/model/qwen3_asr/model_bf16.py`, `vllm_neuron/functional/attention/{attention_cte,qkv,o_proj}.py`, `vllm_neuron/model/qwen3_asr/audio_encoder_bf16.py`, `vllm_neuron/envs.py`, `vllm_neuron/vllm/patches/dp_load_balancer_patch.py`.
+Files: `vllm_neuron/functional/{argmax,merge_multimodal_embeddings}.py`, `vllm_neuron/vllm/worker/neuron_model_runner.py` (`_use_async_reorder`, `_build_async_reorder_kwargs`), `vllm_neuron/model/qwen3_asr/model_bf16.py`, `vllm_neuron/functional/attention/{attention_cte,qkv,o_proj}.py`, `vllm_neuron/model/qwen3_asr/audio_encoder_bf16.py`, `vllm_neuron/envs.py`, `vllm_neuron/vllm/patches/dp_load_balancer_patch.py`.
 
 ## Results
 
@@ -46,6 +47,7 @@ These are for the full champion stack: this branch plus the champion nkilib. The
 | **champion + FP8 KV**: TP1 × DP8, LNC=1, max_num_seqs 48, decode bucket [512] | **1,825–1,845** (fused encoder attention; 1,784–1,792 before it) | — |
 | **champion + FP8 KV + `NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=0`**: same | **1,953–1,961** (same session without it: 1,815–1,883) | — |
 | **champion + FP8 KV + low-latency completion off + async decode reorder** (default since Task 033): same | **2,080–2,139** (same session without the reorder: 1,949–1,976) | — |
+| **champion + FP8 KV + low-latency completion off + async decode reorder + async prefill reorder** (default since Task 034): same | **2,115–2,178** (same session without the prefill reorder: 2,064–2,145) | — |
 | **champion + FP8 KV**, later session (different instance): same | **1,864–1,917**; `--max-logprobs` 20 vs 0 makes no difference (same-session A/B); the fused lm_head adds ~0.4 % | — |
 
 | single stream (TP4, LNC=2, 30 s clip, 256 requests) | TTFT p50 | ITL p50 | E2E p50 |
@@ -54,6 +56,7 @@ These are for the full champion stack: this branch plus the champion nkilib. The
 | **champion** | **44.9–47.5 ms** | **3.13–3.14 ms** | **319–324 ms** (−11 %) |
 | **champion + low-latency completion off** (same session as the default row below: 320–324 ms) | 44.3–44.7 ms | 3.11 ms (p99 3.65 vs 5.4) | **315–316 ms** (−2.1 %) |
 | **champion + low-latency completion off + async decode reorder** | 44.3–47.6 ms | 3.12 ms | 316–323 ms (neutral vs above) |
+| **champion + low-latency completion off + async decode + prefill reorder** (same session as the default row: 317.7–318.8 ms) | 44.8–45.5 ms | 3.12 ms | 316–318 ms (neutral) |
 
 - **Earnings22 WER** (upstream `run_accuracy_asr`, 341 chunks): champion TP1 × DP4 **6.01 %** with the decode bucket [512] (5.99 % without). With FP8 KV: 6.01 % (TP1 × DP4), 6.07 % (TP1 × DP8 MNS48), 6.06 % (MNS96); with FP8 KV + fused encoder attention 5.97 % (TP1 × DP8 MNS48); with `--max-logprobs 0` and the fused lm_head 5.98 %. Reference gate: 6.24 %.
 - **API-server balance:** the largest per-worker request share was 0.26–0.29 with 4 servers and 0.15 with 8, so the load is even (fair share is 0.25 and 0.125).
@@ -67,6 +70,7 @@ These are for the full champion stack: this branch plus the champion nkilib. The
 export OMP_NUM_THREADS=1        # REQUIRED on trn2.3xlarge (12 vCPU): otherwise TTFT rises 5-10x
 export NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=0   # frees host CPU: +4.1 % RTFx, TTFT -65 %; single stream E2E -2 %
 # The in-graph async decode reorder is on by default (VLLM_NEURON_MM_ASYNC_REORDER=0 turns it off): +7.4 % RTFx.
+# So is the async prefill->decode reorder (VLLM_NEURON_ASYNC_PREFILL_REORDER=0 turns it off): +1.6 %, device ~99.8 % busy.
 # --api-server-count 4 (vs the default 8 at DP8): no effect (-0.4 %, same session), keep the default.
 # LNC=2 (default), 4 replicas:
 vllm serve Qwen/Qwen3-ASR-1.7B --tensor-parallel-size 1 --data-parallel-size 4 --max-num-seqs 48 \
