@@ -357,7 +357,8 @@ def _supports_async_reorder_multimodal(model: Any) -> bool:
     ``supports_async_reorder_multimodal``. Only a model whose decode graph has no multimodal
     inputs and plain 1-D positions (no M-RoPE / XD-RoPE) may set it: the reorder then changes
     only the decode input_ids, and the encoder path runs on prefill steps, which never take the
-    reorder. The opt-in is off unless ``VLLM_NEURON_MM_ASYNC_REORDER`` is ``1``.
+    reorder. ``VLLM_NEURON_MM_ASYNC_REORDER=0`` turns the opt-in off (default on). Only
+    Qwen3-ASR sets the flag today; it measured +7.4 % RTFx with identical transcripts.
 
     Args:
         model: The loaded model, wrapped or unwrapped.
@@ -365,7 +366,7 @@ def _supports_async_reorder_multimodal(model: Any) -> bool:
     Returns:
         True when the model opts in and the environment switch allows it.
     """
-    if os.environ.get("VLLM_NEURON_MM_ASYNC_REORDER", "0").strip() != "1":
+    if os.environ.get("VLLM_NEURON_MM_ASYNC_REORDER", "1").strip() == "0":
         return False
     model = getattr(model, "_orig_mod", model)
     return getattr(model, "supports_async_reorder_multimodal", False) is True
@@ -7944,7 +7945,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         draft-NEFF handoff; multimodal, whose encoder path needs the materialized future; and
         synchronous scheduling, where no cross-step future exists. A multimodal model leaves the
         exclusion only when it sets ``supports_async_reorder_multimodal`` and
-        ``VLLM_NEURON_MM_ASYNC_REORDER=1`` (see ``_supports_async_reorder_multimodal``).
+        ``VLLM_NEURON_MM_ASYNC_REORDER`` is not ``0`` (see ``_supports_async_reorder_multimodal``).
 
         Example:
             >>> runner._use_async_reorder()  # doctest: +SKIP

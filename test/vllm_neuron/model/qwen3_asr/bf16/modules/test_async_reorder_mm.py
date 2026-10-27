@@ -2,7 +2,7 @@
 """In-graph async decode reorder for Qwen3-ASR (multimodal opt-in).
 
 The runner keeps multimodal models on the host swap path. Qwen3-ASR opts out of that exclusion
-with ``supports_async_reorder_multimodal`` when ``VLLM_NEURON_MM_ASYNC_REORDER=1``. These tests
+with ``supports_async_reorder_multimodal`` (default on; ``VLLM_NEURON_MM_ASYNC_REORDER=0`` turns it off). These tests
 check the gate, that the Qwen3-ASR forward holds the same reorder block as the GPT-OSS models,
 and that the block assembles the right decode input_ids.
 """
@@ -84,7 +84,7 @@ def test_only_qwen3_asr_opts_into_multimodal():
     [
         ("1", True, True, True),
         ("0", True, True, False),
-        (None, True, True, False),
+        (None, True, True, True),
         ("1", False, True, False),
         ("1", True, False, True),
         ("0", True, False, True),
