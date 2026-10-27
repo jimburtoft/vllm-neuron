@@ -357,16 +357,18 @@ run on device).** Instead of each rank attending its own head over every query
 and every key under the DSA mask, each rank attends its `C / world` queries for
 all heads over only their selected keys. The rank's local selection becomes
 per-query row lists into the chunk's keys (`HY4_PREFILL_KSEL` slots, default
-2176, rounded up to 128; built with triangular-matmul prefix counts, no sort,
-top-k or gather; a query with more selected keys than slots drops the excess),
+2176, rounded up to 128; on Neuron by the NKI kernel `select_to_rows`, GpSimd
+nonzero compaction, and on CPU by a torch reference; a query with more selected
+keys than slots keeps its first ones),
 so the mask all-gather is gone. The absorbed queries are all-gathered over
 heads, `sparse_decode_attn` runs with the keys as its cache (each local query
 is one "request"), the sink is folded in, and the bf16 result is all-gathered
 so each rank takes its own heads back for `w_uv` / gate / `o_proj`. Shared
 layers reuse the row lists. Needs `C % world == 0` and the key count a multiple
 of 128, else the dense path runs. CPU check against the dense path:
-`test_prefill_sparse.py`; simulator check at prefill shapes:
-`test/sim/sim_sparse_prefill.py`.
+`test_prefill_sparse.py`; simulator checks at prefill shapes:
+`test/sim/sim_sparse_prefill.py` (attention) and `test/sim/sim_select_rows.py`
+(row lists vs the torch reference, including tie-heavy selections).
 
 **Prefill prefix bound.** With more than one `kv_segment_size_buckets` entry,
 the plugin picks the smallest segment that holds the whole prefix, so a prefill

@@ -136,3 +136,42 @@ def test_prefill_rows_exact():
         assert torch.equal(rows[i, :n], want), i
         assert (rows[i, n:] == n_keys).all()
         assert (bound[i, :n] > 0).all() and (bound[i, n:] < 0).all()
+
+
+class _FakeSelectRows:
+    """``select_to_rows``'s contract in torch: ``[Q, ksel + chunk]`` rows, pad ``K``."""
+
+    def __getitem__(self, grid):
+        def run(sel, ksel, chunk=2048):
+            q, k = sel.shape
+            out = torch.full((q, ksel + min(chunk, k)), k, dtype=torch.int32)
+            for i in range(q):
+                nz = torch.nonzero(sel[i]).flatten()[:ksel]
+                out[i, : nz.numel()] = nz.to(torch.int32)
+            return out
+
+        return run
+
+
+@torch.no_grad()
+def test_prefill_rows_kernel_dispatch_same_set(monkeypatch):
+    """The device branch of ``_prefill_rows`` (kernel output sliced, bound from
+    ``rows < K``) selects the same set per query as the torch reference."""
+    set_group(Group())
+    a = model.HYV4Attention(make_config(torch.float32), 0)
+    a._select_rows_k = _FakeSelectRows()
+    g = torch.Generator().manual_seed(3)
+    q, n_keys = 8, 2048
+    s = torch.round(torch.randn(q, n_keys, generator=g) * 2) / 2  # ties
+    vis = torch.rand(q, n_keys, generator=g) < 0.8
+    vis[0] = False
+    vis[0, 5] = True
+    sel = model.select_topk(s, vis, 300)
+    monkeypatch.setattr(model, "PREFILL_KSEL", 384)
+    ref_rows, ref_bound = a._prefill_rows_ref(sel)
+    monkeypatch.setattr(model, "_use_sparse_kernels", lambda t: True)
+    rows, bound = a._prefill_rows(sel)
+    assert rows.shape == ref_rows.shape and rows.dtype == torch.int32
+    for i in range(q):
+        assert set(rows[i][bound[i] > 0].tolist()) == set(ref_rows[i][ref_bound[i] > 0].tolist())
+    assert torch.equal(bound > 0, ref_bound > 0)

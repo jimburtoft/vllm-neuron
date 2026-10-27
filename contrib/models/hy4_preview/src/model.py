@@ -396,25 +396,27 @@ _SPARSE_KERNELS: list = []
 
 
 def _sparse_kernels():
-    """``(attn, gather_cols)`` NKI kernels through the plugin's ``wrap_nki`` (lazy)."""
+    """``(attn, gather_cols, select_to_rows)`` NKI kernels through the plugin's ``wrap_nki`` (lazy)."""
     if not _SPARSE_KERNELS:
         try:
             from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
         except ImportError:  # source-tree layout
             from vllm_neuron.nki.nki_hop import wrap_nki
-        from .nki_sparse_decode import gather_rows_cols, sparse_decode_attn
+        from .nki_sparse_decode import gather_rows_cols, select_to_rows, sparse_decode_attn
 
-        _SPARSE_KERNELS.extend((wrap_nki(sparse_decode_attn), wrap_nki(gather_rows_cols)))
+        _SPARSE_KERNELS.extend(
+            (wrap_nki(sparse_decode_attn), wrap_nki(gather_rows_cols), wrap_nki(select_to_rows))
+        )
     return _SPARSE_KERNELS
 
 
 def _sparse_kernels_or_none() -> tuple:
-    """The kernels where nki and the plugin's ``wrap_nki`` import; else ``(None, None)``
+    """The kernels where nki and the plugin's ``wrap_nki`` import; else ``None``s
     (CPU unit tests), in which case the torch references run."""
     try:
         return tuple(_sparse_kernels())
     except ImportError:
-        return (None, None)
+        return (None, None, None)
 
 
 def _sparse_grid() -> int:
@@ -704,8 +706,8 @@ class HYV4Attention(nn.Module):
         # Built here, never inside the traced forward: a lazy build there puts a
         # guard on the module-level cache that flips after the first trace and
         # forces a recompile at serving time.
-        self._sparse_attn_k, self._sparse_gather_k = (
-            _sparse_kernels_or_none() if use_kernels else (None, None)
+        self._sparse_attn_k, self._sparse_gather_k, self._select_rows_k = (
+            _sparse_kernels_or_none() if use_kernels else (None, None, None)
         )
 
         set_weight_loader(self.q_a_proj_weight, _replicated_transposed())
@@ -1122,6 +1124,32 @@ class HYV4Attention(nn.Module):
     def _prefill_rows(self, local: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Bool selection ``[Q, K]`` -> its first ``ksel`` selected key indices per
         row, ascending, ``[Q, ksel]`` int32, and their bound (``+BIG`` / ``-BIG``).
+
+        On Neuron, the NKI kernel ``select_to_rows`` (GpSimd nonzero compaction)
+        builds the rows from the 0/1 mask, and the bound is ``rows < K``; the
+        torch formulation below (``_prefill_rows_ref``) runs on CPU. Its
+        ``[Q, ksel, K / 128]`` intermediates must not reach the device graph.
+        """
+        q, n_keys = local.shape
+        dev = local.device
+        ksel = self._prefill_ksel(n_keys)
+        if self._select_rows_k is not None and _use_sparse_kernels(local):
+            rows = self._select_rows_k[self.sparse_grid](
+                sel=local.to(torch.float32).contiguous(), ksel=ksel
+            )[:, :ksel]
+            big = 1.0e30
+            # A tensor limit, not a Python int compare (see _zero_beyond).
+            filled = rows < torch.full((1, 1), n_keys, dtype=torch.int32, device=dev)
+            bound = torch.where(
+                filled,
+                torch.full(filled.shape, big, dtype=torch.float32, device=dev),
+                torch.full(filled.shape, -big, dtype=torch.float32, device=dev),
+            )
+            return rows, bound
+        return self._prefill_rows_ref(local)
+
+    def _prefill_rows_ref(self, local: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Torch reference of ``_prefill_rows`` (CPU).
 
         Unfilled slots get ``K`` (out of range: the kernel's DMA skips it). The
         ``j``-th selected key is the number of keys whose inclusive selected

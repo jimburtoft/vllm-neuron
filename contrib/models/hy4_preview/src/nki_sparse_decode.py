@@ -303,3 +303,81 @@ def gather_rows_cols(
             row0 = kt * KS_all + k0
             nisa.dma_copy(dst=out[r, row0 : row0 + KS, 0:width], src=t[0:KS, 0:width])
     return out
+
+
+_GPSIMD_STRIDE = 16  # nonzero_with_count reads/writes partitions 0, 16, ..., 112 only
+_GPSIMD_CORES = 8
+
+
+@nki.jit
+def select_to_rows(
+    sel,  # [Q, K] fp32 0/1 selection
+    ksel=2176,  # slots per query that the caller keeps
+    chunk=2048,  # keys per nonzero_with_count call
+):
+    """``rows[q, :ksel]`` = the first ``ksel`` indices ``k`` with ``sel[q, k] != 0``,
+    ascending, then ``K`` (out of range for the attention kernel's DMA).
+
+    Output is ``[Q, ksel + chunk]``; the caller keeps ``[:, :ksel]`` (the tail
+    absorbs the chunk written at a count already clamped to ``ksel``).
+
+    The GpSimd ``nonzero_with_count`` compacts one query's chunk per GpSimd
+    core (8 queries per call, on partitions 0, 16, ..., 112), and each chunk's
+    indices are written into the query's output row at its running count,
+    clamped to ``ksel`` (the pattern of nkilib's ``find_nonzero_indices``).
+    Launched at the logical NC config: queries are split across programs.
+    """
+    Q, K = sel.shape
+    n_prg, prg = _programs()
+    _kassert(Q % n_prg == 0, "queries must divide by the number of programs")
+    QP = Q // n_prg
+    q_base = prg * QP
+    CH = min(chunk, K)
+    n_ch = (K + CH - 1) // CH
+    WS = ksel + CH
+    rows_out = nl.ndarray((Q, WS), dtype=nl.int32, buffer=nl.shared_hbm)
+
+    fill = nl.ndarray((QP, WS), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.memset(dst=fill, value=K)
+    nisa.dma_copy(dst=rows_out[q_base : q_base + QP, 0:WS], src=fill[0:QP, 0:WS])
+
+    n_rounds = (QP + _GPSIMD_CORES - 1) // _GPSIMD_CORES
+    for rd in nl.static_range(n_rounds):
+        q0 = q_base + rd * _GPSIMD_CORES
+        nq = min(_GPSIMD_CORES, QP - rd * _GPSIMD_CORES)
+        offs = nl.ndarray((1, _GPSIMD_CORES), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(dst=offs, value=0)
+        for c in nl.static_range(n_ch):
+            c0 = c * CH
+            cw = min(CH, K - c0)
+            src = nl.ndarray((P_MAX, cw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(dst=src, value=0.0)
+            for j in nl.static_range(nq):
+                p = j * _GPSIMD_STRIDE
+                nisa.dma_copy(dst=src[p : p + 1, 0:cw], src=sel[q0 + j : q0 + j + 1, c0 : c0 + cw])
+            dst = nl.ndarray((P_MAX, cw + 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.nonzero_with_count(dst=dst, src=src, index_offset=c0, padding_val=K)
+            for j in nl.static_range(nq):
+                p = j * _GPSIMD_STRIDE
+                off_j = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=off_j, src=offs[0:1, j : j + 1])
+                nisa.dma_copy(
+                    dst=rows_out.ap(
+                        pattern=[[WS, 1], [1, cw]],
+                        offset=(q0 + j) * WS,
+                        scalar_offset=off_j,
+                        indirect_dim=1,
+                    ),
+                    src=dst[p : p + 1, 0:cw],
+                )
+                # Count to partition 0 by DMA, then off = min(off + n, ksel).
+                cnt = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=cnt, src=dst[p : p + 1, cw : cw + 1])
+                nisa.tensor_tensor(
+                    dst=offs[0:1, j : j + 1], data1=offs[0:1, j : j + 1], data2=cnt, op=nl.add
+                )
+                nisa.tensor_scalar(
+                    dst=offs[0:1, j : j + 1], data=offs[0:1, j : j + 1],
+                    op0=nl.minimum, operand0=float(ksel),
+                )
+    return rows_out
