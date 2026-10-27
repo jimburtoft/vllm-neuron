@@ -93,6 +93,10 @@ DEC_SPARSE_NKI = os.environ.get("HY4_DEC_SPARSE_NKI", "0") == "1"
 # queries for every head over only the rows DSA selected, with the decode
 # kernel ``sparse_decode_attn`` on Neuron (torch reference on CPU). Off by default.
 PREFILL_SPARSE_NKI = os.environ.get("HY4_PREFILL_SPARSE_NKI", "0") == "1"
+# The sparse prefill runs for graphs whose prefix span (static per graph, from
+# the kv_segment bound) is at least this many keys; shorter spans keep the
+# dense blocked attention. Shared-indexer layers follow their full layer.
+PREFILL_SPARSE_MIN_SPAN = int(os.environ.get("HY4_PREFILL_SPARSE_MIN_SPAN", "4096"))
 # Selected-row slots per query for the sparse prefill (rounded up to 128). It
 # must hold the top-k plus keys tied with the k-th score; a query with more
 # selected keys than slots drops the excess (inexact).
@@ -1209,6 +1213,7 @@ class HYV4Attention(nn.Module):
         chunk in whole 128-key tiles."""
         return (
             PREFILL_SPARSE_NKI
+            and span >= PREFILL_SPARSE_MIN_SPAN
             and chunk % self.world_size == 0
             and span % 128 == 0
             and chunk % 128 == 0

@@ -98,6 +98,7 @@ def test_prefill_sparse_matches_dense(monkeypatch, dtype, tol, world, order_seed
             ref[li] = (out.float(), selected)
         dense = run(ranks, rope, x, pos, meta)
         monkeypatch.setattr(model, "PREFILL_SPARSE_NKI", True)
+        monkeypatch.setattr(model, "PREFILL_SPARSE_MIN_SPAN", 0)
         sparse = run(ranks, rope, x, pos, meta)
         for li in range(2):
             for r in range(world):
