@@ -1775,6 +1775,8 @@ class WhisperDecoder(nn.Module):
         object.__setattr__(self, "_cross_kv_owner", owner)
 
     def forward(self, input_ids, positions, attn_metadata, is_prefill):
+        # Keep padded rows in range of the position table. Real rows are already in range.
+        positions = positions.clamp(0, self.embed_positions.num_embeddings - 1)
         x = self.embed_tokens(input_ids) + self.embed_positions(positions)
         owner = self._cross_kv_owner
         # All decoder layers are in one KV-cache group, so they share one

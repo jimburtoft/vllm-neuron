@@ -135,7 +135,10 @@ class WhisperDraftPropose(nn.Module):
             prev = prev_sampled_token_ids.to(torch.int32)
             valid = ((prev != -1) & (prev < self.vocab_size)).sum(dim=1).to(torch.int32)
             rejected = (1 + prev_num_draft_tokens.to(torch.int32)) - valid
-            positions = positions.to(torch.int64) - rejected[req_indices_per_token].to(torch.int64)
+            # Clamp as the target correction does: a padded row can get a negative position.
+            positions = (positions.to(torch.int64) - rejected[req_indices_per_token].to(torch.int64)).clamp(
+                min=0, max=self.max_pos
+            )
         B = raw_sampled_token_ids.shape[0]
         T = input_ids.shape[0]
         S = T // B

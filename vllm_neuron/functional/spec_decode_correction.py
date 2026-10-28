@@ -75,7 +75,11 @@ def correct_spec_decode_positions_and_slot_mapping(
 
     # Expand per-req rejection count to per-scheduled-token.
     per_token_offset = num_rejected[req_indices_per_token]  # [total_scheduled]
-    positions = positions - per_token_offset
+    # A padded row copies the last real position but keeps the previous-step
+    # row of its slot, so its offset can be larger than its position. Clamp
+    # to 0 to keep the position and slot lookups in range. Real rows are not
+    # changed: their corrected position is never negative.
+    positions = (positions - per_token_offset).clamp(min=0)
 
     # Recompute slot_mapping per layer using corrected positions. For now,
     # recompute per layer — layers in the same KV cache group share the
