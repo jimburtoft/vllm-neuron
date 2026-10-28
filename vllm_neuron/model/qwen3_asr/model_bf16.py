@@ -82,6 +82,27 @@ def get_lmhead_backend() -> str:
     return v
 
 
+# Prefill graph options (comma list; empty = stock). Read once per module at __init__.
+# - "mlpfuse": at TP1, the MLP kernel adds the attention residual and applies the
+#   post-attention RMSNorm itself (fused_add_tensor + RMS_NORM, as decode does), instead of
+#   a torch add + a torch RMSNorm before it. TP>1 keeps the stock path (SP shards the residual).
+# - "gqa": attention_cte reads the 8 KV heads directly (native GQA) instead of a
+#   repeat_interleave copy of K and V to 16 heads. Same math, same kernel.
+_PREFILL_OPTS = ("mlpfuse", "gqa")
+
+
+def get_prefill_opts() -> frozenset:
+    raw = os.environ.get("VLLM_NEURON_QWEN3_ASR_PREFILL_OPT", "").strip().lower()
+    opts = frozenset(o.strip() for o in raw.split(",") if o.strip())
+    bad = opts - set(_PREFILL_OPTS)
+    if bad:
+        raise ValueError(
+            f"VLLM_NEURON_QWEN3_ASR_PREFILL_OPT={raw!r}: unknown {sorted(bad)}; "
+            f"use a comma list of {_PREFILL_OPTS}."
+        )
+    return opts
+
+
 def _write_packed_k_pairs(
     k_cache: torch.Tensor,
     k_new: torch.Tensor,
@@ -300,6 +321,9 @@ class Qwen3ASRTextAttention(nn.Module):
         self.register_buffer("v_scale", None, persistent=False)
         self.k_scale_float = 1.0
         self.v_scale_float = 1.0
+
+        # Prefill attention reads the KV heads natively (attention_cte GQA), no K/V copy.
+        self.prefill_native_gqa = "gqa" in get_prefill_opts()
 
         self._setup_weight_loaders()
 
@@ -522,9 +546,11 @@ class Qwen3ASRTextAttention(nn.Module):
             if self.v_scale_float != 1.0:
                 attn_output = attn_output / self.v_scale_float
         else:
-            # Full prefill attends the local bf16 K/V, not the cache.
-            k = k.repeat_interleave(self.num_key_value_groups, dim=0)
-            v = v.repeat_interleave(self.num_key_value_groups, dim=0)
+            # Full prefill attends the local bf16 K/V, not the cache. The kernel maps Q head h
+            # to KV head h // groups itself (native GQA), the same pairing as repeat_interleave.
+            if not self.prefill_native_gqa:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=0)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=0)
 
             q_flash = q.transpose(1, 2)
             k_flash = k.transpose(1, 2)
@@ -823,6 +849,9 @@ class Qwen3ASRTextMLP(nn.Module):
 
         self._setup_weight_loaders(config)
 
+        # Prefill residual-add + RMSNorm folded into the MLP kernel (TP1 only).
+        self.prefill_fuse_ok = self.world_size == 1 and "mlpfuse" in get_prefill_opts()
+
     def _setup_weight_loaders(self, config: Qwen3ASRTextConfig):
         """>>> PARALLELISM: TP sharding of MLP weights. <<<"""
         gate_up_loader = sharding_weight_loader(
@@ -859,14 +888,17 @@ class Qwen3ASRTextMLP(nn.Module):
 
         TODO: fuse both on prefill after the removal of sequence parallelism.
         """
-        if is_prefill and fused_add_tensor is not None:
+        # TP1 has no SP, so the prefill MLP kernel may fold the residual add and the norm
+        # (VLLM_NEURON_QWEN3_ASR_PREFILL_OPT=mlpfuse); the layer then passes fused_add_tensor.
+        prefill_fused = is_prefill and fused_add_tensor is not None
+        if prefill_fused and not self.prefill_fuse_ok:
             raise ValueError(
                 "The prefill path must not fuse the residual add. Give "
                 "fused_add_tensor on decode only, and add the residual after "
                 "this call."
             )
 
-        if is_prefill:
+        if is_prefill and not prefill_fused:
             # Normalize on the SP shard, before the gather, then tell the kernel
             # that the activation is already normalized.
             hidden_states = self.post_attention_layernorm(hidden_states)
@@ -954,6 +986,10 @@ class Qwen3ASRTextDecoderLayer(nn.Module):
         if is_decode:
             hidden_states, residual = self.mlp(
                 hidden_states, is_prefill=False, fused_add_tensor=residual
+            )
+        elif self.mlp.prefill_fuse_ok:
+            hidden_states, residual = self.mlp(
+                hidden_states, is_prefill=True, fused_add_tensor=residual
             )
         else:
             hidden_states = residual + hidden_states
@@ -1147,6 +1183,20 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
 
         if not self.mm_encoder_only:
             self.language_model = Qwen3ASRTextModel(config.text_config)
+            logger.info(
+                "qwen3_asr prefill opts: %s (requested %s, tp=%d)",
+                ",".join(
+                    o
+                    for o, on in (
+                        ("mlpfuse", self.language_model.layers[0].mlp.prefill_fuse_ok),
+                        ("gqa", self.language_model.layers[0].self_attn.prefill_native_gqa),
+                    )
+                    if on
+                )
+                or "stock",
+                ",".join(sorted(get_prefill_opts())) or "none",
+                self.language_model.world_size,
+            )
         else:
             self.language_model = None
 
