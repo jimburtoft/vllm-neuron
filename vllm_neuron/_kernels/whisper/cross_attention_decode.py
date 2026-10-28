@@ -17,7 +17,7 @@ An odd head count (TP4: 5) is padded to the next even count by the caller (zero 
   qmask   [128, NP*U] bf16 (NP = U/2): 1 at (k, p, 2p) for k < 64 and at
           (k, p, 2p+1) for k >= 64, else 0. Built one time by the caller.
   dmask   [U, VB*64] fp32 (PV=1): 1 at (u, 64 (u % VB) + c), else 0.
-  out     PV=1: [B*H, 64] bf16, row = row * H + head.
+  out     PV=1: [B*S*H, 64] bf16, row = (row * S + query row) * H + head.
           PV=0: [B/G, 4, G*H/4 * 64] bf16. The context of unit u = 4 f + q of group g
           (unit u = row-in-group * H + head) is out[g, q, 64 f : 64 f + 64].
 
@@ -42,6 +42,13 @@ FP8 1: k_cache and v_cache hold float8 e4m3 codes (trn2 e4m3, |x| <= 240, unit s
     The loads read them as float8_e4m3 and the matmuls take them as the moving operand as
     they are (fp32 accumulation), which halves the cross-KV bytes. 0: bf16.
 
+S   query rows per slot (default 1). With S > 1 (a speculative-decoding verify step), each
+    real row b has S query rows (b, 0) .. (b, S - 1), in token order in q_t and out. The
+    kernel loads the K and V of a slot one time and uses them for the S query rows, so the
+    HBM bytes do not change with S. A unit is then (row, query row, head), U = G * S * H.
+    The masked-q matmuls add exact zeros for the other units, so each query row gets the
+    same values as with S = 1. PV=1 only.
+
 LNC: the launch grid is the LNC degree. With 2 programs, program i runs the groups
 g = i, i + 2, ... (each group is independent and writes its own output rows).
 """
@@ -57,11 +64,11 @@ QK_W = 512
 
 
 @nki.jit
-def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, VH=10, PV=1, VB=5, HW=0, FP8=0):
+def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, VH=10, PV=1, VB=5, HW=0, FP8=0, S=1):
     """See the module docstring."""
     B = slots.shape[1]
-    H = 2 * q_t.shape[1] // B
-    U = G * H
+    H = 2 * q_t.shape[1] // (B * S)
+    U = G * S * H
     NP = U // 2
     NG = B // G
     HP = H // 2
@@ -70,12 +77,13 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
     kv_dt = nl.float8_e4m3 if FP8 == 1 else k_cache.dtype
     kv_ap = {"dtype": nl.float8_e4m3} if FP8 == 1 else {}
     kernel_assert(H % 2 == 0, "whisper_xattn_decode: H must be even (pad odd head counts)")
+    kernel_assert(S == 1 or PV == 1, "whisper_xattn_decode: S > 1 needs PV=1")
     kernel_assert(U <= 128 and (PV == 1 or U % 4 == 0), "whisper_xattn_decode: G * H up to 128 (a multiple of 4 for PV=0)")
     kernel_assert(NG * G == B, "whisper_xattn_decode: G must divide the batch")
     kernel_assert(HP % KP == 0 and H % VH == 0, "whisper_xattn_decode: KP must divide H / 2 and VH must divide H")
     kernel_assert(PV == 0 or (VH % VB == 0 and VB * 64 <= 512), "whisper_xattn_decode: VB must divide VH, 64 VB <= 512")
     if PV == 1:
-        out = nl.ndarray((B * H, 64), dtype=q_t.dtype, buffer=nl.shared_hbm)
+        out = nl.ndarray((B * S * H, 64), dtype=q_t.dtype, buffer=nl.shared_hbm)
         dm_sb = nl.ndarray((U, VB * 64), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=dm_sb, src=dmask[0:U, 0:VB * 64])
         # One zero-padded p^T per PV block. Only the VB columns of the block are
@@ -123,12 +131,13 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
                                    offset=kc * KP * 128 * C, scalar_offset=sl[r], indirect_dim=0, **kv_ap),
                     dge_mode=nisa.dge_mode.hwdge if HW == 1 else nisa.dge_mode.unknown,
                 )
-                for pk in range(KP):
-                    p = r * HP + kc * KP + pk
-                    for c in range(C // QK_W):
-                        nisa.nc_matmul(dst=sc[c], stationary=qm[0:128, p, 0:U],
-                                       moving=kb[0:128, pk, c * QK_W:(c + 1) * QK_W],
-                                       accumulate=(p != 0))
+                for s in range(S):
+                    for pk in range(KP):
+                        p = (r * S + s) * HP + kc * KP + pk
+                        for c in range(C // QK_W):
+                            nisa.nc_matmul(dst=sc[c], stationary=qm[0:128, p, 0:U],
+                                           moving=kb[0:128, pk, c * QK_W:(c + 1) * QK_W],
+                                           accumulate=(p != 0))
 
         # Softmax over the 1500 valid positions, fp32. The pad positions get p = 0.
         widths = (QK_W, QK_W, VALID - 2 * QK_W)
@@ -177,13 +186,14 @@ def whisper_xattn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, G=4, KP=5, 
                                        offset=vc * VH * C * 64, scalar_offset=sl[r], indirect_dim=0, **kv_ap),
                     dge_mode=nisa.dge_mode.hwdge if HW == 1 else nisa.dge_mode.unknown,
                     )
-                    for bb in range(VH // VB):
-                        b = (r * H + vc * VH) // VB + bb
-                        for j in range(NCH):
-                            nisa.nc_matmul(dst=o_ps, stationary=ptz[b][0:128, j, 0:U],
-                                           moving=vb[0:128, bb * VB:(bb + 1) * VB, 64 * j:64 * j + 64],
-                                           accumulate=(first == 0))
-                            first = 0
+                    for s in range(S):
+                        for bb in range(VH // VB):
+                            b = ((r * S + s) * H + vc * VH) // VB + bb
+                            for j in range(NCH):
+                                nisa.nc_matmul(dst=o_ps, stationary=ptz[b][0:128, j, 0:U],
+                                               moving=vb[0:128, bb * VB:(bb + 1) * VB, 64 * j:64 * j + 64],
+                                               accumulate=(first == 0))
+                                first = 0
             o_m = nl.ndarray((U, VB, 64), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_tensor(dst=o_m.reshape((U, VB * 64)), data1=o_ps, data2=dm_sb, op=nl.multiply)
             o_sb = nl.ndarray((U, 64), dtype=q_t.dtype, buffer=nl.sbuf)

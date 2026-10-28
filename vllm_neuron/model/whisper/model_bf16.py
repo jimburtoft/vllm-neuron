@@ -318,6 +318,31 @@ def cross_fp8() -> bool:
     return on
 
 
+def spec_rows_mode() -> str:
+    """Return ``WHISPER_SPEC_ROWS``: how the slot kernels run the S > 1 query rows of a verify step.
+
+    * ``kernel`` (default): one kernel call reads the K/V of each slot one time for its S
+      query rows (``s_rows``). The rows are split into chunks of at most ``128 // heads``.
+    * ``repeat``: each query row is a kernel row with the slot of its request, so the
+      kernel reads the K/V of each slot S times (reference and fallback).
+    """
+    mode = os.environ.get("WHISPER_SPEC_ROWS", "kernel")
+    if mode not in ("kernel", "repeat"):
+        raise ValueError(f"WHISPER_SPEC_ROWS={mode!r}: use kernel or repeat.")
+    return mode
+
+
+def spec_row_chunks(S: int, heads: int) -> list[tuple[int, int]]:
+    """Return the ``(start, rows)`` chunks of S query rows, each with ``rows * heads <= 128``."""
+    top = max(1, 128 // heads)
+    out, s0 = [], 0
+    while s0 < S:
+        n = min(top, S - s0)
+        out.append((s0, n))
+        s0 += n
+    return out
+
+
 def xkernel_dma() -> tuple[int, int, int, int]:
     """Return ``WHISPER_XKERNEL_DMA=KP,VH[,VB[,HW]]`` (default ``5,10,5,0``).
 
@@ -849,6 +874,16 @@ class WhisperCrossKVEncoder(nn.Module):
             write_block_ids = torch.zeros(
                 input_features.shape[0], dtype=torch.int64, device=input_features.device
             )
+        self.write_cross_kv(encoder_hidden, write_block_ids)
+        # Return a tensor, so that the warmup trace has an output.
+        return encoder_hidden
+
+    def write_cross_kv(self, encoder_hidden, write_block_ids):
+        """Project ``encoder_hidden`` ``[n, 1500, H]`` to the cross K/V and write slot ``write_block_ids[j]``.
+
+        The buffers get the layout of the cross mode (blocked, MQA, xkernel, fp8). A
+        speculative-decoding draft with the same encoder calls this on its own owner.
+        """
         slots = write_block_ids.to(torch.int64)
         if self.blocked:
             nb = 128 * self.mqa_groups if self.mqa else CROSS_BLOCKS_PER_SLOT
@@ -887,8 +922,6 @@ class WhisperCrossKVEncoder(nn.Module):
                     k, v = fp8_e4m3_encode(k), fp8_e4m3_encode(v)
                 getattr(self, f"cross_k_{i}").index_put_((slots,), k)
                 getattr(self, f"cross_v_{i}").index_put_((slots,), v)
-        # Return a tensor, so that the warmup trace has an output.
-        return encoder_hidden
 
     def _to_mqa_blocks(self, x):
         """``[n, h, 1500, d]`` to ``[n * groups * 128, 1, span / 128, d]``, head-major.
@@ -1036,34 +1069,49 @@ class CrossAttention(nn.Module):
             out = all_reduce(out, reduceOp="sum", group=self.tp_group)
         return (out + self.out_proj.bias.to(out.dtype)).view(B, S, hidden)
 
-    def attn_xkernel(self, hc, cross_k, cross_v, slots, qmask, group):
-        """Cross-attention of B decode rows with the Whisper cross-attention kernel.
+    def attn_xkernel(self, hc, cross_k, cross_v, slots, chunks, s_rows=1):
+        """Cross-attention of the decode tokens with the Whisper cross-attention kernel.
 
         Args:
-            hc: ``[B, H]`` after the LayerNorm.
+            hc: ``[T, H]`` after the LayerNorm, ``T = B * s_rows`` in token order.
             cross_k: ``[S, h, d, 1536]`` K^T of all slots.
             cross_v: ``[S, h, 1536, d]`` V of all slots.
-            slots: ``[B]`` int32, the slot of each row.
-            qmask: the kernel head-pair mask (see ``xkernel_qmask``).
-            group: rows per kernel group.
+            slots: the slot of each kernel row, int32: ``[B]``, or ``[T]`` when ``chunks``
+                has one ``(0, 1, ...)`` entry and ``s_rows`` is 1 (the ``repeat`` mode).
+            chunks: ``[(start, rows, qmask, group)]``: the kernel calls over the query rows
+                of each slot (``WhisperDecoder._xkernel_chunks``).
+            s_rows: query rows per slot (1, or K + 1 in a verify step).
         """
         from vllm_neuron.functional.whisper_cross_attention import (
             whisper_cross_attention_decode,
         )
 
-        B = hc.shape[0]
+        T = hc.shape[0]
         h, d = self.num_heads, self.head_dim
-        q = (self.q_proj(hc) * self.scaling).view(B, h, d)
+        q = (self.q_proj(hc) * self.scaling).view(T, h, d)
         hk = cross_k.shape[1]
         if hk != h:
             # Odd heads per rank: the zero pad head of the buffers gets a zero q.
             q = F.pad(q, (0, 0, 0, hk - h))
         kp, vh, vb, hw = self.xkernel_dma
-        ctx = whisper_cross_attention_decode(
-            q, cross_k, cross_v, slots, qmask, group, k_pairs=kp, v_heads=vh, pv_block=vb,
-            hw_dge=hw, fp8=self.cross_fp8,
-        )
-        return self.out_proj(ctx[:, :h].reshape(B, h * d))
+
+        def call(qc, sc, qmask, group):
+            return whisper_cross_attention_decode(
+                qc, cross_k, cross_v, slots, qmask, group, k_pairs=kp, v_heads=vh, pv_block=vb,
+                hw_dge=hw, fp8=self.cross_fp8, s_rows=sc,
+            )
+
+        if len(chunks) == 1 and chunks[0][1] == s_rows:
+            ctx = call(q, s_rows, chunks[0][2], chunks[0][3])
+        else:
+            B = T // s_rows
+            qv = q.view(B, s_rows, hk, d)
+            parts = [
+                call(qv[:, s0:s0 + sc].reshape(B * sc, hk, d), sc, qm, g).view(B, sc, hk, d)
+                for s0, sc, qm, g in chunks
+            ]
+            ctx = torch.cat(parts, dim=1).reshape(T, hk, d)
+        return self.out_proj(ctx[:, :h].reshape(T, h * d))
 
     def _shape(self, x, seqlen, bsz):
         return x.view(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -1273,12 +1321,17 @@ class DecoderSelfAttention(nn.Module):
 
         A pad row (slot_mapping -1) writes the scratch slot.
         """
-        h, B, d = k.shape
-        slots = self._row_slots(meta, B, k.device)
+        h, T, d = k.shape
+        rows = meta["block_table_tensor"].shape[0]
+        slots = self._row_slots(meta, rows, k.device)
+        if T != rows:
+            # A verify step: S = T // rows tokens of each row, in token order.
+            slots = slots.repeat_interleave(T // rows)
         scratch = torch.full_like(slots, self.num_slots - 1)
-        slots = torch.where(meta["slot_mapping"].view(B) < 0, scratch, slots)
+        slots = torch.where(meta["slot_mapping"].view(T) < 0, scratch, slots)
+        B = T
         if self.self_kernel:
-            # One [hk * d] row for each batch row at (slot, position).
+            # One [hk * d] row for each token at (slot, position).
             hk = self.kernel_heads
             pos = positions.to(torch.int64).view(B)
             for buf, x in ((self.slot_k, k), (self.slot_v, v)):
@@ -1327,10 +1380,14 @@ class DecoderSelfAttention(nn.Module):
         (``WHISPER_SELF_ATTN=kernel``), built one time per step by the decoder.
         """
         B = meta["block_table_tensor"].shape[0]
+        T = hidden_states.shape[0]
+        S = T // B  # 1, or K + 1 query rows of a verify step
         h, d, C = self.num_heads, self.head_dim, self.slot_ctx
         c = min(meta["block_table_tensor"].shape[1] * meta["block_size"], C)
-        q, k, v = self._project(hidden_states)  # [h, B, d]
+        q, k, v = self._project(hidden_states)  # [h, T, d]
         if self.slot_write_where:
+            if S != 1:
+                raise ValueError("WHISPER_SELF_WRITE=where supports one token per row only.")
             self._slot_write_where(k, v, meta, positions)
         else:
             self._slot_write_decode(k, v, meta, positions)
@@ -1339,33 +1396,56 @@ class DecoderSelfAttention(nn.Module):
         idx = self._slot_head_rows(self._row_slots(meta, B, hidden_states.device))
         kc = self.slot_k[:, :c].index_select(0, idx).view(B, h, c, d)
         vc = self.slot_v[:, :c].index_select(0, idx).view(B, h, c, d)
-        pos = positions.to(torch.int64).view(B)
-        qd = q.transpose(0, 1).unsqueeze(2)  # [B, h, 1, d]
-        attn = torch.matmul(qd, kc.transpose(-1, -2))  # [B, h, 1, c]
+        pos = positions.to(torch.int64).view(B, S)
+        qd = q.view(h, B, S, d).transpose(0, 1)  # [B, h, S, d]
+        attn = torch.matmul(qd, kc.transpose(-1, -2))  # [B, h, S, c]
         ar = torch.arange(c, device=attn.device, dtype=torch.int64)
-        valid = ar.view(1, c) <= pos.view(B, 1)
+        valid = ar.view(1, 1, c) <= pos.view(B, S, 1)
         neg = torch.full((), float("-inf"), dtype=attn.dtype, device=attn.device)
         zero = torch.zeros((), dtype=attn.dtype, device=attn.device)
-        attn = attn + torch.where(valid, zero, neg).view(B, 1, 1, c)
+        attn = attn + torch.where(valid, zero, neg).view(B, 1, S, c)
         attn = F.softmax(attn.to(torch.float32), dim=-1).to(vc.dtype)
-        ctx = torch.matmul(attn, vc)  # [B, h, 1, d]
-        return self.out_proj(ctx.reshape(B, h * d))
+        ctx = torch.matmul(attn, vc)  # [B, h, S, d]
+        return self.out_proj(ctx.transpose(1, 2).reshape(T, h * d))
 
     def _decode_slot_kernel(self, q, meta, positions, B, c, self_meta):
-        """Self-attention of B decode rows with the Whisper self-attention kernel.
+        """Self-attention of the decode tokens with the Whisper self-attention kernel.
 
-        ``q`` is ``[h, B, d]``, scaled. The K/V of this step are already in the slots.
+        ``q`` is ``[h, T, d]``, scaled, ``T = B * S`` in token order. The K/V of this step
+        are already in the slots. ``self_meta`` is ``(chunks, S, repeat)`` from
+        ``WhisperDecoder._self_kernel_inputs``.
         """
         from vllm_neuron.functional.whisper_self_attention import whisper_self_attention_decode
 
         h, d, hk = self.num_heads, self.head_dim, self.kernel_heads
-        qmask, maskb, group = self_meta
-        qb = F.pad(q.transpose(0, 1), (0, 0, 0, hk - h))  # [B, hk, d]
+        chunks, S, repeat = self_meta
+        T = q.shape[1]
+        qb = F.pad(q.transpose(0, 1), (0, 0, 0, hk - h))  # [T, hk, d]
         slots = self._row_slots(meta, B, q.device)
-        ctx = whisper_self_attention_decode(
-            qb, self.slot_k, self.slot_v, slots, positions.view(B), c, qmask, maskb, group
-        )
-        return self.out_proj(ctx[:, :h].reshape(B, h * d))
+        pos = positions.view(T)
+        if repeat:
+            # One kernel row for each token, with the slot of its request.
+            slots = slots.repeat_interleave(S) if S > 1 else slots
+            _, _, qmask, maskb, group = chunks[0]
+            ctx = whisper_self_attention_decode(
+                qb, self.slot_k, self.slot_v, slots, pos, c, qmask, maskb, group
+            )
+        elif len(chunks) == 1:
+            _, sc, qmask, maskb, group = chunks[0]
+            ctx = whisper_self_attention_decode(
+                qb, self.slot_k, self.slot_v, slots, pos, c, qmask, maskb, group, s_rows=sc
+            )
+        else:
+            qv, pv = qb.view(B, S, hk, d), pos.view(B, S)
+            parts = []
+            for s0, sc, qmask, maskb, group in chunks:
+                o = whisper_self_attention_decode(
+                    qv[:, s0:s0 + sc].reshape(B * sc, hk, d), self.slot_k, self.slot_v, slots,
+                    pv[:, s0:s0 + sc].reshape(B * sc), c, qmask, maskb, group, s_rows=sc,
+                )
+                parts.append(o.view(B, sc, hk, d))
+            ctx = torch.cat(parts, dim=1).reshape(T, hk, d)
+        return self.out_proj(ctx[:, :h].reshape(T, h * d))
 
     @torch.no_grad()
     def finalize_weights(self) -> None:
@@ -1642,9 +1722,9 @@ class DecoderLayer(nn.Module):
             x = x + self.mlp(self.final_layer_norm(x), is_prefill)
             return x
         if cross_meta is not None and isinstance(cross_meta[0], str):
-            _, xslots, qmask, group = cross_meta
+            _, xslots, chunks, s_rows = cross_meta
             hc = self.encoder_attn_layer_norm(x)
-            ca = self.encoder_attn.attn_xkernel(hc, cross_k, cross_v, xslots, qmask, group)
+            ca = self.encoder_attn.attn_xkernel(hc, cross_k, cross_v, xslots, chunks, s_rows)
         elif cross_meta is not None:
             table, mask = cross_meta
             num_rows = table.shape[0]
@@ -1681,6 +1761,8 @@ class WhisperDecoder(nn.Module):
         # Read the env flags one time (see DecoderLayer.__init__).
         self.cross_mode = cross_mode()
         self.cross_active = os.environ.get("WHISPER_CROSS_ACTIVE", "0") == "1"
+        # Read one time (see DecoderLayer.__init__).
+        self.spec_rows = spec_rows_mode()
 
     def bind_cross_kv(self, owner: WhisperCrossKVEncoder) -> None:
         """Point the cross-KV reads at the module that owns the buffers.
@@ -1744,11 +1826,24 @@ class WhisperDecoder(nn.Module):
 
             # The one-column PV (VB=0) needs a multiple of 4 units per group.
             umult = 4 if owner.decoder_xkernel_vb == 0 else 2
-            group = xkernel_group(owner.xk_heads, rows, lnc=get_logical_nc_config(), unit_mult=umult)
-            qmask = xkernel_qmask(
-                owner.xk_heads, group, device=x.device, dtype=self.embed_tokens.weight.dtype
-            )
-            cross_meta = ("xkernel", xslots.to(torch.int32), qmask, group)
+            s_rows = x.shape[0] // rows  # K + 1 in a verify step
+            dt = self.embed_tokens.weight.dtype
+            lnc = get_logical_nc_config()
+            hk = owner.xk_heads
+            if s_rows > 1 and self.spec_rows == "repeat":
+                xslots = xslots.repeat_interleave(s_rows)
+                group = xkernel_group(hk, rows * s_rows, lnc=lnc, unit_mult=umult)
+                chunks = [(0, 1, xkernel_qmask(hk, group, device=x.device, dtype=dt), group)]
+                s_cross = 1
+            else:
+                chunks = []
+                for s0, sc in spec_row_chunks(s_rows, hk):
+                    group = xkernel_group(hk * sc, rows, lnc=lnc, unit_mult=umult)
+                    chunks.append(
+                        (s0, sc, xkernel_qmask(hk, group * sc, device=x.device, dtype=dt), group)
+                    )
+                s_cross = s_rows
+            cross_meta = ("xkernel", xslots.to(torch.int32), chunks, s_cross)
         if mode == "xgather":
             rows = meta["block_table_tensor"].shape[0]
             xslots = (
@@ -1859,7 +1954,11 @@ class WhisperDecoder(nn.Module):
         return self.layer_norm(x)
 
     def _self_kernel_inputs(self, x, sa, meta, positions):
-        """Return ``(qmask, maskb, group)`` of the self-attention kernel, one time per decode step."""
+        """Return ``(chunks, S, repeat)`` of the self-attention kernel, one time per decode step.
+
+        ``chunks`` is ``[(start, rows, qmask, maskb, group)]`` over the S query rows of each
+        slot (S = K + 1 in a verify step, else 1).
+        """
         from vllm_neuron._kernels.whisper.cross_attention_decode import (
             xkernel_group,
             xkernel_qmask,
@@ -1868,12 +1967,25 @@ class WhisperDecoder(nn.Module):
         from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
         rows = meta["block_table_tensor"].shape[0]
+        T = x.shape[0]
+        S = T // rows
         c = min(meta["block_table_tensor"].shape[1] * meta["block_size"], sa.slot_ctx)
         hk = sa.kernel_heads
-        group = xkernel_group(hk, rows, lnc=get_logical_nc_config())
-        qmask = xkernel_qmask(hk, group, device=x.device, dtype=self.embed_tokens.weight.dtype)
-        maskb = self_attn_mask_bias(positions.view(rows), hk, c)
-        return qmask, maskb, group
+        dt = self.embed_tokens.weight.dtype
+        lnc = get_logical_nc_config()
+        if S == 1 or self.spec_rows == "repeat":
+            group = xkernel_group(hk, T, lnc=lnc)
+            qmask = xkernel_qmask(hk, group, device=x.device, dtype=dt)
+            maskb = self_attn_mask_bias(positions.view(T), hk, c)
+            return [(0, 1, qmask, maskb, group)], S, S > 1
+        pos = positions.view(rows, S)
+        chunks = []
+        for s0, sc in spec_row_chunks(S, hk):
+            group = xkernel_group(hk * sc, rows, lnc=lnc)
+            qmask = xkernel_qmask(hk, group * sc, device=x.device, dtype=dt)
+            maskb = self_attn_mask_bias(pos[:, s0:s0 + sc].reshape(rows * sc), hk, c)
+            chunks.append((s0, sc, qmask, maskb, group))
+        return chunks, S, False
 
     def _cross_kernel_inputs(self, x, slots, meta, owner):
         """Build the per-head block table and the mask of the kernel cross-attention.

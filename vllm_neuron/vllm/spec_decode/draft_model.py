@@ -52,12 +52,8 @@ class DraftCrossKV(nn.Module):
         object.__setattr__(self, "_owner", owner)
 
     def forward(self, encoder_hidden: torch.Tensor, write_block_ids: torch.Tensor) -> torch.Tensor:
-        owner = self._owner
-        slots = write_block_ids.to(torch.int64)
-        for i in range(owner.n_layers):
-            k, v = owner.cross_attns[i].project_kv(encoder_hidden)
-            getattr(owner, f"cross_k_{i}").index_put_((slots,), k)
-            getattr(owner, f"cross_v_{i}").index_put_((slots,), v)
+        # The owner writes the layout of its cross mode (plain, xkernel, fp8, ...).
+        self._owner.write_cross_kv(encoder_hidden, write_block_ids)
         # Return a tensor, so that the warmup trace has an output.
         return encoder_hidden[:1, :1, :1]
 

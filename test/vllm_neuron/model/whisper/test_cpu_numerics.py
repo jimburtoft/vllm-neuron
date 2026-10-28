@@ -726,3 +726,80 @@ def test_xkernel_dma_rejects_one_column_pv(monkeypatch):
         model_bf16.xkernel_dma()
     monkeypatch.setenv("WHISPER_XKERNEL_DMA", "5,10,5,1")
     assert model_bf16.xkernel_dma() == (5, 10, 5, 1)
+
+
+@pytest.mark.parametrize(
+    "cross,self_attn,rows_mode",
+    [("xkernel", "kernel", "kernel"), ("xkernel", "kernel", "repeat"), ("xkernel", "torch", "kernel"),
+     ("mask", "torch", "kernel")],
+)
+def test_slot_verify_step_matches_one_token_steps(hf_checkpoint, monkeypatch, cross, self_attn, rows_mode):
+    """A verify-shaped step (S tokens per row) on the slot self-KV equals S one-token steps.
+
+    Two requests in slots 2 and 0 and a pad row. After the prefill, one step with S = 3
+    tokens per row (the HF greedy tokens) must give the same logits as three one-token
+    decode steps, for every row and token. This is the target verify step of speculative
+    decoding on the throughput layout (slot self-KV, xkernel cross-attention).
+    """
+    path, hf = hf_checkpoint
+    monkeypatch.setenv("WHISPER_SELF_KV", "slot")
+    monkeypatch.setenv("WHISPER_CROSS_MODE", cross)
+    monkeypatch.setenv("WHISPER_SELF_ATTN", self_attn)
+    monkeypatch.setenv("WHISPER_SPEC_ROWS", rows_mode)
+    S = 3
+    torch.manual_seed(3)
+    mels = [torch.randn(1, 128, 3000), torch.randn(1, 128, 3000)]
+    req_slots = [2, 0]
+    n = len(PROMPT)
+    ref = [_hf_greedy(hf, mels[r], S + 1) for r in range(2)]
+
+    def prefill(model):
+        for r in range(2):
+            model.embed_multimodal(
+                input_features=mels[r], encoder_cache=_FakeEncoderCache(), mm_hashes=[f"c{r}"],
+                request_slots=[req_slots[r]],
+            )
+            table = torch.full((1, MAX_BLOCKS_PER_SEQ), -1, dtype=torch.int32)
+            model(
+                input_ids=torch.tensor(PROMPT + [0] * 4, dtype=torch.int32),
+                positions=torch.tensor(list(range(n)) + [n - 1] * 4, dtype=torch.int32),
+                attn_metadata=_metadata(
+                    model, torch.tensor(list(range(n)) + [-1] * 4), table, n + 4,
+                    request_slots=[req_slots[r]],
+                ),
+                sampling_positions=torch.tensor([n - 1]),
+            )
+
+    order = [1, 0]
+    table = torch.full((3, 2), -1, dtype=torch.int32)
+    rs = [req_slots[r] for r in order] + [3]
+    # S one-token steps.
+    one = _build_native(path, max_num_seqs=3)
+    prefill(one)
+    step_logits = []
+    for j in range(S):
+        out = one(
+            input_ids=torch.tensor([ref[r][n + j] for r in order] + [0], dtype=torch.int32),
+            positions=torch.tensor([n + j] * 2 + [0], dtype=torch.int32),
+            attn_metadata=_metadata(one, torch.tensor([1, 1, -1]), table, 1, request_slots=rs),
+            sampling_positions=torch.arange(3),
+        )
+        step_logits.append(out[:2])
+    # One step with S tokens per row (token order: row 0 tokens, row 1 tokens, pad row).
+    ver = _build_native(path, max_num_seqs=3)
+    prefill(ver)
+    ids = [ref[r][n + j] for r in order for j in range(S)] + [0] * S
+    pos = [n + j for _ in order for j in range(S)] + [0] * S
+    meta = _metadata(ver, torch.tensor([1] * (2 * S) + [-1] * S), table, S, request_slots=rs)
+    for m in meta.values():
+        m["decode_token_threshold"] = S
+    out = ver(
+        input_ids=torch.tensor(ids, dtype=torch.int32),
+        positions=torch.tensor(pos, dtype=torch.int32),
+        attn_metadata=meta,
+        sampling_positions=torch.arange(3 * S),
+    )
+    for row in range(2):
+        for j in range(S):
+            torch.testing.assert_close(out[row * S + j], step_logits[j][row], atol=2e-4, rtol=2e-4)
+            assert int(out[row * S + j].argmax()) == ref[order[row]][n + j + 1]

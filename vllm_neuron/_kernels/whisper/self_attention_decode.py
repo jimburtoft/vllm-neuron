@@ -18,8 +18,8 @@ the buffers carry a zero pad head).
   slots   [1, B] int32: the slot of each row.
   qmask   [128, NP*U] bf16 (NP = U/2): the head-pair mask of the cross-attention kernel.
   dmask   [U, VB*64] fp32: 1 at (u, 64 (u % VB) + c), else 0.
-  maskb   [B*H, CTX] fp32: 0 for a valid position, -1e30 for a masked one.
-  out     [B*H, 64] bf16, row = row * H + head.
+  maskb   [B*S*H, CTX] fp32: 0 for a valid position, -1e30 for a masked one.
+  out     [B*S*H, 64] bf16, row = (row * S + query row) * H + head.
 
 Position layout: chunk j holds the positions 128 j .. 128 j + 127 (the last chunk can be
 partial), one position per partition, so score column c is position c. A larger ctx bucket
@@ -28,6 +28,11 @@ same values whatever the bucket of its batch.
 
 Math for each unit (row, head): s = q . K (fp32), p = softmax(s + maskb) in fp32, cast
 to bf16, ctx = p @ V with fp32 accumulation, cast to bf16.
+
+S: query rows per slot (default 1). With S > 1 (a speculative-decoding verify step), each real
+row b has S query rows in token order in q_t, maskb and out. The kernel loads the K and V of
+a slot one time and uses them (and the K transposes) for the S query rows. A unit is then
+(row, query row, head), U = G * S * H. Each query row gets the same values as with S = 1.
 
 LNC: the launch grid is the LNC degree. With 2 programs, program i runs the groups
 g = i, i + 2, ... (each group is independent and writes its own output rows).
@@ -39,12 +44,12 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 
 
 @nki.jit
-def whisper_self_attn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, maskb, G=4, VB=5):
+def whisper_self_attn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, maskb, G=4, VB=5, S=1):
     """See the module docstring."""
     B = slots.shape[1]
-    H = 2 * q_t.shape[1] // B
+    H = 2 * q_t.shape[1] // (B * S)
     E = H * 64
-    U = G * H
+    U = G * S * H
     NP = U // 2
     NG = B // G
     HP = H // 2
@@ -60,7 +65,7 @@ def whisper_self_attn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, maskb, 
     kernel_assert(CTX <= CS and CTX <= 512, "whisper_self_attn_decode: CTX up to the slot length and 512")
     kernel_assert(H % VB == 0 and VB * 64 <= 512, "whisper_self_attn_decode: VB must divide H, 64 VB <= 512")
 
-    out = nl.ndarray((B * H, 64), dtype=q_t.dtype, buffer=nl.shared_hbm)
+    out = nl.ndarray((B * S * H, 64), dtype=q_t.dtype, buffer=nl.shared_hbm)
     dm_sb = nl.ndarray((U, VB * 64), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=dm_sb, src=dmask[0:U, 0:VB * 64])
     # One zero-padded p^T per PV block. Only the VB columns of the block are written
@@ -122,9 +127,10 @@ def whisper_self_attn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, maskb, 
                                       data=kb[0:pj, j, pk * 128:pk * 128 + 128])
                 kt = nl.ndarray((128, CTX), dtype=k_cache.dtype, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=kt, src=kt_ps)
-                p = r * HP + pk
-                nisa.nc_matmul(dst=sc, stationary=qm[0:128, p, 0:U], moving=kt,
-                               accumulate=(p != 0))
+                for s in range(S):
+                    p = (r * S + s) * HP + pk
+                    nisa.nc_matmul(dst=sc, stationary=qm[0:128, p, 0:U], moving=kt,
+                                   accumulate=(p != 0))
 
         # Softmax over the CTX columns, fp32. A masked position gets p = 0.
         s = nl.ndarray((U, CTX), dtype=nl.float32, buffer=nl.sbuf)
@@ -155,14 +161,15 @@ def whisper_self_attn_decode(q_t, k_cache, v_cache, slots, qmask, dmask, maskb, 
         o_ps = nl.ndarray((U, VB * 64), dtype=nl.float32, buffer=nl.psum)
         first = 1
         for r in range(G):
-            for bb in range(H // VB):
-                b = r * (H // VB) + bb
-                for j in range(NCH):
-                    pj = min(128, CTX - 128 * j)
-                    nisa.nc_matmul(dst=o_ps, stationary=ptz[b][0:pj, j, 0:U],
-                                   moving=vbs[r][0:pj, j, bb * VB * 64:(bb + 1) * VB * 64],
-                                   accumulate=(first == 0))
-                    first = 0
+            for s in range(S):
+                for bb in range(H // VB):
+                    b = (r * S + s) * (H // VB) + bb
+                    for j in range(NCH):
+                        pj = min(128, CTX - 128 * j)
+                        nisa.nc_matmul(dst=o_ps, stationary=ptz[b][0:pj, j, 0:U],
+                                       moving=vbs[r][0:pj, j, bb * VB * 64:(bb + 1) * VB * 64],
+                                       accumulate=(first == 0))
+                        first = 0
         o_m = nl.ndarray((U, VB, 64), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=o_m.reshape((U, VB * 64)), data1=o_ps, data2=dm_sb, op=nl.multiply)
         o_sb = nl.ndarray((U, 64), dtype=q_t.dtype, buffer=nl.sbuf)

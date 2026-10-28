@@ -37,6 +37,7 @@ def whisper_self_attention_decode(
     qmask: torch.Tensor | None,
     maskb: torch.Tensor | None,
     group: int,
+    s_rows: int = 1,
 ) -> torch.Tensor:
     """Return the self-attention context of B decode rows, ``[B, H, 64]``.
 
@@ -53,21 +54,26 @@ def whisper_self_attention_decode(
         qmask: the ``xkernel_qmask(H, group)`` tensor on the device (kernel only).
         maskb: the ``self_attn_mask_bias(positions, H, ctx)`` tensor (kernel only).
         group: rows per kernel group (``xkernel_group``).
+        s_rows: query rows per slot (a verify step: K + 1). ``q`` and ``positions`` then have
+            ``B * s_rows`` rows in token order and ``slots`` has ``B``. ``group * s_rows * H``
+            must be at most 128, and ``qmask`` must be built for ``group * s_rows`` rows.
 
     Example:
         >>> # ctx = whisper_self_attention_decode(q, slot_k, slot_v, slots, pos, 128, qm, mb, 4)
     """
-    B, H, D = q.shape
+    BT, H, D = q.shape
+    B = BT // s_rows
     S, CS = k_slots.shape[0], k_slots.shape[1]
     if not can_run_kernel(q):
+        tok_slots = slots.view(-1).repeat_interleave(s_rows) if s_rows > 1 else slots
         return whisper_self_attn_decode_torch(
-            q, k_slots.view(S, CS, H, D), v_slots.view(S, CS, H, D), slots, positions, ctx
+            q, k_slots.view(S, CS, H, D), v_slots.view(S, CS, H, D), tok_slots, positions, ctx
         )
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
     vb = self_attn_vb(H)
-    q_t = q.reshape(B * H // 2, 2 * D).t().contiguous()
-    dmask = xkernel_dmask(H, group, vb, device=q.device)
+    q_t = q.reshape(BT * H // 2, 2 * D).t().contiguous()
+    dmask = xkernel_dmask(H, group * s_rows, vb, device=q.device)
     out = wrap_nki(whisper_self_attn_decode)[get_logical_nc_config()](
         q_t=q_t,
         k_cache=k_slots.view(S, CS * H * D),
@@ -78,10 +84,11 @@ def whisper_self_attention_decode(
         maskb=maskb,
         G=group,
         VB=vb,
+        S=s_rows,
     )
     if isinstance(out, (tuple, list)):
         out = out[0]
-    return out.view(B, H, D)
+    return out.view(BT, H, D)
 
 
 __all__ = ["whisper_self_attention_decode", "self_attn_mask_bias"]
