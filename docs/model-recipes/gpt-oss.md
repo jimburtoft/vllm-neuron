@@ -145,6 +145,28 @@ variable (`GPTOSS_KV_WRITE=kernel`, `GPTOSS_PREFILL_IMPL=shard_on_block`,
 native route `-O2` decode is already as fast, so the hook has no measurable effect there.
 An explicit `--optimization-level` turns the per-graph hook off.
 
+### EAGLE3 speculative decoding (gpt-oss-20b, Trn2)
+
+The public EAGLE3 draft [`RedHatAI/gpt-oss-20b-speculator.eagle3`](https://huggingface.co/RedHatAI/gpt-oss-20b-speculator.eagle3)
+works with the FP8 configuration above. It needs the companion NKI Library branch at `e9b52c6` or later: older
+versions fail to compile the verify step (`cannot align DMA operands ... partition count (8)` in
+`attention_block_tkg`).
+
+```bash
+vllm serve openai/gpt-oss-20b --tensor-parallel-size 4 --max-model-len 4096 \
+  --max-num-batched-tokens 2048 --max-num-seqs 16 --block-size 128 --no-enable-prefix-caching \
+  --additional-config '{"neuron_config": {"quantization": "fp8",
+      "num_batched_tokens_buckets": [128, 256, 512, 1024, 2048],
+      "decode_context_length_buckets": [1024, 2048], "num_seqs_buckets": [1, 4, 16],
+      "on_device_sampling_config": {"all_greedy": true}}}' \
+  --speculative-config '{"method": "eagle3", "model": "RedHatAI/gpt-oss-20b-speculator.eagle3", "num_speculative_tokens": 1}'
+```
+
+On trn2.3xlarge (chat prompts, 256 output tokens): output tokens/s 187 / 402 / 907 at 1 / 4 / 16 concurrent
+requests, against 167 / 410 / 707 without speculation (+12 % / -2 % / +28 %). The draft acceptance rate was
+71-73 %. GSM8K-CoT (1,319 questions) was 0.876 with EAGLE3 and 0.873 without. `num_speculative_tokens: 2` was
+slower than `1` at every concurrency. The first compile takes about 48 minutes instead of 19.
+
 ## Known issues
 
 - **Intermittent HTTP 500 errors with an FP8 KV cache on Trn3.** A race
