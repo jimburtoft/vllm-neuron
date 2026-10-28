@@ -375,3 +375,150 @@ def sparse_prefill_attn(
         nisa.dma_copy(dst=num_out[q, 0:H, 0:L], src=num_sb)
 
     return m_out, den_out, num_out
+
+
+_TOPK_GROUP = 16  # nisa.topk ranks one 16-partition snake per problem
+_TOPK_SHIFT = 4
+_TOPK_PER_CALL = P_MAX // _TOPK_GROUP
+
+
+@nki.jit
+def topk_rows(
+    scores_ctx,  # [Q, P] fp32 (or bf16) indexer scores of the prefix; invisible keys = -BIG
+    scores_own,  # [Q, C] the chunk's keys (positions P ..); invisible = -BIG
+    k=2048,
+    big=1.0e30,
+    passes=3,
+):
+    """Per query, the ``k`` highest-scoring positions of ``[scores_ctx | scores_own]``
+    (never concatenated in HBM) -> ``rows [Q, k]`` int32 positions in ``[0, P + C)``
+    (unordered) and ``bound [Q, k]`` fp32: ``+big`` for a visible key (score
+    ``> -big / 2``), ``-big`` otherwise (a query with fewer than ``k`` visible
+    keys fills the rest with invisible ones).
+
+    ``nisa.topk`` (GpSimd, after nkilib's deepseek_v32 ``_select_topk_indices``)
+    ranks bf16. To keep the fp32 ranking near the cut, ``passes`` rounds: pass
+    1 ranks bf16 scores and gives an approximate k-th value ``t`` per query (the
+    min of its top-k); each later pass ranks bf16 ``(s - t)`` -- small near the
+    cut, so finely resolved there -- and refines ``t`` by its own k-th value.
+
+    Layout: 8 queries per call, query ``j`` on partitions ``16 j .. 16 j + 15``;
+    partition ``r`` holds prefix positions ``r * P/16 ..`` in columns ``[0, P/16)``
+    and chunk positions ``P + r * C/16 ..`` in columns ``[P/16, (P + C)/16)``
+    (one contiguous run per partition and piece). Snake index ``i`` is at
+    partition ``i & 15``, column ``i >> 4``. Queries split across programs.
+    """
+    Q, P = scores_ctx.shape
+    C = scores_own.shape[1]
+    N = P + C
+    _kassert(scores_own.shape[0] == Q, "score pieces must have the same queries")
+    _kassert(P % _TOPK_GROUP == 0 and C % _TOPK_GROUP == 0, "pieces must be multiples of 16")
+    _kassert(k % _TOPK_GROUP == 0 and k <= N and k <= 16384, "k must be a multiple of 16, <= keys")
+    _kassert(N < 65536, "nisa.topk needs fewer than 65536 keys")
+    n_prg, prg = _programs()
+    _kassert(Q % n_prg == 0, "queries must divide by the number of programs")
+    QP = Q // n_prg
+    q_base = prg * QP
+    cp = P // _TOPK_GROUP
+    co = C // _TOPK_GROUP
+    cols = cp + co
+    kc = k // _TOPK_GROUP
+
+    rows_out = nl.ndarray((Q, k), dtype=nl.int32, buffer=nl.shared_hbm)
+    bound_out = nl.ndarray((Q, k), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    n_rounds = (QP + _TOPK_PER_CALL - 1) // _TOPK_PER_CALL
+    for rd in nl.sequential_range(n_rounds):
+        q0 = q_base + rd * _TOPK_PER_CALL
+        nq = min(_TOPK_PER_CALL, QP - rd * _TOPK_PER_CALL)
+        npart = nq * _TOPK_GROUP
+        s_f = nl.ndarray((P_MAX, cols), dtype=nl.float32, buffer=nl.sbuf)
+        if npart < P_MAX:
+            nisa.memset(dst=s_f, value=0.0)
+        nisa.dma_copy(
+            dst=s_f[0:npart, 0:cp], src=scores_ctx.ap(pattern=[[cp, npart], [1, cp]], offset=q0 * P)
+        )
+        nisa.dma_copy(
+            dst=s_f[0:npart, cp:cols], src=scores_own.ap(pattern=[[co, npart], [1, co]], offset=q0 * C)
+        )
+
+        # ---- pass 1 ranks bf16(s); pass j > 1 ranks bf16(s - t), t refined from the last pass ----
+        t_col = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=t_col, value=0.0)
+        val = nl.ndarray((P_MAX, k), dtype=nl.bfloat16, buffer=nl.sbuf)
+        idx = nl.ndarray((P_MAX, k), dtype=nl.uint32, buffer=nl.sbuf)
+        key = nl.ndarray((P_MAX, cols), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for ps in nl.static_range(passes):
+            if ps == 0:
+                nisa.tensor_copy(dst=key, src=s_f)
+            else:
+                nisa.tensor_scalar(dst=key, data=s_f, op0=nl.subtract, operand0=t_col)
+            nisa.topk(val_dst=val, idx_dst=idx, src=key, n=N)
+            if ps == passes - 1:
+                break
+            # t += the group's k-th value of this pass (min of its top-k): the
+            # min over the 16 partitions of a group, broadcast back to them.
+            pmin = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=pmin, op=nl.minimum, data=val[0:P_MAX, 0:kc], axis=1)
+            pm_t = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(dst=pm_t, data=pmin)
+            pm_g = nl.ndarray((1, _TOPK_PER_CALL, _TOPK_GROUP), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=pm_g, src=pm_t)
+            t8 = nl.ndarray((1, _TOPK_PER_CALL), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=t8, op=nl.minimum, data=pm_g, axis=2)
+            t_row = nl.ndarray((1, _TOPK_PER_CALL, _TOPK_GROUP), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(
+                dst=t_row,
+                src=t8.ap(pattern=[[_TOPK_PER_CALL, 1], [1, _TOPK_PER_CALL], [0, _TOPK_GROUP]], offset=0),
+            )
+            t_cp = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(dst=t_cp, data=t_row)
+            nisa.tensor_tensor(dst=t_col, data1=t_col, data2=t_cp, op=nl.add)
+            # Floor t at -big/4: with fewer than k visible keys t would reach
+            # -big, and s - t would lose the visible / invisible split.
+            nisa.tensor_scalar(dst=t_col, data=t_col, op0=nl.maximum, operand0=-0.25 * big)
+        val2 = val
+        idx2 = idx
+
+        # ---- bound: visible iff s - t > -big/2 (t >= -big/4) ----
+        bnd = nl.ndarray((P_MAX, kc), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=bnd, data=val2[0:P_MAX, 0:kc], op0=nl.greater, operand0=-0.5 * big,
+            op1=nl.multiply, operand1=2.0 * big,
+        )
+        nisa.tensor_scalar(dst=bnd, data=bnd, op0=nl.add, operand0=-big)
+
+        # ---- snake index -> position (fp32 arithmetic, exact below 2^24) ----
+        si = nl.ndarray((P_MAX, kc), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=si, src=idx2[0:P_MAX, 0:kc])
+        ri = nl.ndarray((P_MAX, kc), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=ri, data=si, op0=nl.bitwise_and, operand0=_TOPK_GROUP - 1)
+        ci = nl.ndarray((P_MAX, kc), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=ci, data=si, op0=nl.right_shift, operand0=_TOPK_SHIFT)
+        rf = nl.ndarray((P_MAX, kc), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=rf, src=ri)
+        cf = nl.ndarray((P_MAX, kc), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=cf, src=ci)
+        # prefix: r * cp + c;  chunk (c >= cp): P + r * co + (c - cp) = that + (P - cp) + r * (co - cp)
+        pos = nl.ndarray((P_MAX, kc), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.scalar_tensor_tensor(
+            dst=pos, data=rf, op0=nl.multiply, operand0=float(cp), op1=nl.add, operand1=cf
+        )
+        adj = nl.ndarray((P_MAX, kc), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=adj, data=rf, op0=nl.multiply, operand0=float(co - cp), op1=nl.add, operand1=float(P - cp)
+        )
+        own = nl.ndarray((P_MAX, kc), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=own, data=cf, op0=nl.greater_equal, operand0=float(cp))
+        nisa.tensor_tensor(dst=adj, data1=adj, data2=own, op=nl.multiply)
+        nisa.tensor_tensor(dst=pos, data1=pos, data2=adj, op=nl.add)
+        pos_i = nl.ndarray((P_MAX, kc), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=pos_i, src=pos)
+
+        nisa.dma_copy(
+            dst=rows_out.ap(pattern=[[kc, npart], [1, kc]], offset=q0 * k), src=pos_i[0:npart, 0:kc]
+        )
+        nisa.dma_copy(
+            dst=bound_out.ap(pattern=[[kc, npart], [1, kc]], offset=q0 * k), src=bnd[0:npart, 0:kc]
+        )
+    return rows_out, bound_out
