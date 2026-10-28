@@ -82,7 +82,8 @@ def get_lmhead_backend() -> str:
     return v
 
 
-# Prefill graph options (comma list; empty = stock). Read once per module at __init__.
+# Prefill graph options (comma list). Default "kvblock"; "none" (or an empty value) runs the
+# stock prefill. Read once per module at __init__.
 # - "mlpfuse": at TP1, the MLP kernel adds the attention residual and applies the
 #   post-attention RMSNorm itself (fused_add_tensor + RMS_NORM, as decode does), instead of
 #   a torch add + a torch RMSNorm before it. TP>1 keeps the stock path (SP shards the residual).
@@ -90,13 +91,16 @@ def get_lmhead_backend() -> str:
 #   repeat_interleave copy of K and V to 16 heads. Same math, same kernel.
 # - "kvblock": the full-prefill KV cache write stores whole cache blocks (one row per
 #   block_size tokens) instead of one scatter row per token, and writes the packed FP8 K
-#   pairs directly (no read of the stored pairs). See _write_kv_blocks.
+#   pairs directly (no read of the stored pairs). See _write_kv_blocks. Default on:
+#   PRE-416 35.0 -> 31.2 ms in serving, +3.3 % RTFx, WER unchanged (Task 036).
 _PREFILL_OPTS = ("mlpfuse", "gqa", "kvblock")
+_PREFILL_OPTS_DEFAULT = "kvblock"
 
 
 def get_prefill_opts() -> frozenset:
-    raw = os.environ.get("VLLM_NEURON_QWEN3_ASR_PREFILL_OPT", "").strip().lower()
-    opts = frozenset(o.strip() for o in raw.split(",") if o.strip())
+    raw = os.environ.get("VLLM_NEURON_QWEN3_ASR_PREFILL_OPT", _PREFILL_OPTS_DEFAULT)
+    raw = raw.strip().lower()
+    opts = frozenset(o.strip() for o in raw.split(",") if o.strip()) - {"none"}
     bad = opts - set(_PREFILL_OPTS)
     if bad:
         raise ValueError(

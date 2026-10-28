@@ -5,7 +5,8 @@
   post-attention RMSNorm itself (as decode does) instead of a torch add + torch RMSNorm.
 - ``gqa``: prefill attention passes the 8 KV heads to attention_cte (native GQA) instead
   of a repeat_interleave copy to 16 heads.
-- ``kvblock``: the full-prefill KV write stores whole cache blocks (bf16 and packed FP8).
+- ``kvblock`` (default on): the full-prefill KV write stores whole cache blocks (bf16 and
+  packed FP8). ``none`` turns every option off.
 
 On CPU the NKI calls run their torch fallbacks, so this checks the wiring and the math
 (one decoder layer, same weights, stock vs option): outputs match within bf16 rounding and
@@ -37,7 +38,10 @@ NUM_BLOCKS = 20
 
 def test_env_parsing(monkeypatch):
     monkeypatch.delenv("VLLM_NEURON_QWEN3_ASR_PREFILL_OPT", raising=False)
-    assert mb.get_prefill_opts() == frozenset()
+    assert mb.get_prefill_opts() == frozenset({"kvblock"})  # default on
+    for off in ("none", "", " NONE "):
+        monkeypatch.setenv("VLLM_NEURON_QWEN3_ASR_PREFILL_OPT", off)
+        assert mb.get_prefill_opts() == frozenset()
     monkeypatch.setenv("VLLM_NEURON_QWEN3_ASR_PREFILL_OPT", " MLPFuse , gqa,kvblock ")
     assert mb.get_prefill_opts() == frozenset({"mlpfuse", "gqa", "kvblock"})
     monkeypatch.setenv("VLLM_NEURON_QWEN3_ASR_PREFILL_OPT", "gqa,bogus")
@@ -141,7 +145,7 @@ def _run(opts, args):
 def test_prefill_opts_match_stock(opts):
     real = 150
     args = _inputs(real, 160)
-    o0, k0, v0, f0 = _run("", args)
+    o0, k0, v0, f0 = _run("none", args)
     o1, k1, v1, f1 = _run(opts, args)
     assert f0.tolist() == [False, False]
     assert f1.tolist() == ["mlpfuse" in opts, "gqa" in opts]
@@ -268,7 +272,7 @@ def test_kvblock_matches_stock_write(fp8, nkh, real, padded):
     nreq = (padded + BLOCK - 1) // BLOCK
     table = torch.tensor([3, 17, 5, 9, 2, 11, 7, 19, 13, 4, 15, 6, 8][:nreq])
     args = _attn_inputs(real, padded, table)
-    o0, k0, v0, f0 = _run_attn("", nkh, fp8, args)
+    o0, k0, v0, f0 = _run_attn("none", nkh, fp8, args)
     o1, k1, v1, f1 = _run_attn("kvblock", nkh, fp8, args)
     assert f0.tolist() == [False, fp8] and f1.tolist() == [True, fp8]
     torch.testing.assert_close(o1, o0, atol=0, rtol=0)
@@ -293,7 +297,7 @@ def test_kvblock_falls_back_when_not_whole_blocks():
     # 150 tokens unpadded is not a multiple of the block size: the stock write runs.
     table = torch.arange(1, 6)
     args = _attn_inputs(150, 150, table)
-    o0, k0, v0, _ = _run_attn("", 2, True, args)
+    o0, k0, v0, _ = _run_attn("none", 2, True, args)
     o1, k1, v1, _ = _run_attn("kvblock", 2, True, args)
     assert torch.equal(k1, k0) and torch.equal(v1, v0)
     torch.testing.assert_close(o1, o0, atol=0, rtol=0)
