@@ -234,6 +234,25 @@ def _all_gather(group, t: torch.Tensor, dim: int, world: int) -> torch.Tensor:
     return group.all_gather(t, dim=dim)
 
 
+def _all_to_all(
+    group, t: torch.Tensor, split: int, concat: int, world: int, rank: torch.Tensor | None = None
+) -> torch.Tensor:
+    """The plugin's ``all_to_all`` over the TP group (``group.device_group``):
+    ``t`` split into ``world`` pieces along ``split``, piece ``k`` sent to the
+    rank that receives slot ``k``; the received pieces concatenated along
+    ``concat`` in the collective's block order. Neither the slot a rank receives
+    nor the block order is assumed to be tp-rank order (on Trn2 the plugin
+    emulates it with an all-gather, whose order is the mesh's): callers
+    exchange tags (``forward_prefill_sparse``). ``rank`` is the runner's rank
+    tensor (the Trn2 fallback slices with it). Tests replace this function."""
+    if "collectives" in PERF_SKIP:
+        piece = t.narrow(split, 0, t.shape[split] // world)
+        return torch.cat([piece] * world, dim=concat)
+    from vllm_neuron.functional.collectives.all_to_all import all_to_all
+
+    return all_to_all(t.contiguous(), split, concat, group=group.device_group, rank=rank)
+
+
 def _capture(layer_idx: int, name: str, tensor: torch.Tensor) -> None:
     if DEBUG_CAPTURE and layer_idx in DEBUG_LAYERS:
         from vllm_neuron.accuracy import capture_tensor
@@ -1511,7 +1530,16 @@ class HYV4Attention(nn.Module):
         if rank is None:
             rank = torch.tensor(self.tp_group.rank_in_group, device=dev)
         r = rank.reshape(1).to(torch.long)
-        mine = r * per_rank + torch.arange(per_rank, device=dev)  # this rank's queries
+        a2a = self.prefill_backend == "cte"
+        if a2a:
+            # All-to-all exchanges (cte): this rank attends query block ``d`` --
+            # the slot it receives in the all-to-all, learnt from a tag (piece
+            # ``k`` carries ``k``) -- and ``d`` need not equal the tp rank.
+            tag = torch.arange(world, dtype=torch.float32, device=dev).view(world, 1)
+            d = _all_to_all(self.tp_group, tag, 0, 1, world, r)[0, 0:1].to(torch.long)
+            mine = d * per_rank + torch.arange(per_rank, device=dev)
+        else:
+            mine = r * per_rank + torch.arange(per_rank, device=dev)  # this rank's queries
         prior = metadata["cached_seq_len"].reshape(1, 1).to(torch.long)
         pos_map = self._prefill_pos_map(block_table, prior)  # [P]
         span = pos_map.shape[0]
@@ -1529,7 +1557,9 @@ class HYV4Attention(nn.Module):
             sc_own = (s_own * local_w.unsqueeze(-1)).sum(dim=1)  # [Q, C]
             vis_ctx = (torch.arange(span, device=dev).view(1, span) < prior).expand(rows_q, span)
             vis_own = torch.arange(chunk, device=dev).view(1, chunk) <= mine.view(rows_q, 1)
-            if "collectives" in PERF_SKIP:
+            if a2a:
+                sources = None  # the cte exchanges carry their own tags
+            elif "collectives" in PERF_SKIP:
                 sources = torch.arange(world, dtype=torch.float32, device=dev)
             else:
                 sources = self.tp_group.all_gather(r.to(torch.float32), dim=0)
@@ -1545,11 +1575,26 @@ class HYV4Attention(nn.Module):
             selected = (rows, bound, sources)
         rows, bound, sources = selected
 
-        ql_all = _all_gather(self.tp_group, q_lat, 1, world)  # [C, heads, 512]
-        qr_all = _all_gather(self.tp_group, q_rope, 1, world)  # [C, heads, 64]
-        ql_loc = torch.index_select(ql_all, 0, mine).float()
-        qr_loc = torch.index_select(qr_all, 0, mine).float()
-        sinks = _all_gather(self.tp_group, self.sinks.float(), 0, world)  # [heads]
+        if a2a:
+            # Head blocks arrive in the all-to-all's block order ``b``; the sinks
+            # ride the same collective so they share that order, with each
+            # sender's slot ``d_b`` (to route the results back).
+            ql_loc = _all_to_all(self.tp_group, q_lat, 0, 1, world, r).float()  # [Q, heads, 512]
+            qr_loc = _all_to_all(self.tp_group, q_rope, 0, 1, world, r).float()  # [Q, heads, 64]
+            tagged = torch.cat(
+                (d.to(torch.float32).view(1, 1).expand(world, 1),
+                 self.sinks.float().view(1, nh).expand(world, nh)),
+                dim=1,
+            )  # [world, 1 + nh], every row the same
+            got = _all_to_all(self.tp_group, tagged, 0, 1, world, r).view(world, 1 + nh)
+            d_b = got[:, 0]  # slot of the sender of block b
+            sinks = got[:, 1:].reshape(world * nh)  # [heads]
+        else:
+            ql_all = _all_gather(self.tp_group, q_lat, 1, world)  # [C, heads, 512]
+            qr_all = _all_gather(self.tp_group, q_rope, 1, world)  # [C, heads, 64]
+            ql_loc = torch.index_select(ql_all, 0, mine).float()
+            qr_loc = torch.index_select(qr_all, 0, mine).float()
+            sinks = _all_gather(self.tp_group, self.sinks.float(), 0, world)  # [heads]
         own_lat = lat_own.to(self.kv_pages.dtype)
         own_rope = k_rope.to(self.kv_pages.dtype)
         col_off = self.latent_slice.start
@@ -1598,6 +1643,21 @@ class HYV4Attention(nn.Module):
         ).unsqueeze(-1)  # [Q, heads, 512]
 
         rank_v = self.kv_lora_rank
+        if a2a:
+            # Head block b goes back to the rank in slot d_b: piece k is the head
+            # block with d_b == k. The query blocks then arrive in block order,
+            # block b' holding the queries of slot d_b' (same order and tags as
+            # above); the same 0/1 matrix puts them in query order. Exact: every
+            # output element is one 0/1 product.
+            slots = torch.arange(world, dtype=torch.float32, device=dev)
+            route = (slots.view(world, 1) == d_b.view(1, world)).to(self.dtype)  # [k, b]
+            o_b = o_loc.to(self.dtype).view(per_rank, world, nh * rank_v)
+            o_send = torch.einsum("kb,qbx->qkx", route, o_b).reshape(per_rank, world * nh, rank_v)
+            o_got = _all_to_all(self.tp_group, o_send, 1, 0, world, r)  # [C, nh, 512], block order
+            ordered = route @ o_got.reshape(world, per_rank * nh * rank_v)
+            out = self._finish(ordered.reshape(chunk, nh, rank_v), gate)
+            _capture(self.layer_idx, "attn_out", out)
+            return out, selected
         o_all = _all_gather(self.tp_group, o_loc.to(self.dtype), 0, world)  # [C, heads, 512]
         pick = self._pick_from(sources, r, dev).to(self.dtype)  # [nh, heads]
         o_mine = torch.einsum("jh,qhc->qjc", pick, o_all)  # blocks in gather order

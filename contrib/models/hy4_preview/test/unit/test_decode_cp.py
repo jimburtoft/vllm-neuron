@@ -35,8 +35,12 @@ CASES = [  # (positions per row, dead rows)
 
 
 class Hub:
-    def __init__(self, world, order):
+    def __init__(self, world, order, a2a_order=None, a2a_slot=None):
         self.order = order  # order[j] = rank at all-gather block j
+        # all-to-all: a2a_order[j] = rank at received block j; a2a_slot[r] = the
+        # piece index rank r receives (neither is tp-rank order on device).
+        self.a2a_order = a2a_order if a2a_order is not None else list(order)
+        self.a2a_slot = a2a_slot if a2a_slot is not None else list(range(world))
         self.slots = [None] * world
         self.barrier = threading.Barrier(world)
 
@@ -59,6 +63,20 @@ class HubGroup(Group):
     def all_gather(self, t, dim=0):
         got = self.hub.exchange(self.rank_in_group, t)
         return torch.cat([got[j] for j in self.hub.order], dim=dim)
+
+    def all_to_all(self, t, split, concat):
+        got = self.hub.exchange(self.rank_in_group, t)
+        k = self.hub.a2a_slot[self.rank_in_group]
+        world = self.world_size
+        pieces = [got[j].chunk(world, dim=split)[k] for j in self.hub.a2a_order]
+        return torch.cat(pieces, dim=concat)
+
+
+def hub_all_to_all(group, t, split, concat, world, rank=None):
+    """``model._all_to_all`` for the threaded harness (and identity for one rank)."""
+    if world == 1:
+        return t
+    return group.all_to_all(t, split, concat)
 
 
 def make_config(dtype):

@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from hy4_stubs import Group, model, set_group
-from test_decode_cp import BLOCK, HIDDEN, PAGES, TOPK, WIDTH, Hub, build_rank, build_reference, make_config, rel
+from test_decode_cp import BLOCK, HIDDEN, PAGES, TOPK, WIDTH, Hub, hub_all_to_all, build_rank, build_reference, make_config, rel
 
 CHUNK = 128  # keys = WIDTH * BLOCK + CHUNK = 640, a multiple of 128
 
@@ -82,8 +82,12 @@ def test_prefill_sparse_matches_dense(monkeypatch, dtype, tol, world, order_seed
     cfg = make_config(dtype)
     ref_layers = build_reference(cfg)
     rope = model.HYV4RotaryEmbedding(cfg)
-    order = torch.randperm(world, generator=torch.Generator().manual_seed(order_seed)).tolist()
-    hub = Hub(world, order)
+    gen = torch.Generator().manual_seed(order_seed)
+    order = torch.randperm(world, generator=gen).tolist()
+    # Independent shuffles for the all-to-all's block order and slot assignment.
+    hub = Hub(world, order, torch.randperm(world, generator=gen).tolist(),
+              torch.randperm(world, generator=gen).tolist())
+    monkeypatch.setattr(model, "_all_to_all", hub_all_to_all)
     ranks = [[build_rank(cfg, a, world, r, hub) for a in ref_layers] for r in range(world)]
     for layers in ranks:
         for a in layers:
@@ -110,8 +114,10 @@ def test_prefill_sparse_matches_dense(monkeypatch, dtype, tol, world, order_seed
             for r in range(world):
                 rows, bound, _ = sparse[r][1][li]
                 assert rows.shape == (per, 128) and rows.dtype == torch.int32
-                want = dense[r][1][li][r * per : (r + 1) * per]
-                assert torch.equal(want, ref[li][1][r * per : (r + 1) * per])
+                # cte: rank r attends the query block of its all-to-all slot.
+                b = hub.a2a_slot[r] if backend == "cte" else r
+                want = dense[r][1][li][b * per : (b + 1) * per]
+                assert torch.equal(want, ref[li][1][b * per : (b + 1) * per])
                 if backend == "v1":
                     assert torch.equal(rows_to_mask(rows, n_keys), want), (cached, li, r)
                     assert torch.equal(bound > 0, rows < n_keys)
@@ -123,7 +129,7 @@ def test_prefill_sparse_matches_dense(monkeypatch, dtype, tol, world, order_seed
                     assert not (got & ~want).any(), (cached, li, r)
                     n_vis = want.sum(dim=1).clamp(max=TOPK)
                     assert torch.equal(got.sum(dim=1), n_vis), (cached, li, r)
-                    tok_ok[r * per : (r + 1) * per] &= (got == want).all(dim=1)
+                    tok_ok[b * per : (b + 1) * per] &= (got == want).all(dim=1)
                 assert torch.equal(sparse[r][0][li], sparse[0][0][li]), "ranks disagree"
         # Attention is per query: tokens whose selection is exact must match. A
         # token that dropped keys tied with the k-th index score (cte: exactly
