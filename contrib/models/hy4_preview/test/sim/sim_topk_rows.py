@@ -28,6 +28,7 @@ from nki_sparse_prefill import topk_rows  # noqa: E402
 
 BIG = 1.0e30
 K = int(os.environ.get("K", "2048"))
+WIDTH = int(os.environ.get("WIDTH", "0"))
 C = 2048
 SEEDS = [int(x) for x in os.environ.get("SEEDS", "0").split(",")]
 
@@ -58,11 +59,14 @@ def case(Q, P, seed=0):
     sm = torch.where(vis, s, torch.full_like(s, -BIG))
     t0 = time.time()
     rows, bound = nki.simulate(topk_rows)[GRID](
-        sm[:, :P].contiguous().numpy(), sm[:, P:].contiguous().numpy(), k=K
+        sm[:, :P].contiguous().numpy(), sm[:, P:].contiguous().numpy(), k=K, width=WIDTH
     )
     t = time.time() - t0
     rows = torch.as_tensor(np.asarray(rows)).long()
     bound = torch.as_tensor(np.asarray(bound))
+    if WIDTH > K:
+        assert (rows[:, K:] == N).all() and (bound[:, K:] < 0).all(), "pad slots"
+        rows, bound = rows[:, :K], bound[:, :K]
     ref = sm.topk(K, dim=1).indices
     bad_set, bad_bound, n_diff = 0, 0, 0
     for i in range(Q):
