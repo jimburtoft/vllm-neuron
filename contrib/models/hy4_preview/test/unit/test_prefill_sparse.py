@@ -71,7 +71,7 @@ def rows_to_mask(rows, n_keys):
     return mask[:, :n_keys]
 
 
-@pytest.mark.parametrize("backend", ["v1", "cte-skip", "cte-clamp"])
+@pytest.mark.parametrize("backend", ["v1", "cte"])
 @pytest.mark.parametrize("dtype,tol", [(torch.float32, 2e-5), (torch.bfloat16, 2e-2)])
 @pytest.mark.parametrize("world,order_seed", [(4, 2), (8, 1)])
 @torch.no_grad()
@@ -87,8 +87,7 @@ def test_prefill_sparse_matches_dense(monkeypatch, dtype, tol, world, order_seed
     ranks = [[build_rank(cfg, a, world, r, hub) for a in ref_layers] for r in range(world)]
     for layers in ranks:
         for a in layers:
-            a.prefill_backend = backend.split("-")[0]
-            a.prefill_cte_oob = backend.split("-")[-1]
+            a.prefill_backend = backend
     per = CHUNK // world
     n_keys = WIDTH * BLOCK + CHUNK
     for ci, cached in enumerate([0, 40, 300, WIDTH * BLOCK - CHUNK]):
@@ -222,17 +221,15 @@ def test_apply_rope_nocat_bitwise(monkeypatch, style):
             assert torch.equal(model.apply_rope_nocat(x, cos, sin), model.apply_rope(x, cos, sin))
 
 
-@pytest.mark.parametrize("oob", ["skip", "clamp"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.no_grad()
-def test_prefill_cte_matches_v1(oob, dtype):
+def test_prefill_cte_matches_v1(dtype):
     """``_prefill_attn_cte`` (flat per-slot rows from the position tables, then the
     ``sparse_prefill_attn`` contract) == ``sparse_prefill_ref`` (position mode):
     prefix rows past the cached length, chunk rows, pads, a query with nothing
     selected and one with chunk keys only."""
     set_group(Group())
     a = model.HYV4Attention(make_config(dtype), 0)
-    a.prefill_cte_oob = oob
     g = torch.Generator().manual_seed(5)
     a.kv_pages = torch.randn(PAGES, 1, BLOCK, a.entry_dim, generator=g).to(dtype)
     pages, bs, width = a._num_pages(), a._block_size(), a.kv_pages.shape[-1]
@@ -245,8 +242,6 @@ def test_prefill_cte_matches_v1(oob, dtype):
     for i in range(q):
         n = [0, 40, 128, 9, 77, 100][i]
         pool = torch.arange(span, n_keys) if i == 4 else torch.arange(n_keys)
-        if oob == "clamp":  # the model never selects an unmapped prefix position (vis_ctx)
-            pool = pool[(pool < prior.item()) | (pool >= span)]
         pick = pool[torch.randperm(pool.numel(), generator=g)[:n]].sort().values
         rows[i, :n] = pick.to(torch.int32)
     # Skip mode: prefix positions at or past ``prior`` may be selected (unmapped -> zeros, as v1).
@@ -271,7 +266,7 @@ def test_prefill_cte_matches_v1(oob, dtype):
         return num * sc.unsqueeze(-1) / (den * sc + torch.exp(sink - m_f)).unsqueeze(-1)
 
     # Raw m/den/num agree wherever a query has a selected key; a query with none
-    # (all -BIG) differs raw in clamp mode (it sums row 0) but folds to zero.
+    # (all -BIG) is compared after the fold only.
     live = (bound > 0).any(dim=1)
     for w, x in zip(want, got):
         assert torch.allclose(w[live], x[live], rtol=1e-5, atol=1e-5)

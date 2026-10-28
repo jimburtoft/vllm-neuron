@@ -3,7 +3,7 @@
 
 SIMULATOR ONLY: a pass here is a development milestone, not device evidence.
 
-    NEURON_PLATFORM_TARGET_OVERRIDE=trn3 GRID=2 MODE=skip python test/sim/sim_sparse_prefill_cte.py [Q K NSEL ...]
+    NEURON_PLATFORM_TARGET_OVERRIDE=trn3 GRID=2 DMA_T=5 python test/sim/sim_sparse_prefill_cte.py [Q K NSEL ...]
 
 Same cases as ``sim_sparse_prefill.py`` (prefix from a paged cache through a
 position table, positions past the cached length unmapped; the 2048 chunk rows
@@ -11,8 +11,8 @@ from separate latent / rope inputs; ``KSEL`` slots per query, ascending, padded
 with ``P + C``; some queries with few selected, one with chunk keys only), but
 the kernel takes per-slot flat rows: ``rows_cache = pos_full[rows]``,
 ``rows_own = own_map[rows]`` (tables of length ``P + C + 1``, the pad out of
-range in both). ``MODE=skip`` (out-of-range rows skipped by the DMA) or
-``MODE=clamp`` (every row clamped in range, source picked by ``src_sel``).
+range in both, skipped by the DMA). ``DMA_T`` = feature-major key chunks
+landed by indirect ``dma_transpose`` (the rest PE transposes).
 Checks the sink-folded output against an fp32 dense reference.
 """
 import os
@@ -36,7 +36,7 @@ D = L + R
 BIG = 1.0e30
 SCALE = 192 ** -0.5
 KSEL = int(os.environ.get("KSEL", "2176"))
-MODE = os.environ.get("MODE", "skip")
+DMA_T = int(os.environ.get("DMA_T", "1"))  # feature-major chunks by DMA gather-transpose
 QDT = os.environ.get("QDT", "bf16")  # query dtype passed to the kernel (bf16 as the model, or fp32)
 
 
@@ -98,12 +98,7 @@ def case(Q, K, nsel, seed=0, cached_frac=0.75):
     r_l = rows.long()
     rows_cache = pos_full[r_l].to(torch.int32)
     rows_own = own_map[r_l].to(torch.int32)
-    kw = {}
-    if MODE == "clamp":
-        is_c = rows_cache < n_rows
-        kw["src_sel"] = is_c.float().numpy()
-        rows_cache = torch.where(is_c, rows_cache, torch.zeros_like(rows_cache))
-        rows_own = torch.where(rows_own < C, rows_own, torch.zeros_like(rows_own))
+    kw = {"dma_t": DMA_T}
     t0 = time.time()
     km, kd, kn = nki.simulate(sparse_prefill_attn)[GRID](
         qcast(q[..., :L]), qcast(q[..., L:]),
@@ -132,7 +127,7 @@ if __name__ == "__main__":
         r = case(Q, K, nsel)
         good = r["max_rel"] < 2e-2 and r["cos"] > 0.999 and not r["nan"]
         ok &= good
-        print(f"target={os.environ['NEURON_PLATFORM_TARGET_OVERRIDE']} grid={GRID} mode={MODE} q={QDT} "
+        print(f"target={os.environ['NEURON_PLATFORM_TARGET_OVERRIDE']} grid={GRID} dma_t={DMA_T} q={QDT} "
               f"Q={Q} K={K} nsel={nsel} ksel={KSEL}: "
               f"{'PASS' if good else 'FAIL'} (simulator only) "
               + " ".join(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}" for k, v in r.items()),

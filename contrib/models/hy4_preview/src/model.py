@@ -127,11 +127,13 @@ PREFILL_SPARSE_NKI = _flag("HY4_PREFILL_SPARSE_NKI", False)
 # source, after nkilib's ``mla_sparse_attention_cte``). Platform default: "cte"
 # on Trn3, "v1" elsewhere. CPU runs the matching torch reference.
 PREFILL_SPARSE_BACKEND = os.environ.get("HY4_PREFILL_SPARSE_BACKEND", "v1")
-# ``HY4_PREFILL_CTE_OOB`` (cte backend): "skip" (default) = a slot's unused
-# source row is out of range and skipped by the DMA (no read); "clamp" = every
-# gathered row is in range (unused ones read row 0, the source picked per slot,
-# pads masked by the bound) -- a fallback that reads both sources per slot.
-PREFILL_CTE_OOB = os.environ.get("HY4_PREFILL_CTE_OOB", "skip")
+# ``HY4_PREFILL_CTE_DMA_T`` (cte backend): how many of the 5 feature-major key
+# chunks (4 latent + the rope window) an indirect ``dma_transpose`` lands
+# directly; the rest are PE transposes of the gathered rows. Each DMA-transposed
+# chunk moves PE / eviction work onto the DMA queues, whose traffic it
+# multiplies (one partition write per element); nkilib's MLA decode kernel
+# keeps one chunk on the DMA for that reason. To be swept on device.
+PREFILL_CTE_DMA_T = int(os.environ.get("HY4_PREFILL_CTE_DMA_T", "1"))
 
 
 def resolve_platform_defaults() -> str:
@@ -655,12 +657,10 @@ def sparse_prefill_cte_ref(
     scale: float,
     col_off: int,
     value_dtype: torch.dtype,
-    src_sel: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``nki_sparse_prefill.sparse_prefill_attn`` (CPU): slot ``k`` reads cache row
     ``rows_cache[q, k]`` and own row ``rows_own[q, k]`` (out of range = zeros),
-    summed; with ``src_sel`` (clamp mode, all rows in range) it picks the cache
-    row where 1, the own row where 0. -> ``m, den, num`` as ``sparse_decode_ref``."""
+    summed. -> ``m, den, num`` as ``sparse_decode_ref``."""
     n_own = own_lat.shape[0]
     lat_dim, rope_dim = own_lat.shape[1], own_rope.shape[1]
     ctx = gather_rows_cols_ref(kv_pages, rows_cache, col_off, lat_dim + rope_dim).float()
@@ -669,11 +669,7 @@ def sparse_prefill_cte_ref(
     oi = torch.where(ok, ro, torch.zeros_like(ro))
     m_own = ok.unsqueeze(-1).float()
     own = torch.cat((own_lat.float()[oi], own_rope.float()[oi]), dim=-1) * m_own
-    if src_sel is not None:
-        w = src_sel.unsqueeze(-1).float()
-        keys = ctx * w + own * (1.0 - w)
-    else:
-        keys = ctx + own
+    keys = ctx + own
     lat, rope = keys[..., :lat_dim], keys[..., lat_dim:]
     s = (q_lat.float() @ lat.transpose(1, 2) + q_rope.float() @ rope.transpose(1, 2)) * scale
     s = torch.minimum(s, bound.unsqueeze(1))
@@ -915,7 +911,7 @@ class HYV4Attention(nn.Module):
             self._topk_rows_k,
         ) = _sparse_kernels_or_none() if use_kernels else (None, None, None, None, None)
         self.prefill_backend = PREFILL_SPARSE_BACKEND
-        self.prefill_cte_oob = PREFILL_CTE_OOB
+        self.prefill_cte_dma_t = PREFILL_CTE_DMA_T
 
         set_weight_loader(self.q_a_proj_weight, _replicated_transposed())
         set_weight_loader(self.kv_a_proj_weight, _replicated_transposed())
@@ -1628,13 +1624,9 @@ class HYV4Attention(nn.Module):
         Lookup tables over positions ``[0, P + C]`` (the pad ``P + C`` included),
         built with ``arange`` / ``where`` (no concatenation, no integer ``mod``),
         then one ``index_select`` per table by the slot positions ``rows``:
-        ``rows_cache`` (prefix -> flat cache row), ``rows_own`` (chunk -> own row)
-        and, in clamp mode, ``src_sel`` (1 = the slot reads the cache). Clamp
-        mode puts every unused row on row 0 (in range; the slot is either read
-        from the other source or masked by its ``-BIG`` bound); skip mode leaves
-        them out of range for the DMA to skip. The two agree whenever no
-        selected slot is an unmapped prefix position (one at or past
-        ``cached_seq_len``), which the selection guarantees (``vis_ctx``).
+        ``rows_cache`` (prefix -> flat cache row), ``rows_own`` (chunk -> own row);
+        a slot's other source (and both, for the pad) is out of range, which
+        the kernel's DMA skips.
         """
         span, n_own = pos_map.shape[0], own_lat.shape[0]
         n_rows = self._n_cache_rows()
@@ -1648,23 +1640,11 @@ class HYV4Attention(nn.Module):
             torch.index_select(pos_map, 0, torch.clamp(pos, max=span - 1)),
             torch.full_like(pos, n_rows, dtype=pos_map.dtype),
         )
-        # A tensor limit, not a Python int compare (see _zero_beyond).
-        has_ctx = cache_row < torch.full((1,), n_rows, dtype=cache_row.dtype, device=dev)
-        clamp = self.prefill_cte_oob != "skip"
-        if clamp:
-            cache_t = torch.where(has_ctx, cache_row, torch.zeros_like(cache_row))
-            own_t = torch.where(in_own, pos - span, torch.zeros_like(pos))
-        else:
-            cache_t = cache_row
-            own_t = torch.where(in_own, pos - span, torch.full_like(pos, n_own))
+        own_t = torch.where(in_own, pos - span, torch.full_like(pos, n_own))
         flat = rows.reshape(q * ksel).to(torch.long)
-        rows_cache = torch.index_select(cache_t.to(torch.int32), 0, flat).view(q, ksel)
+        rows_cache = torch.index_select(cache_row.to(torch.int32), 0, flat).view(q, ksel)
         rows_own = torch.index_select(own_t.to(torch.int32), 0, flat).view(q, ksel)
-        src_sel = (
-            torch.index_select(has_ctx.to(torch.float32), 0, flat).view(q, ksel) if clamp else None
-        )
         if self._prefill_attn_k is not None and _use_sparse_kernels(ql_loc):
-            kw = {} if src_sel is None else {"src_sel": src_sel.contiguous()}
             # bf16 query (the cache dtype): the score matmuls run at the bf16
             # rate, accumulating in fp32 PSUM; the softmax stays fp32.
             qdt = self.kv_pages.dtype
@@ -1673,12 +1653,13 @@ class HYV4Attention(nn.Module):
                 kv_cache=self.kv_pages,
                 rows_cache=rows_cache.contiguous(), own_lat=own_lat.contiguous(),
                 own_rope=own_rope.contiguous(), rows_own=rows_own.contiguous(),
-                bound=bound.contiguous(), scale=float(self.scaling), col_off=col_off, **kw,
+                bound=bound.contiguous(), scale=float(self.scaling), col_off=col_off,
+                dma_t=self.prefill_cte_dma_t,
             )
         qdt = self.kv_pages.dtype
         return sparse_prefill_cte_ref(
             ql_loc.to(qdt), qr_loc.to(qdt), self.kv_pages, rows_cache, own_lat, own_rope, rows_own, bound,
-            self.scaling, col_off, self.dtype, src_sel,
+            self.scaling, col_off, self.dtype,
         )
 
     def forward_decode(

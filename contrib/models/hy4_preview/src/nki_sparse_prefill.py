@@ -121,8 +121,8 @@ _PT_BATCH = 8  # p transposes staged per PSUM eviction
 
 @nki.jit
 def sparse_prefill_attn(
-    q_lat,  # [Q, H, L] fp32 or bf16 (query latent part; sets the score precision)
-    q_rope,  # [Q, H, R]
+    q_lat,  # [Q, H, L] bf16 (query latent part)
+    q_rope,  # [Q, H, R] bf16
     kv_cache,  # [..., W] bf16 paged cache; leading dims flatten to rows
     rows_cache,  # [Q, KSEL] int32 flat cache row per slot; out of range (>= n_rows) = none
     own_lat,  # [C, L] the chunk's own latent keys / values
@@ -131,36 +131,43 @@ def sparse_prefill_attn(
     bound,  # [Q, KSEL] fp32 +BIG keep / -BIG drop
     scale=1.0,
     col_off=0,  # first cache column of the attended [latent | rope] slice
-    src_sel=None,  # [Q, KSEL] fp32 1 = cache, 0 = own: clamp mode (all rows in range)
+    dma_t=1,  # feature-major key chunks (of n_l latent + 1 rope) transposed by the DMA; the rest on the PE
 ):
-    """Sparse prefill attention, one batched indirect DMA per query and source.
+    """Sparse prefill attention, one batched indirect gather per query and source.
 
     For query ``q`` and all ``H`` heads, over its ``KSEL`` slots: slot ``k``
-    reads its key from cache row ``rows_cache[q, k]`` (the whole row is
-    gathered, columns ``col_off .. col_off + L + R`` used) and/or own row ``rows_own[q, k]``; a row out of range is
-    skipped (zeros), so a slot reads at most one source. Then
+    reads its key from cache row ``rows_cache[q, k]`` (columns ``col_off ..
+    col_off + L + R``) or own row ``rows_own[q, k]``; a row out of range is
+    skipped. A slot must read at most one source; a slot that reads neither
+    holds stale finite data and must carry bound ``-BIG``. Then
 
         s[h, k]  = min(scale * <q[h], key_k>, bound[q, k])
         m[q, h]  = max_k s       den[q, h] = sum_k exp(s - m)
         num[q,h] = sum_k exp(s - m) * latent_k     (unnormalised, fp32)
 
-    Clamp mode (``src_sel`` given): every index is in range (the caller
-    clamps unused ones to a valid row) and ``src_sel`` picks the source per
-    slot; no out-of-range DMA at all.
+    Layout after nkilib's ``mla_sparse_attention_cte`` (DMA path):
 
-    Layout after nkilib's ``mla_sparse_attention_cte`` (DMA path): the slot
-    indices load column-major ``[128, KT]`` in one DMA and feed a 2-D
-    ``vector_offset`` -- ONE indirect DMA gathers all ``KSEL`` rows of a source
-    (``dst[p, m]`` = slot ``p * KT + m``). Queries are split across programs;
-    every program attends all heads. Scores are ``[H, KSEL]`` with keys on the
-    free axis (score column ``m * 128 + p`` = slot ``p * KT + m``; the bound is
-    permuted to match on chip).
+    - the chunk's own keys are first copied (once per call) into a scratch
+      shaped like cache rows, so both sources gather whole rows into ONE
+      key-major buffer ``kv[p, m, :]`` (slot ``p * KT + m``) with ``oob_mode.skip``
+      -- one batched (2-D ``vector_offset``) DMA per source per query;
+    - feature-major keys ``kT[d, c, j]`` for the score matmul: chunk ``c`` from
+      an indirect ``dma_transpose`` (the first ``dma_t`` chunks; index table in
+      row-major order so column ``j = m * 128 + p`` is slot ``p * KT + m``,
+      the order the PE transposes of ``kv`` produce) or a PE transpose. The
+      rope chunk is the 128-wide window ending at the rope (an indirect
+      ``dma_transpose`` must be 128 wide); its first 64 rows meet zero query rows;
+    - scores ``[H, KSEL]`` with keys on the free axis (bound permuted to match),
+      fp32 softmax, PV against ``kv``'s latent columns;
+    - queries split across programs, all heads per program; two buffer sets so
+      query ``i + 1``'s gathers overlap query ``i``'s compute.
     """
     Q, H, L = q_lat.shape
     R = q_rope.shape[2]
     D = L + R
     KSEL = rows_cache.shape[1]
     W = kv_cache.shape[-1]
+    C = own_lat.shape[0]
     n_rows = 1
     for d in kv_cache.shape[:-1]:
         n_rows = n_rows * d
@@ -171,32 +178,73 @@ def sparse_prefill_attn(
     q_base = prg * QP
     _kassert(H <= P_MAX, "heads must be <= 128")
     _kassert(L % P_MAX == 0 and L <= _PSUM_F32, "latent must be a multiple of 128 and <= 512")
-    _kassert(R <= P_MAX, "rope must be <= 128")
+    _kassert(R <= P_MAX and D >= P_MAX, "rope must be <= 128")
     _kassert(KSEL % P_MAX == 0, "KSEL must be a multiple of 128")
     _kassert(col_off + D <= W, "attended slice exceeds the cache row")
     _kassert(own_lat.shape[1] == L and own_rope.shape[1] == R, "own widths")
     KT = KSEL // P_MAX
     n_l = L // P_MAX
-    clamp = src_sel is not None
-    # Whole cache rows are gathered: a batched (2-D vector_offset) DMA needs a
-    # contiguous source, which a column slice of the row is not.
-    GW = W
-    g_off = col_off
-    qk_dt = q_lat.dtype
+    NCH = n_l + 1  # feature-major chunks: n_l latent, then the rope window
+    _kassert(0 <= dma_t <= NCH, "dma_t must be in [0, n_l + 1]")
     kv_dt = kv_cache.dtype
+    _kassert(q_lat.dtype == kv_dt and q_rope.dtype == kv_dt, "query must be in the cache dtype")
+    r_win = col_off + D - P_MAX  # first column of the 128-wide rope window
+    r_lo = P_MAX - R  # rope rows inside the window
 
     m_out = nl.ndarray((Q, H), dtype=nl.float32, buffer=nl.shared_hbm)
     den_out = nl.ndarray((Q, H), dtype=nl.float32, buffer=nl.shared_hbm)
     num_out = nl.ndarray((Q, H, L), dtype=nl.float32, buffer=nl.shared_hbm)
 
-    for i in nl.sequential_range(QP):
-        q = q_base + i
-        # ---- slot indices, column-major [128, KT]: idx[p, m] = rows[q, m * 128 + p] ----
-        idx_c = nl.ndarray((P_MAX, KT), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=idx_c, src=rows_cache[q].reshape((KT, P_MAX)).ap(pattern=[[1, P_MAX], [P_MAX, KT]], offset=0))
-        idx_o = nl.ndarray((P_MAX, KT), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=idx_o, src=rows_own[q].reshape((KT, P_MAX)).ap(pattern=[[1, P_MAX], [P_MAX, KT]], offset=0))
+    # Own keys as cache-shaped rows (columns outside the attended slice unused).
+    own_rows = nl.ndarray((C, W), dtype=kv_dt, buffer=nl.private_hbm)
+    nisa.dma_copy(dst=own_rows[0:C, col_off : col_off + L], src=own_lat[0:C, 0:L])
+    nisa.dma_copy(dst=own_rows[0:C, col_off + L : col_off + D], src=own_rope[0:C, 0:R])
 
+    # Two buffer sets. Zeroed once: a slot that reads no source keeps the
+    # previous query's (finite) values, masked by its bound.
+    NB = 2 if QP > 1 else 1
+    kv_b, kT_b = [], []
+    for b in range(NB):
+        kv = nl.ndarray((P_MAX, KT, W), dtype=kv_dt, buffer=nl.sbuf)
+        nisa.memset(dst=kv, value=0.0)
+        kv_b.append(kv)
+        kT = nl.ndarray((P_MAX, NCH, KSEL), dtype=kv_dt, buffer=nl.sbuf)
+        nisa.memset(dst=kT, value=0.0)
+        kT_b.append(kT)
+
+    def gather(i):
+        q = q_base + i
+        kv, kT = kv_b[i % NB], kT_b[i % NB]
+        srcs = ((cache, rows_cache), (own_rows, rows_own))
+        for src_t, rows_t in srcs:
+            # Column-major [128, KT] (idx[p, m] = rows[m * 128 + p]) for the batched gather ...
+            idx = nl.ndarray((P_MAX, KT), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=idx, src=rows_t[q].reshape((KT, P_MAX)).ap(pattern=[[1, P_MAX], [P_MAX, KT]], offset=0))
+            nisa.dma_copy(
+                dst=kv,
+                src=src_t.ap(pattern=[[W, P_MAX * KT], [1, W]], offset=0, vector_offset=idx.view(nl.uint32),
+                             indirect_dim=0),
+                oob_mode=nisa.oob_mode.skip,
+                dge_mode=nisa.dge_mode.swdge,
+            )
+            if dma_t > 0:
+                # ... and row-major [128, KT] for the gather-transposes (same column order as kv's PE transposes).
+                idx_n = nl.ndarray((P_MAX, KT), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=idx_n, src=rows_t[q].reshape((P_MAX, KT)))
+                for c in nl.static_range(dma_t):
+                    c0 = col_off + c * P_MAX if c < n_l else r_win
+                    nisa.dma_transpose(
+                        dst=kT[0:P_MAX, c, 0:KSEL],
+                        src=src_t.ap(pattern=[[W, KSEL], [1, P_MAX]], offset=c0,
+                                     vector_offset=idx_n.view(nl.uint32), indirect_dim=0),
+                        axes=(1, 0),
+                        oob_mode=nisa.oob_mode.skip,
+                        dge_mode=nisa.dge_mode.swdge,
+                    )
+
+    def compute(i):
+        q = q_base + i
+        kv, kT = kv_b[i % NB], kT_b[i % NB]
         # ---- bound in score-column order, broadcast over heads: bnd[h, m*128+p] = bound[q, p*KT+m] ----
         bnd_nat = nl.ndarray((H, KSEL), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=bnd_nat, src=bound[q].reshape((1, KSEL)).ap(pattern=[[0, H], [1, KSEL]], offset=0))
@@ -207,122 +255,41 @@ def sparse_prefill_attn(
             engine=nisa.engine.vector,
         )
 
-        # ---- queries feature-major: qT[d, c, h] (chunk n_l = rope) ----
-        q_sb = nl.ndarray((H, D), dtype=qk_dt, buffer=nl.sbuf)
+        # ---- queries feature-major: qT[d, c, h]; chunk n_l = rope window (rows < r_lo zero) ----
+        q_sb = nl.ndarray((H, P_MAX + L), dtype=kv_dt, buffer=nl.sbuf)
         nisa.dma_copy(dst=q_sb[0:H, 0:L], src=q_lat[q, 0:H, 0:L])
-        nisa.dma_copy(dst=q_sb[0:H, L:D], src=q_rope[q, 0:H, 0:R])
-        qT = nl.ndarray((P_MAX, n_l + 1, H), dtype=qk_dt, buffer=nl.sbuf)
-        for c in nl.static_range(n_l):
-            tp = nl.ndarray((P_MAX, H), dtype=qk_dt, buffer=nl.psum)
-            nisa.nc_transpose(dst=tp[0:P_MAX, 0:H], data=q_sb[0:H, c * P_MAX : (c + 1) * P_MAX])
-            nisa.tensor_copy(dst=qT[0:P_MAX, c, 0:H], src=tp[0:P_MAX, 0:H])
-        tpr = nl.ndarray((P_MAX, H), dtype=qk_dt, buffer=nl.psum)
-        nisa.nc_transpose(dst=tpr[0:R, 0:H], data=q_sb[0:H, L:D])
-        nisa.tensor_copy(dst=qT[0:R, n_l, 0:H], src=tpr[0:R, 0:H])
+        nisa.memset(dst=q_sb[0:H, L : L + r_lo], value=0.0)
+        nisa.dma_copy(dst=q_sb[0:H, L + r_lo : L + P_MAX], src=q_rope[q, 0:H, 0:R])
+        qT = nl.ndarray((P_MAX, NCH, H), dtype=kv_dt, buffer=nl.sbuf)
+        tq = nl.ndarray((P_MAX, NCH * H), dtype=kv_dt, buffer=nl.psum)
+        for c in nl.static_range(NCH):
+            nisa.nc_transpose(dst=tq[0:P_MAX, c * H : (c + 1) * H], data=q_sb[0:H, c * P_MAX : (c + 1) * P_MAX])
+        nisa.tensor_copy(dst=qT, src=tq)
 
-        # ---- ONE batched indirect DMA per source: all KSEL slots ----
-        c_nat = nl.ndarray((P_MAX, KT, GW), dtype=kv_dt, buffer=nl.sbuf)
-        o_lat = nl.ndarray((P_MAX, KT, L), dtype=kv_dt, buffer=nl.sbuf)
-        o_rope = nl.ndarray((P_MAX, KT, R), dtype=kv_dt, buffer=nl.sbuf)
-        if not clamp:
-            nisa.memset(dst=c_nat, value=0.0)
-            nisa.memset(dst=o_lat, value=0.0)
-            nisa.memset(dst=o_rope, value=0.0)
-        oob = nisa.oob_mode.error if clamp else nisa.oob_mode.skip
-        nisa.dma_copy(
-            dst=c_nat,
-            src=cache.ap(
-                pattern=[[W, P_MAX * KT], [1, GW]],
-                offset=0,
-                vector_offset=idx_c.view(nl.uint32),
-                indirect_dim=0,
-            ),
-            oob_mode=oob,
-            dge_mode=nisa.dge_mode.swdge,
-        )
-        nisa.dma_copy(
-            dst=o_lat,
-            src=own_lat.ap(pattern=[[L, P_MAX * KT], [1, L]], offset=0, vector_offset=idx_o.view(nl.uint32),
-                           indirect_dim=0),
-            oob_mode=oob,
-            dge_mode=nisa.dge_mode.swdge,
-        )
-        nisa.dma_copy(
-            dst=o_rope,
-            src=own_rope.ap(pattern=[[R, P_MAX * KT], [1, R]], offset=0, vector_offset=idx_o.view(nl.uint32),
-                            indirect_dim=0),
-            oob_mode=oob,
-            dge_mode=nisa.dge_mode.swdge,
-        )
-
-        # ---- merge the sources into o_lat / o_rope (key-major [p, m, :]) ----
-        if clamp:
-            # src_sel in gather order: [p, m] = slot p * KT + m (a plain row-major load).
-            sel_c2 = nl.ndarray((P_MAX, KT), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=sel_c2, src=src_sel[q].reshape((P_MAX, KT)))
-            sel_o2 = nl.ndarray((P_MAX, KT), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_scalar(dst=sel_o2, data=sel_c2, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=1.0)
-            for m in nl.static_range(KT):
-                nisa.tensor_scalar(
-                    dst=o_lat[0:P_MAX, m, 0:L], data=o_lat[0:P_MAX, m, 0:L],
-                    op0=nl.multiply, operand0=sel_o2[0:P_MAX, m : m + 1],
-                )
-                nisa.scalar_tensor_tensor(
-                    dst=o_lat[0:P_MAX, m, 0:L], data=c_nat[0:P_MAX, m, g_off : g_off + L],
-                    op0=nl.multiply, operand0=sel_c2[0:P_MAX, m : m + 1],
-                    op1=nl.add, operand1=o_lat[0:P_MAX, m, 0:L],
-                )
-                nisa.tensor_scalar(
-                    dst=o_rope[0:P_MAX, m, 0:R], data=o_rope[0:P_MAX, m, 0:R],
-                    op0=nl.multiply, operand0=sel_o2[0:P_MAX, m : m + 1],
-                )
-                nisa.scalar_tensor_tensor(
-                    dst=o_rope[0:P_MAX, m, 0:R], data=c_nat[0:P_MAX, m, g_off + L : g_off + D],
-                    op0=nl.multiply, operand0=sel_c2[0:P_MAX, m : m + 1],
-                    op1=nl.add, operand1=o_rope[0:P_MAX, m, 0:R],
-                )
-        else:
-            # A slot reads one source; the other stayed zero (skipped).
-            nisa.tensor_tensor(
-                dst=o_lat, data1=o_lat, data2=c_nat[0:P_MAX, 0:KT, g_off : g_off + L], op=nl.add
-            )
-            nisa.tensor_tensor(
-                dst=o_rope, data1=o_rope, data2=c_nat[0:P_MAX, 0:KT, g_off + L : g_off + D], op=nl.add
-            )
-
-        # ---- keys feature-major: kT[d, c, m*128 + p] ----
-        kT = nl.ndarray((P_MAX, n_l + 1, KSEL), dtype=qk_dt, buffer=nl.sbuf)
-        for m in nl.static_range(KT):
-            tk = nl.ndarray((P_MAX, L), dtype=kv_dt, buffer=nl.psum)
-            for c in nl.static_range(n_l):
-                nisa.nc_transpose(
-                    dst=tk[0:P_MAX, c * P_MAX : (c + 1) * P_MAX],
-                    data=o_lat[0:P_MAX, m, c * P_MAX : (c + 1) * P_MAX],
-                )
-            for c in nl.static_range(n_l):
+        # ---- feature-major chunks not done by the DMA: PE transposes of kv ----
+        for c in nl.static_range(dma_t, NCH):
+            c0 = col_off + c * P_MAX if c < n_l else r_win
+            for m0 in nl.static_range(0, KT, 4):
+                nm = min(4, KT - m0)
+                tk = nl.ndarray((P_MAX, 4 * P_MAX), dtype=kv_dt, buffer=nl.psum)
+                for j in nl.static_range(nm):
+                    nisa.nc_transpose(dst=tk[0:P_MAX, j * P_MAX : (j + 1) * P_MAX],
+                                      data=kv[0:P_MAX, m0 + j, c0 : c0 + P_MAX])
                 nisa.tensor_copy(
-                    dst=kT[0:P_MAX, c, m * P_MAX : (m + 1) * P_MAX],
-                    src=tk[0:P_MAX, c * P_MAX : (c + 1) * P_MAX],
-                    engine=nisa.engine.vector if c % 2 == 0 else nisa.engine.scalar,
+                    dst=kT[0:P_MAX, c, m0 * P_MAX : (m0 + nm) * P_MAX], src=tk[0:P_MAX, 0 : nm * P_MAX],
+                    engine=nisa.engine.vector if (m0 // 4) % 2 == 0 else nisa.engine.scalar,
                 )
-            tkr = nl.ndarray((P_MAX, P_MAX), dtype=kv_dt, buffer=nl.psum)
-            nisa.nc_transpose(dst=tkr[0:R, 0:P_MAX], data=o_rope[0:P_MAX, m, 0:R])
-            nisa.tensor_copy(dst=kT[0:R, n_l, m * P_MAX : (m + 1) * P_MAX], src=tkr[0:R, 0:P_MAX])
 
         # ---- scores [H, KSEL] (keys on the free axis), scaled and bounded ----
         s_sb = nl.ndarray((H, KSEL), dtype=nl.float32, buffer=nl.sbuf)
         for off in nl.static_range(0, KSEL, _PSUM_F32):
             w = min(_PSUM_F32, KSEL - off)
             sp = nl.ndarray((H, _PSUM_F32), dtype=nl.float32, buffer=nl.psum)
-            for c in nl.static_range(n_l):
+            for c in nl.static_range(NCH):
                 nisa.nc_matmul(
                     dst=sp[0:H, 0:w], stationary=qT[0:P_MAX, c, 0:H], moving=kT[0:P_MAX, c, off : off + w],
                     accumulate=(c > 0),
                 )
-            nisa.nc_matmul(
-                dst=sp[0:H, 0:w], stationary=qT[0:R, n_l, 0:H], moving=kT[0:R, n_l, off : off + w],
-                accumulate=True,
-            )
             nisa.scalar_tensor_tensor(
                 dst=s_sb[0:H, off : off + w], data=sp[0:H, 0:w],
                 op0=nl.multiply, operand0=float(scale),
@@ -330,10 +297,10 @@ def sparse_prefill_attn(
             )
 
         # ---- softmax along the free axis: max, then fused exp + sum ----
-        mx = nl.ndarray((H, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_reduce(dst=mx, op=nl.maximum, data=s_sb, axis=1)
         neg_m = nl.ndarray((H, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=neg_m, data=mx, op0=nl.multiply, operand0=-1.0)
+        nisa.tensor_reduce(dst=neg_m, op=nl.maximum, data=s_sb, axis=1, negate=True)
+        mx = nl.ndarray((H, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=mx, data=neg_m, op0=nl.multiply, operand0=-1.0)
         nisa.dma_copy(dst=m_out[q : q + 1, 0:H], src=mx)
         p_bf = nl.ndarray((H, KSEL), dtype=kv_dt, buffer=nl.sbuf)
         den = nl.ndarray((H, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -367,12 +334,19 @@ def sparse_prefill_attn(
         num_p = nl.ndarray((H, L), dtype=nl.float32, buffer=nl.psum)
         for m in nl.static_range(KT):
             nisa.nc_matmul(
-                dst=num_p[0:H, 0:L], stationary=p_t[0:P_MAX, m, 0:H], moving=o_lat[0:P_MAX, m, 0:L],
+                dst=num_p[0:H, 0:L], stationary=p_t[0:P_MAX, m, 0:H], moving=kv[0:P_MAX, m, col_off : col_off + L],
                 accumulate=(m > 0),
             )
         num_sb = nl.ndarray((H, L), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=num_sb, src=num_p)
         nisa.dma_copy(dst=num_out[q, 0:H, 0:L], src=num_sb)
+
+    # Issue query i + 1's gathers before query i's compute (separate buffers).
+    gather(0)
+    for i in nl.static_range(QP):
+        if i + 1 < QP:
+            gather(i + 1)
+        compute(i)
 
     return m_out, den_out, num_out
 
