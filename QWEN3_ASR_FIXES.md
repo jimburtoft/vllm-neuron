@@ -59,6 +59,7 @@ These are for the full champion stack: this branch plus the champion nkilib. The
 | **champion + low-latency completion off** (same session as the default row below: 320–324 ms) | 44.3–44.7 ms | 3.11 ms (p99 3.65 vs 5.4) | **315–316 ms** (−2.1 %) |
 | **champion + low-latency completion off + async decode reorder** | 44.3–47.6 ms | 3.12 ms | 316–323 ms (neutral vs above) |
 | **champion + low-latency completion off + async decode + prefill reorder** (same session as the default row: 317.7–318.8 ms) | 44.8–45.5 ms | 3.12 ms | 316–318 ms (neutral) |
+| **same + prefill bucket 416** (same session with bucket 512: 318.3–321.2 ms) | 45.4–46.0 ms | 3.12 ms | 317–318 ms (neutral) |
 
 - **Earnings22 WER** (upstream `run_accuracy_asr`, 341 chunks): champion TP1 × DP4 **6.01 %** with the decode bucket [512] (5.99 % without). With FP8 KV: 6.01 % (TP1 × DP4), 6.07 % (TP1 × DP8 MNS48), 6.06 % (MNS96); with FP8 KV + fused encoder attention 5.97 % (TP1 × DP8 MNS48); with `--max-logprobs 0` and the fused lm_head 5.98 %. Reference gate: 6.24 %.
 - **API-server balance:** the largest per-worker request share was 0.26–0.29 with 4 servers and 0.15 with 8, so the load is even (fair share is 0.25 and 0.125).
