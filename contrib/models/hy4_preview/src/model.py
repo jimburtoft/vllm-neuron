@@ -1665,14 +1665,19 @@ class HYV4Attention(nn.Module):
         )
         if self._prefill_attn_k is not None and _use_sparse_kernels(ql_loc):
             kw = {} if src_sel is None else {"src_sel": src_sel.contiguous()}
+            # bf16 query (the cache dtype): the score matmuls run at the bf16
+            # rate, accumulating in fp32 PSUM; the softmax stays fp32.
+            qdt = self.kv_pages.dtype
             return self._prefill_attn_k[self.sparse_grid](
-                q_lat=ql_loc.contiguous(), q_rope=qr_loc.contiguous(), kv_cache=self.kv_pages,
+                q_lat=ql_loc.to(qdt).contiguous(), q_rope=qr_loc.to(qdt).contiguous(),
+                kv_cache=self.kv_pages,
                 rows_cache=rows_cache.contiguous(), own_lat=own_lat.contiguous(),
                 own_rope=own_rope.contiguous(), rows_own=rows_own.contiguous(),
                 bound=bound.contiguous(), scale=float(self.scaling), col_off=col_off, **kw,
             )
+        qdt = self.kv_pages.dtype
         return sparse_prefill_cte_ref(
-            ql_loc, qr_loc, self.kv_pages, rows_cache, own_lat, own_rope, rows_own, bound,
+            ql_loc.to(qdt), qr_loc.to(qdt), self.kv_pages, rows_cache, own_lat, own_rope, rows_own, bound,
             self.scaling, col_off, self.dtype, src_sel,
         )
 

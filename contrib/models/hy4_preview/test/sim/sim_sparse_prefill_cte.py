@@ -37,10 +37,15 @@ BIG = 1.0e30
 SCALE = 192 ** -0.5
 KSEL = int(os.environ.get("KSEL", "2176"))
 MODE = os.environ.get("MODE", "skip")
+QDT = os.environ.get("QDT", "bf16")  # query dtype passed to the kernel (bf16 as the model, or fp32)
 
 
 def bf(t):
     return t.float().numpy().astype(ml_dtypes.bfloat16)
+
+
+def qcast(t):
+    return bf(t.contiguous()) if QDT == "bf16" else t.contiguous().numpy().astype(np.float32)
 
 
 def case(Q, K, nsel, seed=0, cached_frac=0.75):
@@ -101,8 +106,7 @@ def case(Q, K, nsel, seed=0, cached_frac=0.75):
         rows_own = torch.where(rows_own < C, rows_own, torch.zeros_like(rows_own))
     t0 = time.time()
     km, kd, kn = nki.simulate(sparse_prefill_attn)[GRID](
-        q[..., :L].contiguous().numpy().astype(np.float32),
-        q[..., L:].contiguous().numpy().astype(np.float32),
+        qcast(q[..., :L]), qcast(q[..., L:]),
         bf(cache), rows_cache.numpy(), bf(own_lat), bf(own_rope), rows_own.numpy(), bound.numpy(),
         scale=SCALE, col_off=IDX, **kw,
     )
@@ -126,9 +130,9 @@ if __name__ == "__main__":
     ok = True
     for Q, K, nsel in shapes:
         r = case(Q, K, nsel)
-        good = r["max_rel"] < 2e-2 and r["cos"] > 0.9999 and not r["nan"]
+        good = r["max_rel"] < 2e-2 and r["cos"] > 0.999 and not r["nan"]
         ok &= good
-        print(f"target={os.environ['NEURON_PLATFORM_TARGET_OVERRIDE']} grid={GRID} mode={MODE} "
+        print(f"target={os.environ['NEURON_PLATFORM_TARGET_OVERRIDE']} grid={GRID} mode={MODE} q={QDT} "
               f"Q={Q} K={K} nsel={nsel} ksel={KSEL}: "
               f"{'PASS' if good else 'FAIL'} (simulator only) "
               + " ".join(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}" for k, v in r.items()),

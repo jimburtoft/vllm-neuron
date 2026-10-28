@@ -254,6 +254,8 @@ def test_prefill_cte_matches_v1(oob, dtype):
     lat = a.kv_lora_rank
     ql = torch.randn(q, nh, lat, generator=g)
     qr = torch.randn(q, nh, a.rope_dim, generator=g)
+    # cte rounds the query to the cache dtype (bf16 scores); give v1 the same query.
+    ql, qr = ql.to(dtype).float(), qr.to(dtype).float()
     own_lat = torch.randn(chunk, lat, generator=g).to(a.kv_pages.dtype)
     own_rope = torch.randn(chunk, a.rope_dim, generator=g).to(a.kv_pages.dtype)
     col = a.latent_slice.start
