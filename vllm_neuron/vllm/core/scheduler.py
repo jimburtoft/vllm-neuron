@@ -518,6 +518,38 @@ class NeuronScheduler(Scheduler):
                     f"{self.max_jump_forward_tokens})."
                 )
         super().add_request(request)
+        self._cap_max_tokens_for_async_spec(request)
+
+    def _cap_max_tokens_for_async_spec(self, request: Request) -> None:
+        """Keep async speculative requests out of the near-max_model_len spec cutoff.
+
+        Under async scheduling, ``NeuronAsyncScheduler._update_after_schedule`` stops
+        proposing drafts for a request once ``num_computed_tokens`` passes
+        ``max_model_len - 3 - 2k``. That request then sits in a verify batch with 0
+        drafts while the other rows still speculate. In that mixed batch the 0-draft
+        row gets no bonus token from the rejection sampler, so it never advances and
+        the engine spins with nothing scheduled (CPU, Task 043; stock 0.29 does the
+        same). Capping ``max_tokens`` so that ``prompt + max_tokens`` plus one
+        in-flight optimistic draft block stays below the cutoff keeps the cutoff from
+        firing: the last ``5 * (k + 1)`` positions (80 for DFlash k=15; up to 2(k+1) optimistic positions are in flight) of
+        ``max_model_len`` are not generated.
+        """
+        k = getattr(self, "num_spec_tokens", 0)
+        if not k or not getattr(self.scheduler_config, "async_scheduling", False):
+            return
+        if request.sampling_params is None:
+            return
+        limit = self.max_model_len - 5 * (k + 1) - request.num_prompt_tokens
+        if request.max_tokens > limit:
+            if not getattr(self, "_spec_max_tokens_warned", False):
+                logger.warning(
+                    "Async speculative decoding: max_tokens of request %s capped %d -> %d "
+                    "(the last %d positions of max_model_len %d are not generated, so no "
+                    "request reaches the near-max_model_len draft cutoff).",
+                    request.request_id, request.max_tokens, max(limit, 1),
+                    5 * (k + 1), self.max_model_len)
+                self._spec_max_tokens_warned = True
+            request.max_tokens = max(limit, 1)
 
     def _free_request(self, request, delay_free_blocks: bool = False):
         """Attach this request's EC locators onto kv_transfer_params for the PD.
