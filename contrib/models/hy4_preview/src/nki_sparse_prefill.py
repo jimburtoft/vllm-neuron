@@ -389,12 +389,14 @@ def topk_rows(
     k=2048,
     big=1.0e30,
     passes=3,
+    width=0,  # output slots per query (0 = k); slots past k get position P + C, bound -big
 ):
     """Per query, the ``k`` highest-scoring positions of ``[scores_ctx | scores_own]``
     (never concatenated in HBM) -> ``rows [Q, k]`` int32 positions in ``[0, P + C)``
     (unordered) and ``bound [Q, k]`` fp32: ``+big`` for a visible key (score
     ``> -big / 2``), ``-big`` otherwise (a query with fewer than ``k`` visible
-    keys fills the rest with invisible ones).
+    keys fills the rest with invisible ones). With ``width > k`` the slots
+    past ``k`` hold the pad position ``P + C`` with bound ``-big``.
 
     ``nisa.topk`` (GpSimd, after nkilib's deepseek_v32 ``_select_topk_indices``)
     ranks bf16. To keep the fp32 ranking near the cut, ``passes`` rounds: pass
@@ -423,9 +425,18 @@ def topk_rows(
     co = C // _TOPK_GROUP
     cols = cp + co
     kc = k // _TOPK_GROUP
+    WS = width if width > 0 else k
+    _kassert(WS >= k, "width must be >= k")
 
-    rows_out = nl.ndarray((Q, k), dtype=nl.int32, buffer=nl.shared_hbm)
-    bound_out = nl.ndarray((Q, k), dtype=nl.float32, buffer=nl.shared_hbm)
+    rows_out = nl.ndarray((Q, WS), dtype=nl.int32, buffer=nl.shared_hbm)
+    bound_out = nl.ndarray((Q, WS), dtype=nl.float32, buffer=nl.shared_hbm)
+    if WS > k:
+        pad_r = nl.ndarray((QP, WS - k), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(dst=pad_r, value=N)
+        nisa.dma_copy(dst=rows_out[q_base : q_base + QP, k:WS], src=pad_r)
+        pad_b = nl.ndarray((QP, WS - k), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=pad_b, value=-big)
+        nisa.dma_copy(dst=bound_out[q_base : q_base + QP, k:WS], src=pad_b)
 
     n_rounds = (QP + _TOPK_PER_CALL - 1) // _TOPK_PER_CALL
     for rd in nl.sequential_range(n_rounds):
@@ -516,9 +527,11 @@ def topk_rows(
         nisa.tensor_copy(dst=pos_i, src=pos)
 
         nisa.dma_copy(
-            dst=rows_out.ap(pattern=[[kc, npart], [1, kc]], offset=q0 * k), src=pos_i[0:npart, 0:kc]
+            dst=rows_out.ap(pattern=[[WS, nq], [kc, _TOPK_GROUP], [1, kc]], offset=q0 * WS),
+            src=pos_i[0:npart, 0:kc],
         )
         nisa.dma_copy(
-            dst=bound_out.ap(pattern=[[kc, npart], [1, kc]], offset=q0 * k), src=bnd[0:npart, 0:kc]
+            dst=bound_out.ap(pattern=[[WS, nq], [kc, _TOPK_GROUP], [1, kc]], offset=q0 * WS),
+            src=bnd[0:npart, 0:kc],
         )
     return rows_out, bound_out

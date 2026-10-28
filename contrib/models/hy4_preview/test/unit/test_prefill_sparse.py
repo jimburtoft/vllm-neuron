@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from hy4_stubs import Group, model, set_group
-from test_decode_cp import BLOCK, HIDDEN, PAGES, WIDTH, Hub, build_rank, build_reference, make_config, rel
+from test_decode_cp import BLOCK, HIDDEN, PAGES, TOPK, WIDTH, Hub, build_rank, build_reference, make_config, rel
 
 CHUNK = 128  # keys = WIDTH * BLOCK + CHUNK = 640, a multiple of 128
 
@@ -76,6 +76,7 @@ def rows_to_mask(rows, n_keys):
 @pytest.mark.parametrize("world,order_seed", [(4, 2), (8, 1)])
 @torch.no_grad()
 def test_prefill_sparse_matches_dense(monkeypatch, dtype, tol, world, order_seed, backend):
+    n_exact = 0
     torch.set_num_threads(2)
     monkeypatch.setattr(model, "PREFILL_KSEL", 128)  # TOPK = 64 plus ties
     cfg = make_config(dtype)
@@ -105,17 +106,42 @@ def test_prefill_sparse_matches_dense(monkeypatch, dtype, tol, world, order_seed
         monkeypatch.setattr(model, "PREFILL_SPARSE_NKI", True)
         monkeypatch.setattr(model, "PREFILL_SPARSE_MIN_SPAN", 0)
         sparse = run(ranks, rope, x, pos, meta)
+        tok_ok = torch.ones(CHUNK, dtype=torch.bool)  # token's selection exact in both layers
         for li in range(2):
             for r in range(world):
                 rows, bound, _ = sparse[r][1][li]
                 assert rows.shape == (per, 128) and rows.dtype == torch.int32
                 want = dense[r][1][li][r * per : (r + 1) * per]
                 assert torch.equal(want, ref[li][1][r * per : (r + 1) * per])
-                assert torch.equal(rows_to_mask(rows, n_keys), want), (cached, li, r)
-                assert torch.equal(bound > 0, rows < n_keys)
+                if backend == "v1":
+                    assert torch.equal(rows_to_mask(rows, n_keys), want), (cached, li, r)
+                    assert torch.equal(bound > 0, rows < n_keys)
+                else:
+                    # Exactly min(TOPK, visible) keys, all inside the dense
+                    # selection (which also keeps every key tied with the k-th).
+                    live = torch.where(bound > 0, rows, torch.full_like(rows, n_keys))
+                    got = rows_to_mask(live, n_keys)
+                    assert not (got & ~want).any(), (cached, li, r)
+                    n_vis = want.sum(dim=1).clamp(max=TOPK)
+                    assert torch.equal(got.sum(dim=1), n_vis), (cached, li, r)
+                    tok_ok[r * per : (r + 1) * per] &= (got == want).all(dim=1)
                 assert torch.equal(sparse[r][0][li], sparse[0][0][li]), "ranks disagree"
-                assert rel(sparse[r][0][li], dense[r][0][li]) < tol, (cached, li)
-                assert rel(sparse[r][0][li], ref[li][0]) < tol, (cached, li)
+        # Attention is per query: tokens whose selection is exact must match. A
+        # token that dropped keys tied with the k-th index score (cte: exactly
+        # k kept) attends a different set -- its selection is checked above
+        # (subset, count), not its output. The toy indexer ties often (relu
+        # zeros); realistic fp32 scores rarely do (test_prefill_topk_exact_no_ties).
+        n_exact += int(tok_ok.sum())
+        ok = tok_ok
+        for li in range(2):
+            for r in range(world):
+                out = sparse[r][0][li]
+                assert rel(out[ok], dense[r][0][li][ok]) < tol, (cached, li)
+                assert rel(out[ok], ref[li][0][ok]) < tol, (cached, li)
+    if backend == "v1":
+        assert n_exact == 4 * CHUNK
+    else:
+        assert n_exact > 2 * CHUNK, "the exact check must cover most tokens"
 
 
 def test_prefill_rows_exact():
@@ -250,3 +276,30 @@ def test_prefill_cte_matches_v1(oob, dtype):
     assert torch.allclose(fold(*want), fold(*got), rtol=1e-5, atol=1e-6)
     assert not live[0] and fold(*got)[0].abs().max() == 0
     assert width >= col + lat + a.rope_dim
+
+
+@pytest.mark.parametrize("n_vis_min", [10, 3000])
+@torch.no_grad()
+def test_prefill_topk_exact_no_ties(monkeypatch, n_vis_min):
+    """cte ``_prefill_topk`` on tie-free scores == the threshold selection
+    (``select_topk``) exactly, as positions with bound ``+BIG``; pads and
+    invisible picks carry ``-BIG``; a query with fewer than k visible keys
+    keeps all of them."""
+    set_group(Group())
+    cfg = make_config(torch.float32)
+    a = model.HYV4Attention(cfg, 0)
+    a.index_topk = 2000  # -> 2048 slots, 48 pads
+    g = torch.Generator().manual_seed(7)
+    q, p, c = 8, 6144, 2048
+    sc_ctx = torch.randn(q, p, generator=g)
+    sc_own = torch.randn(q, c, generator=g)
+    vis_ctx = (torch.arange(p) < 4500).view(1, p).expand(q, p).clone()
+    vis_own = torch.arange(c).view(1, c) <= (100 + torch.arange(q)).view(q, 1)
+    vis_ctx[0] = False
+    vis_ctx[0, :n_vis_min] = True
+    rows, bound = a._prefill_topk(sc_ctx, vis_ctx, sc_own, vis_own)
+    assert rows.shape == (q, 2048) and rows.dtype == torch.int32
+    want = model.select_topk(torch.cat((sc_ctx, sc_own), 1), torch.cat((vis_ctx, vis_own), 1), 2000)
+    live = torch.where(bound > 0, rows, torch.full_like(rows, p + c))
+    assert torch.equal(rows_to_mask(live, p + c), want)
+    assert (rows[:, 2000:] == p + c).all() and (bound[:, 2000:] < 0).all()

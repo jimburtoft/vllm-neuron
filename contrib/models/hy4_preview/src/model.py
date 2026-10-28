@@ -511,15 +511,15 @@ _SPARSE_KERNELS: list = []
 
 
 def _sparse_kernels():
-    """``(attn, gather_cols, select_to_rows, prefill_attn)`` NKI kernels through the
-    plugin's ``wrap_nki`` (lazy)."""
+    """``(attn, gather_cols, select_to_rows, prefill_attn, topk_rows)`` NKI kernels
+    through the plugin's ``wrap_nki`` (lazy)."""
     if not _SPARSE_KERNELS:
         try:
             from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
         except ImportError:  # source-tree layout
             from vllm_neuron.nki.nki_hop import wrap_nki
         from .nki_sparse_decode import gather_rows_cols, sparse_decode_attn
-        from .nki_sparse_prefill import select_to_rows, sparse_prefill_attn
+        from .nki_sparse_prefill import select_to_rows, sparse_prefill_attn, topk_rows
 
         _SPARSE_KERNELS.extend(
             (
@@ -527,6 +527,7 @@ def _sparse_kernels():
                 wrap_nki(gather_rows_cols),
                 wrap_nki(select_to_rows),
                 wrap_nki(sparse_prefill_attn),
+                wrap_nki(topk_rows),
             )
         )
     return _SPARSE_KERNELS
@@ -538,7 +539,7 @@ def _sparse_kernels_or_none() -> tuple:
     try:
         return tuple(_sparse_kernels())
     except ImportError:
-        return (None, None, None, None)
+        return (None, None, None, None, None)
 
 
 def _sparse_grid() -> int:
@@ -906,9 +907,13 @@ class HYV4Attention(nn.Module):
         # Built here, never inside the traced forward: a lazy build there puts a
         # guard on the module-level cache that flips after the first trace and
         # forces a recompile at serving time.
-        self._sparse_attn_k, self._sparse_gather_k, self._select_rows_k, self._prefill_attn_k = (
-            _sparse_kernels_or_none() if use_kernels else (None, None, None, None)
-        )
+        (
+            self._sparse_attn_k,
+            self._sparse_gather_k,
+            self._select_rows_k,
+            self._prefill_attn_k,
+            self._topk_rows_k,
+        ) = _sparse_kernels_or_none() if use_kernels else (None, None, None, None, None)
         self.prefill_backend = PREFILL_SPARSE_BACKEND
         self.prefill_cte_oob = PREFILL_CTE_OOB
 
@@ -1378,6 +1383,53 @@ class HYV4Attention(nn.Module):
         # CPU only: the concatenation never reaches a device graph.
         return self._prefill_rows_ref(torch.cat((sel_ctx, sel_own), dim=1))
 
+    _TOPK_BIG = 1.0e30  # invisible-key score / bound magnitude of the cte top-k
+
+    def _prefill_topk(
+        self,
+        sc_ctx: torch.Tensor,
+        vis_ctx: torch.Tensor,
+        sc_own: torch.Tensor,
+        vis_own: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """cte backend: the exact top-``k`` positions over ``[prefix | chunk]`` and
+        their bound, ``[Q, ksel]`` (``k = min(index_topk, keys)``, ``ksel`` = ``k``
+        rounded up to 128; slots past ``k`` get the pad ``P + C`` / ``-BIG``).
+
+        Invisible keys score ``-BIG``; a selected invisible key (a query with
+        fewer than ``k`` visible) gets bound ``-BIG``, so the attended set is
+        the visible top-k. Unlike the threshold path, keys tied with the k-th
+        score are not all kept: exactly ``k`` are. On Neuron the NKI kernel
+        ``topk_rows`` (``nisa.topk``) takes the two pieces separately; on CPU
+        ``torch.topk`` over their concatenation (never in a device graph).
+        """
+        big = self._TOPK_BIG
+        dev = sc_ctx.device
+        n_keys = sc_ctx.shape[1] + sc_own.shape[1]
+        k = min(self.index_topk, n_keys)
+        width = min(n_keys, -(-k // 128) * 128)
+        neg = torch.full((1, 1), -big, dtype=torch.float32, device=dev)
+        s_ctx = torch.where(vis_ctx, sc_ctx.float(), neg)
+        s_own = torch.where(vis_own, sc_own.float(), neg)
+        if self._topk_rows_k is not None and _use_sparse_kernels(sc_ctx):
+            return self._topk_rows_k[self.sparse_grid](
+                scores_ctx=s_ctx.contiguous(), scores_own=s_own.contiguous(),
+                k=k, big=big, width=width,
+            )
+        # CPU only: the concatenation never reaches a device graph.
+        top = torch.topk(torch.cat((s_ctx, s_own), dim=1), k, dim=1)
+        rows = top.indices.to(torch.int32)
+        bound = torch.where(
+            top.values > -0.5 * big,
+            torch.full_like(top.values, big),
+            torch.full_like(top.values, -big),
+        )
+        if width > k:
+            q = rows.shape[0]
+            rows = torch.cat((rows, torch.full((q, width - k), n_keys, dtype=torch.int32)), dim=1)
+            bound = torch.cat((bound, torch.full((q, width - k), -big)), dim=1)
+        return rows, bound
+
     def _prefill_rows_ref(self, local: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Torch reference of ``_prefill_rows`` (CPU).
 
@@ -1481,15 +1533,19 @@ class HYV4Attention(nn.Module):
             sc_own = (s_own * local_w.unsqueeze(-1)).sum(dim=1)  # [Q, C]
             vis_ctx = (torch.arange(span, device=dev).view(1, span) < prior).expand(rows_q, span)
             vis_own = torch.arange(chunk, device=dev).view(1, chunk) <= mine.view(rows_q, 1)
-            lo = topk_threshold2(sc_ctx, vis_ctx, sc_own, vis_own, self.index_topk)
-            sel_ctx = vis_ctx & (sc_ctx >= lo)
-            sel_own = vis_own & (sc_own >= lo)
-            _capture(self.layer_idx, "selected_local", sel_own.to(torch.bfloat16))
             if "collectives" in PERF_SKIP:
                 sources = torch.arange(world, dtype=torch.float32, device=dev)
             else:
                 sources = self.tp_group.all_gather(r.to(torch.float32), dim=0)
-            rows, bound = self._prefill_rows(sel_ctx, sel_own)
+            # nisa.topk ranks fewer than 65536 keys (the threshold path otherwise).
+            if self.prefill_backend == "cte" and span + chunk < 65536:
+                rows, bound = self._prefill_topk(sc_ctx, vis_ctx, sc_own, vis_own)
+            else:
+                lo = topk_threshold2(sc_ctx, vis_ctx, sc_own, vis_own, self.index_topk)
+                sel_ctx = vis_ctx & (sc_ctx >= lo)
+                sel_own = vis_own & (sc_own >= lo)
+                _capture(self.layer_idx, "selected_local", sel_own.to(torch.bfloat16))
+                rows, bound = self._prefill_rows(sel_ctx, sel_own)
             selected = (rows, bound, sources)
         rows, bound, sources = selected
 
