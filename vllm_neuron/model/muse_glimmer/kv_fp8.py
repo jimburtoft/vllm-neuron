@@ -160,6 +160,20 @@ def _check_single_shot_prefill() -> None:
             f"max_model_len={mml}. Chunked prefill would need segmented attention over the FP8 "
             "cache, which the runner disables for a non-packed FP8 cache. Set "
             "max_num_batched_tokens >= max_model_len or use --kv-cache-dtype auto.")
+    # Speculative decoding: the scheduler caps a prefill step at mnbt - draft slots (DFlash:
+    # 15) and rounds it down to the KV block size (scheduler._align_token_budget_to_kv_blocks;
+    # DFlash unifies the groups to block 64). At mnbt == mml a prompt longer than that budget
+    # is chunked, and the FP8 cache has no segmented prefill: wrong tokens from step 0
+    # (CPU, Task 043). The runner clamps its own mnbt to mml, so mnbt = mml + 64 keeps the
+    # prefill buckets and makes the scheduler budget mml.
+    spec = getattr(vc, "speculative_config", None)
+    draft = int(getattr(spec, "max_num_new_slots_for_drafting", 0) or 0) if spec is not None else 0
+    if draft and mnbt is not None and mml is not None and (mnbt - draft) // 64 * 64 < mml:
+        raise ValueError(
+            f"MuseGlimmer FP8 KV cache with speculative decoding needs max_num_batched_tokens >= "
+            f"max_model_len + 64 (draft slots {draft}, rounded to the KV block), e.g. "
+            f"{mml + 64}; got max_num_batched_tokens={mnbt}, max_model_len={mml}. Otherwise "
+            "prompts near max_model_len are chunked, and the FP8 cache has no segmented prefill.")
 
 
 def setup(layers) -> bool:

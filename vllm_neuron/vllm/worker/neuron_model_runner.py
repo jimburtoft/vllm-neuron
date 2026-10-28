@@ -5533,8 +5533,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # fails on the Neuron device.
             pos_offset = np.clip(ctx_lens.astype(np.int64) - R, 0, None).astype(np.int32)
         else:
+            # Upper clip: a verify step is padded to query_len rows, so within
+            # query_len - 1 tokens of max_model_len the start would select a column
+            # past the block table (IndexError, engine dead). The padded rows past
+            # max_model_len are never sampled; the real rows keep their prior tokens
+            # because ctx + real query <= max_model_len = table width * block_size.
+            table_width = self._raw_block_table(blk_table.block_table).shape[1]
             start_blocks = np.clip(
-                (ctx_lens + query_len - 1) // block_size - num_swa_blocks + 1, 0, None
+                (ctx_lens + query_len - 1) // block_size - num_swa_blocks + 1,
+                0,
+                max(table_width - num_swa_blocks, 0),
             )
             gather_index = start_blocks[:, None] + np.arange(
                 num_swa_blocks, dtype=start_blocks.dtype

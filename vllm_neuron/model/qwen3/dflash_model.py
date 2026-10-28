@@ -26,6 +26,11 @@ import vllm_neuron.nn as neuron_nn
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+from vllm_neuron.utils.dtype_utils import FP8_CLAMP_MAX
+
+_FP8_KV_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+# Headroom over the analytic |K| / |V| bounds (bf16 rounding of the normed inputs).
+_FP8_KV_BOUND_MARGIN = 1.125
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -316,6 +321,14 @@ class DFlashQwen3Model(nn.Module):
 
             k_flat = k.transpose(0, 1).reshape(-1, hd)
             v_flat = v.transpose(0, 1).reshape(-1, hd)
+            if attn.k_scale is not None and attn.k_cache.dtype in _FP8_KV_DTYPES:
+                # FP8 KV: quantize with the drafter's scales (set at weight load).
+                k_flat = (k_flat.to(torch.float32) * attn.k_scale).clamp(
+                    -FP8_CLAMP_MAX, FP8_CLAMP_MAX
+                )
+                v_flat = (v_flat.to(torch.float32) * attn.v_scale).clamp(
+                    -FP8_CLAMP_MAX, FP8_CLAMP_MAX
+                )
 
             attn.k_cache.index_put_(
                 (block_idx_put, head_idx, pos_idx_put), k_flat.to(attn.k_cache.dtype)
@@ -750,3 +763,60 @@ class DFlashQwen3ForCausalLM(nn.Module):
             attn.v_cache = kv_caches[layer_name][1]
 
         self.model._build_fused_kv_buffers()
+        self._setup_fp8_kv_scales()
+
+    def _setup_fp8_kv_scales(self) -> None:
+        """FP8 KV for the drafter: analytic per-layer scales, no calibration.
+
+        The decode megakernel needs ``k_scale`` / ``v_scale`` for an FP8 cache (it
+        rejects an FP8 cache with bf16 active K/V). The drafter checkpoint has no
+        KV scales, so both come from the weights:
+
+        * K is stored after the weighted RMSNorm (``k_norm``) and RoPE, so
+          ``|k_i| < sqrt(d) * max|w_knorm|`` (RoPE rotates pairs).
+        * V is ``x @ W_v`` for an RMS-normed input ``x = w * x_hat`` with
+          ``||x_hat|| < sqrt(H)``: the context rows use ``hidden_norm``, the draft
+          block rows use the layer's ``input_layernorm``. Cauchy-Schwarz gives
+          ``|v_j| < sqrt(H) * max(||w_hn * W_v[:, j]||, ||w_ln * W_v[:, j]||)``.
+
+        FP8 e4m3 is floating point, so a loose bound costs range only, not
+        mantissa precision. ``qscale = FP8_MAX / (margin * bound)``. The V bound is
+        reduced with MAX over the TP group (``k/v_scale_float`` are compile-time
+        constants of a NEFF shared by every rank). A non-FP8 cache leaves the
+        scales unset (bf16 path unchanged).
+        """
+        layers = self.model.layers
+        attn0 = layers[0].self_attn
+        if attn0.k_cache is None or attn0.k_cache.dtype not in _FP8_KV_DTYPES:
+            return
+        if attn0.qkv_proj_weight.is_meta:  # CPU compile: weights not loaded
+            raise NotImplementedError("DFlash drafter FP8 KV scales need the drafter weights")
+        import math
+
+        H = attn0.hidden_size
+        w_hn = self.model.hidden_norm.weight.detach().float().cpu()
+        bounds = []
+        for layer in layers:
+            a = layer.self_attn
+            w_k = a.k_norm.weight.detach().float().cpu()
+            k_bound = math.sqrt(a.head_dim) * float(w_k.abs().max())
+            w_ln = layer.input_layernorm.weight.detach().float().cpu()
+            qkv = a.qkv_proj_weight.detach().float().cpu()  # [H, q + 2 kv]
+            w_v = qkv[:, a.q_size + a.kv_size :]
+            v_col = torch.maximum(
+                (w_hn[:, None] * w_v).norm(dim=0), (w_ln[:, None] * w_v).norm(dim=0)
+            )
+            bounds += [k_bound, math.sqrt(H) * float(v_col.max())]
+        t = torch.tensor(bounds, dtype=torch.float32)
+        tp = get_tp_group()
+        if tp.world_size > 1:
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=tp.cpu_group)
+        dev = attn0.k_cache.device
+        for i, layer in enumerate(layers):
+            a = layer.self_attn
+            k_q = FP8_CLAMP_MAX / (_FP8_KV_BOUND_MARGIN * float(t[2 * i]))
+            v_q = FP8_CLAMP_MAX / (_FP8_KV_BOUND_MARGIN * float(t[2 * i + 1]))
+            a.k_scale = torch.full((1, 1), k_q, dtype=torch.float32, device=dev)
+            a.v_scale = torch.full((1, 1), v_q, dtype=torch.float32, device=dev)
+            a.k_scale_float = k_q
+            a.v_scale_float = v_q

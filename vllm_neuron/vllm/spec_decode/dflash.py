@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import time
 from typing import Any
 
@@ -63,14 +64,24 @@ class DFlashProposer:
 
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         num_verify_tokens = max_num_seqs * (self.num_speculative_tokens + 1)
-        # TODO: Remove this guard once the distributed argmax kernel supports
-        # more than 256 verification rows.
-        assert num_verify_tokens <= 256, (
-            "DFlash currently supports at most 256 verification tokens; "
+        # The distributed argmax kernel takes at most pmax * LNC = 256 verify rows;
+        # larger batches use its torch.max fallback (functional/argmax.py) and the
+        # decode megakernel tiles B * S over pmax. VLLM_NEURON_DFLASH_MAX_VERIFY_TOKENS
+        # raises the guard for configurations validated on hardware.
+        max_verify = int(os.environ.get("VLLM_NEURON_DFLASH_MAX_VERIFY_TOKENS", "256"))
+        assert num_verify_tokens <= max_verify, (
+            f"DFlash supports at most {max_verify} verification tokens "
+            "(VLLM_NEURON_DFLASH_MAX_VERIFY_TOKENS); "
             f"max_num_seqs={max_num_seqs} with "
             f"num_speculative_tokens={self.num_speculative_tokens} would verify "
             f"{num_verify_tokens} tokens at once"
         )
+        if num_verify_tokens > 256:
+            logger.warning(
+                "DFlash verifies %d tokens per step (> 256): the target argmax uses the "
+                "torch fallback.",
+                num_verify_tokens,
+            )
 
         draft_hf_config = self.draft_model_config.hf_config
         nested_dflash_config = getattr(draft_hf_config, "dflash_config", {}) or {}
