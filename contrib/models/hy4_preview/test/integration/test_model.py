@@ -39,8 +39,10 @@ EXPECTED = {
     # so this one is checked by content: a blank, then Paris among the options.
     "The capital of France is": ("_", "Paris"),
     "I am gonna keep counting forever, 1 2 3 4 5": " 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21",
-    # ``n == 0`` vs ``n <= 0`` is a near-tie between attention paths; both are correct.
-    "def fibonacci(n):": '\n    """Return the nth value in the Fibonacci series."""\n    if n ',
+    # The docstring and body are near-ties between attention paths and between
+    # Trn2 and Trn3 (recursive "nth value" vs iterative "first n numbers"); checked
+    # by content: it documents and implements a Fibonacci function.
+    "def fibonacci(n):": ('\n    """', "Fibonacci"),
     "Once upon a time, there was a": " king who was very rich. He had a lot of gold and silver, but he was not happy.",
 }
 
@@ -105,9 +107,9 @@ def test_demo_prompts(llm) -> None:
         text = output.outputs[0].text
         print(f"{prompt!r} -> {text!r}")
         expected = EXPECTED[prompt]
-        if isinstance(expected, tuple):  # (blank char it starts with, word it contains)
-            blank, word = expected
-            ok = text.lstrip().startswith(blank) and word in text
+        if isinstance(expected, tuple):  # (prefix it starts with, word it contains)
+            head, word = expected
+            ok = (text.lstrip().startswith(head.lstrip()) if head.strip() else text.startswith(head)) and word in text
         else:
             ok = text.startswith(expected)
         assert ok, f"{prompt!r}: expected {expected!r}..., got {text!r}"
