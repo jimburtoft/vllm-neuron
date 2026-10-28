@@ -37,6 +37,8 @@ export UNSAFE_FP8FNCAST=${UNSAFE_FP8FNCAST:-1}
 # The in-graph async decode reorder (+7.4 % RTFx, identical transcripts) is on by default in this branch;
 # VLLM_NEURON_MM_ASYNC_REORDER=0 turns it off. The async prefill->decode reorder (+1.6 % RTFx, device ~99.8 % busy,
 # identical transcripts at C=1) is also on by default; VLLM_NEURON_ASYNC_PREFILL_REORDER=0 turns it off.
+# Serve 30 s clips with "num_batched_tokens_buckets": [128,256,416,512,1024] (a 30 s prompt is 403 tokens; 416 instead of
+# 512 makes each prefill 11 % faster, +3.9 % RTFx). See QWEN3_ASR_FIXES.md "Recommended settings".
 export NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=${NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION:-0}
 python - <<PY
 import nkilib, vllm_neuron
