@@ -88,7 +88,10 @@ def get_lmhead_backend() -> str:
 #   a torch add + a torch RMSNorm before it. TP>1 keeps the stock path (SP shards the residual).
 # - "gqa": attention_cte reads the 8 KV heads directly (native GQA) instead of a
 #   repeat_interleave copy of K and V to 16 heads. Same math, same kernel.
-_PREFILL_OPTS = ("mlpfuse", "gqa")
+# - "kvblock": the full-prefill KV cache write stores whole cache blocks (one row per
+#   block_size tokens) instead of one scatter row per token, and writes the packed FP8 K
+#   pairs directly (no read of the stored pairs). See _write_kv_blocks.
+_PREFILL_OPTS = ("mlpfuse", "gqa", "kvblock")
 
 
 def get_prefill_opts() -> frozenset:
@@ -170,6 +173,55 @@ def _write_packed_k_pairs(
     lane1 = torch.where(lane_b == 0, other, k_new)
     pairs = torch.stack([lane0, lane1], dim=-1).reshape(nkh * T, d, 2)
     k_cache.index_put_(index, pairs.to(k_cache.dtype).contiguous())
+
+
+def _write_kv_blocks(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    block_indices: torch.Tensor,
+    fp8_packed: bool,
+) -> None:
+    """Write a full prefill's K/V into the paged cache as whole blocks.
+
+    The full-prefill path (no ``kv_segment_size``) attends only the local K/V, causal
+    from position 0, so the prompt starts at in-block position 0 and token ``t`` sits
+    at in-block position ``t % block_size`` of the block that holds token
+    ``t - t % block_size``. Each ``block_size`` chunk of the prompt is then one cache
+    block, so one ``index_put_`` row per block replaces one row per token, and the
+    packed FP8 K needs no read of the stored lane: both tokens of every pair are new.
+
+    Pad tokens follow the real ones. A chunk that holds only pads takes the block of
+    its first slot, which the runner sets to the null block. The pad tail of the last
+    real chunk lands in that request's own block at positions past the prompt; decode
+    writes each of those positions before its mask can reach it (it writes position
+    ``p``, then attends positions ``<= p``), and the stock path leaves stale values there
+    too.
+
+    Args:
+        k_cache: ``[nb, nkh, bs, d]`` or packed fp8 ``[nb, nkh, bs // 2, d, 2]``.
+        v_cache: ``[nb, nkh, bs, d]``.
+        k_new, v_new: ``[nkh, T, d]`` in the compute dtype, already rounded to the
+            cache dtype (the relayout runs in the compute dtype, the scatter casts;
+            fp8 -> bf16 -> fp8 is exact), ``T % bs == 0``.
+        block_indices: ``[T]`` block of each token (null block for padding).
+        fp8_packed: whether ``k_cache`` is the packed FP8 layout.
+    """
+    nkh, T, d = v_new.shape
+    bs = v_cache.shape[-2]
+    nblk = T // bs
+    blk = block_indices.view(nblk, bs)[:, 0].contiguous()
+    v_rows = v_new.view(nkh, nblk, bs, d).permute(1, 0, 2, 3).contiguous()
+    if fp8_packed:
+        # Lane p % 2 of packed row p // 2 holds in-block position p.
+        k_rows = (
+            k_new.view(nkh, nblk, bs // 2, 2, d).permute(1, 0, 2, 4, 3).contiguous()
+        )
+    else:
+        k_rows = k_new.view(nkh, nblk, bs, d).permute(1, 0, 2, 3).contiguous()
+    k_cache.index_put_((blk,), k_rows.to(k_cache.dtype))
+    v_cache.index_put_((blk,), v_rows.to(v_cache.dtype))
 
 
 # =============================================================================
@@ -324,6 +376,8 @@ class Qwen3ASRTextAttention(nn.Module):
 
         # Prefill attention reads the KV heads natively (attention_cte GQA), no K/V copy.
         self.prefill_native_gqa = "gqa" in get_prefill_opts()
+        # Full-prefill KV write in whole cache blocks (_write_kv_blocks).
+        self.prefill_kv_block = "kvblock" in get_prefill_opts()
 
         self._setup_weight_loaders()
 
@@ -504,7 +558,24 @@ class Qwen3ASRTextAttention(nn.Module):
             self.num_key_value_heads_per_rank
         )
 
-        if self.fp8_packed:
+        # Static per graph: full prefill and a token count that is whole blocks.
+        kv_block_write = (
+            self.prefill_kv_block
+            and not kv_segment_size
+            and tokens % block_size == 0
+            and self.v_cache.shape[-2] == block_size
+        )
+        if kv_block_write:
+            nkh = self.num_key_value_heads_per_rank
+            _write_kv_blocks(
+                self.k_cache,
+                self.v_cache,
+                k_flat.to(self.dtype).view(nkh, tokens, self.head_dim),
+                v_flat.to(self.dtype).view(nkh, tokens, self.head_dim),
+                block_indices,
+                self.fp8_packed,
+            )
+        elif self.fp8_packed:
             # Packed K [nb, nkh, block_size // 2, Dh, 2]: write whole token pairs.
             # The helper merges in the compute dtype; k_flat is already
             # fp8-rounded, so the round trip through bf16 is exact.
@@ -521,10 +592,11 @@ class Qwen3ASRTextAttention(nn.Module):
                 (block_indices_for_put, head_indices_for_put, position_indices_for_put),
                 k_flat,
             )
-        self.v_cache.index_put_(
-            (block_indices_for_put, head_indices_for_put, position_indices_for_put),
-            v_flat,
-        )
+        if not kv_block_write:
+            self.v_cache.index_put_(
+                (block_indices_for_put, head_indices_for_put, position_indices_for_put),
+                v_flat,
+            )
 
         # Step 4: Attention — no sinks, no sliding window
         if kv_segment_size:
@@ -1190,6 +1262,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                     for o, on in (
                         ("mlpfuse", self.language_model.layers[0].mlp.prefill_fuse_ok),
                         ("gqa", self.language_model.layers[0].self_attn.prefill_native_gqa),
+                        ("kvblock", self.language_model.layers[0].self_attn.prefill_kv_block),
                     )
                     if on
                 )
