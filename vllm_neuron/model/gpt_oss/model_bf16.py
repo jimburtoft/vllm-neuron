@@ -2384,6 +2384,10 @@ class GptOssModel(nn.Module):
 
 @async_speculative_decoding
 class GptOssForCausalLM(nn.Module, SupportsEagle3):
+    # The forward assembles the decode input_ids on the device, so the runner may send the
+    # in-graph reorder arguments. A model without this attribute keeps the host swap path.
+    supports_async_reorder = True
+
     """GPT-OSS model with language modeling head.
 
     >>> PARALLELISM: Column-parallel linear for LM head <<<
@@ -2519,6 +2523,30 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
         if is_prefill and ((T <= self.world_size) or (T % self.world_size != 0)):
             raise ValueError(
                 f"Prompt Length ({T}) must be > world_size ({self.world_size}) for SP."
+            )
+
+        # Assemble the decode input_ids on the device.
+        #
+        # The runner gives the device future of the previous step, plus a permutation and a
+        # mask that it builds on the host from the request ids. A request that continues takes
+        # the reordered future. A new request, a resumed request, a row that still prefills,
+        # and a padded slot take the host input_ids. The host therefore does not read the
+        # sampled tokens of the previous step back.
+        #
+        # The arguments are absent on a step that does not use the reorder, and this block is
+        # then a no-op. Remove all three arguments in every case, so a later consumer of
+        # ``**kwargs`` never sees a partial set.
+        #
+        # Keep this block identical in every model that declares supports_async_reorder.
+        # test_async_reorder.py compares them and fails on a divergence.
+        async_reorder_perm = kwargs.pop("async_reorder_perm", None)
+        async_reorder_future = kwargs.pop("async_reorder_future", None)
+        async_reorder_mask = kwargs.pop("async_reorder_mask", None)
+        if async_reorder_perm is not None:
+            input_ids = torch.where(
+                async_reorder_mask,
+                input_ids,
+                torch.index_select(async_reorder_future, 0, async_reorder_perm),
             )
 
         hidden_states, aux_hidden_states = self.model(
