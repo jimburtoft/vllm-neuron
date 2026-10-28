@@ -794,14 +794,14 @@ class DFlashQwen3ForCausalLM(nn.Module):
         import math
 
         H = attn0.hidden_size
-        w_hn = self.model.hidden_norm.weight.detach().float().cpu()
+        w_hn = self.model.hidden_norm.weight.detach().cpu().float()  # host first: no device casts
         bounds = []
         for layer in layers:
             a = layer.self_attn
-            w_k = a.k_norm.weight.detach().float().cpu()
+            w_k = a.k_norm.weight.detach().cpu().float()
             k_bound = math.sqrt(a.head_dim) * float(w_k.abs().max())
-            w_ln = layer.input_layernorm.weight.detach().float().cpu()
-            qkv = a.qkv_proj_weight.detach().float().cpu()  # [H, q + 2 kv]
+            w_ln = layer.input_layernorm.weight.detach().cpu().float()
+            qkv = a.qkv_proj_weight.detach().cpu().float()  # [H, q + 2 kv]
             w_v = qkv[:, a.q_size + a.kv_size :]
             v_col = torch.maximum(
                 (w_hn[:, None] * w_v).norm(dim=0), (w_ln[:, None] * w_v).norm(dim=0)
@@ -816,7 +816,7 @@ class DFlashQwen3ForCausalLM(nn.Module):
             a = layer.self_attn
             k_q = FP8_CLAMP_MAX / (_FP8_KV_BOUND_MARGIN * float(t[2 * i]))
             v_q = FP8_CLAMP_MAX / (_FP8_KV_BOUND_MARGIN * float(t[2 * i + 1]))
-            a.k_scale = torch.full((1, 1), k_q, dtype=torch.float32, device=dev)
-            a.v_scale = torch.full((1, 1), v_q, dtype=torch.float32, device=dev)
+            a.k_scale = torch.full((1, 1), k_q, dtype=torch.float32).to(dev)
+            a.v_scale = torch.full((1, 1), v_q, dtype=torch.float32).to(dev)
             a.k_scale_float = k_q
             a.v_scale_float = v_q
