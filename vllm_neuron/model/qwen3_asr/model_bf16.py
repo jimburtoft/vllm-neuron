@@ -82,6 +82,34 @@ def get_lmhead_backend() -> str:
     return v
 
 
+# Prefill graph options (comma list). Default "kvblock"; "none" (or an empty value) runs the
+# stock prefill. Read once per module at __init__.
+# - "mlpfuse": at TP1, the MLP kernel adds the attention residual and applies the
+#   post-attention RMSNorm itself (fused_add_tensor + RMS_NORM, as decode does), instead of
+#   a torch add + a torch RMSNorm before it. TP>1 keeps the stock path (SP shards the residual).
+# - "gqa": attention_cte reads the 8 KV heads directly (native GQA) instead of a
+#   repeat_interleave copy of K and V to 16 heads. Same math, same kernel.
+# - "kvblock": the full-prefill KV cache write stores whole cache blocks (one row per
+#   block_size tokens) instead of one scatter row per token, and writes the packed FP8 K
+#   pairs directly (no read of the stored pairs). See _write_kv_blocks. Default on:
+#   PRE-416 35.0 -> 31.2 ms in serving, +3.3 % RTFx, WER unchanged (Task 036).
+_PREFILL_OPTS = ("mlpfuse", "gqa", "kvblock")
+_PREFILL_OPTS_DEFAULT = "kvblock"
+
+
+def get_prefill_opts() -> frozenset:
+    raw = os.environ.get("VLLM_NEURON_QWEN3_ASR_PREFILL_OPT", _PREFILL_OPTS_DEFAULT)
+    raw = raw.strip().lower()
+    opts = frozenset(o.strip() for o in raw.split(",") if o.strip()) - {"none"}
+    bad = opts - set(_PREFILL_OPTS)
+    if bad:
+        raise ValueError(
+            f"VLLM_NEURON_QWEN3_ASR_PREFILL_OPT={raw!r}: unknown {sorted(bad)}; "
+            f"use a comma list of {_PREFILL_OPTS}."
+        )
+    return opts
+
+
 def _write_packed_k_pairs(
     k_cache: torch.Tensor,
     k_new: torch.Tensor,
@@ -149,6 +177,55 @@ def _write_packed_k_pairs(
     lane1 = torch.where(lane_b == 0, other, k_new)
     pairs = torch.stack([lane0, lane1], dim=-1).reshape(nkh * T, d, 2)
     k_cache.index_put_(index, pairs.to(k_cache.dtype).contiguous())
+
+
+def _write_kv_blocks(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    block_indices: torch.Tensor,
+    fp8_packed: bool,
+) -> None:
+    """Write a full prefill's K/V into the paged cache as whole blocks.
+
+    The full-prefill path (no ``kv_segment_size``) attends only the local K/V, causal
+    from position 0, so the prompt starts at in-block position 0 and token ``t`` sits
+    at in-block position ``t % block_size`` of the block that holds token
+    ``t - t % block_size``. Each ``block_size`` chunk of the prompt is then one cache
+    block, so one ``index_put_`` row per block replaces one row per token, and the
+    packed FP8 K needs no read of the stored lane: both tokens of every pair are new.
+
+    Pad tokens follow the real ones. A chunk that holds only pads takes the block of
+    its first slot, which the runner sets to the null block. The pad tail of the last
+    real chunk lands in that request's own block at positions past the prompt; decode
+    writes each of those positions before its mask can reach it (it writes position
+    ``p``, then attends positions ``<= p``), and the stock path leaves stale values there
+    too.
+
+    Args:
+        k_cache: ``[nb, nkh, bs, d]`` or packed fp8 ``[nb, nkh, bs // 2, d, 2]``.
+        v_cache: ``[nb, nkh, bs, d]``.
+        k_new, v_new: ``[nkh, T, d]`` in the compute dtype, already rounded to the
+            cache dtype (the relayout runs in the compute dtype, the scatter casts;
+            fp8 -> bf16 -> fp8 is exact), ``T % bs == 0``.
+        block_indices: ``[T]`` block of each token (null block for padding).
+        fp8_packed: whether ``k_cache`` is the packed FP8 layout.
+    """
+    nkh, T, d = v_new.shape
+    bs = v_cache.shape[-2]
+    nblk = T // bs
+    blk = block_indices.view(nblk, bs)[:, 0].contiguous()
+    v_rows = v_new.view(nkh, nblk, bs, d).permute(1, 0, 2, 3).contiguous()
+    if fp8_packed:
+        # Lane p % 2 of packed row p // 2 holds in-block position p.
+        k_rows = (
+            k_new.view(nkh, nblk, bs // 2, 2, d).permute(1, 0, 2, 4, 3).contiguous()
+        )
+    else:
+        k_rows = k_new.view(nkh, nblk, bs, d).permute(1, 0, 2, 3).contiguous()
+    k_cache.index_put_((blk,), k_rows.to(k_cache.dtype))
+    v_cache.index_put_((blk,), v_rows.to(v_cache.dtype))
 
 
 # =============================================================================
@@ -300,6 +377,11 @@ class Qwen3ASRTextAttention(nn.Module):
         self.register_buffer("v_scale", None, persistent=False)
         self.k_scale_float = 1.0
         self.v_scale_float = 1.0
+
+        # Prefill attention reads the KV heads natively (attention_cte GQA), no K/V copy.
+        self.prefill_native_gqa = "gqa" in get_prefill_opts()
+        # Full-prefill KV write in whole cache blocks (_write_kv_blocks).
+        self.prefill_kv_block = "kvblock" in get_prefill_opts()
 
         self._setup_weight_loaders()
 
@@ -480,7 +562,24 @@ class Qwen3ASRTextAttention(nn.Module):
             self.num_key_value_heads_per_rank
         )
 
-        if self.fp8_packed:
+        # Static per graph: full prefill and a token count that is whole blocks.
+        kv_block_write = (
+            self.prefill_kv_block
+            and not kv_segment_size
+            and tokens % block_size == 0
+            and self.v_cache.shape[-2] == block_size
+        )
+        if kv_block_write:
+            nkh = self.num_key_value_heads_per_rank
+            _write_kv_blocks(
+                self.k_cache,
+                self.v_cache,
+                k_flat.to(self.dtype).view(nkh, tokens, self.head_dim),
+                v_flat.to(self.dtype).view(nkh, tokens, self.head_dim),
+                block_indices,
+                self.fp8_packed,
+            )
+        elif self.fp8_packed:
             # Packed K [nb, nkh, block_size // 2, Dh, 2]: write whole token pairs.
             # The helper merges in the compute dtype; k_flat is already
             # fp8-rounded, so the round trip through bf16 is exact.
@@ -497,10 +596,11 @@ class Qwen3ASRTextAttention(nn.Module):
                 (block_indices_for_put, head_indices_for_put, position_indices_for_put),
                 k_flat,
             )
-        self.v_cache.index_put_(
-            (block_indices_for_put, head_indices_for_put, position_indices_for_put),
-            v_flat,
-        )
+        if not kv_block_write:
+            self.v_cache.index_put_(
+                (block_indices_for_put, head_indices_for_put, position_indices_for_put),
+                v_flat,
+            )
 
         # Step 4: Attention — no sinks, no sliding window
         if kv_segment_size:
@@ -522,9 +622,11 @@ class Qwen3ASRTextAttention(nn.Module):
             if self.v_scale_float != 1.0:
                 attn_output = attn_output / self.v_scale_float
         else:
-            # Full prefill attends the local bf16 K/V, not the cache.
-            k = k.repeat_interleave(self.num_key_value_groups, dim=0)
-            v = v.repeat_interleave(self.num_key_value_groups, dim=0)
+            # Full prefill attends the local bf16 K/V, not the cache. The kernel maps Q head h
+            # to KV head h // groups itself (native GQA), the same pairing as repeat_interleave.
+            if not self.prefill_native_gqa:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=0)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=0)
 
             q_flash = q.transpose(1, 2)
             k_flash = k.transpose(1, 2)
@@ -823,6 +925,9 @@ class Qwen3ASRTextMLP(nn.Module):
 
         self._setup_weight_loaders(config)
 
+        # Prefill residual-add + RMSNorm folded into the MLP kernel (TP1 only).
+        self.prefill_fuse_ok = self.world_size == 1 and "mlpfuse" in get_prefill_opts()
+
     def _setup_weight_loaders(self, config: Qwen3ASRTextConfig):
         """>>> PARALLELISM: TP sharding of MLP weights. <<<"""
         gate_up_loader = sharding_weight_loader(
@@ -859,14 +964,17 @@ class Qwen3ASRTextMLP(nn.Module):
 
         TODO: fuse both on prefill after the removal of sequence parallelism.
         """
-        if is_prefill and fused_add_tensor is not None:
+        # TP1 has no SP, so the prefill MLP kernel may fold the residual add and the norm
+        # (VLLM_NEURON_QWEN3_ASR_PREFILL_OPT=mlpfuse); the layer then passes fused_add_tensor.
+        prefill_fused = is_prefill and fused_add_tensor is not None
+        if prefill_fused and not self.prefill_fuse_ok:
             raise ValueError(
                 "The prefill path must not fuse the residual add. Give "
                 "fused_add_tensor on decode only, and add the residual after "
                 "this call."
             )
 
-        if is_prefill:
+        if is_prefill and not prefill_fused:
             # Normalize on the SP shard, before the gather, then tell the kernel
             # that the activation is already normalized.
             hidden_states = self.post_attention_layernorm(hidden_states)
@@ -954,6 +1062,10 @@ class Qwen3ASRTextDecoderLayer(nn.Module):
         if is_decode:
             hidden_states, residual = self.mlp(
                 hidden_states, is_prefill=False, fused_add_tensor=residual
+            )
+        elif self.mlp.prefill_fuse_ok:
+            hidden_states, residual = self.mlp(
+                hidden_states, is_prefill=True, fused_add_tensor=residual
             )
         else:
             hidden_states = residual + hidden_states
@@ -1147,6 +1259,21 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
 
         if not self.mm_encoder_only:
             self.language_model = Qwen3ASRTextModel(config.text_config)
+            logger.info(
+                "qwen3_asr prefill opts: %s (requested %s, tp=%d)",
+                ",".join(
+                    o
+                    for o, on in (
+                        ("mlpfuse", self.language_model.layers[0].mlp.prefill_fuse_ok),
+                        ("gqa", self.language_model.layers[0].self_attn.prefill_native_gqa),
+                        ("kvblock", self.language_model.layers[0].self_attn.prefill_kv_block),
+                    )
+                    if on
+                )
+                or "stock",
+                ",".join(sorted(get_prefill_opts())) or "none",
+                self.language_model.world_size,
+            )
         else:
             self.language_model = None
 
