@@ -259,6 +259,7 @@ def mlp(
     up_clamp_lower_limit: float | None = None,
     gate_up_w_layout=None,
     column_tiling: bool | None = None,
+    computation_mode: ComputationMode | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """MLP API that automatically selects between nkilib NKI kernel and PyTorch fallback.
 
@@ -300,6 +301,10 @@ def mlp(
             off for all MX dtypes. ``False`` turns tiling off regardless of dtype.
             ``True`` is a no-op (the default already enables tiling for non-MX and
             the kernel requires tiling off for MX, so ``True`` cannot force it on).
+        computation_mode: Explicit nkilib ``ComputationMode``. ``None`` (default)
+            derives it: ``DECODE`` for a fused static-FP8 decode norm, else ``AUTO``
+            (TKG for T <= 96). ``DECODE`` forces the TKG kernel at any T, e.g. a
+            128-row decode batch with bf16 activations and ROW fp8 weights.
 
     Returns:
         Tensor with shape [T, H] normally, or tuple[Tensor, Tensor] when
@@ -339,12 +344,13 @@ def mlp(
     # validated and can run the shape, so an unvalidated target or a shape TKG must
     # reject takes nkilib's own T-based choice instead. Derived before the eligibility
     # gate, which validates whichever of the CTE/TKG constraint sets this mode selects.
-    computation_mode = (
-        ComputationMode.DECODE
-        if norm_type == NormType.RMS_NORM
-        and _can_fuse_decode_norm(hidden, quantization_type)
-        else ComputationMode.AUTO
-    )
+    if computation_mode is None:
+        computation_mode = (
+            ComputationMode.DECODE
+            if norm_type == NormType.RMS_NORM
+            and _can_fuse_decode_norm(hidden, quantization_type)
+            else ComputationMode.AUTO
+        )
 
     if _can_use_kernel(
         hidden, gate_w, gate_b, up_b, down_b, quantization_type, computation_mode

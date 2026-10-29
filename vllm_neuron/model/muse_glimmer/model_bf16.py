@@ -50,7 +50,7 @@ from vllm.model_executor.models.interfaces import SupportsEagle3
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
-from nkilib.core.utils.common_types import NormType, QuantizationType
+from nkilib.core.utils.common_types import ComputationMode, NormType, QuantizationType
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig, EncoderNeuronConfig
 from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
@@ -875,6 +875,11 @@ class MuseGlimmerAttention(nn.Module):
 
 # nkilib mlp picks TKG for B*S <= 96 (TKG_BS_SEQLEN_THRESHOLD); TKG ROW takes bf16 input.
 _MLP_TKG_MAX_T = 96
+# MUSE_GLIMMER_MLP_TKG_MAX_T (default 128; 96 = old path): FP8 decode batches of 97..N rows also take the TKG
+# ROW kernel (ComputationMode.DECODE: bf16 activations x fp8 weights, one 128-row BxS tile, the same kernel as
+# <= 96 rows) instead of rmsnorm_quant(ROW) + CTE ROW (dynamic per-row fp8 activations). trn2, 128-row decode
+# graph: MLP 474 -> 360 us/layer, step 58.4 -> 52.9 ms; eq66 / goldens / gsm8k unchanged. Prefill is unchanged.
+_MLP_TKG_FORCE_MAX_T = max(_MLP_TKG_MAX_T, min(128, int(os.environ.get("MUSE_GLIMMER_MLP_TKG_MAX_T", "128") or 128)))
 # nkilib 2.33 (SDK 2.33) mlp CTE ROW fails kernel validation ("Stack out of memory",
 # NCC_INKI016, allocate_intermediate_tensor_tile in row quantization) for T >= 1024 at
 # H=6656 / I=5120 per rank; 512 passes. Rows are independent (per-row activation
@@ -965,7 +970,9 @@ class MuseGlimmerMLP(nn.Module):
         set_weight_loader(self.up_proj_weight, col)
         set_weight_loader(self.down_proj_weight, row)
 
-    def _mlp_fp8(self, x: torch.Tensor) -> torch.Tensor:
+    def _mlp_fp8(self, x: torch.Tensor, is_prefill: bool = True) -> torch.Tensor:
+        if not is_prefill and _MLP_TKG_MAX_T < x.shape[0] <= _MLP_TKG_FORCE_MAX_T:
+            return self._mlp_fp8_call(x, computation_mode=ComputationMode.DECODE)
         if x.shape[0] > _MLP_TKG_MAX_T:
             # CTE (prefill / large T): the ROW CTE kernel needs a pre-quantized input,
             # [T, H+4] fp8 with the per-token fp32 dequant scale in the tail.
@@ -982,12 +989,12 @@ class MuseGlimmerMLP(nn.Module):
                 return torch.cat([self._mlp_fp8_call(c) for c in torch.split(x, C)], dim=0)
         return self._mlp_fp8_call(x)
 
-    def _mlp_fp8_call(self, x: torch.Tensor) -> torch.Tensor:
+    def _mlp_fp8_call(self, x: torch.Tensor, **kw) -> torch.Tensor:
         return NF.mlp(
             x, self.gate_proj_weight, self.up_proj_weight, self.down_proj_weight,
             quantization_type=QuantizationType.ROW,
             gate_w_scale=self.gate_w_scale, up_w_scale=self.up_w_scale,
-            down_w_scale=self.down_w_scale, output_dtype=self.out_dtype_name,
+            down_w_scale=self.down_w_scale, output_dtype=self.out_dtype_name, **kw,
         )
 
     def forward_fused_decode(self, residual: torch.Tensor, attn_out: torch.Tensor, norm) -> tuple:
@@ -1011,7 +1018,7 @@ class MuseGlimmerMLP(nn.Module):
         if is_prefill and self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
         if self.fp8:
-            out = self._mlp_fp8(hidden_states)
+            out = self._mlp_fp8(hidden_states, is_prefill)
         else:
             out = NF.mlp(
                 hidden_states, self.gate_proj_weight, self.up_proj_weight, self.down_proj_weight
