@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MXFP8 experts, torch backend (``HY4_MX_BACKEND=torch``, the default), on CPU.
+"""MXFP8 experts, torch backend (``HY4_MX_BACKEND=torch``), on CPU.
 
 * the loaders (real transforms, per TP rank) give the expected bytes/exponents;
 * the in-graph dequantisation is bit-exact vs fp32 ``fp8 * 2**(e - 127)`` cast to bf16;
@@ -9,6 +9,8 @@
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 import torch
@@ -80,7 +82,7 @@ NAMES = (
 
 @pytest.fixture(autouse=True)
 def torch_backend(monkeypatch):
-    monkeypatch.delenv(moe.MX_BACKEND_ENV, raising=False)  # the default
+    monkeypatch.setenv(moe.MX_BACKEND_ENV, moe.MX_BACKEND_TORCH)
     monkeypatch.delenv(moe.MX_FORCE_ENV, raising=False)  # no platform override needed
 
 
@@ -95,7 +97,15 @@ def _router(c, seed):
 def build(world, rank, ckpt, router, bias, c=None):
     c = c or Cfg()
     set_group(type("G", (Group,), {"world_size": world, "rank_in_group": rank})())
-    m = moe.HYV4MoE(c)
+    prev = os.environ.get(moe.MX_BACKEND_ENV)
+    os.environ[moe.MX_BACKEND_ENV] = moe.MX_BACKEND_TORCH
+    try:
+        m = moe.HYV4MoE(c)
+    finally:
+        if prev is None:
+            os.environ.pop(moe.MX_BACKEND_ENV, None)
+        else:
+            os.environ[moe.MX_BACKEND_ENV] = prev
     assert m.mx_experts and m.mx_backend == moe.MX_BACKEND_TORCH
     for name, src in zip(NAMES, ckpt):
         p = getattr(m, name)
@@ -217,6 +227,8 @@ def test_dispatch():
 
 
 def test_backend_env(monkeypatch):
+    monkeypatch.delenv(moe.MX_BACKEND_ENV, raising=False)
+    assert moe.mx_backend() == moe.MX_BACKEND_BF16  # the default
     monkeypatch.setenv(moe.MX_BACKEND_ENV, "nope")
     with pytest.raises(ValueError, match=moe.MX_BACKEND_ENV):
         moe.mx_backend()

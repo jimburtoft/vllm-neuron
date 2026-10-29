@@ -43,15 +43,17 @@ written by ``convert_mxfp8_to_neuron_fp8.py --keep-mx-experts``). The published
 OCP e4m3fn + e8m0 expert tensors are loaded without requantisation, in the same
 TP-over-I layout as above. ``HY4_MX_BACKEND`` picks how they are run:
 
-* ``torch`` (default): the fp8-row paths' layout and compute (selective gather at
+* ``bf16`` (default): the exact dequantisation (below) done once, at load
+  time; the experts are stored as bf16 in the fp8-row paths' layouts and run by
+  those paths with no scale step (``_forward_selected`` / ``_forward_dense``).
+  Twice the expert HBM of fp8, and no dequant in the graph.
+* ``torch``: the fp8-row paths' layout and compute (selective gather at
   decode, dense over experts at prefill), with each MX block dequantised in the
   graph as ``fp8.to(bf16) * 2**(e - 127)``. The power of two is built from its
   bf16 exponent bits, so the dequantised weight is exactly the checkpoint value
-  (see ``_e8m0_to_bf16``). Pure torch: runs on any platform.
-* ``bf16``: the same exact dequantisation done once, at load time; the experts
-  are stored as bf16 in the fp8-row paths' layouts and run by those paths with
-  no scale step (``_forward_selected`` / ``_forward_dense``). Bit-identical to
-  ``torch``; twice the expert HBM of fp8, and no dequant in the graph.
+  (see ``_e8m0_to_bf16``). Bit-identical to ``bf16``, with the experts kept
+  fp8 in HBM (half the expert memory, so more KV cache) at the cost of the
+  per-step dequant. Pure torch: runs on any platform.
 * ``kernel``: tiled at load time into nkilib ``moe_tkg``'s MX layouts
   (``mx_experts.py``) and run through ``NF.moe_tkg``: selective over the top-k at
   decode, all-expert dynamic at prefill. Trn3 only (the MX kernels need gen4).
@@ -83,7 +85,8 @@ FORMAT_FP8_ROW = "fp8_row_experts"
 FORMAT_MXFP8 = "mxfp8_experts"
 # Testing only: skip the Trn3 platform check for the MXFP8 expert kernel backend.
 MX_FORCE_ENV = "HY4_MX_EXPERTS_FORCE"
-# How ``mxfp8_experts`` checkpoints are run: in-graph dequant + torch, or moe_tkg.
+# How ``mxfp8_experts`` checkpoints are run: dequantised at load (bf16), in the
+# graph (torch), or by nkilib moe_tkg (kernel).
 MX_BACKEND_ENV = "HY4_MX_BACKEND"
 MX_BACKEND_TORCH = "torch"
 MX_BACKEND_KERNEL = "kernel"
@@ -94,8 +97,8 @@ logger = logging.getLogger(__name__)
 
 
 def mx_backend() -> str:
-    """``$HY4_MX_BACKEND`` (default ``torch``); read at model construction."""
-    backend = os.environ.get(MX_BACKEND_ENV, MX_BACKEND_TORCH)
+    """``$HY4_MX_BACKEND`` (default ``bf16``); read at model construction."""
+    backend = os.environ.get(MX_BACKEND_ENV, MX_BACKEND_BF16)
     if backend not in MX_BACKENDS:
         raise ValueError(
             f"{MX_BACKEND_ENV} must be one of {', '.join(map(repr, MX_BACKENDS))}, "
@@ -621,7 +624,7 @@ class HYV4MoE(nn.Module):
     Takes the *normed* hidden states and returns this rank's partial sum.
     With ``neuron_quantization.format == "mxfp8_experts"`` (Trn3) the routed
     experts are the published MXFP8 tensors, dequantised in the graph
-    (``HY4_MX_BACKEND=torch``, default), dequantised at load into bf16 (``bf16``),
+    (``HY4_MX_BACKEND=torch``), dequantised at load into bf16 (``bf16``, default),
     or run by nkilib ``moe_tkg`` (``kernel``).
     """
 

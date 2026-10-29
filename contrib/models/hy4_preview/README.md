@@ -122,24 +122,27 @@ takes `MAX_NUM_SEQS` (4) and `SEQ_BUCKETS` (`[1, 4]`).
 | Trn3                   | Not tested (see note)           | Not tested              | Not tested |
 | Trn2 (trn2.48xlarge)   | Working, single node and 1P1D   | Working (previous port) | Not tested |
 
-Trn3: an optional native-MXFP8 expert path is included
+Trn3: the published MXFP8 checkpoint runs without requantisation
 (`convert_mxfp8_to_neuron_fp8.py --keep-mx-experts`, `neuron_quantization.format`
-`mxfp8_experts`). The published OCP e4m3fn weights and e8m0 exponents are loaded
-unchanged. By default (`HY4_MX_BACKEND=torch`) the routed experts run the same
-torch selective/dense paths as the fp8-row checkpoint, with each 32-element MX
-block dequantised in the graph as `fp8 * 2^(e-127)` in bf16 -- exact, since an
-e4m3 value times a power of two is representable in bf16 (the load checks the
-exponent range and logs it). This backend is pure torch and loads on any
-platform, though the format is intended for Trn3. `HY4_MX_BACKEND=bf16` does
-the same exact dequantisation once at load and keeps the routed experts as bf16
-(no scales in the graph; values bit-identical to `torch`). It doubles the
-expert HBM: about 21.7 GiB of experts per rank at TP=64, ~25.5 GiB with the
-rest of the model, so on Trn3 (36 GiB per logical core) it needs
-`--gpu-memory-utilization 0.85` or more to leave room for a 32K KV cache.
-`HY4_MX_BACKEND=kernel`
-instead tiles the experts into nkilib's MX `moe_tkg` layouts (`src/mx_experts.py`)
-and runs that kernel; it refuses to load on any platform but Trn3. Only the CPU
-unit tests of both backends are reported here.
+`mxfp8_experts`). The OCP e4m3fn weights and e8m0 exponents are loaded
+unchanged and dequantised exactly as `fp8 * 2^(e-127)` in bf16 (an e4m3 value
+times a power of two is representable in bf16; the load checks the exponent
+range and logs it). `HY4_MX_BACKEND` picks where that happens:
+
+| `HY4_MX_BACKEND` | Routed experts in HBM | Dequant | Use when |
+|---|---|---|---|
+| `bf16` (default) | bf16, ~21.7 GiB per rank at TP=64 (~25.5 GiB with the rest of the model) | once, at load | default; on Trn3 (36 GiB per logical core) run with `--gpu-memory-utilization 0.85` or more |
+| `torch` | fp8 + exponents, ~10.8 GiB per rank (~15.3 GiB with the rest) | in the graph, every step | you need more KV cache: more concurrent long-context requests at `max_model_len` 32768 |
+| `kernel` | nkilib MX `moe_tkg` layouts (`src/mx_experts.py`) | inside the MX kernel | Trn3 only (refuses to load elsewhere); experimental |
+
+`bf16` and `torch` give bit-identical expert weights and the same selective /
+dense expert paths as the fp8-row checkpoint. The difference is the per-step
+dequant (`torch`) against the HBM it saves. On Trn3 at `max_model_len` 32768,
+the default `bf16` leaves a KV cache for about one to two concurrent 32K
+requests at `--gpu-memory-utilization` 0.85 to 0.9 (raise
+`VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` to use all of it), and `torch` leaves
+room for about four at 0.8. For decode-heavy serving of many long requests at
+once, try `HY4_MX_BACKEND=torch`.
 
 ## Example Checkpoints
 
