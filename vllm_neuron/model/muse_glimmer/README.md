@@ -140,6 +140,7 @@ The first generated token matched HF on every prompt in all configs. FP8 is clos
 | `MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS` | 16 | Smallest decode batch bucket that uses the in-kernel gate. It is about 3 % slower at batch 1. |
 | `MUSE_GLIMMER_DECODE_OPT` | 3 | neuronx-cc `-O` level for the decode graph only. `-O3` is up to 12.6 % faster at batch >= 32. `off` keeps the engine level. |
 | `MUSE_GLIMMER_KV_DEFER` | 2 | Decode KV writes run after the layer loop, one write per physical KV buffer. This avoids a per-step copy of the shared hybrid KV buffers. `0` restores per-layer writes. |
+| `MUSE_GLIMMER_MLP_TKG_MAX_T` | 128 | FP8 MLP decode batches of 97 to this many rows use the TKG ROW kernel (bf16 activations, the same kernel as <= 96 rows) instead of the prefill CTE ROW kernel. The 128-row decode step is about 11 % faster. `96` restores the old path. |
 | `MUSE_GLIMMER_FP8_CTE_CHUNK` | 512 | FP8 MLP prefill row chunk. It works around an nkilib 2.33 kernel-validation failure ("Stack out of memory") at > 512 rows. The output is bit-exact with the un-chunked kernel. |
 | `MUSE_GLIMMER_FP8_CTE_SHARED_ABS` | 0 | `1`: patch the nkilib CTE ROW kernel at build time so that one scratch buffer is shared (see below). Prefill then runs un-chunked: about 8 % lower TTFT at 1k-4k tokens. Opt-in. |
 | `MUSE_GLIMMER_VIS_SMALL_BLOCK` | 0 | `1`: single-block images run the smallest vision bucket that fits, instead of the full block. Needs `num_vision_tokens_buckets` below the block size. |

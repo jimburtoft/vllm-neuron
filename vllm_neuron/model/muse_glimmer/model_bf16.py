@@ -875,10 +875,11 @@ class MuseGlimmerAttention(nn.Module):
 
 # nkilib mlp picks TKG for B*S <= 96 (TKG_BS_SEQLEN_THRESHOLD); TKG ROW takes bf16 input.
 _MLP_TKG_MAX_T = 96
-# MUSE_GLIMMER_MLP_TKG_MAX_T (> 96, <= 128): FP8 decode batches of 97..N rows also take the TKG ROW
-# kernel (ComputationMode.DECODE: bf16 activations x fp8 weights, one 128-row BxS tile) instead of
-# rmsnorm_quant(ROW) + CTE ROW (dynamic per-row fp8 activations). Prefill (T > 128) is unchanged.
-_MLP_TKG_FORCE_MAX_T = max(_MLP_TKG_MAX_T, min(128, int(os.environ.get("MUSE_GLIMMER_MLP_TKG_MAX_T", "96") or 96)))
+# MUSE_GLIMMER_MLP_TKG_MAX_T (default 128; 96 = old path): FP8 decode batches of 97..N rows also take the TKG
+# ROW kernel (ComputationMode.DECODE: bf16 activations x fp8 weights, one 128-row BxS tile, the same kernel as
+# <= 96 rows) instead of rmsnorm_quant(ROW) + CTE ROW (dynamic per-row fp8 activations). trn2, 128-row decode
+# graph: MLP 474 -> 360 us/layer, step 58.4 -> 52.9 ms; eq66 / goldens / gsm8k unchanged. Prefill is unchanged.
+_MLP_TKG_FORCE_MAX_T = max(_MLP_TKG_MAX_T, min(128, int(os.environ.get("MUSE_GLIMMER_MLP_TKG_MAX_T", "128") or 128)))
 # nkilib 2.33 (SDK 2.33) mlp CTE ROW fails kernel validation ("Stack out of memory",
 # NCC_INKI016, allocate_intermediate_tensor_tile in row quantization) for T >= 1024 at
 # H=6656 / I=5120 per rank; 512 passes. Rows are independent (per-row activation
