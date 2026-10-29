@@ -141,7 +141,6 @@ The first generated token matched HF on every prompt in all configs. FP8 is clos
 | `MUSE_GLIMMER_DECODE_FUSE` | `gate` | `gate`: sigmoid gate and o_proj inside the decode attention kernel. `off`: the gate runs in torch. `norm`, `ffn`, `early_gate`: other folds, measured slower or neutral. |
 | `MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS` | 16 | Smallest decode batch bucket that uses the in-kernel gate. It is about 3 % slower at batch 1. |
 | `MUSE_GLIMMER_DECODE_OPT` | 3 | neuronx-cc `-O` level for the decode graph only. `-O3` is up to 12.6 % faster at batch >= 32. `off` keeps the engine level. |
-| `MUSE_GLIMMER_MLP_TKG_MAX_T` | 128 | FP8 decode batches up to this many rows use the decode (TKG) MLP kernel. Above 96 rows the default nkilib path switches to the prefill kernel and streams weights slowly; 128 is 11.5 % faster at batch 128. |
 | `VLLM_NEURON_SWA_REAL_ADMISSION` | 0 (set 1) | Admit requests by their real peak KV blocks (sliding-window groups capped at the window) instead of vLLM's worst case, which charges every SWA group the full context |
 | `VLLM_NEURON_SWA_EARLY_FREE` | 0 (set 1) | Free out-of-window sliding-window blocks at the end of prefill (needs REAL_ADMISSION) |
 | `VLLM_NEURON_SWA_RING` | 0 (set 1) | Each sliding-window group keeps a fixed ring of cdiv(window, block) blocks. Decode reads half the KV of the trimmed table, so steps are 12-14 % faster at batch >= 32. Refuses spec decode, prefix caching and chunked prefill. |
