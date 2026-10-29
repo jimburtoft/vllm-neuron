@@ -17,8 +17,8 @@ def _restore_flags(monkeypatch):
 @pytest.mark.parametrize(
     "target, expected",
     [
-        ("trn2", (True, True, True, "v1")),
-        ("trn3", (True, True, False, "cte")),
+        ("trn2", (True, True, True, "cte")),
+        ("trn3", (True, True, True, "cte")),
         ("", (False, False, False, "v1")),
     ],
 )

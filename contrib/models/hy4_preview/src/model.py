@@ -102,10 +102,9 @@ def _flag(name: str, default: bool) -> bool:
 
 # Defaults per platform, each overridable with its environment variable:
 #   ``HY4_DEC_CP`` (decode attention sharded by KEY across the TP ranks,
-#   ``HYV4Attention.forward_decode_cp``) and ``HY4_DEC_SPARSE_NKI``: on, on
-#   Trn2 and Trn3; ``HY4_PREFILL_SPARSE_NKI``: on for Trn2 only -- on Trn3 its
-#   kernels currently run slower than the dense blocked attention, so Trn3
-#   keeps the dense prefill. Off device (CPU tests) everything defaults off.
+#   ``HYV4Attention.forward_decode_cp``), ``HY4_DEC_SPARSE_NKI`` and
+#   ``HY4_PREFILL_SPARSE_NKI`` (with ``HY4_PREFILL_SPARSE_BACKEND=cte``): on, on
+#   Trn2 and Trn3. Off device (CPU tests) everything defaults off.
 # The values below are the environment-only defaults; the model sets the
 # platform defaults at construction (``resolve_platform_defaults``).
 DEC_CP = _flag("HY4_DEC_CP", False)
@@ -118,22 +117,23 @@ DEC_SPARSE_NKI = _flag("HY4_DEC_SPARSE_NKI", False)
 # ``HY4_PREFILL_SPARSE_NKI=1``: prefill attention split by QUERY instead of by
 # head (``HYV4Attention.forward_prefill_sparse``): each rank attends its ``C / world``
 # queries for every head over only the rows DSA selected, with the decode
-# kernel ``sparse_decode_attn`` on Neuron (torch reference on CPU).
+# kernels on Neuron (torch references on CPU).
 PREFILL_SPARSE_NKI = _flag("HY4_PREFILL_SPARSE_NKI", False)
 # ``HY4_PREFILL_SPARSE_BACKEND``: the sparse prefill attention kernel. "v1" =
 # ``sparse_decode_attn`` in position mode (per-128-key-tile indirect DMAs
 # through position tables); "cte" = ``nki_sparse_prefill.sparse_prefill_attn``
 # (per-slot flat rows built in torch, one batched indirect DMA per query and
-# source, after nkilib's ``mla_sparse_attention_cte``). Platform default: "cte"
-# on Trn3, "v1" elsewhere. CPU runs the matching torch reference.
+# source, after nkilib's ``mla_sparse_attention_cte``, with all-to-all query /
+# result exchanges). Default "cte" on Neuron. CPU runs the matching torch
+# reference.
 PREFILL_SPARSE_BACKEND = os.environ.get("HY4_PREFILL_SPARSE_BACKEND", "v1")
 # ``HY4_PREFILL_CTE_DMA_T`` (cte backend): how many of the 5 feature-major key
 # chunks (4 latent + the rope window) an indirect ``dma_transpose`` lands
 # directly; the rest are PE transposes of the gathered rows. Each DMA-transposed
 # chunk moves PE / eviction work onto the DMA queues, whose traffic it
-# multiplies (one partition write per element); nkilib's MLA decode kernel
-# keeps one chunk on the DMA for that reason. To be swept on device.
-PREFILL_CTE_DMA_T = int(os.environ.get("HY4_PREFILL_CTE_DMA_T", "1"))
+# multiplies (one partition write per element). Default 0: a nonzero value hung
+# the device on Trn3 (an indirect dma_transpose with a 2-D vector_offset).
+PREFILL_CTE_DMA_T = int(os.environ.get("HY4_PREFILL_CTE_DMA_T", "0"))
 
 
 def resolve_platform_defaults() -> str:
@@ -144,12 +144,12 @@ def resolve_platform_defaults() -> str:
     """
     global DEC_CP, DEC_SPARSE_NKI, PREFILL_SPARSE_NKI, PREFILL_SPARSE_BACKEND
     target = _platform_target()
-    on_neuron, on_trn2 = target.startswith("trn"), target.startswith("trn2")
+    on_neuron = target.startswith("trn")
     DEC_CP = _flag("HY4_DEC_CP", on_neuron)
     DEC_SPARSE_NKI = _flag("HY4_DEC_SPARSE_NKI", on_neuron)
-    PREFILL_SPARSE_NKI = _flag("HY4_PREFILL_SPARSE_NKI", on_trn2)
+    PREFILL_SPARSE_NKI = _flag("HY4_PREFILL_SPARSE_NKI", on_neuron)
     PREFILL_SPARSE_BACKEND = os.environ.get(
-        "HY4_PREFILL_SPARSE_BACKEND", "cte" if target.startswith("trn3") else "v1"
+        "HY4_PREFILL_SPARSE_BACKEND", "cte" if on_neuron else "v1"
     )
     return target
 
