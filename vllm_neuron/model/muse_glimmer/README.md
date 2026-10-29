@@ -191,7 +191,7 @@ Both changes, plus three kernel issues found during this port, are proposed for 
 
 - Tested only on `trn2.3xlarge` at TP=4, `max_model_len` 8192, with prefix caching off.
 - Images and video are not tested together with DFlash.
-- DFlash and the FP8 KV cache have not been tested in the same server.
+- DFlash with the FP8 KV cache runs (drafter KV scales are analytic) but does not fit in HBM on trn2: FP8 KV needs the 8192-token prefill graph loaded, and with DFlash only a 0.05 KV cap loads, which fails at runtime at 8-16 concurrent streams. Use DFlash with a BF16 KV cache, prefill buckets 512/2048, cap 0.10, `max_num_seqs` 16, plus `VLLM_NEURON_SWA_REAL_ADMISSION=1 VLLM_NEURON_SWA_EARLY_FREE=1` (not the SWA ring). It beats the ring server up to about 8 concurrent streams per device.
 - FP8 prefill graphs compile slowly. Raise `VLLM_NEURON_BARRIER_TIMEOUT`.
 - Any change to the KV cap or `max_num_seqs` recompiles every graph.
 - Windowed vision layers still compute full masked blocks. A tile-skip in nkilib `attention_cte` would remove that work.
