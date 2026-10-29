@@ -29,24 +29,30 @@ Add 64 GB of swap first (`sudo fallocate -l 64G /swapfile && sudo chmod 600 /swa
 ```bash
 export MUSE_GLIMMER_FP8=mlp
 export MUSE_GLIMMER_KV_SCALES=/path/to/kv_scales.json     # per-layer V scales, see "FP8 KV cache"
-export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.27
+export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.21
 export VLLM_NEURON_BARRIER_TIMEOUT=14400                  # FP8 prefill graphs compile slowly
+# Sliding-window KV: admit by each request's real peak, free out-of-window blocks after prefill, ring per SWA group
+export VLLM_NEURON_SWA_REAL_ADMISSION=1 VLLM_NEURON_SWA_EARLY_FREE=1 VLLM_NEURON_SWA_RING=1
 export MUSE_GLIMMER_VIS_SMALL_BLOCK=1 MUSE_GLIMMER_VIS_MLP=nki MUSE_GLIMMER_VIS_LN=fused
 
 vllm serve meta-models/Muse-Glimmer-30B --tensor-parallel-size 4 \
-  --max-model-len 8192 --max-num-seqs 64 --max-num-batched-tokens 8192 \
+  --max-model-len 8192 --max-num-seqs 128 --max-num-batched-tokens 8192 \
   --kv-cache-dtype fp8 --max-logprobs 0 --no-enable-prefix-caching \
   --limit-mm-per-prompt '{"image": 1, "video": 0}' --mm-processor-kwargs '{"max_image_tokens": 1024}' \
   --additional-config '{
     "neuron_config": {"num_batched_tokens_buckets": [512, 1024, 2048, 4096, 8192],
-                      "num_seqs_buckets": [1, 2, 4, 8, 16, 32, 48, 64],
+                      "num_seqs_buckets": [1, 2, 4, 8, 16, 32, 48, 64, 96, 128],
                       "decode_context_length_buckets": [4096],
                       "on_device_sampling_config": {"all_greedy": true}},
     "vision_neuron_config": {"vision_attention_block_size": 4096,
                              "num_vision_tokens_buckets": [1024, 2048, 3072, 4096],
-                             "encoder_cache_num_blocks": 16, "tp_size": 4}}' \
+                             "encoder_cache_num_blocks": 64, "tp_size": 4}}' \
   --port 8000
 ```
+
+- **The ring needs** single-shot prefill (`--max-num-batched-tokens` = `--max-model-len`), prefix caching off, and no speculative decoding.
+- **Encoder cache:** many concurrent small images need about 4 blocks per concurrent image; 24 blocks failed at concurrency 16 with `Encoder cache full`.
+- **Cap:** 0.27 runs everything except long prompts (6000 tokens) late in a full sweep, where runtime DMA buffers no longer fit. 0.21 is clean and has the same peak throughput.
 
 **BF16 (no quantization):**
 - Drop `MUSE_GLIMMER_FP8`, `MUSE_GLIMMER_KV_SCALES` and `--kv-cache-dtype`.
@@ -57,35 +63,31 @@ An offline example is in `examples/vllm_neuron/models/muse_glimmer/run.py`.
 
 ## Performance (trn2.3xlarge, one device, recommended config)
 
-Measured with `vllm bench serve` (random dataset, `--ignore-eos`, greedy). Concurrency was doubled until throughput stopped improving.
+Measured on a dedicated EC2 trn2.3xlarge with `vllm bench serve` (random dataset, `--ignore-eos`, greedy). Concurrency was doubled until throughput stopped improving.
 
 | Workload (in / out tokens) | Peak output tok/s (concurrency) | c=1 TTFT / TPOT (ms) |
 |---|---|---|
-| 128 / 128 | 747 (128) | 76 / 21.1 |
-| 128 / 512 | 1,061 (256) | 76 / 21.1 |
-| 1024 / 256 | 773 (128) | 136 / 21.1 |
-| 2048 / 128 | 380 (128) | 247 / 21.0 |
-| 2048 / 512 | 787 (256) | 247 / 21.1 |
-| 896x672 image + 256 / 128 | 304 (128) | 343 / 21.1 |
+| 128 / 128 | 1,039 (256) | 77 / 21.0 |
+| 128 / 512 | 1,839 (256) | 78 / 21.0 |
+| 1024 / 256 | 1,112 (256) | 136 / 21.0 |
+| 2048 / 128 | 445 (128) | 250 / 21.0 |
+| 2048 / 512 | 1,154 (512) | 249 / 21.0 |
+| 896x672 image + 256 / 128 | 346 (256) | 348 / 21.0 |
+| 6000 / 256, c=8 | 152 | |
 
-- 58.5 sequences fit in the KV cache at `max_model_len` 8192, and throughput plateaus there.
-- Decode step at batch 1 / 13 / 32 / 48 / 58 is 21.0 / 26.2 / 33.3 / 41.1 / 47.1 ms.
-- The in-kernel decode gate (`MUSE_GLIMMER_DECODE_FUSE=gate`, now the default) is not included in the table above. Measured separately on a trn2 device against the same config, it gave:
-  - a further 4-16 % faster decode step at batch 13-58;
-  - +5 to +16 % peak throughput on the text workloads;
-  - +3.5 % peak throughput on images.
-- **BF16:**
-  - TPOT 27.2 ms at c=1;
-  - peak output tok/s 184 (image) to 455 (128 / 512);
-  - 16 sequences fit in the KV cache.
-- **DFlash** (natural-language prompts, 256 output tokens, acceptance length about 4.1):
+- Decode step at batch 1 / 32 / 64 / 128: 21.0 / 27.1 / 34.5 / 52.2 ms.
+- With the sliding-window admission flags, KV memory no longer limits concurrency: 128 requests use about a fifth of the KV pool.
+- **BF16** (no FP8): TPOT 27.2 ms at c=1; 16 sequences fit in the KV cache at cap 0.15 without the SWA flags.
+- **Low-latency server with DFlash** (natural-language prompts, 256 output tokens, acceptance length about 4.1):
+  - Config: FP8 MLP + BF16 KV, cap 0.10, `--max-num-seqs 16`, prefill buckets [512, 2048], `--max-num-batched-tokens 2048`, `VLLM_NEURON_SWA_REAL_ADMISSION=1 VLLM_NEURON_SWA_EARLY_FREE=1`, no ring.
 
-  | | c=1 tok/s | Speedup at c=1 | c=4 tok/s | c=8 tok/s |
+  | Concurrency | 1 | 4 | 8 | 16 |
   |---|---|---|---|---|
-  | FP8 MLP | 132.9 | 2.76x | 291 | 355 |
-  | BF16 | 108.1 | 2.93x | 263 | 355 |
+  | DFlash (tok/s) | 133 | 294 | 377 | 459 |
+  | recommended server, same prompts (tok/s) | 47 | 134 | 311 | 560 |
 
-  DFlash is a latency option. It runs with a smaller KV cap and helps up to about c=8.
+  DFlash wins up to about 8 concurrent streams per device, and the throughput server wins above that. Run them as two servers and route by load.
+  - FP8 KV with DFlash does not fit in device memory on trn2.3xlarge.
 
 ## Accuracy
 
@@ -139,6 +141,10 @@ The first generated token matched HF on every prompt in all configs. FP8 is clos
 | `MUSE_GLIMMER_DECODE_FUSE` | `gate` | `gate`: sigmoid gate and o_proj inside the decode attention kernel. `off`: the gate runs in torch. `norm`, `ffn`, `early_gate`: other folds, measured slower or neutral. |
 | `MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS` | 16 | Smallest decode batch bucket that uses the in-kernel gate. It is about 3 % slower at batch 1. |
 | `MUSE_GLIMMER_DECODE_OPT` | 3 | neuronx-cc `-O` level for the decode graph only. `-O3` is up to 12.6 % faster at batch >= 32. `off` keeps the engine level. |
+| `MUSE_GLIMMER_MLP_TKG_MAX_T` | 128 | FP8 decode batches up to this many rows use the decode (TKG) MLP kernel. Above 96 rows the default nkilib path switches to the prefill kernel and streams weights slowly; 128 is 11.5 % faster at batch 128. |
+| `VLLM_NEURON_SWA_REAL_ADMISSION` | 0 (set 1) | Admit requests by their real peak KV blocks (sliding-window groups capped at the window) instead of vLLM's worst case, which charges every SWA group the full context |
+| `VLLM_NEURON_SWA_EARLY_FREE` | 0 (set 1) | Free out-of-window sliding-window blocks at the end of prefill (needs REAL_ADMISSION) |
+| `VLLM_NEURON_SWA_RING` | 0 (set 1) | Each sliding-window group keeps a fixed ring of cdiv(window, block) blocks. Decode reads half the KV of the trimmed table, so steps are 12-14 % faster at batch >= 32. Refuses spec decode, prefix caching and chunked prefill. |
 | `MUSE_GLIMMER_KV_DEFER` | 2 | Decode KV writes run after the layer loop, one write per physical KV buffer. This avoids a per-step copy of the shared hybrid KV buffers. `0` restores per-layer writes. |
 | `MUSE_GLIMMER_MLP_TKG_MAX_T` | 128 | FP8 MLP decode batches of 97 to this many rows use the TKG ROW kernel (bf16 activations, the same kernel as <= 96 rows) instead of the prefill CTE ROW kernel. The 128-row decode step is about 11 % faster. `96` restores the old path. |
 | `MUSE_GLIMMER_FP8_CTE_CHUNK` | 512 | FP8 MLP prefill row chunk. It works around an nkilib 2.33 kernel-validation failure ("Stack out of memory") at > 512 rows. The output is bit-exact with the un-chunked kernel. |
@@ -152,7 +158,7 @@ The first generated token matched HF on every prompt in all configs. FP8 is clos
 | `VLLM_NEURON_MLP_CTE_I_OVERRIDE` | 0 | Mirrors nkilib's I-sharding rule (I > 4096) in the plugin's MLP kernel gate |
 
 **Config rules:**
-- **KV cap.** The default `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (0.30) leaves no HBM for the compiled graphs. Use 0.27 with FP8 MLP and 0.15 with BF16.
+- **KV cap.** The default `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (0.30) leaves no HBM for the compiled graphs. Use 0.21 with FP8 MLP + FP8 KV at `--max-num-seqs` 128, 0.27 at 64, and 0.15 with BF16.
 - **Validate any new cap or bucket set with a sweep that runs every prefill, decode and vision bucket.** DMA rings are allocated the first time each graph runs, so a short test can pass while a full sweep fails with `status=4`.
 - **Don't count batch slots that aren't admitted.** Concurrency above the admitted sequence count only queues requests. When you time a decode batch, make sure every sequence was admitted.
 - **`decode_context_length_buckets` below 4096** is supported: sliding-window groups trim to the bucket. It is 5-14 % faster at batch 13-58 for short contexts, but it costs about 0.9 GiB per core. That does not fit at cap 0.27 / MNS 64.
