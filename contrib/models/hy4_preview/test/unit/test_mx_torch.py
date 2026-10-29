@@ -257,3 +257,101 @@ def test_scale_checks(caplog):
     assert torch.isfinite(moe.mx_dequant(big, e, dim=0).float()).all()
     e = e + 1
     assert not torch.isfinite(moe.mx_dequant(big, e, dim=0).float()).all()
+
+
+# ── HY4_MX_BACKEND=bf16: dequantised at load, bit-identical to the torch backend ──
+
+
+def build_bf16(world, rank, ckpt, router, bias, monkeypatch, c=None):
+    c = c or Cfg()
+    monkeypatch.setenv(moe.MX_BACKEND_ENV, moe.MX_BACKEND_BF16)
+    set_group(type("G", (Group,), {"world_size": world, "rank_in_group": rank})())
+    m = moe.HYV4MoE(c)
+    monkeypatch.delenv(moe.MX_BACKEND_ENV)
+    assert m.mx_experts and m.mx_backend == moe.MX_BACKEND_BF16 and m.experts_bf16
+    assert not hasattr(m, "experts_gate_up_scale") and not hasattr(m, "experts_down_scale")
+    gu, gus, dn, dns = ckpt
+    for name, srcs in (
+        ("experts_gate_up_weight", (gu, gus)),
+        ("experts_down_weight", (dn, dns)),
+    ):
+        p = getattr(m, name)
+        t = p.weight_loader.load([Slice(s) for s in srcs], rank)
+        assert t.dtype == p.dtype == torch.bfloat16 and tuple(t.shape) == tuple(p.shape), name
+        p.data = t
+    m.router_weight.data = router
+    m.e_score_correction_bias.data = bias
+    return m
+
+
+@pytest.mark.parametrize("world", [1, 2])
+def test_bf16_weights_equal_in_graph_dequant(world, monkeypatch):
+    c = Cfg()
+    E, H, I = c.n_routed_experts, c.hidden_size, c.moe_intermediate_size
+    ckpt = checkpoint(E, H, I, seed=11, lo=moe.MX_E8M0_EXACT_MIN, hi=moe.MX_E8M0_MAX_FINITE)
+    for r in range(world):
+        t = build(world, r, ckpt, *_router(c, 0))
+        b = build_bf16(world, r, ckpt, *_router(c, 0), monkeypatch)
+        want_gu = moe.mx_dequant(t.experts_gate_up_weight, t.experts_gate_up_scale, dim=1)
+        want_dn = moe.mx_dequant(t.experts_down_weight, t.experts_down_scale, dim=1)
+        assert torch.equal(b.experts_gate_up_weight.data, want_gu)
+        assert torch.equal(b.experts_down_weight.data, want_dn)
+
+
+@pytest.mark.parametrize("world", [1, 2])
+@pytest.mark.parametrize("tokens", [1, 2, 5, 33])
+@torch.no_grad()
+def test_bf16_backend_bit_exact_vs_torch(world, tokens, monkeypatch):
+    """Selective (decode) and dense (prefill) outputs equal the torch backend's, per rank."""
+    c = Cfg()
+    E, H, I = c.n_routed_experts, c.hidden_size, c.moe_intermediate_size
+    ckpt = checkpoint(E, H, I, seed=200 + tokens)
+    router, bias = _router(c, tokens)
+    gen = torch.Generator().manual_seed(tokens)
+    x = torch.randn(tokens, H, generator=gen).to(torch.bfloat16)
+    for r in range(world):
+        t = build(world, r, ckpt, router, bias)
+        b = build_bf16(world, r, ckpt, router, bias, monkeypatch)
+        assert torch.equal(b._forward_selected(x), t._forward_selected_mx(x))
+        assert torch.equal(b._forward_dense(x), t._forward_dense_mx(x))
+        assert torch.equal(b(x), t(x))
+
+
+@torch.no_grad()
+def test_bf16_dispatch(monkeypatch):
+    c = Cfg()
+    E, H, I = c.n_routed_experts, c.hidden_size, c.moe_intermediate_size
+    m = build_bf16(1, 0, checkpoint(E, H, I, seed=3), *_router(c, 3), monkeypatch)
+    n = moe.SELECTIVE_MOE_MAX_TOKENS
+    x = torch.randn(n, H).to(torch.bfloat16)
+    assert torch.equal(m(x), m._forward_selected(x))
+    x = torch.randn(n + 1, H).to(torch.bfloat16)
+    assert torch.equal(m(x), m._forward_dense(x))
+
+
+@pytest.mark.parametrize(
+    "backend", [moe.MX_BACKEND_TORCH, moe.MX_BACKEND_BF16, moe.MX_BACKEND_KERNEL]
+)
+def test_checkpoint_mappings_per_backend(backend, monkeypatch):
+    from hy4_stubs import model
+
+    class C:
+        num_hidden_layers = 2
+        indexer_types = ["none", "none"]
+        tie_word_embeddings = True
+        neuron_quantization = {"format": moe.FORMAT_MXFP8}
+
+        @staticmethod
+        def is_moe_layer(i):
+            return i == 1
+
+    monkeypatch.setenv(moe.MX_BACKEND_ENV, backend)
+    m = model.checkpoint_mappings(C())
+    mlp, hm = "model.layers.1.mlp", f"{model.HF_PREFIX}.layers.1.mlp.experts"
+    if backend == moe.MX_BACKEND_BF16:
+        assert m[f"{mlp}.experts_gate_up_weight"] == [f"{hm}.gate_up_proj", f"{hm}.gate_up_proj_scale"]
+        assert m[f"{mlp}.experts_down_weight"] == [f"{hm}.down_proj", f"{hm}.down_proj_scale"]
+        assert f"{mlp}.experts_gate_up_scale" not in m and f"{mlp}.experts_down_scale" not in m
+    else:
+        assert m[f"{mlp}.experts_gate_up_weight"] == f"{hm}.gate_up_proj"
+        assert m[f"{mlp}.experts_down_scale"] == f"{hm}.down_proj_scale"

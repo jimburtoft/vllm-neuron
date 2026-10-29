@@ -48,6 +48,10 @@ TP-over-I layout as above. ``HY4_MX_BACKEND`` picks how they are run:
   graph as ``fp8.to(bf16) * 2**(e - 127)``. The power of two is built from its
   bf16 exponent bits, so the dequantised weight is exactly the checkpoint value
   (see ``_e8m0_to_bf16``). Pure torch: runs on any platform.
+* ``bf16``: the same exact dequantisation done once, at load time; the experts
+  are stored as bf16 in the fp8-row paths' layouts and run by those paths with
+  no scale step (``_forward_selected`` / ``_forward_dense``). Bit-identical to
+  ``torch``; twice the expert HBM of fp8, and no dequant in the graph.
 * ``kernel``: tiled at load time into nkilib ``moe_tkg``'s MX layouts
   (``mx_experts.py``) and run through ``NF.moe_tkg``: selective over the top-k at
   decode, all-expert dynamic at prefill. Trn3 only (the MX kernels need gen4).
@@ -83,6 +87,8 @@ MX_FORCE_ENV = "HY4_MX_EXPERTS_FORCE"
 MX_BACKEND_ENV = "HY4_MX_BACKEND"
 MX_BACKEND_TORCH = "torch"
 MX_BACKEND_KERNEL = "kernel"
+MX_BACKEND_BF16 = "bf16"
+MX_BACKENDS = (MX_BACKEND_TORCH, MX_BACKEND_BF16, MX_BACKEND_KERNEL)
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +96,9 @@ logger = logging.getLogger(__name__)
 def mx_backend() -> str:
     """``$HY4_MX_BACKEND`` (default ``torch``); read at model construction."""
     backend = os.environ.get(MX_BACKEND_ENV, MX_BACKEND_TORCH)
-    if backend not in (MX_BACKEND_TORCH, MX_BACKEND_KERNEL):
+    if backend not in MX_BACKENDS:
         raise ValueError(
-            f"{MX_BACKEND_ENV} must be {MX_BACKEND_TORCH!r} or {MX_BACKEND_KERNEL!r}, "
+            f"{MX_BACKEND_ENV} must be one of {', '.join(map(repr, MX_BACKENDS))}, "
             f"got {backend!r}"
         )
     return backend
@@ -355,6 +361,42 @@ def mx_torch_down_scale_loader(
     return SafetensorsWeightLoader(transform=transform)
 
 
+# ── OCP MXFP8 experts dequantised at load (``HY4_MX_BACKEND=bf16``) ───────────
+#
+# Each parameter is mapped to two checkpoint keys (weight, scale). The torch
+# backend's transforms produce the fp8 bytes and bf16 power-of-two scales, and
+# ``mx_dequant`` multiplies them on the host: the same values that backend
+# computes in the graph, so the two backends are bit-identical.
+
+
+def mx_bf16_gate_up_loader(intermediate: int, shard: int) -> SafetensorsWeightLoader:
+    """``gate_up_proj`` + ``gate_up_proj_scale`` -> bf16 ``[E, H, 2, I_r]``."""
+    weight = mx_torch_gate_up_loader(intermediate, shard)
+    scale = mx_torch_gate_up_scale_loader(intermediate, shard)
+
+    def transform(slices: list, rank: int) -> torch.Tensor:
+        w_src, s_src = slices
+        w8 = weight.transform([w_src], rank)  # [E, H, 2, I_r] fp8
+        s = scale.transform([s_src], rank)  # [E, H/32, 2, I_r] bf16
+        return mx_dequant(w8, s, dim=1)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def mx_bf16_down_loader(intermediate: int, shard: int) -> SafetensorsWeightLoader:
+    """``down_proj`` + ``down_proj_scale`` -> bf16 ``[E, I_r, H]``."""
+    weight = mx_torch_down_loader(intermediate, shard)
+    scale = mx_torch_down_scale_loader(intermediate, shard)
+
+    def transform(slices: list, rank: int) -> torch.Tensor:
+        w_src, s_src = slices
+        w8 = weight.transform([w_src], rank)  # [E, I_r, H] fp8
+        s = scale.transform([s_src], rank)  # [E, I_r/32, H] bf16
+        return mx_dequant(w8, s, dim=1)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
 def e8m0_to_bf16_host(scale: torch.Tensor) -> torch.Tensor:
     """Load-time: uint8 e8m0 ``e`` -> bf16 ``2**(e - 127)`` (exact for 1 <= e <= 254).
 
@@ -397,7 +439,8 @@ def mx_dequant(w8: torch.Tensor, scale: torch.Tensor, dim: int) -> torch.Tensor:
 def require_mx_platform() -> None:
     """Raise unless this host targets Trn3 (the MX ``moe_tkg`` kernels are gen4-only).
 
-    Applies to ``HY4_MX_BACKEND=kernel`` only; the torch backend runs anywhere.
+    Applies to ``HY4_MX_BACKEND=kernel`` only; the torch and bf16 backends run
+    anywhere.
 
     Evaluated once, at model construction, never inside a traced forward
     (``get_platform_target()`` builds a torchbind object; see
@@ -578,7 +621,8 @@ class HYV4MoE(nn.Module):
     Takes the *normed* hidden states and returns this rank's partial sum.
     With ``neuron_quantization.format == "mxfp8_experts"`` (Trn3) the routed
     experts are the published MXFP8 tensors, dequantised in the graph
-    (``HY4_MX_BACKEND=torch``, default) or run by nkilib ``moe_tkg`` (``kernel``).
+    (``HY4_MX_BACKEND=torch``, default), dequantised at load into bf16 (``bf16``),
+    or run by nkilib ``moe_tkg`` (``kernel``).
     """
 
     def __init__(self, config: HYV4Config):
@@ -604,12 +648,17 @@ class HYV4MoE(nn.Module):
         if fmt not in (FORMAT_FP8_ROW, FORMAT_MXFP8):
             raise ValueError(f"unknown neuron_quantization.format {fmt!r}")
         self.mx_experts = fmt == FORMAT_MXFP8
-        # "kernel": nkilib MX moe_tkg; "torch": in-graph dequant (default); None: fp8 row.
+        # "kernel": nkilib MX moe_tkg; "torch": in-graph dequant (default);
+        # "bf16": dequantised at load; None: fp8 row.
         self.mx_backend = mx_backend() if self.mx_experts else None
+        # bf16 experts with no scales: the fp8-row paths skip the scale steps.
+        self.experts_bf16 = self.mx_backend == MX_BACKEND_BF16
         if self.mx_backend == MX_BACKEND_KERNEL:
             self._init_mx_experts(intermediate)
         elif self.mx_backend == MX_BACKEND_TORCH:
             self._init_mx_torch_experts(intermediate)
+        elif self.mx_backend == MX_BACKEND_BF16:
+            self._init_mx_bf16_experts(intermediate)
         else:
             self._init_fp8_row_experts(intermediate)
 
@@ -723,6 +772,32 @@ class HYV4MoE(nn.Module):
         )
         set_weight_loader(
             self.experts_down_scale, mx_torch_down_scale_loader(intermediate, i_r)
+        )
+
+    def _init_mx_bf16_experts(self, intermediate: int) -> None:
+        """OCP MXFP8 dequantised at load into bf16, fp8-row-path layout (``HY4_MX_BACKEND=bf16``).
+
+        No scale parameters: ``checkpoint_mappings`` maps each weight to its
+        (weight, scale) checkpoint pair, and the loaders apply the scale.
+        """
+        h, e, i_r = self.hidden_size, self.num_experts, self.inter_per_rank
+        blk = mx.MX_BLOCK
+        if h % blk or i_r % blk:
+            raise ValueError(
+                f"MX experts need hidden_size and the per-rank intermediate size to "
+                f"be multiples of {blk} (MX blocks are not split); got H={h}, I_r={i_r}"
+            )
+        self.experts_gate_up_weight = nn.Parameter(
+            torch.empty(e, h, 2, i_r, dtype=torch.bfloat16), requires_grad=False
+        )
+        self.experts_down_weight = nn.Parameter(
+            torch.empty(e, i_r, h, dtype=torch.bfloat16), requires_grad=False
+        )
+        set_weight_loader(
+            self.experts_gate_up_weight, mx_bf16_gate_up_loader(intermediate, i_r)
+        )
+        set_weight_loader(
+            self.experts_down_weight, mx_bf16_down_loader(intermediate, i_r)
         )
 
     def forward(self, normed: torch.Tensor) -> torch.Tensor:
@@ -852,21 +927,24 @@ class HYV4MoE(nn.Module):
         pairs = flat.shape[0]
 
         w_gu = torch.index_select(self.experts_gate_up_weight, 0, flat)  # [P, H, 2, I_r]
-        s_gu = torch.index_select(
-            self.experts_gate_up_scale.view(e, 2 * i_r), 0, flat
-        )  # [P, 2*I_r]
         x = normed.repeat_interleave(k, dim=0)  # [P, H]
         gate_up = torch.einsum(
             "ph,phc->pc", x, w_gu.to(self.dtype).view(pairs, h, 2 * i_r)
-        )
-        gate_up = (gate_up.reshape(pairs, 2 * i_r).float() * s_gu).view(pairs, 2, i_r)
+        ).float()
+        if not self.experts_bf16:
+            s_gu = torch.index_select(
+                self.experts_gate_up_scale.view(e, 2 * i_r), 0, flat
+            )  # [P, 2*I_r]
+            gate_up = gate_up * s_gu
+        gate_up = gate_up.view(pairs, 2, i_r)
         act = self._act(gate_up[:, 0, :], gate_up[:, 1, :])
         act = act * weights.reshape(pairs, 1)  # [P, I_r] fp32
 
         w_d = torch.index_select(self.experts_down_weight, 0, flat)  # [P, I_r, H]
-        s_d = torch.index_select(self.experts_down_scale, 0, flat)  # [P, 1, H]
-        down = torch.einsum("pi,pih->ph", act.to(self.dtype), w_d.to(self.dtype))
-        down = down.float() * s_d.view(pairs, h)
+        down = torch.einsum("pi,pih->ph", act.to(self.dtype), w_d.to(self.dtype)).float()
+        if not self.experts_bf16:
+            s_d = torch.index_select(self.experts_down_scale, 0, flat)  # [P, 1, H]
+            down = down * s_d.view(pairs, h)
         return down.view(tokens, k, h).sum(dim=1).to(self.dtype)
 
     def _act(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
@@ -892,12 +970,13 @@ class HYV4MoE(nn.Module):
         )  # [T, E] fp32
 
         # gate/up: the per-row scale is per *output* column here, so it applies
-        # after the matmul and the weight only needs a dtype convert.
+        # after the matmul and the weight only needs a dtype convert. bf16
+        # experts (``HY4_MX_BACKEND=bf16``) have no scales to apply.
         w_gu = self.experts_gate_up_weight.to(self.dtype).view(e, self.hidden_size, 2 * i_r)
-        gate_up = torch.einsum("th,ehc->tec", normed, w_gu)
-        gate_up = (gate_up.float().reshape(tokens, -1) * self.experts_gate_up_scale).view(
-            tokens, e, 2, i_r
-        )
+        gate_up = torch.einsum("th,ehc->tec", normed, w_gu).float()
+        if not self.experts_bf16:
+            gate_up = gate_up.reshape(tokens, -1) * self.experts_gate_up_scale
+        gate_up = gate_up.view(tokens, e, 2, i_r)
         gate, up = gate_up[:, :, 0, :], gate_up[:, :, 1, :]
         if self.swiglu_limit > 0:
             gate = gate.clamp(max=self.swiglu_limit)
@@ -907,9 +986,12 @@ class HYV4MoE(nn.Module):
         # down: the scale is per output channel *per expert*, so it cannot be
         # pulled out of the sum over experts -- dequantise the weight instead.
         # The product is formed in fp32: a bf16 scale alone would cost 0.4% per row.
-        down = (self.experts_down_weight.float() * self.experts_down_scale).to(
-            self.dtype
-        )
+        if self.experts_bf16:
+            down = self.experts_down_weight
+        else:
+            down = (self.experts_down_weight.float() * self.experts_down_scale).to(
+                self.dtype
+            )
         return act.to(self.dtype).reshape(tokens, e * i_r) @ down.view(
             e * i_r, self.hidden_size
         )

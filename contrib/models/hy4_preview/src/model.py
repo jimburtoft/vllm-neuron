@@ -264,6 +264,7 @@ from .moe import (
     FORMAT_FP8_ROW,
     FORMAT_MXFP8,
     HYV4MLP,
+    MX_BACKEND_BF16,
     MX_BACKEND_ENV,
     MX_BACKEND_KERNEL,
     MX_BACKEND_TORCH,
@@ -2245,6 +2246,7 @@ def checkpoint_mappings(config: HYV4Config) -> dict[str, str]:
     """Port parameter name -> converted-checkpoint key, for every loaded parameter."""
     m: dict[str, str] = {}
     mx_experts = (config.neuron_quantization or {}).get("format") == FORMAT_MXFP8
+    mx_bf16 = mx_experts and mx_backend() == MX_BACKEND_BF16
     for i in range(config.num_hidden_layers):
         hf, ours = f"{HF_PREFIX}.layers.{i}", f"model.layers.{i}"
         m[f"{ours}.input_layernorm.weight"] = f"{hf}.input_layernorm.weight"
@@ -2278,14 +2280,20 @@ def checkpoint_mappings(config: HYV4Config) -> dict[str, str]:
         if config.is_moe_layer(i):
             m[f"{mlp}.router_weight"] = f"{hm}.gate.weight"
             m[f"{mlp}.e_score_correction_bias"] = f"{hm}.gate.e_score_correction_bias"
-            m[f"{mlp}.experts_gate_up_weight"] = f"{hm}.experts.gate_up_proj"
-            m[f"{mlp}.experts_gate_up_scale"] = f"{hm}.experts.gate_up_proj_scale"
+            gu, gus = f"{hm}.experts.gate_up_proj", f"{hm}.experts.gate_up_proj_scale"
             # fp8-row checkpoints store the down weight transposed; the MXFP8
             # expert checkpoint keeps the published [E, H, I] ``down_proj``.
-            m[f"{mlp}.experts_down_weight"] = (
-                f"{hm}.experts.down_proj" if mx_experts else f"{hm}.experts.down_proj_t"
-            )
-            m[f"{mlp}.experts_down_scale"] = f"{hm}.experts.down_proj_scale"
+            dn = f"{hm}.experts.down_proj" if mx_experts else f"{hm}.experts.down_proj_t"
+            dns = f"{hm}.experts.down_proj_scale"
+            if mx_bf16:
+                # Dequantised at load: each bf16 weight reads (weight, scale).
+                m[f"{mlp}.experts_gate_up_weight"] = [gu, gus]
+                m[f"{mlp}.experts_down_weight"] = [dn, dns]
+            else:
+                m[f"{mlp}.experts_gate_up_weight"] = gu
+                m[f"{mlp}.experts_gate_up_scale"] = gus
+                m[f"{mlp}.experts_down_weight"] = dn
+                m[f"{mlp}.experts_down_scale"] = dns
             shared, hs = f"{mlp}.shared_experts", f"{hm}.shared_experts"
         else:
             shared, hs = mlp, hm
@@ -2474,6 +2482,12 @@ class HYV4ForCausalLM(nn.Module):
                 # nkilib MX moe_tkg is Trn3-only. Checked once here, outside
                 # any traced region.
                 require_mx_platform()
+            elif mx_backend() == MX_BACKEND_BF16:
+                logger.info(
+                    "neuron_quantization.format=%s: routed experts dequantised to "
+                    "bf16 at load (%s=%s)",
+                    FORMAT_MXFP8, MX_BACKEND_ENV, MX_BACKEND_BF16,
+                )
             else:
                 logger.info(
                     "neuron_quantization.format=%s: routed experts dequantised in "
