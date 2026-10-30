@@ -66,6 +66,13 @@ FUSED_MASK_ENV = "MUSE_GLIMMER_KV_FP8_FUSED_MASK"
 PACKED_ENV = "MUSE_GLIMMER_KV_PACKED"
 BLOCK_WRITE_ENV = "MUSE_GLIMMER_PREFILL_KV_BLOCK_WRITE"
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+# MUSE_GLIMMER_KV_PACKED_WRITE: how a packed K pair write reads the stored lane.
+#   flat (default): index_select / index_put_ on the cache viewed as 2-D [pairs, 2 * d] (one flat row index).
+#   index: advanced indexing on the 5-D cache (trn2: the graph copies the whole K buffer each decode step).
+#   blind: debug only (timing), no read: the other lane is overwritten with this row (wrong values).
+_PACKED_WRITE = os.environ.get("MUSE_GLIMMER_KV_PACKED_WRITE", "flat").strip().lower() or "flat"
+if _PACKED_WRITE not in ("flat", "index", "blind"):
+    raise ValueError(f"MUSE_GLIMMER_KV_PACKED_WRITE={_PACKED_WRITE!r} not in (flat, index, blind)")
 
 
 def packed_requested() -> bool:
@@ -117,7 +124,19 @@ def write_packed_k(k_cache: torch.Tensor, k_rows: torch.Tensor, b: torch.Tensor,
     o = p // 2
     lane = p % 2
     idx = (b, h, o)
-    old = k_cache[idx].to(torch.bfloat16)  # [N, d, 2]; fp8 -> bf16 -> fp8 is exact
+    d = k_rows.shape[-1]
+    if _PACKED_WRITE == "flat":
+        nkh, half = k_cache.shape[1], k_cache.shape[2]
+        row = (b * nkh + h) * half + o
+        k_flat = k_cache.view(-1, 2 * d)
+    if unique_pairs and _PACKED_WRITE == "blind":
+        kb = k_rows.to(torch.bfloat16)
+        k_cache.index_put_(idx, torch.stack([kb, kb], dim=-1).to(k_cache.dtype))
+        return
+    if _PACKED_WRITE == "flat":
+        old = torch.index_select(k_flat, 0, row).view(-1, d, 2).to(torch.bfloat16)
+    else:
+        old = k_cache[idx].to(torch.bfloat16)  # [N, d, 2]; fp8 -> bf16 -> fp8 is exact
     kb = k_rows.to(torch.bfloat16)
     is0 = (lane == 0).unsqueeze(-1)
     other0, other1 = old[..., 0], old[..., 1]
@@ -140,7 +159,11 @@ def write_packed_k(k_cache: torch.Tensor, k_rows: torch.Tensor, b: torch.Tensor,
         other1 = torch.where(f, part, other1)
     lane0 = torch.where(is0, kb, other0)
     lane1 = torch.where(is0, other1, kb)
-    k_cache.index_put_(idx, torch.stack([lane0, lane1], dim=-1).to(k_cache.dtype))
+    val = torch.stack([lane0, lane1], dim=-1).to(k_cache.dtype)
+    if _PACKED_WRITE == "flat":
+        k_flat.index_put_((row,), val.view(-1, 2 * d))
+    else:
+        k_cache.index_put_(idx, val)
 
 
 def write_kv_blocks(k_cache: torch.Tensor, v_cache: torch.Tensor, k_q: torch.Tensor, v_q: torch.Tensor,
@@ -167,14 +190,16 @@ def write_kv_blocks(k_cache: torch.Tensor, v_cache: torch.Tensor, k_q: torch.Ten
         ok = (blocks == 0) | ((blocks == blocks[:, :1]) & (pos == off))
         assert bool(ok.all()), "MuseGlimmer block KV write: prefill slots are not block-aligned"
     blk = (safe.view(nblk, block_size)[:, 0] // block_size)
-    index = (blk.repeat(nkh), torch.arange(nkh, dtype=blk.dtype, device=blk.device).repeat_interleave(nblk))
-    v_cache.index_put_(index, v_q.reshape(nkh * nblk, block_size, d))
+    heads = torch.arange(nkh, dtype=blk.dtype, device=blk.device).repeat_interleave(nblk)
+    # one flat row index into the caches viewed as [blocks * nkh, block * d] (a (block, head) slab is contiguous)
+    row = blk.repeat(nkh) * v_cache.shape[1] + heads
+    v_cache.view(-1, block_size * d).index_put_((row,), v_q.reshape(nkh * nblk, block_size * d))
     if packed:
         k_rows = k_q.reshape(nkh * nblk, block_size // 2, 2, d).to(torch.bfloat16)
         k_rows = k_rows.transpose(-1, -2).contiguous().to(k_cache.dtype)  # [rows, bs/2, d, 2]
     else:
         k_rows = k_q.reshape(nkh * nblk, block_size, d)
-    k_cache.index_put_(index, k_rows)
+    k_cache.view(-1, block_size * d).index_put_((row,), k_rows.reshape(nkh * nblk, block_size * d))
 
 
 
