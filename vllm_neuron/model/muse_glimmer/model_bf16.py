@@ -467,7 +467,8 @@ class MuseGlimmerAttention(nn.Module):
         self.v_cache = None
         # FP8 KV state, set in bind_kv_cache by kv_fp8.setup (outside the trace).
         self.kv_fp8 = False
-        # Packed FP8 K layout [blocks, nkh, block // 2, d, 2] (MUSE_GLIMMER_KV_PACKED), set in kv_fp8.setup.
+        # Packed FP8 K layout [blocks, nkh, block // 2, d, 2] (MUSE_GLIMMER_KV_PACKED), set in kv_fp8.setup;
+        # k_cache is then bound as the 4-D [blocks, nkh, block, d] view of the same bytes.
         self.kv_packed = False
         # decode step with one token per request (trace-time bool, set in forward_decode).
         self._decode_s1 = False
@@ -604,7 +605,7 @@ class MuseGlimmerAttention(nn.Module):
         return swa_ring.ring_modulus(self.sliding_window, block_size)
 
     def _write_paged_kv(self, k, v, slot_mapping, block_size, block_write: bool = False, decode: bool = False):
-        """k, v: [nkh, T, d] -> 4D paged cache [blocks, nkh, block, d] (packed K: [blocks, nkh, block/2, d, 2])."""
+        """k, v: [nkh, T, d] -> 4D paged cache [blocks, nkh, block, d] (packed K: pair writes into the 4-D view)."""
         # fp8 caches quantize (scale + clamp) here; already-fp8 values pass through.
         k_q = _kv_fp8.to_cache(self, k.reshape(-1, self.head_dim), "k", self.k_cache)
         v_q = _kv_fp8.to_cache(self, v.reshape(-1, self.head_dim), "v", self.v_cache)
@@ -708,7 +709,7 @@ class MuseGlimmerAttention(nn.Module):
             # now holds prior chunks plus this chunk.
             attn_output = NF.segmented_attention(
                 q,
-                k_cache=self.k_cache,
+                k_cache=_kv_fp8.packed_view(self.k_cache) if self.kv_packed else self.k_cache,
                 v_cache=self.v_cache,
                 block_tables=meta["block_table_tensor"],
                 prior_tokens=meta.get("cached_seq_len"),
@@ -798,6 +799,8 @@ class MuseGlimmerAttention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         table = block_table
         packed = self.kv_packed
+        if packed:
+            k_cache = _kv_fp8.packed_view(k_cache)
         self._decode_s1 = S == 1
         if nkh == 1:
             # 3D [blocks, block, d] cache (packed K: 4D [blocks, block/2, d, 2]) + 2D table: kernel-eligible.
@@ -1711,6 +1714,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         # resolve physical-buffer groups here, never inside the trace.
         lm = self.language_model
         _kv_fp8.setup(lm.layers)  # FP8 KV scales (no-op for a bf16 cache)
+        _kv_fp8.bind_packed_views(lm.layers)  # packed K: bind the 4-D view (writes stay in place)
         lm.kv_ptr_group_of = _resolve_kv_ptr_groups(lm.layers)
         if lm.kv_ptr_group_of is not None:
             groups: dict[int, list[int]] = {}

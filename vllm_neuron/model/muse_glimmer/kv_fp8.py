@@ -66,13 +66,6 @@ FUSED_MASK_ENV = "MUSE_GLIMMER_KV_FP8_FUSED_MASK"
 PACKED_ENV = "MUSE_GLIMMER_KV_PACKED"
 BLOCK_WRITE_ENV = "MUSE_GLIMMER_PREFILL_KV_BLOCK_WRITE"
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
-# MUSE_GLIMMER_KV_PACKED_WRITE: how a packed K pair write reads the stored lane.
-#   flat (default): index_select / index_put_ on the cache viewed as 2-D [pairs, 2 * d] (one flat row index).
-#   index: advanced indexing on the 5-D cache (trn2: the graph copies the whole K buffer each decode step).
-#   blind: debug only (timing), no read: the other lane is overwritten with this row (wrong values).
-_PACKED_WRITE = os.environ.get("MUSE_GLIMMER_KV_PACKED_WRITE", "flat").strip().lower() or "flat"
-if _PACKED_WRITE not in ("flat", "index", "blind"):
-    raise ValueError(f"MUSE_GLIMMER_KV_PACKED_WRITE={_PACKED_WRITE!r} not in (flat, index, blind)")
 
 
 def packed_requested() -> bool:
@@ -100,51 +93,47 @@ def block_write_mode() -> str:
     return v
 
 
-def write_packed_k(k_cache: torch.Tensor, k_rows: torch.Tensor, b: torch.Tensor, h: torch.Tensor,
+def packed_view(k4: torch.Tensor) -> torch.Tensor:
+    """Packed K layout ``[blocks, nkh, block // 2, d, 2]`` of the bound 4-D K cache (a view, same bytes)."""
+    nb, nkh, bs, d = k4.shape
+    return k4.view(nb, nkh, bs // 2, d, 2)
+
+
+def write_packed_k(k4: torch.Tensor, k_rows: torch.Tensor, b: torch.Tensor, h: torch.Tensor,
                    p: torch.Tensor, unique_pairs: bool = False, ring_modulus: int | None = None) -> None:
-    """Write K rows into the packed cache ``[blocks, nkh, block // 2, d, 2]`` (in place).
+    """Write K rows into the packed cache (in place).
 
-    ``k_rows`` [N, d] (cache dtype) go to (block ``b``, head ``h``, in-block slot ``p``):
-    packed element ``p // 2``, lane ``p % 2``. A single-lane store does not lower on
-    Neuron, so a row writes its whole pair: the other lane comes from the row of this
-    write that targets the partner slot, or else from the cache (read-modify-write).
-    Lane parity comes from the slot, so any slot order works.
+    ``k4`` is the packed K cache bound as its 4-D ``[blocks, nkh, block, d]`` view (see
+    :func:`bind_packed_views`): packed element o of a block holds slots 2o / 2o + 1 as
+    ``[d, 2]`` and occupies 4-D rows 2o and 2o + 1. Writing through that view uses the
+    same (block, head, row) scatter as the unpacked cache, so the compiled graph updates
+    the shared KV buffer in place (other views of it made the graph copy the buffer).
 
-    Partner rows are searched at fixed offsets, one gather each:
-
-    - ``t +- 1``: consecutive slots of one sequence (prefill, linear layout).
-    - ``t +- 1 -+ R`` with ``ring_modulus=R``: the SWA ring maps position q to slot
-      q % R with R odd, so the two slots of a pair can belong to the first and the
-      last kept position of a prompt (rows R - 1 apart).
-
-    ``unique_pairs=True`` (decode: one new slot per request and head, so no two rows
-    share a pair) skips the search. Rows in the null block (``b == 0``, padding) never
-    pair; several of them may write the same null pair, which is never read unmasked.
+    ``k_rows`` [N, d] (cache dtype) go to (block ``b``, head ``h``, slot ``p``): element
+    ``p // 2``, lane ``p % 2``. A single-lane store does not lower on Neuron, so a row
+    writes its whole pair: the other lane comes from the row of this write that targets
+    the partner slot, or else from the cache. Lane parity comes from the slot, so any
+    slot order works. Partner rows are searched at fixed offsets: ``t +- 1``
+    (consecutive slots of one sequence) and, with ``ring_modulus=R``, ``t +- (1 - R)``
+    (the SWA ring maps position q to slot q % R with R odd, so the two slots of a pair
+    can be the first and the last kept position of a prompt). ``unique_pairs=True``
+    (decode, one token per request) skips the search. Rows in the null block (padding)
+    never pair.
     """
     o = p // 2
     lane = p % 2
-    idx = (b, h, o)
     d = k_rows.shape[-1]
-    if _PACKED_WRITE == "flat":
-        nkh, half = k_cache.shape[1], k_cache.shape[2]
-        row = (b * nkh + h) * half + o
-        k_flat = k_cache.view(-1, 2 * d)
-    if unique_pairs and _PACKED_WRITE == "blind":
-        kb = k_rows.to(torch.bfloat16)
-        k_cache.index_put_(idx, torch.stack([kb, kb], dim=-1).to(k_cache.dtype))
-        return
-    if _PACKED_WRITE == "flat":
-        old = torch.index_select(k_flat, 0, row).view(-1, d, 2).to(torch.bfloat16)
-    else:
-        old = k_cache[idx].to(torch.bfloat16)  # [N, d, 2]; fp8 -> bf16 -> fp8 is exact
+    bb, hh, rr = torch.cat([b, b]), torch.cat([h, h]), torch.cat([2 * o, 2 * o + 1])
+    n = k_rows.shape[0]
+    g = k4[(bb, hh, rr)].to(torch.bfloat16)  # [2N, d]; fp8 -> bf16 -> fp8 is exact
+    old = torch.cat([g[:n], g[n:]], dim=-1).view(n, d, 2)
     kb = k_rows.to(torch.bfloat16)
     is0 = (lane == 0).unsqueeze(-1)
     other0, other1 = old[..., 0], old[..., 1]
     if not unique_pairs:
-        n = kb.shape[0]
         t = torch.arange(n, device=kb.device)
         offs = [1] if ring_modulus is None else [1, 1 - int(ring_modulus)]
-        part = torch.zeros(n, kb.shape[-1], dtype=kb.dtype, device=kb.device)
+        part = torch.zeros_like(kb)
         found = torch.zeros(n, dtype=torch.bool, device=kb.device)
         for off in offs:
             # lane-0 rows look forward by +off, lane-1 rows backward by -off
@@ -159,11 +148,28 @@ def write_packed_k(k_cache: torch.Tensor, k_rows: torch.Tensor, b: torch.Tensor,
         other1 = torch.where(f, part, other1)
     lane0 = torch.where(is0, kb, other0)
     lane1 = torch.where(is0, other1, kb)
-    val = torch.stack([lane0, lane1], dim=-1).to(k_cache.dtype)
-    if _PACKED_WRITE == "flat":
-        k_flat.index_put_((row,), val.view(-1, 2 * d))
-    else:
-        k_cache.index_put_(idx, val)
+    val = torch.stack([lane0, lane1], dim=-1).reshape(n, 2 * d).to(k4.dtype)  # [N, d, 2] -> rows 2o | 2o + 1
+    k4.index_put_((bb, hh, rr), torch.cat([val[:, :d], val[:, d:]]))
+
+
+def bind_packed_views(layers) -> None:
+    """Rebind each layer's packed 5-D K cache as a 4-D ``[blocks, nkh, block, d]`` view.
+
+    The view object is shared by every layer on the same buffer (as the runner does for its
+    slices): distinct per-layer views of one buffer would be overlapping graph inputs.
+    Called from ``bind_kv_cache`` (outside the trace) after :func:`setup`.
+    """
+    memo: dict = {}
+    for l in layers:
+        a = l.self_attn
+        if not a.kv_packed:
+            continue
+        k5, v = a.k_cache, a.v_cache
+        key = (id(k5), tuple(k5.shape))
+        if key not in memo:
+            nb, nkh = k5.shape[0], k5.shape[1]
+            memo[key] = k5.view(nb, nkh, v.shape[2], v.shape[3])
+        a.k_cache = memo[key]
 
 
 def write_kv_blocks(k_cache: torch.Tensor, v_cache: torch.Tensor, k_q: torch.Tensor, v_q: torch.Tensor,
@@ -176,7 +182,8 @@ def write_kv_blocks(k_cache: torch.Tensor, v_cache: torch.Tensor, k_q: torch.Ten
     to the null block. The pad tail of the last real block holds pad values at slots past
     the prompt; the decode mask stops at the sequence length, so they are not read before
     decode writes them. A packed K block gets both lanes of every pair from the new
-    tokens, so the write does not read the cache.
+    tokens, so the write does not read the cache. ``k_cache`` is the 4-D K view (packed
+    or not), so one (block, head) row is a contiguous [block, d] slab in both layouts.
     """
     T = slot_mapping.shape[0]
     d = k_q.shape[-1]
@@ -190,16 +197,15 @@ def write_kv_blocks(k_cache: torch.Tensor, v_cache: torch.Tensor, k_q: torch.Ten
         ok = (blocks == 0) | ((blocks == blocks[:, :1]) & (pos == off))
         assert bool(ok.all()), "MuseGlimmer block KV write: prefill slots are not block-aligned"
     blk = (safe.view(nblk, block_size)[:, 0] // block_size)
-    heads = torch.arange(nkh, dtype=blk.dtype, device=blk.device).repeat_interleave(nblk)
-    # one flat row index into the caches viewed as [blocks * nkh, block * d] (a (block, head) slab is contiguous)
-    row = blk.repeat(nkh) * v_cache.shape[1] + heads
-    v_cache.view(-1, block_size * d).index_put_((row,), v_q.reshape(nkh * nblk, block_size * d))
+    index = (blk.repeat(nkh), torch.arange(nkh, dtype=blk.dtype, device=blk.device).repeat_interleave(nblk))
+    v_cache.index_put_(index, v_q.reshape(nkh * nblk, block_size, d))
     if packed:
+        # packed bytes of a block, written through the 4-D K view as [block, d] rows
         k_rows = k_q.reshape(nkh * nblk, block_size // 2, 2, d).to(torch.bfloat16)
-        k_rows = k_rows.transpose(-1, -2).contiguous().to(k_cache.dtype)  # [rows, bs/2, d, 2]
+        k_rows = k_rows.transpose(-1, -2).contiguous().to(k_cache.dtype).view(nkh * nblk, block_size, d)
     else:
         k_rows = k_q.reshape(nkh * nblk, block_size, d)
-    k_cache.view(-1, block_size * d).index_put_((row,), k_rows.reshape(nkh * nblk, block_size * d))
+    k_cache.index_put_(index, k_rows)
 
 
 
