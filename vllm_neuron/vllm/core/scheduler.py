@@ -528,7 +528,7 @@ class NeuronScheduler(Scheduler):
         ``max_model_len - 3 - 2k``. That request then sits in a verify batch with 0
         drafts while the other rows still speculate. In that mixed batch the 0-draft
         row gets no bonus token from the rejection sampler, so it never advances and
-        the engine spins with nothing scheduled (CPU, Task 043; stock 0.29 does the
+        the engine spins with nothing scheduled (CPU check; stock 0.29 does the
         same). Capping ``max_tokens`` so that ``prompt + max_tokens`` plus one
         in-flight optimistic draft block stays below the cutoff keeps the cutoff from
         firing: the last ``5 * (k + 1)`` positions (80 for DFlash k=15; up to 2(k+1) optimistic positions are in flight) of
