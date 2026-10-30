@@ -141,8 +141,12 @@ dequant (`torch`) against the HBM it saves. On Trn3 at `max_model_len` 32768,
 the default `bf16` leaves a KV cache for about one to two concurrent 32K
 requests at `--gpu-memory-utilization` 0.85 to 0.9 (raise
 `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` to use all of it), and `torch` leaves
-room for about four at 0.8. For decode-heavy serving of many long requests at
-once, try `HY4_MX_BACKEND=torch`.
+room for about four at 0.8. When the KV cache holds fewer `max_model_len`
+requests than `--max-num-seqs`, vLLM admits them one at a time (it logs
+"Effective concurrency will be capped"): throughput holds, but queued requests
+wait for a full previous request before their first token. For concurrent
+serving, either lower `--max-model-len` (at 16384 the `bf16` default admits
+four requests) or use `HY4_MX_BACKEND=torch`.
 
 ## Example Checkpoints
 
