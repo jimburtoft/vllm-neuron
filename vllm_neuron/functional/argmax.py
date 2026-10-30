@@ -149,7 +149,17 @@ def _compute_local_max(tensor: Tensor, dim: int) -> tuple[Tensor, Tensor]:
         # Grid must match the runtime lnc so the kernel's program sharding matches
         # the cores the NEFF runs on; a mismatch leaves output shards unwritten.
         grid = 1 if envs.VLLM_NEURON_CPU_MODE else get_logical_nc_config()
-        value, index = cascaded_max_nki[grid](input_tensor)
+        rows, vocab = input_tensor.shape
+        slices = _cascaded_max_row_slices(rows, vocab, grid)
+        if len(slices) > 1:
+            vals, idxs = [], []
+            for r0, r1 in slices:
+                v, i = cascaded_max_nki[grid](input_tensor[r0:r1].contiguous())
+                vals.append(v)
+                idxs.append(i)
+            value, index = torch.cat(vals, dim=0), torch.cat(idxs, dim=0)
+        else:
+            value, index = cascaded_max_nki[grid](input_tensor)
         # The NKI kernel returns uint32 indices. torch has no promotion rule for
         # uint32, so the dtype after a later add is backend-dependent: the XLA
         # uint32, so the dtype after a later add is backend-dependent.
@@ -164,6 +174,62 @@ def _compute_local_max(tensor: Tensor, dim: int) -> tuple[Tensor, Tensor]:
         return value, index
     else:
         return torch.max(tensor, dim=dim, keepdim=True)
+
+
+_FIND_INDEX8_MAX_ELEMENTS = 16384
+
+
+def _cascaded_max_stage_size(rows: int, vocab: int, grid: int) -> int:
+    """Return the per-partition element count that cascaded_max uses for one call.
+
+    This copies the stage calculation of nkilib cascaded_max. The kernel uses
+    one program for one row. Otherwise it shards the rows across `grid` programs.
+    The return value is 0 if the call breaks the partition limit of the kernel.
+    """
+    n_prgs = 1 if rows == 1 else grid
+    per_lnc = -(-rows // n_prgs)
+    if rows < 1 or per_lnc > 128:
+        return 0
+    n_stages = min(128 // per_lnc, vocab // 128)
+    if n_stages < 1:
+        return 0
+    return -(-vocab // n_stages)
+
+
+def _cascaded_max_row_slices(rows: int, vocab: int, grid: int) -> list[tuple[int, int]]:
+    """Return the row slices [(start, end), ...] for the cascaded_max calls.
+
+    nc_find_index8 accepts a maximum of 16384 elements in each partition.
+    cascaded_max uses fewer stages when the row count increases, so a large
+    row count gives a larger stage. Split the rows into slices of `max_rows`.
+    The last slice can be smaller. A row count that the earlier code split
+    evenly gets the same slices.
+
+    Example:
+        >>> _cascaded_max_row_slices(140, 65552, 2)
+        [(0, 35), (35, 70), (70, 105), (105, 140)]
+        >>> _cascaded_max_row_slices(155, 65552, 2)[-1]
+        (152, 155)
+    """
+
+    def _chunk(r: int) -> int:
+        stages = 128 // max(1, r // 2)
+        return vocab if stages == 0 else (vocab + stages - 1) // stages
+
+    def _valid(r: int) -> bool:
+        size = _cascaded_max_stage_size(r, vocab, grid)
+        return 0 < size <= _FIND_INDEX8_MAX_ELEMENTS
+
+    # Keep the earlier max_rows rule, so that the slices do not change for a
+    # row count that worked before.
+    max_rows = rows
+    while max_rows > 2 and (128 // max(1, max_rows // 2) == 0 or _chunk(max_rows) > _FIND_INDEX8_MAX_ELEMENTS):
+        max_rows //= 2
+    # The earlier rule uses floor(rows / 2) rows for each program. The kernel
+    # uses ceil(rows / grid). Make max_rows smaller until the kernel accepts it.
+    while max_rows > 1 and not _valid(max_rows):
+        max_rows -= 1
+    return [(r0, min(r0 + max_rows, rows)) for r0 in range(0, rows, max_rows)]
 
 
 def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:

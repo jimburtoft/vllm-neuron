@@ -14,7 +14,7 @@ jitted_attention_cte = nki.jit()(attention_cte)
 # Match kernel constraints in attention_cte
 MAX_BS = 512
 MAX_SEQLEN = 131072
-MAX_HEAD_DIM = 128
+MAX_HEAD_DIM = 256  # Gemma3 head_dim 256; nkilib attention_cte supports up to 512
 
 
 # TODO: Define this NKI attention_cte kernel constraints check in NKILIB

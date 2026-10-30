@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 
+from .gemma3 import Gemma3ForCausalLM
 from .llama3 import LlamaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM, PEagleLlamaForCausalLM
@@ -27,6 +28,10 @@ def get_models() -> list[tuple[str, type]]:
         ("Qwen3ForCausalLM", Qwen3ForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
         ("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration),
+        # Gemma3 text decoder (head_dim 256). Gemma3 checkpoints (also text-only finetunes) declare the
+        # multimodal wrapper name in config.json; both names map to the text-decoder implementation.
+        ("Gemma3ForConditionalGeneration", Gemma3ForCausalLM),
+        ("Gemma3ForCausalLM", Gemma3ForCausalLM),
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural

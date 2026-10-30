@@ -169,7 +169,7 @@ logging.getLogger(__name__).info(
 )
 
 # Maximum head dimension supported by the NKI kernel (SBUF partition constraint).
-_MAX_HEAD_DIM = 128
+_MAX_HEAD_DIM = 256  # Gemma3 head_dim 256; nkilib attention_cte supports up to 512
 
 
 def _decode_packed_to_unpacked(k_cache: Tensor) -> Tensor:

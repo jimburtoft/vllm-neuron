@@ -294,6 +294,8 @@ class _SwaGroupState:
     rows: np.ndarray | None = None
     trimmed_table: torch.Tensor | None = None
     position_offset: torch.Tensor | None = None
+    # Host copy of the ring position offset (VLLM_NEURON_SWA_RING only).
+    ring_offset: np.ndarray | None = None
 
     def fits(self, shape: tuple[int, ...], dtype: np.dtype) -> bool:
         """Report whether the ring fits a gather of this shape and this dtype."""
@@ -1160,6 +1162,27 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             )
 
+        # VLLM_NEURON_SWA_RING: SWA layers keep a ring layout in the cache. A
+        # segmented or prefix-cached prefill reads prior K/V in the linear
+        # layout, and a multi-token decode step breaks the reserved active slot.
+        self._swa_ring = bool(envs.VLLM_NEURON_SWA_RING)
+        if self._swa_ring:
+            _ring_refusals = {
+                "segmented prefill (kv_segment_size_buckets is set)": not segmented_off,
+                "automatic prefix caching": bool(
+                    getattr(vllm_config.cache_config, "enable_prefix_caching", False)
+                ),
+                "speculative decoding": self.speculative_config is not None,
+                "jump-forward decoding": self.neuron_config.max_jump_forward_tokens > 0,
+                "decode context parallelism": self._dcp_size > 1,
+            }
+            _bad = [k for k, v in _ring_refusals.items() if v]
+            if _bad:
+                raise ValueError(
+                    f"VLLM_NEURON_SWA_RING=1 does not support {', '.join(_bad)}. "
+                    "Disable these features, or unset VLLM_NEURON_SWA_RING."
+                )
+
         # Ensure max_num_batched_tokens is large enough for the largest prefill bucket
         # This is required because slot_mapping buffer is sized by max_num_batched_tokens
         max_bucket_size = max(self.neuron_config.num_batched_tokens_buckets)
@@ -2022,7 +2045,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.compile_options = {"alias_meta_to_neuron": True}
 
         # FIXME: -O1 and mac-threshold are temporary until NKI adds MAC count estimates for kernels.
-        hlo2tensorizer_opts = "--modular-flow-mac-threshold=10"
+        hlo2tensorizer_opts = "--modular-flow-mac-threshold=" + (
+            os.environ.get("VLLM_NEURON_MODULAR_FLOW_MAC_THRESHOLD") or "10"
+        )
         # The unsafe fp8 cast flag is only needed on Trn2 where kernels use
         # legacy nl.float8_e4m3 (max=240). Trn3 supports OCP e4m3fn natively.
         from libtorch_neuronx_lite.compile.platform import get_platform_target
@@ -3455,7 +3480,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
               encoder_positions[i, j] = batch position for token j in block i.
               Sentinel value = num_tokens for don't-care positions.
         """
-        assert len(req_ids) == 1, (
+        _packed = int(os.environ.get("VLLM_NEURON_MAX_PREFILLS_PER_BATCH", "1") or 1) > 1
+        if _packed:
+            # Packed text prefill: the gather loops over every request and leaves sentinel positions for
+            # text-only ones; at most one packed request may carry images.
+            _n_mm = sum(1 for r in req_ids if r in self.requests and self.requests[r].mm_features)
+            assert _n_mm <= 1, f"packed prefill supports at most one multimodal request per step, got {_n_mm}"
+        assert _packed or len(req_ids) == 1, (
             f"_gather_mm_embeddings expects single-request prefill but got "
             f"{len(req_ids)} requests. The prefill NEFF input is sized for "
             f"max_encoder_blocks_per_request={self.max_encoder_blocks_per_request} "
@@ -4178,6 +4209,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 cp_rank=self.cp_rank,
                 cp_kv_cache_interleave_size=block_table.block_size,
             )
+        if getattr(self, "_swa_ring", False):
+            self._apply_swa_ring_slot_mapping(
+                slot_positions, padded_req_indices, num_scheduled_tokens_padded
+            )
         # Redirect padding writes to the reserved null block.
         if padding_map:
             # Calculate padding token indices
@@ -4234,11 +4269,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Compute cached_seq_len for segmented prefill
         cached_seq_len = self._compute_cached_seq_len()
 
+        # Packed prefill: the prefill graph is compiled with max_query_len == bucket (a dynamo guard).
+        _mql = max_num_scheduled_tokens_padded
+        if (
+            num_reqs > 1
+            and max_num_scheduled_tokens_padded > self._decode_token_threshold()
+            and int(os.environ.get("VLLM_NEURON_MAX_PREFILLS_PER_BATCH", "1") or 1) > 1
+        ):
+            _mql = total_num_scheduled_tokens_padded
         # Build attention metadata
         attn_metadata = self._build_attention_metadata(
             padded_num_reqs,
             total_num_scheduled_tokens_padded,  # Includes decode padding
-            max_num_scheduled_tokens_padded,
+            _mql,
             max_num_draft_tokens,
             cached_seq_len,
             max_decode_ctx_len=max_decode_ctx_len,
@@ -5299,6 +5342,54 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"Found min={min_id}, max={max_id}. Invalid IDs: {invalid_ids}"
             )
 
+    def _apply_swa_ring_slot_mapping(
+        self,
+        positions: np.ndarray,
+        req_indices: np.ndarray,
+        num_scheduled_tokens: np.ndarray,
+    ) -> None:
+        """VLLM_NEURON_SWA_RING: remap the slot mapping of each SWA group to ring slots.
+
+        Overwrite the first ``len(positions)`` host slots of every sliding-window
+        group. Each request keeps its last R positions of the step at ring slot
+        ``p % R`` and sends earlier positions to the null block. Full-attention
+        groups keep their slot mapping. See vllm_neuron/vllm/core/swa_ring.py.
+
+        Args:
+            positions: Absolute position of each scheduled (padded) token.
+            req_indices: Block-table row of each token.
+            num_scheduled_tokens: Scheduled (padded) token count per request.
+
+        Example:
+            >>> runner._apply_swa_ring_slot_mapping(pos, rows, counts)  # doctest: +SKIP
+        """
+        from vllm_neuron.vllm.core import swa_ring
+
+        n = len(positions)
+        if n == 0:
+            return
+        # A chunk that continues a prefill would need the prior K/V in the
+        # linear layout. Single-shot prefill starts at position 0.
+        first = np.flatnonzero(np.r_[True, req_indices[1:] != req_indices[:-1]])
+        multi = num_scheduled_tokens[req_indices[first]] > 1
+        if bool((positions[first][multi] > 0).any()):
+            raise RuntimeError(
+                "VLLM_NEURON_SWA_RING=1 got a prefill chunk that does not start at "
+                "position 0. Raise max_num_batched_tokens above the longest prompt."
+            )
+        for gid, block_table in enumerate(self.input_batch.block_table.block_tables):
+            spec = self.kv_cache_config.kv_cache_groups[gid].kv_cache_spec
+            if not isinstance(spec, SlidingWindowSpec):
+                continue
+            block_table.slot_mapping.np[:n] = swa_ring.ring_slot_mapping(
+                positions,
+                req_indices,
+                self._raw_block_table(block_table.block_table),
+                block_table.block_size,
+                spec.sliding_window,
+                null_slot=NULL_BLOCK_ID,
+            )
+
     def _compute_swa_num_blocks(
         self, sliding_window: int, block_size: int, bs: int
     ) -> int:
@@ -5324,11 +5415,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         tighter bound (the common case) the clip is a no-op, and the runtime
         gather (``_compute_swa_decode_tensors``) only runs in that
         no-op-clip regime, so its P_MAX-aligned geometry is preserved.
+
+        With VLLM_NEURON_SWA_RING=1 the width is the fixed ring
+        ``cdiv(sliding_window, block_size)`` (32 blocks, s_prior 1024 for Gemma3).
         """
+        if getattr(self, "_swa_ring", False):
+            from vllm_neuron.vllm.core import swa_ring
+
+            dcp_block_size = block_size * max(self._dcp_size, 1)
+            full_ctx_blocks = (self.max_model_len + dcp_block_size - 1) // dcp_block_size
+            return min(swa_ring.ring_blocks(sliding_window, block_size), full_ctx_blocks)
         # Trimmed SWA kv block counts must produce S_ctx divisible by P_MAX.
         P_MAX = 128
         min_blocks = sliding_window // block_size + 1
-        blocks_per_pmax = P_MAX // block_size
+        _align = max(P_MAX, int(os.environ.get("VLLM_NEURON_SWA_ALIGN_TOKENS", "0") or 0))
+        blocks_per_pmax = max(1, _align // block_size)
         num_swa_blocks = (
             (min_blocks + blocks_per_pmax - 1) // blocks_per_pmax * blocks_per_pmax
         )
@@ -5376,26 +5477,56 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # compares numpy arrays, so a torch build would add nine host dispatches for each
         # step and then convert the result back.
         ctx_lens = self.input_batch.num_computed_tokens_cpu[:padded_num_reqs]
-        start_blocks = np.clip(ctx_lens // block_size - num_swa_blocks + 1, 0, None)
-        gather_index = start_blocks[:, None] + np.arange(
-            num_swa_blocks, dtype=start_blocks.dtype
-        )
+        if getattr(self, "_swa_ring", False):
+            # Ring: the table is always the first num_swa_blocks columns. The
+            # offset max(0, p - R) makes the model's mask end pos - offset equal
+            # min(p, R) and its window start 0, so prior slot s is valid iff
+            # s < min(p, R). See vllm_neuron/vllm/core/swa_ring.py.
+            from vllm_neuron.vllm.core import swa_ring
+
+            R = swa_ring.ring_modulus(sliding_window, block_size)
+            gather_index = np.ascontiguousarray(
+                np.broadcast_to(
+                    np.arange(num_swa_blocks, dtype=np.int64),
+                    (padded_num_reqs, num_swa_blocks),
+                )
+            )
+            # Keep the offset int32 on the host. A combined dtype + device copy
+            # fails on the Neuron device.
+            pos_offset = np.clip(ctx_lens.astype(np.int64) - R, 0, None).astype(np.int32)
+        else:
+            start_blocks = np.clip(ctx_lens // block_size - num_swa_blocks + 1, 0, None)
+            gather_index = start_blocks[:, None] + np.arange(
+                num_swa_blocks, dtype=start_blocks.dtype
+            )
+            pos_offset = start_blocks * block_size
 
         rows = self._raw_block_table(blk_table.block_table)[:padded_num_reqs]
         if self._swa_groups is None:
             self._swa_groups = {}
         state = self._swa_groups.setdefault(kv_cache_group_id, _SwaGroupState())
-        if state.hits(gather_index, rows):
+        table_hit = state.hits(gather_index, rows)
+        if table_hit and (
+            not getattr(self, "_swa_ring", False)
+            or np.array_equal(state.ring_offset, pos_offset)
+        ):
             return state.trimmed_table, state.position_offset
 
-        trimmed_bt = self._gather_swa_columns(state, rows, gather_index).to(self.device)
-        swa_kv_pos_offset = torch.from_numpy(start_blocks * block_size).to(
+        if table_hit:
+            # Ring: the table is unchanged and only the offset moved (one step).
+            trimmed_bt = state.trimmed_table
+        else:
+            trimmed_bt = self._gather_swa_columns(state, rows, gather_index).to(
+                self.device
+            )
+        swa_kv_pos_offset = torch.from_numpy(pos_offset).to(
             dtype=torch.int32, device=self.device
         )
         # Copy both inputs. The scheduler changes the host block table in place, so a
         # view would compare the next step against itself and report a false cache hit.
         state.gather_index = gather_index.copy()
         state.rows = rows.copy()
+        state.ring_offset = pos_offset.copy()
         state.trimmed_table = trimmed_bt
         state.position_offset = swa_kv_pos_offset
         return trimmed_bt, swa_kv_pos_offset
@@ -5531,6 +5662,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             block_size = spec.block_size
             blk_table = self.input_batch.block_table[kv_cache_group_id]
             blk_table_tensor = blk_table.get_device_tensor(padded_num_reqs)
+            # Packed prefill: the prefill graph has a 1-row block table; single-shot prefill writes the cache
+            # through slot_mapping (per token) and never reads the table.
+            if (
+                not is_decode
+                and padded_num_reqs > 1
+                and int(os.environ.get("VLLM_NEURON_MAX_PREFILLS_PER_BATCH", "1") or 1) > 1
+            ):
+                blk_table_tensor = blk_table.get_device_tensor(1)
             # Clone so ``full_blk_table_tensor`` is a distinct tensor object
             # from ``blk_table_tensor``. Required because torch.compile's
             # input guards reject duplicate tensor identities, and warmup
@@ -5614,7 +5753,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 num_swa_blocks = self._compute_swa_num_blocks(
                     spec.sliding_window, block_size, padded_num_reqs
                 )
-                if num_swa_blocks < blk_table_tensor.shape[1]:
+                _swa_ctx_blocks = None
+                if (
+                    os.environ.get("VLLM_NEURON_SWA_CTX_BUCKETS", "0") == "1"
+                    and self.neuron_config.decode_context_length_buckets is not None
+                ):
+                    _swa_ctx_blocks = self._decode_ctx_blocks_from_max_decode_ctx_len(
+                        max_decode_ctx_len=max_decode_ctx_len,
+                        block_size=block_size,
+                        max_num_draft_tokens=max_num_draft_tokens,
+                    )
+                if _swa_ctx_blocks is not None and _swa_ctx_blocks < num_swa_blocks:
+                    # Every live token is inside the first _swa_ctx_blocks blocks: narrow the table, no trim/offset.
+                    _bidx = self._cached_constant_tensor(
+                        ("bucket_idx", _swa_ctx_blocks),
+                        lambda: torch.arange(_swa_ctx_blocks, device=self.device),
+                    )
+                    blk_table_tensor = torch.index_select(blk_table_tensor, 1, _bidx)
+                    swa_kv_pos_offset = self._cached_constant_tensor(
+                        ("swa_kv_pos_offset", kv_cache_group_id, padded_num_reqs),
+                        lambda: torch.zeros(padded_num_reqs, dtype=torch.int32, device=self.device),
+                    )
+                elif num_swa_blocks < blk_table_tensor.shape[1] or getattr(
+                    self, "_swa_ring", False
+                ):
                     blk_table_tensor, swa_kv_pos_offset = (
                         self._compute_swa_decode_tensors(
                             blk_table,
@@ -5916,7 +6078,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             rotary_position_ids = None
         positions = positions.to(device)
         # Sample from last token only
-        logits_indices = torch.tensor([num_tokens - 1], dtype=torch.long).to(device)
+        # Packed prefill (K>1): prefill graphs are compiled with K sampling rows (unused rows repeat the last index).
+        _pack_k = int(os.environ.get("VLLM_NEURON_MAX_PREFILLS_PER_BATCH", "1") or 1)
+        logits_indices = torch.full((max(1, _pack_k),), num_tokens - 1, dtype=torch.long).to(device)
 
         attn_metadata = self._build_warmup_attention_metadata(
             num_tokens=num_tokens,
@@ -5931,7 +6095,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # Create dummy sampling params for warmup
         dummy_sampling_params = torch.tensor(
-            [[0, 1.0, 1.0]],  # [top_k, top_p, temperature]
+            [[0, 1.0, 1.0]] * max(1, _pack_k),  # [top_k, top_p, temperature]
             dtype=torch.float32,
             device=device,
         )
@@ -8954,6 +9118,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
 
             sampling_params_tensor = sampling_params_tensor.to(self.device)
+
+        # Packed prefill: the prefill graph has K sampling rows; pad indices / params on the host.
+        _pack_k = int(os.environ.get("VLLM_NEURON_MAX_PREFILLS_PER_BATCH", "1") or 1)
+        if (
+            _pack_k > 1
+            and spec_decode_metadata is None
+            and input_ids.shape[0] > logits_indices.shape[0] * self._decode_token_threshold()
+        ):
+            _n = logits_indices.shape[0]
+            if _n < _pack_k:
+                _li = logits_indices.cpu()
+                logits_indices = torch.cat([_li, _li[-1:].repeat(_pack_k - _n)]).to(self.device)
+            if sampling_params_tensor is not None:
+                _sp = sampling_params_tensor.cpu()[:_n]
+                if _sp.shape[0] < _pack_k:
+                    _sp = torch.cat([_sp, _sp[-1:].repeat(_pack_k - _sp.shape[0], 1)])
+                sampling_params_tensor = _sp.contiguous().to(self.device)
 
         # Execute model on Neuron device (compiled with vllm_neuron backend)
         model_kwargs = {
