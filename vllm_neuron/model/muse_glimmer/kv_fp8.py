@@ -68,15 +68,27 @@ BLOCK_WRITE_ENV = "MUSE_GLIMMER_PREFILL_KV_BLOCK_WRITE"
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
-def packed_requested() -> bool:
-    """``MUSE_GLIMMER_KV_PACKED=1``: ask the runner for the packed FP8 K layout.
+def packed_mode() -> str:
+    """``MUSE_GLIMMER_KV_PACKED``: ``off`` (default), ``global`` or ``all`` (``1``).
 
-    The packed layout stores K as ``[blocks, kv_heads, block // 2, d, 2]``: two
-    consecutive slots share one bf16-wide element, so the decode kernel loads K
-    with a DMA transpose instead of an fp8 -> bf16 cast plus a PE transpose. V is
-    never packed. The byte footprint is unchanged.
+    The packed layout stores a layer's K blocks as ``[block // 2, d, 2]``: two
+    consecutive slots share one bf16-wide element, so the decode kernel loads K with
+    a DMA transpose instead of an fp8 -> bf16 cast plus a PE transpose. V is never
+    packed and the byte footprint is unchanged. Every layer owns its own blocks of a
+    shared buffer, so the layout is chosen per layer: ``global`` packs the
+    full-attention layers only (the sliding-window kernel is slower packed at small
+    batch on trn2), ``all`` packs every layer.
     """
-    return os.environ.get(PACKED_ENV, "0").strip().lower() in ("1", "true", "yes")
+    v = os.environ.get(PACKED_ENV, "0").strip().lower()
+    v = {"": "off", "0": "off", "false": "off", "1": "all", "true": "all", "yes": "all"}.get(v, v)
+    if v not in ("off", "global", "all"):
+        raise ValueError(f"{PACKED_ENV}={v!r} not in (0, global, all)")
+    return v
+
+
+def packed_requested() -> bool:
+    """True when ``MUSE_GLIMMER_KV_PACKED`` asks the runner for the packed K allocation."""
+    return packed_mode() != "off"
 
 
 def block_write_mode() -> str:
@@ -162,9 +174,9 @@ def bind_packed_views(layers) -> None:
     memo: dict = {}
     for l in layers:
         a = l.self_attn
-        if not a.kv_packed:
-            continue
         k5, v = a.k_cache, a.v_cache
+        if k5 is None or v is None or k5.dim() != v.dim() + 1:
+            continue
         key = (id(k5), tuple(k5.shape))
         if key not in memo:
             nb, nkh = k5.shape[0], k5.shape[1]
@@ -351,12 +363,14 @@ def setup(layers) -> bool:
             "--kv-cache-dtype fp8 (e4m3) and the V1 model runner)")
     if packed[0] and layers[0].self_attn.k_cache.dtype != torch.float8_e4m3fn:
         raise ValueError("MuseGlimmer packed FP8 KV needs float8_e4m3fn")
+    mode = packed_mode()
     for l in layers:
         l.self_attn.kv_fp8 = True
-        l.self_attn.kv_packed = packed[0]
+        l.self_attn.kv_packed = packed[0] and (mode == "all" or l.self_attn.sliding_window is None)
     logger.info(
         "MuseGlimmer FP8 KV: %d layers, k_dq=%.6g (analytic), v_dq range [%.4g, %.4g] "
-        "(margin %s, scales=%s), fused_mask=%s, packed K=%s, prefill block write=%s", len(layers),
+        "(margin %s, scales=%s), fused_mask=%s, packed K=%s (%d layers), prefill block write=%s", len(layers),
         layers[0].self_attn.k_dq, min(l.self_attn.v_dq for l in layers), max(l.self_attn.v_dq for l in layers),
-        margin, src, fused_mask_allowed(), packed[0], block_write_mode())
+        margin, src, fused_mask_allowed(), packed_mode() if packed[0] else "off",
+        sum(l.self_attn.kv_packed for l in layers), block_write_mode())
     return True

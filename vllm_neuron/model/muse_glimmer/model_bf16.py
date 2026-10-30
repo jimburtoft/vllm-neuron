@@ -277,21 +277,31 @@ def _issue_decode_kv_writes(writeback: list, group_of: list[int] | None) -> None
             continue
         attn0 = items[0][1]
         idx = [attn._paged_kv_indices(slot, bsz, k.device) for _li, attn, k, _v, slot, bsz in items]
-        b = torch.cat([i[0] for i in idx])
-        h = torch.cat([i[1] for i in idx])
-        p = torch.cat([i[2] for i in idx])
         d = attn0.head_dim
         kc, vc = attn0.k_cache, attn0.v_cache
+
+        def cat(sel, j):
+            return torch.cat([idx[i][j] for i in sel])
+
         # FP8 KV -> per-layer quantization before the concat (scales differ per layer).
-        k_rows = torch.cat([_kv_fp8.to_cache(it[1], it[2].reshape(-1, d), "k", kc) for it in items])
-        if attn0.kv_packed:
-            # members come from different KV groups (disjoint blocks); each keeps its own row order.
-            # decode with one token per request: rows never share a packed pair.
-            _kv_fp8.write_packed_k(kc, k_rows, b, h, p, unique_pairs=all(it[1]._decode_s1 for it in items),
-                                   ring_modulus=attn0._ring_modulus(items[0][5]))
-        else:
-            kc.index_put_((b, h, p), k_rows)
-        vc.index_put_((b, h, p), torch.cat([_kv_fp8.to_cache(it[1], it[3].reshape(-1, d), "v", vc) for it in items]))
+        allr = list(range(len(items)))
+        vc.index_put_((cat(allr, 0), cat(allr, 1), cat(allr, 2)),
+                      torch.cat([_kv_fp8.to_cache(it[1], it[3].reshape(-1, d), "v", vc) for it in items]))
+        # K: the members own disjoint blocks of the buffer, and the layout is per layer
+        # (MUSE_GLIMMER_KV_PACKED=global packs only the full-attention layers): unpacked
+        # members in one scatter, packed members in one pair write.
+        for packed in (False, True):
+            sel = [i for i in allr if items[i][1].kv_packed == packed]
+            if not sel:
+                continue
+            k_rows = torch.cat([_kv_fp8.to_cache(items[i][1], items[i][2].reshape(-1, d), "k", kc) for i in sel])
+            b, h, p = cat(sel, 0), cat(sel, 1), cat(sel, 2)
+            if packed:
+                # decode with one token per request: rows never share a packed pair. Multi-token
+                # decode rows are consecutive positions of one request, found at offset 1.
+                _kv_fp8.write_packed_k(kc, k_rows, b, h, p, unique_pairs=all(items[i][1]._decode_s1 for i in sel))
+            else:
+                kc.index_put_((b, h, p), k_rows)
 
 
 # ---------------------------------------------------------------------------
