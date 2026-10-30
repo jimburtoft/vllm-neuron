@@ -127,7 +127,14 @@ class MuseGlimmerForConditionalGeneration(
         encoder_neuron_config: EncoderNeuronConfig | None = None,
     ) -> nn.Module:
         cls._validate_config(hf_config, text_neuron_config)
+        from . import kv_fp8
         from .model_bf16 import MuseGlimmerForConditionalGeneration as Model
+
+        # MUSE_GLIMMER_KV_PACKED=1 asks the runner for the packed FP8 K cache layout. The
+        # runner reads neuron_config.fp8_packed_kv when it allocates the KV cache, after
+        # the model is built; the layout only applies with --kv-cache-dtype fp8.
+        if kv_fp8.packed_requested() and text_neuron_config is not None:
+            text_neuron_config.fp8_packed_kv = True
 
         return Model.from_configs(
             hf_config,

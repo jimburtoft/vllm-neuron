@@ -56,13 +56,127 @@ import math
 import os
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor as _FakeTensor
 
 logger = logging.getLogger(__name__)
 
 SCALES_ENV = "MUSE_GLIMMER_KV_SCALES"
 V_MARGIN_ENV = "MUSE_GLIMMER_KV_V_MARGIN"
 FUSED_MASK_ENV = "MUSE_GLIMMER_KV_FP8_FUSED_MASK"
+PACKED_ENV = "MUSE_GLIMMER_KV_PACKED"
+BLOCK_WRITE_ENV = "MUSE_GLIMMER_PREFILL_KV_BLOCK_WRITE"
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def packed_requested() -> bool:
+    """``MUSE_GLIMMER_KV_PACKED=1``: ask the runner for the packed FP8 K layout.
+
+    The packed layout stores K as ``[blocks, kv_heads, block // 2, d, 2]``: two
+    consecutive slots share one bf16-wide element, so the decode kernel loads K
+    with a DMA transpose instead of an fp8 -> bf16 cast plus a PE transpose. V is
+    never packed. The byte footprint is unchanged.
+    """
+    return os.environ.get(PACKED_ENV, "0").strip().lower() in ("1", "true", "yes")
+
+
+def block_write_mode() -> str:
+    """``MUSE_GLIMMER_PREFILL_KV_BLOCK_WRITE``: ``packed`` (default), ``all`` or ``off``.
+
+    Full-prefill KV write in whole cache blocks (one scatter row per block and head)
+    for layers whose prefill slots are linear (no SWA ring). ``packed``: only for a
+    packed FP8 K cache, where the per-token write must read the stored pairs.
+    """
+    v = os.environ.get(BLOCK_WRITE_ENV, "packed").strip().lower() or "packed"
+    v = {"1": "all", "true": "all", "0": "off", "false": "off"}.get(v, v)
+    if v not in ("packed", "all", "off"):
+        raise ValueError(f"{BLOCK_WRITE_ENV}={v!r} not in (packed, all, off)")
+    return v
+
+
+def write_packed_k(k_cache: torch.Tensor, k_rows: torch.Tensor, b: torch.Tensor, h: torch.Tensor,
+                   p: torch.Tensor, unique_pairs: bool = False, ring_modulus: int | None = None) -> None:
+    """Write K rows into the packed cache ``[blocks, nkh, block // 2, d, 2]`` (in place).
+
+    ``k_rows`` [N, d] (cache dtype) go to (block ``b``, head ``h``, in-block slot ``p``):
+    packed element ``p // 2``, lane ``p % 2``. A single-lane store does not lower on
+    Neuron, so a row writes its whole pair: the other lane comes from the row of this
+    write that targets the partner slot, or else from the cache (read-modify-write).
+    Lane parity comes from the slot, so any slot order works.
+
+    Partner rows are searched at fixed offsets, one gather each:
+
+    - ``t +- 1``: consecutive slots of one sequence (prefill, linear layout).
+    - ``t +- 1 -+ R`` with ``ring_modulus=R``: the SWA ring maps position q to slot
+      q % R with R odd, so the two slots of a pair can belong to the first and the
+      last kept position of a prompt (rows R - 1 apart).
+
+    ``unique_pairs=True`` (decode: one new slot per request and head, so no two rows
+    share a pair) skips the search. Rows in the null block (``b == 0``, padding) never
+    pair; several of them may write the same null pair, which is never read unmasked.
+    """
+    o = p // 2
+    lane = p % 2
+    idx = (b, h, o)
+    old = k_cache[idx].to(torch.bfloat16)  # [N, d, 2]; fp8 -> bf16 -> fp8 is exact
+    kb = k_rows.to(torch.bfloat16)
+    is0 = (lane == 0).unsqueeze(-1)
+    other0, other1 = old[..., 0], old[..., 1]
+    if not unique_pairs:
+        n = kb.shape[0]
+        t = torch.arange(n, device=kb.device)
+        offs = [1] if ring_modulus is None else [1, 1 - int(ring_modulus)]
+        part = torch.zeros(n, kb.shape[-1], dtype=kb.dtype, device=kb.device)
+        found = torch.zeros(n, dtype=torch.bool, device=kb.device)
+        for off in offs:
+            # lane-0 rows look forward by +off, lane-1 rows backward by -off
+            c = torch.where(lane == 0, t + off, t - off)
+            inr = (c >= 0) & (c < n)
+            c = c.clamp(0, n - 1)
+            m = inr & (b[c] == b) & (h[c] == h) & (o[c] == o) & (lane[c] != lane) & (b != 0) & ~found
+            part = torch.where(m.unsqueeze(-1), kb[c], part)
+            found = found | m
+        f = found.unsqueeze(-1)
+        other0 = torch.where(f, part, other0)
+        other1 = torch.where(f, part, other1)
+    lane0 = torch.where(is0, kb, other0)
+    lane1 = torch.where(is0, other1, kb)
+    k_cache.index_put_(idx, torch.stack([lane0, lane1], dim=-1).to(k_cache.dtype))
+
+
+def write_kv_blocks(k_cache: torch.Tensor, v_cache: torch.Tensor, k_q: torch.Tensor, v_q: torch.Tensor,
+                    slot_mapping: torch.Tensor, block_size: int, packed: bool) -> None:
+    """Full-prefill KV write in whole blocks (one ``index_put_`` row per block and head).
+
+    ``k_q`` / ``v_q``: [nkh * T, d] head-major, already in the cache dtype; T is a whole
+    number of blocks and the step is one single-shot prefill (tokens start at position
+    0, so token chunk c fills one block, the block of its first slot). Padding chunks go
+    to the null block. The pad tail of the last real block holds pad values at slots past
+    the prompt; the decode mask stops at the sequence length, so they are not read before
+    decode writes them. A packed K block gets both lanes of every pair from the new
+    tokens, so the write does not read the cache.
+    """
+    T = slot_mapping.shape[0]
+    d = k_q.shape[-1]
+    nkh = k_q.shape[0] // T
+    nblk = T // block_size
+    safe = torch.where(slot_mapping < 0, torch.zeros_like(slot_mapping), slot_mapping)
+    if not torch.compiler.is_dynamo_compiling() and not isinstance(slot_mapping, _FakeTensor):
+        blocks = (safe // block_size).view(nblk, block_size)
+        pos = (safe % block_size).view(nblk, block_size)
+        off = torch.arange(block_size, device=pos.device).view(1, -1)
+        ok = (blocks == 0) | ((blocks == blocks[:, :1]) & (pos == off))
+        assert bool(ok.all()), "MuseGlimmer block KV write: prefill slots are not block-aligned"
+    blk = (safe.view(nblk, block_size)[:, 0] // block_size)
+    index = (blk.repeat(nkh), torch.arange(nkh, dtype=blk.dtype, device=blk.device).repeat_interleave(nblk))
+    v_cache.index_put_(index, v_q.reshape(nkh * nblk, block_size, d))
+    if packed:
+        k_rows = k_q.reshape(nkh * nblk, block_size // 2, 2, d).to(torch.bfloat16)
+        k_rows = k_rows.transpose(-1, -2).contiguous().to(k_cache.dtype)  # [rows, bs/2, d, 2]
+    else:
+        k_rows = k_q.reshape(nkh * nblk, block_size, d)
+    k_cache.index_put_(index, k_rows)
+
+
 
 
 def fp8_max() -> float:
@@ -183,8 +297,11 @@ def setup(layers) -> bool:
     """
     fp8 = [is_fp8(l.self_attn.k_cache) for l in layers]
     if not any(fp8):
+        if packed_requested():
+            logger.warning("MuseGlimmer: %s=1 has no effect with a bf16 KV cache", PACKED_ENV)
         for l in layers:
             l.self_attn.kv_fp8 = False
+            l.self_attn.kv_packed = False
         return False
     if not all(fp8) or not all(is_fp8(l.self_attn.v_cache) for l in layers):
         raise ValueError("MuseGlimmer FP8 KV: every layer's K and V cache must be FP8")
@@ -194,11 +311,21 @@ def setup(layers) -> bool:
         logger.warning(
             "MuseGlimmer FP8 KV: %s was not set at weight load; V scale is 1.0 (values below "
             "~2e-3 lose precision). Calibrate the per-layer V absmax offline.", SCALES_ENV)
+    packed = [l.self_attn.k_cache.dim() == l.self_attn.v_cache.dim() + 1 for l in layers]
+    if any(packed) and not all(packed):
+        raise ValueError("MuseGlimmer FP8 KV: the packed K layout must cover every layer")
+    if packed_requested() and not packed[0]:
+        raise ValueError(
+            f"{PACKED_ENV}=1 but the runner allocated an unpacked K cache (the packed layout needs "
+            "--kv-cache-dtype fp8 (e4m3) and the V1 model runner)")
+    if packed[0] and layers[0].self_attn.k_cache.dtype != torch.float8_e4m3fn:
+        raise ValueError("MuseGlimmer packed FP8 KV needs float8_e4m3fn")
     for l in layers:
         l.self_attn.kv_fp8 = True
+        l.self_attn.kv_packed = packed[0]
     logger.info(
         "MuseGlimmer FP8 KV: %d layers, k_dq=%.6g (analytic), v_dq range [%.4g, %.4g] "
-        "(margin %s, scales=%s), fused_mask=%s", len(layers), layers[0].self_attn.k_dq,
-        min(l.self_attn.v_dq for l in layers), max(l.self_attn.v_dq for l in layers),
-        margin, src, fused_mask_allowed())
+        "(margin %s, scales=%s), fused_mask=%s, packed K=%s, prefill block write=%s", len(layers),
+        layers[0].self_attn.k_dq, min(l.self_attn.v_dq for l in layers), max(l.self_attn.v_dq for l in layers),
+        margin, src, fused_mask_allowed(), packed[0], block_write_mode())
     return True

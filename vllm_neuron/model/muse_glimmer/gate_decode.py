@@ -59,6 +59,7 @@ def _gated_attention_block_kernel(
     W_gate=None,
     W_gate_scale=None,
     gate_dq: float = 1.0,
+    fp8_packed: bool = False,
 ):
     return _gated_block(
         X=X,
@@ -100,6 +101,7 @@ def _gated_attention_block_kernel(
         softmax_scale=softmax_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        fp8_packed=fp8_packed,
         sbm=None,
         KVDP=1,
         KVDP_replica_group=None,
@@ -136,9 +138,15 @@ def gated_attention_decode(
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
     gate_dq: float = 1.0,
+    fp8_packed: bool = False,
     force_torch: bool = False,
 ):
-    """See module docstring. ``pos_ids`` (fused mask) XOR a full ``attention_mask`` [S_ctx, B, N, S]."""
+    """See module docstring. ``pos_ids`` (fused mask) XOR a full ``attention_mask``.
+
+    The full mask is [S_ctx, B, N, S], or [B, N, S, S_ctx] when the kernel takes the QK-swap
+    path for this shape (the caller transposes it, ``maybe_transpose_mask_for_qk_swap``).
+    ``fp8_packed``: K_cache is the packed FP8 layout [blocks, block // 2, d, 2].
+    """
     B, S, H = X.shape
     d = V_cache.shape[-1]
     nq = W_gate.shape[1] // d
@@ -174,6 +182,7 @@ def gated_attention_decode(
             W_out=W_out,
             W_gate=W_gate,
             gate_dq=float(gate_dq),
+            fp8_packed=bool(fp8_packed),
         )
 
     # torch reference (CPU mode): same math, unfused
@@ -191,7 +200,7 @@ def gated_attention_decode(
         X=Xn, W_qkv=W_qkv, rmsnorm_QK_pre_rope_enabled=True, rmsnorm_QK_pre_rope_eps=qk_norm_eps,
         cos=cos, sin=sin, rope_contiguous_layout=True, active_blocks_table=active_blocks_table,
         K_cache=K_cache, V_cache=V_cache, attention_mask=attention_mask, softmax_scale=softmax_scale,
-        update_cache=False, W_out=None)
+        update_cache=False, W_out=None, fp8_packed=fp8_packed)
     attn = o.permute(0, 3, 1, 2).reshape(B * S, nq * d)  # [B, N, d, S] -> [B*S, N*d]
     gate = torch.sigmoid(Xn.reshape(B * S, H) @ W_gate) * gate_dq
     out = (attn * gate).to(X.dtype) @ W_out
