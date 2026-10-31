@@ -187,7 +187,7 @@ def test_ring_off_swa_num_blocks_unchanged(monkeypatch):
     """Flag off: _compute_swa_num_blocks keeps the SWA_ALIGN 1024 width (64 blocks)."""
     R_cls = _runner_cls()
     monkeypatch.setenv("VLLM_NEURON_SWA_ALIGN_TOKENS", "1024")
-    fake = types.SimpleNamespace(_dcp_size=1, max_model_len=ML)
+    fake = types.SimpleNamespace(_dcp_size=1, max_model_len=ML, _decode_token_threshold=lambda: 1)
     assert R_cls._compute_swa_num_blocks(fake, W, BS, 155) == 64
     fake._swa_ring = True
     assert R_cls._compute_swa_num_blocks(fake, W, BS, 155) == 32

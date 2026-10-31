@@ -5449,6 +5449,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             align_tokens, int(os.environ.get("VLLM_NEURON_SWA_ALIGN_TOKENS", "0") or 0)
         )
         min_blocks = sliding_window // block_size + 1
+        # A multi-token decode step (speculative verify, jump-forward) keeps its
+        # q = _decode_token_threshold() active tokens in the last q slots of the
+        # trimmed frame, and _compute_swa_decode_tensors moves the frame start up
+        # to keep the newest prior tokens below them. The window of the first
+        # query must still fit, which needs
+        # s_prior >= sliding_window + q + block_size - 2 (the frame start is block
+        # aligned). Size for that explicitly instead of relying on the alignment
+        # slack below. For q = 1 and a block-aligned window this is the old count;
+        # 2048 / 32 / q 16 needs 66 blocks, and the alignment rounds both to 72.
+        query_len = self._decode_token_threshold()
+        min_frame_tokens = sliding_window + query_len + block_size - 2
+        min_blocks = max(min_blocks, -(-min_frame_tokens // block_size))
         blocks_per_pmax = max(1, align_tokens // block_size)
         num_swa_blocks = (
             (min_blocks + blocks_per_pmax - 1) // blocks_per_pmax * blocks_per_pmax
