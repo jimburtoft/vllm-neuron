@@ -98,7 +98,10 @@ their outputs are under "Measured".
 moved by NIXL (LIBFABRIC over EFA). The plugin's `NeuronNixlConnector` registers
 two slabs (K, V) per layer; this model's cache is key-only, so
 `src/kv_connector.py` subclasses it to register one (`Hy4NixlConnector`, loaded
-through `kv_connector_module_path`).
+through `kv_connector_module_path`). The latent cache is replicated on every
+rank, so with equal prefill and decode TP (no DCP) each decode rank reads from,
+and notifies, its own prefill rank; every prefill rank then frees a request's
+blocks as soon as its one reader is done, rather than at the KV lease expiry.
 
 ```bash
 # prefill node

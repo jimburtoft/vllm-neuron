@@ -7,7 +7,9 @@ cache is key-only -- ``(1, num_blocks, 1, block, 704)``, one ``[index | latent |
 entry per token -- so ``register_kv_caches`` asserts on it. This subclass registers a
 key-only layer as ONE region whose block is the whole page; everything after
 registration (descriptor ids ``region * num_blocks + block``, the TP / DCP read logic)
-is region-count generic and unchanged.
+is region-count generic and unchanged, except the read routing for equal prefill /
+decode TP: decode rank ``d`` reads from prefill rank ``d`` (see
+``Hy4NixlConnectorWorker``).
 
 ``register_kv_caches`` is the base method from vllm-neuron 0.29.0.1.2.0 with only the
 region loop changed (marked ``HY4``). Select it on both servers with::
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from vllm_neuron.vllm.kv_connector import neuron_nixl_connector as base
@@ -38,7 +41,76 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _ModelConfigRoutingView:
+    """``model_config`` with ``get_total_num_kv_heads`` replaced; all else delegated."""
+
+    def __init__(self, model_config, kv_heads: int):
+        self._model_config = model_config
+        self._kv_heads = kv_heads
+
+    def get_total_num_kv_heads(self) -> int:
+        return self._kv_heads
+
+    def __getattr__(self, name):
+        return getattr(self._model_config, name)
+
+
+class _VllmConfigRoutingView:
+    """``vllm_config`` whose ``model_config`` is a ``_ModelConfigRoutingView``."""
+
+    def __init__(self, vllm_config, kv_heads: int):
+        self._vllm_config = vllm_config
+        self.model_config = _ModelConfigRoutingView(vllm_config.model_config, kv_heads)
+
+    def __getattr__(self, name):
+        return getattr(self._vllm_config, name)
+
+
 class Hy4NixlConnectorWorker(base.NeuronNixlConnectorWorker):
+    """Key-only registration, plus one-to-one read routing for equal P/D TP.
+
+    The base read path maps decode rank ``d`` to a prefill rank through the KV-head
+    count (``model_config.get_total_num_kv_heads()``), which is 8 for this checkpoint.
+    At TP64 each group of 8 decode ranks then reads from, and notifies, one prefill
+    rank, and the other 56 prefill ranks keep the request's blocks until the lease
+    expires. Hy4's latent cache is the same on every rank, so with prefill TP ==
+    decode TP, no DCP and no head split / merge, the read routing and the fan-in sent
+    to the producer are computed with the KV-head count set to the TP size: decode
+    rank ``d`` reads from prefill rank ``d``, and every prefill rank expects one
+    read-done notification. The override is swapped in only for the duration of
+    ``_read_blocks_for_req`` and ``_producer_fanin_map``; KV sizing, the
+    compatibility hash and the transfer topology see the real ``model_config``.
+    Other topologies keep the base routing.
+    """
+
+    def _one_to_one_routing(self, eid) -> bool:
+        return (
+            self._remote_tp_size.get(eid) == self.world_size
+            and self._remote_dcp.get(eid, 1) == 1
+            and self._local_dcp_size == 1
+            and self._head_ratio.get(eid, 1.0) == 1.0
+        )
+
+    @contextmanager
+    def _routing_for(self, eid):
+        if not self._one_to_one_routing(eid):
+            yield
+            return
+        real = self.vllm_config
+        self.vllm_config = _VllmConfigRoutingView(real, self.world_size)
+        try:
+            yield
+        finally:
+            self.vllm_config = real
+
+    def _read_blocks_for_req(self, req_id, meta):
+        with self._routing_for(meta.remote.engine_id):
+            return super()._read_blocks_for_req(req_id, meta)
+
+    def _producer_fanin_map(self, eid: str) -> dict[int, int]:
+        with self._routing_for(eid):
+            return super()._producer_fanin_map(eid)
+
     def register_kv_caches(self, kv_caches):
         """Register Neuron KV caches as two NIXL regions per layer (K, V).
 
