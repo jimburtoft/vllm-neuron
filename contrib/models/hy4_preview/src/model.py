@@ -224,6 +224,22 @@ def check_prefill_span_bound(kv_segment_size_buckets, limit: int = 1 << 17) -> b
     return True
 
 
+def _dcp_world() -> int:
+    """``decode_context_parallel_size``: the size of vLLM's DCP group (1 without one).
+
+    Read at construction only. Under DCP the runner gives each rank only its own
+    slots of every block (``_compute_slot_mapping_cpu``: interleave = block size).
+    """
+    try:
+        from vllm.distributed.parallel_state import get_dcp_group
+    except ImportError:
+        return 1
+    try:
+        return int(get_dcp_group().world_size)
+    except AssertionError:  # no DCP group initialised (e.g. offline tools)
+        return 1
+
+
 def _all_reduce(group, t: torch.Tensor) -> torch.Tensor:
     return t if "collectives" in PERF_SKIP else group.all_reduce(t)
 
@@ -843,6 +859,16 @@ class HYV4Attention(nn.Module):
                 f"tp_size={self.world_size}"
             )
         self.num_heads = heads // self.world_size
+        # Decode context parallelism: with dcp > 1 the latent cache is sharded by
+        # key (rank r owns slots [r * block, (r + 1) * block) of every virtual
+        # block of block * dcp tokens). Only dcp == tp is implemented: each rank
+        # then owns one key shard and the key-sharded decode merges all of them.
+        self.dcp = _dcp_world()
+        if self.dcp > 1 and self.dcp != self.world_size:
+            raise ValueError(
+                f"decode_context_parallel_size={self.dcp} is supported only equal to "
+                f"tensor_parallel_size={self.world_size} (or 1)"
+            )
         self.nope_dim = config.qk_nope_head_dim
         self.rope_dim = config.qk_rope_head_dim
         self.qk_dim = config.qk_head_dim
@@ -1177,7 +1203,9 @@ class HYV4Attention(nn.Module):
                 f"layer ran before it"
             )
         if metadata["max_query_len"] <= metadata["decode_token_threshold"]:
-            if DEC_CP and self.cp_supported(metadata["block_table_tensor"].shape[1]):
+            if self.dcp > 1 or (
+                DEC_CP and self.cp_supported(metadata["block_table_tensor"].shape[1])
+            ):
                 return self.forward_decode_cp(
                     x, positions, position_embeddings, metadata, selected, rank
                 )
@@ -1186,6 +1214,14 @@ class HYV4Attention(nn.Module):
             split = rows == 1 or rows >= 16
             decode = self.forward_decode_split if split else self.forward_decode
             return decode(x, positions, position_embeddings, metadata, selected)
+        if self.dcp > 1:
+            # Prefill reads the whole cached prefix from this rank's cache, which
+            # under DCP holds only this rank's key shard.
+            raise NotImplementedError(
+                f"{self.layer_name}: prefill with decode_context_parallel_size="
+                f"{self.dcp} is not implemented yet (decode is); run with "
+                "--decode-context-parallel-size 1"
+            )
         return self.forward_prefill(x, position_embeddings, metadata, selected, rank)
 
     def _select_prefill(
@@ -1999,6 +2035,10 @@ class HYV4Attention(nn.Module):
         The cache is still replicated, but rank ``r`` gathers only block-table
         columns ``[r * nb, (r + 1) * nb)`` (``nb = width / world``), i.e. key
         positions ``[r * n, (r + 1) * n)``, and handles them for ALL heads.
+        Under DCP (``self.dcp == world``) the cache itself is sharded: rank
+        ``r`` reads its whole (local) block table, whose keys sit at the
+        interleaved positions of the runner's slot mapping; the shards are
+        disjoint and together cover every key, so the steps below are unchanged.
         The current token's own key is not in the gather; its query, entry
         and therefore its scores are identical on every rank, so it is added
         as a separate term (once, after the merge), never concatenated.
@@ -2031,12 +2071,26 @@ class HYV4Attention(nn.Module):
         if rank is None:
             rank = torch.tensor(self.tp_group.rank_in_group, device=dev)
         r = rank.reshape(1).to(torch.long)
-        nb = width // world
-        shard = nb * self._block_size()
-        cols = r * nb + torch.arange(nb, device=dev)
-        local_bt = torch.index_select(block_table, 1, cols)
-        live_rows = (metadata["slot_mapping"].view(num_reqs, -1)[:, 0] > 0).view(-1, 1)
-        key_pos = r * shard + torch.arange(shard, device=dev)  # [shard]
+        bs = self._block_size()
+        if self.dcp > 1:
+            # Sharded cache: this rank's table already lists only its own blocks,
+            # and local slot j of rank r holds the token at
+            # (j // bs) * (world * bs) + r * bs + j % bs. Liveness from the table,
+            # not the slot mapping (non-owning ranks get slot 0 for live rows);
+            # padded rows have an all-padding table, so they read the null block.
+            nb = width
+            shard = nb * bs
+            local_bt = block_table
+            live_rows = (block_table[:, :1] > 0).view(-1, 1)
+            j = torch.arange(shard, device=dev)
+            key_pos = (j // bs) * (world * bs) + r * bs + j % bs  # [shard]
+        else:
+            nb = width // world
+            shard = nb * bs
+            cols = r * nb + torch.arange(nb, device=dev)
+            local_bt = torch.index_select(block_table, 1, cols)
+            live_rows = (metadata["slot_mapping"].view(num_reqs, -1)[:, 0] > 0).view(-1, 1)
+            key_pos = r * shard + torch.arange(shard, device=dev)  # [shard]
         limit = positions.view(num_reqs, 1)
         in_prefix = key_pos.view(1, shard) < limit  # [reqs, shard]
         # The kernels take <= 128 keys or a multiple of 128.
