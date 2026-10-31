@@ -175,6 +175,11 @@ SPARSE_PAD_ROW = os.environ.get("HY4_SPARSE_PAD_ROW", "oob")
 if SPARSE_PAD_ROW not in ("oob", "null"):
     raise ValueError(f"HY4_SPARSE_PAD_ROW must be oob or null, got {SPARSE_PAD_ROW!r}")
 
+# Queries per block of the DCP prefill merge (``forward_prefill_dcp``): each block
+# holds fp32 ``[block, heads, 512]`` partials and reduce-scatters them; 0 = the
+# whole chunk at once.
+DCP_PREFILL_QBLOCK = int(os.environ.get("HY4_DCP_PREFILL_QBLOCK", "256") or 0)
+
 # Prefill prefix bound from ``kv_segment_size`` (see ``prefill_span_bound``).
 # Inert unless neuron_config.kv_segment_size_buckets has more than one entry;
 # ``HY4_PREFILL_SPAN_KVSEG=0`` turns it off.
@@ -248,6 +253,53 @@ def _all_gather(group, t: torch.Tensor, dim: int, world: int) -> torch.Tensor:
     if "collectives" in PERF_SKIP:
         return torch.cat([t] * world, dim=dim)
     return group.all_gather(t, dim=dim)
+
+
+def _reduce_scatter(group, t: torch.Tensor, dim: int) -> torch.Tensor:
+    """Sum over ranks, then split along ``dim`` into ``world`` blocks; this rank
+    keeps the block of its reduce-scatter slot. The slot is not assumed to be
+    the tp rank (``HYV4Attention._dcp_route`` learns it from a tag)."""
+    return group.reduce_scatter(t.contiguous(), dim=dim)
+
+
+def topk_threshold_dist(
+    s1: torch.Tensor,
+    v1: torch.Tensor,
+    s2: torch.Tensor,
+    v2: torch.Tensor,
+    k: int,
+    group,
+    world: int,
+) -> torch.Tensor:
+    """``topk_threshold`` over the union of every rank's ``[s1 | s2]`` columns.
+
+    Each rank holds disjoint keys of the same rows. The bracket (global max and
+    min of the visible scores) comes from one all-gather, and each bisection
+    step all-reduces the per-row counts: integers, so the fp32 sum is exact, and
+    every step (hence ``lo``) is bit-identical to ``topk_threshold`` over the
+    concatenated keys on one rank.
+    """
+    hi = torch.maximum(
+        s1.masked_fill(~v1, -_BIG).amax(dim=-1, keepdim=True),
+        s2.masked_fill(~v2, -_BIG).amax(dim=-1, keepdim=True),
+    )
+    lo = torch.minimum(
+        s1.masked_fill(~v1, _BIG).amin(dim=-1, keepdim=True),
+        s2.masked_fill(~v2, _BIG).amin(dim=-1, keepdim=True),
+    )
+    rows = hi.shape[0]
+    hi = _all_gather(group, hi.view(1, rows), 0, world).amax(dim=0).view(rows, 1)
+    lo = -_all_gather(group, (-lo).view(1, rows), 0, world).amax(dim=0).view(rows, 1)
+    for _ in range(TOPK_BISECTION_STEPS):
+        mid = (lo + hi) * 0.5
+        count = ((s1 >= mid) & v1).float().sum(dim=-1, keepdim=True) + (
+            (s2 >= mid) & v2
+        ).float().sum(dim=-1, keepdim=True)
+        count = _all_reduce(group, count)
+        up = count >= k
+        lo = torch.where(up, mid, lo)
+        hi = torch.where(up, hi, mid)
+    return lo
 
 
 def _all_to_all(
@@ -1215,13 +1267,8 @@ class HYV4Attention(nn.Module):
             decode = self.forward_decode_split if split else self.forward_decode
             return decode(x, positions, position_embeddings, metadata, selected)
         if self.dcp > 1:
-            # Prefill reads the whole cached prefix from this rank's cache, which
-            # under DCP holds only this rank's key shard.
-            raise NotImplementedError(
-                f"{self.layer_name}: prefill with decode_context_parallel_size="
-                f"{self.dcp} is not implemented yet (decode is); run with "
-                "--decode-context-parallel-size 1"
-            )
+            # This rank's cache holds only its key shard of the prefix.
+            return self.forward_prefill_dcp(x, position_embeddings, metadata, selected, rank)
         return self.forward_prefill(x, position_embeddings, metadata, selected, rank)
 
     def _select_prefill(
@@ -1702,6 +1749,197 @@ class HYV4Attention(nn.Module):
         perm = (targets.view(world, 1) == sources.view(1, world)).to(self.dtype)
         ordered = perm @ o_mine.reshape(world, per_rank * nh * rank_v)
         out = self._finish(ordered.reshape(chunk, nh, rank_v), gate)
+        _capture(self.layer_idx, "attn_out", out)
+        return out, selected
+
+    # ── prefill with a DCP-sharded cache (decode_context_parallel_size == tp) ──
+    #
+    # Split by KEY, not by query: rank r holds the prefix keys at the interleaved
+    # positions of its shard, so it handles ALL C queries for ALL heads over its
+    # keys. The chunk's own entries come from the replicated kv_a / indexer
+    # projections, so every rank has all C of them; each is counted by exactly one
+    # rank, its cache owner (the same interleave as the prefix, which needs
+    # cached_seq_len % (world * block) == 0 -- the runner enforces it).
+
+    def _dcp_key_pos(self, n: int, r: torch.Tensor, dev) -> torch.Tensor:
+        """Global offset of this rank's local key ``j`` in ``[0, n)``:
+        ``(j // bs) * (world * bs) + r * bs + j % bs``."""
+        bs, world = self._block_size(), self.world_size
+        j = torch.arange(n, device=dev)
+        return (j // bs) * (world * bs) + r * bs + j % bs
+
+    def _dcp_route(self, r: torch.Tensor, dev) -> tuple[torch.Tensor, torch.Tensor]:
+        """-> (``sources [world]`` fp32, the rank at each all-gather block;
+        ``route [world, world]`` fp32 0/1, ``route[k, j] = 1`` iff the rank at
+        gather block ``j`` receives reduce-scatter block ``k``).
+
+        Neither collective's block order is assumed to be tp-rank order: a
+        reduce-scatter of ``arange(world)`` tells each rank its slot (the sum of
+        ``world`` equal integers, exact), then one all-gather of ``(rank, slot)``
+        tells every rank everyone's.
+        """
+        world = self.world_size
+        tag = torch.arange(world, dtype=torch.float32, device=dev).view(world, 1)
+        slot = _reduce_scatter(self.tp_group, tag, 0).view(1) / float(world)
+        pair = torch.stack((r.reshape(1).to(torch.float32), slot), dim=1)  # [1, 2]
+        got = _all_gather(self.tp_group, pair, 0, world)  # [world, 2]
+        sources, slots = got[:, 0], got[:, 1]
+        targets = torch.arange(world, dtype=torch.float32, device=dev)
+        route = (targets.view(world, 1) == slots.view(1, world)).to(torch.float32)
+        return sources, route
+
+    def _dcp_partials(
+        self,
+        q: torch.Tensor,
+        pieces: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Unnormalised attention over this rank's selected keys, no sink.
+
+        ``q [Q, heads, 576]`` fp32; ``pieces`` = ``(keys [K, 576], sel [Q, K])``,
+        processed ``ATTN_KEY_BLOCK`` keys at a time with an online softmax.
+        -> ``m [Q, heads]`` (the floor if nothing is selected), ``den [Q, heads]``,
+        ``num [Q, heads, 512]``, relative to ``m``. Unselected keys weigh exactly
+        0 (``p * sel``), so a rank with no selected key contributes 0.
+        """
+        rows, heads, _ = q.shape
+        dev = q.device
+        floor = -1.0e30
+        rank_v = self.kv_lora_rank
+        m = torch.full((rows, heads), floor, device=dev)
+        den = torch.zeros((rows, heads), device=dev)
+        num = torch.zeros((rows, heads, rank_v), device=dev)
+        qs = q * self.scaling
+        for keys, sel in pieces:
+            total = keys.shape[0]
+            for start in range(0, total, ATTN_KEY_BLOCK):
+                stop = min(start + ATTN_KEY_BLOCK, total)
+                lat = keys[start:stop]
+                keep = sel[:, start:stop].unsqueeze(1)  # [Q, 1, B]
+                s = qs @ lat.float().t()  # [Q, heads, B]
+                s = s.masked_fill(~keep, floor)
+                m_new = torch.maximum(m, s.amax(dim=-1))
+                corr = torch.exp(m - m_new)
+                p = torch.exp(s - m_new.unsqueeze(-1)) * keep.to(torch.float32)
+                den = den * corr + p.sum(dim=-1)
+                # The whole 576-wide row contracted, the 512 value columns kept.
+                num = num * corr.unsqueeze(-1) + (p.to(self.dtype) @ lat).float()[..., :rank_v]
+                m = m_new
+        return m, den, num
+
+    def forward_prefill_dcp(
+        self,
+        x: torch.Tensor,
+        position_embeddings: tuple,
+        metadata: dict,
+        selected: tuple | None,
+        rank: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple]:
+        """``forward_prefill`` over a DCP-sharded cache; same keys, same selection.
+
+        1. this rank's keys: its prefix shard (whole local block table; key ``j``
+           at ``prior``-relative global position ``_dcp_key_pos``, visible iff
+           below ``cached_seq_len``) and the chunk keys it owns (``n_own``
+           slots by the same formula, valid below ``C``, causal per query);
+        2. full layers: indexer scores of all ``C`` queries against them; the
+           global top-k threshold by bisection with all-reduced counts
+           (``topk_threshold_dist``, bit-identical to ``select_topk`` over all
+           keys). Shared layers reuse ``(sel_ctx, sel_own)``;
+        3. all-gather the absorbed queries over heads; per query block of
+           ``DCP_PREFILL_QBLOCK``: local partials (``_dcp_partials``), the
+           global max by an all-gather of ``m``, rescale, reorder head blocks
+           into reduce-scatter order, reduce-scatter ``num`` and ``den`` over
+           heads -> this rank's heads summed over all keys; sink once.
+        """
+        cos, sin = position_embeddings
+        chunk = x.shape[0]
+        world, nh = self.world_size, self.num_heads
+        bs = self._block_size()
+        dev = x.device
+        x = x.to(self.dtype)
+        query, entry, gate, q_resid = self._project(x, cos, sin)
+        self._write_kv(entry, metadata)
+        if rank is None:
+            rank = torch.tensor(self.tp_group.rank_in_group, device=dev)
+        r = rank.reshape(1).to(torch.long)
+
+        prior = metadata["cached_seq_len"].reshape(1, 1).to(torch.long)
+        block_table = metadata["block_table_tensor"][:1]
+        nc = self.neuron_config
+        bound = prefill_span_bound(
+            metadata.get("kv_segment_size", 0),
+            getattr(nc, "kv_segment_size_buckets", None) if nc is not None else None,
+        )
+        if bound is not None:
+            blocks = -(-bound // (bs * world))  # local blocks holding the bound
+            if blocks < block_table.shape[1]:
+                block_table = block_table[:, :blocks]
+        live = torch.ones(1, 1, dtype=torch.bool, device=dev)
+        ctx = self._gather(block_table, live)[0]  # [P_loc, 704]
+        p_loc = ctx.shape[0]
+        key_pos = self._dcp_key_pos(p_loc, r, dev)  # [P_loc]
+        vis_ctx = (key_pos.view(1, p_loc) < prior).expand(chunk, p_loc)
+        ctx = _zero_beyond_at(ctx.unsqueeze(0), prior.reshape(1, 1), key_pos)[0]
+
+        # The chunk keys this rank owns: chunk offsets with the prefix's interleave.
+        n_own = -(-chunk // (bs * world)) * bs
+        own_t = self._dcp_key_pos(n_own, r, dev)  # [n_own] chunk offsets
+        own_ok = own_t < chunk
+        own_idx = torch.where(own_ok, own_t, torch.zeros_like(own_t))
+        own = torch.index_select(entry.to(ctx.dtype), 0, own_idx)  # [n_own, 704]
+        q_t = torch.arange(chunk, device=dev).view(chunk, 1)
+        vis_own = own_ok.view(1, n_own) & (own_t.view(1, n_own) <= q_t)  # [C, n_own]
+
+        if self.indexer is not None:
+            iq, iw = self.indexer.queries(q_resid, x, cos, sin)  # [C, 32, 128], all C
+            heads_i, dim = iq.shape[1], iq.shape[2]
+            flat_q = iq.reshape(chunk * heads_i, dim)
+            s_ctx = torch.relu((flat_q @ ctx[:, self.index_slice].t()).float())
+            s_own = torch.relu((flat_q @ own[:, self.index_slice].t()).float())
+            sc_ctx = (s_ctx.view(chunk, heads_i, p_loc) * iw.unsqueeze(-1)).sum(dim=1)
+            sc_own = (s_own.view(chunk, heads_i, n_own) * iw.unsqueeze(-1)).sum(dim=1)
+            lo = topk_threshold_dist(
+                sc_ctx, vis_ctx, sc_own, vis_own, self.index_topk, self.tp_group, world
+            )
+            selected = (vis_ctx & (sc_ctx >= lo), vis_own & (sc_own >= lo))
+        sel_ctx, sel_own = selected
+
+        sources, route = self._dcp_route(r, dev)
+        pick = self._pick_from(sources, r, dev)  # [nh, heads], gather order
+        # Gathered in the model dtype (``query`` already is): the fp32 cast per
+        # block after it gives the same values at half the collective's bytes.
+        q_all = _all_gather(self.tp_group, query, 1, world)  # [C, heads, 576]
+        lat_ctx = ctx[:, self.latent_slice]
+        lat_own = own[:, self.latent_slice]
+        rank_v = self.kv_lora_rank
+        sink = self.sinks.float().view(1, nh)
+        heads = world * nh
+        qb = DCP_PREFILL_QBLOCK if 0 < DCP_PREFILL_QBLOCK < chunk else chunk
+        o_lat = torch.zeros(chunk, nh, rank_v, dtype=torch.float32, device=dev)
+        for start in range(0, chunk, qb):
+            stop = min(start + qb, chunk)
+            n = stop - start
+            m_loc, den, num = self._dcp_partials(
+                q_all[start:stop].float(),
+                [(lat_ctx, sel_ctx[start:stop]), (lat_own, sel_own[start:stop])],
+            )
+            m = _all_gather(self.tp_group, m_loc.unsqueeze(0), 0, world).amax(dim=0)
+            corr = torch.exp(m_loc - m)  # 0 where this rank selected nothing
+            den = den * corr
+            num = num * corr.unsqueeze(-1)
+            # Head blocks from gather order into reduce-scatter order (0/1, exact).
+            num = torch.einsum("kj,qjx->qkx", route, num.view(n, world, nh * rank_v))
+            den = torch.einsum("kj,qjx->qkx", route, den.view(n, world, nh))
+            num_mine = _reduce_scatter(
+                self.tp_group, num.reshape(n, heads, rank_v), 1
+            )  # [n, nh, 512]
+            den_mine = _reduce_scatter(self.tp_group, den.reshape(n, heads), 1)  # [n, nh]
+            m_mine = torch.einsum("jh,qh->qj", pick, m)  # [n, nh]
+            m_f = torch.maximum(m_mine, sink)
+            scale = torch.exp(m_mine - m_f)
+            o_lat[start:stop] = num_mine * scale.unsqueeze(-1) / (
+                den_mine * scale + torch.exp(sink - m_f)
+            ).unsqueeze(-1)
+        out = self._finish(o_lat, gate)
         _capture(self.layer_idx, "attn_out", out)
         return out, selected
 

@@ -241,18 +241,6 @@ def test_slot_mapping_matches_runner_formula():
                 assert s == NULL
 
 
-def test_dcp_prefill_refused(monkeypatch):
-    cfg = make_config(torch.float32)
-    world = 4
-    hub = Hub(world, list(range(world)))
-    ref = build_reference(cfg)[0]
-    monkeypatch.setattr(model, "_dcp_world", lambda: world)
-    a = build_rank(cfg, ref, world, 0, hub)
-    meta = {"max_query_len": 16, "decode_token_threshold": 1, "block_table_tensor": None}
-    with pytest.raises(NotImplementedError, match="decode_context_parallel_size"):
-        a.forward(None, None, None, {a.layer_name: meta})
-
-
 def test_dcp_must_equal_tp(monkeypatch):
     cfg = make_config(torch.float32)
     hub = Hub(4, list(range(4)))

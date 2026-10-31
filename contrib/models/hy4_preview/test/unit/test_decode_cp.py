@@ -35,8 +35,10 @@ CASES = [  # (positions per row, dead rows)
 
 
 class Hub:
-    def __init__(self, world, order, a2a_order=None, a2a_slot=None):
+    def __init__(self, world, order, a2a_order=None, a2a_slot=None, rs_slot=None):
         self.order = order  # order[j] = rank at all-gather block j
+        # reduce-scatter: rs_slot[r] = the block rank r keeps (not tp-rank order).
+        self.rs_slot = rs_slot if rs_slot is not None else list(range(world))
         # all-to-all: a2a_order[j] = rank at received block j; a2a_slot[r] = the
         # piece index rank r receives (neither is tp-rank order on device).
         self.a2a_order = a2a_order if a2a_order is not None else list(order)
@@ -63,6 +65,11 @@ class HubGroup(Group):
     def all_gather(self, t, dim=0):
         got = self.hub.exchange(self.rank_in_group, t)
         return torch.cat([got[j] for j in self.hub.order], dim=dim)
+
+    def reduce_scatter(self, t, dim=-1):
+        got = self.hub.exchange(self.rank_in_group, t)
+        total = torch.stack([g.float() for g in got]).sum(0).to(t.dtype)
+        return total.chunk(self.world_size, dim=dim)[self.hub.rs_slot[self.rank_in_group]]
 
     def all_to_all(self, t, split, concat):
         got = self.hub.exchange(self.rank_in_group, t)
