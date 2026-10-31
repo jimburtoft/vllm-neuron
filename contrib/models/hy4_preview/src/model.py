@@ -1781,9 +1781,12 @@ class HYV4Attention(nn.Module):
         world = self.world_size
         tag = torch.arange(world, dtype=torch.float32, device=dev).view(world, 1)
         slot = _reduce_scatter(self.tp_group, tag, 0).view(1) / float(world)
-        pair = torch.stack((r.reshape(1).to(torch.float32), slot), dim=1)  # [1, 2]
-        got = _all_gather(self.tp_group, pair, 0, world)  # [world, 2]
-        sources, slots = got[:, 0], got[:, 1]
+        # One all-gather of ``rank * world + slot`` (small integers, exact in fp32;
+        # no stack): every rank learns each gather block's rank and slot.
+        code = r.reshape(1).to(torch.float32) * float(world) + slot
+        got = _all_gather(self.tp_group, code, 0, world)  # [world]
+        sources = torch.floor(got / float(world))
+        slots = got - sources * float(world)
         targets = torch.arange(world, dtype=torch.float32, device=dev)
         route = (targets.view(world, 1) == slots.view(1, world)).to(torch.float32)
         return sources, route
@@ -1889,14 +1892,29 @@ class HYV4Attention(nn.Module):
         q_t = torch.arange(chunk, device=dev).view(chunk, 1)
         vis_own = own_ok.view(1, n_own) & (own_t.view(1, n_own) <= q_t)  # [C, n_own]
 
+        qb = DCP_PREFILL_QBLOCK if 0 < DCP_PREFILL_QBLOCK < chunk else chunk
         if self.indexer is not None:
-            iq, iw = self.indexer.queries(q_resid, x, cos, sin)  # [C, 32, 128], all C
+            # Replicated weights and inputs: every rank has all C queries.
+            iq, iw = self.indexer.queries(q_resid, x, cos, sin)  # [C, 32, 128]
             heads_i, dim = iq.shape[1], iq.shape[2]
-            flat_q = iq.reshape(chunk * heads_i, dim)
-            s_ctx = torch.relu((flat_q @ ctx[:, self.index_slice].t()).float())
-            s_own = torch.relu((flat_q @ own[:, self.index_slice].t()).float())
-            sc_ctx = (s_ctx.view(chunk, heads_i, p_loc) * iw.unsqueeze(-1)).sum(dim=1)
-            sc_own = (s_own.view(chunk, heads_i, n_own) * iw.unsqueeze(-1)).sum(dim=1)
+            ik_ctx = ctx[:, self.index_slice]
+            ik_own = own[:, self.index_slice]
+            # In query blocks: the per-head [rows * 32, keys] fp32 scores of the
+            # whole chunk would be 32x the [C, keys] the bisection needs. The
+            # concatenations feed only torch ops (the bisection), no kernel.
+            parts_ctx, parts_own = [], []
+            for start in range(0, chunk, qb):
+                stop = min(start + qb, chunk)
+                n = stop - start
+                flat_q = iq[start:stop].reshape(n * heads_i, dim)
+                w = iw[start:stop].unsqueeze(-1)
+                s_c = torch.relu((flat_q @ ik_ctx.t()).float()).view(n, heads_i, p_loc)
+                s_o = torch.relu((flat_q @ ik_own.t()).float()).view(n, heads_i, n_own)
+                parts_ctx.append((s_c * w).sum(dim=1))
+                parts_own.append((s_o * w).sum(dim=1))
+            one = len(parts_ctx) == 1
+            sc_ctx = parts_ctx[0] if one else torch.cat(parts_ctx, dim=0)  # [C, P_loc]
+            sc_own = parts_own[0] if one else torch.cat(parts_own, dim=0)  # [C, n_own]
             lo = topk_threshold_dist(
                 sc_ctx, vis_ctx, sc_own, vis_own, self.index_topk, self.tp_group, world
             )
@@ -1913,7 +1931,6 @@ class HYV4Attention(nn.Module):
         rank_v = self.kv_lora_rank
         sink = self.sinks.float().view(1, nh)
         heads = world * nh
-        qb = DCP_PREFILL_QBLOCK if 0 < DCP_PREFILL_QBLOCK < chunk else chunk
         o_lat = torch.zeros(chunk, nh, rank_v, dtype=torch.float32, device=dev)
         for start in range(0, chunk, qb):
             stop = min(start + qb, chunk)
