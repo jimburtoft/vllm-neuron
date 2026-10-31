@@ -39,7 +39,7 @@ export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=$FRAC
 NC='{"decode_context_length_buckets":'$BUCKETS',"on_device_sampling_config":{"all_greedy":true},"max_logprobs":0}'
 
 serve() {
-  vllm serve "$MODEL_ID" --tensor-parallel-size 4 --dtype bfloat16 --max-model-len $ML \
+  exec vllm serve "$MODEL_ID" --tensor-parallel-size 4 --dtype bfloat16 --max-model-len $ML \
     --max-num-seqs $MNS --max-num-batched-tokens $MNBT --gpu-memory-utilization 0.90 \
     --no-enable-prefix-caching --additional-config "{\"neuron_config\":$NC}" --port ${PORT:-8000} "$@"
 }
