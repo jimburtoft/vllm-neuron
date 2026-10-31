@@ -48,6 +48,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# A sticky mark on one request. The mark says that the request must not take a
+# multi-token decode step again. The sync path and the async path both use it.
+_SPEC_DISABLED_ATTR = "_spec_disabled_near_max_model_len"
+
 
 def _kv_capacity_guidance() -> str:
     """Return capacity guidance for the active KV budget policy."""
@@ -106,6 +110,11 @@ class NeuronScheduler(Scheduler):
     - Prefill/decode separation (Neuron hardware requirement)
     - Token padding for compiled model bucket sizes
     """
+
+    # The sync path reserves draft tokens in schedule(). It therefore applies
+    # the near-max_model_len disable there. NeuronAsyncScheduler sets this False,
+    # because it injects the draft placeholders in _update_after_schedule.
+    _applies_spec_disable_in_schedule: bool = True
 
     def __init__(
         self,
@@ -249,6 +258,10 @@ class NeuronScheduler(Scheduler):
         self._pending_jf_tokens: dict[str, list[int]] = {}
         self._jf_total_injections: int = 0
         self._jf_total_tokens_injected: int = 0
+
+        # Set once for each schedule() call. True when one request in the batch
+        # is too close to max_model_len for a multi-token decode step.
+        self._multi_token_decode_blocked_step: bool = False
 
         # Get max_jump_forward_tokens from config
         neuron_config = vllm_config.additional_config.get("neuron_config", {})
@@ -1466,6 +1479,120 @@ class NeuronScheduler(Scheduler):
 
         return scheduler_output
 
+    def _multi_token_decode_width(self) -> int:
+        """Return the extra tokens that a multi-token decode step adds.
+
+        This mirrors ``_decode_token_threshold()`` in the model runner, which
+        returns ``1 + width``. Speculation gives ``num_speculative_tokens``.
+        Jump-forward decoding gives ``max_jump_forward_tokens``. The platform
+        makes the two options exclusive. Plain decode gives 0.
+        """
+        if self.num_spec_tokens > 0:
+            return self.num_spec_tokens
+        return self.max_jump_forward_tokens
+
+    def _multi_token_decode_safe_num_computed(self) -> int:
+        """Return the largest ``num_computed_tokens`` that keeps a full step safe.
+
+        The bound holds for a different reason on each caller's path.
+
+        With speculation the base scheduler trims a step to
+        ``min(1 + width, max_model_len - 1 - num_computed)``. A trimmed step has
+        a partial shape that no NEFF was warmed for. The no-trim bound is
+        therefore ``max_model_len - 2 - width``. This value subtracts one more
+        full step (``1 + width``) of margin.
+
+        With jump-forward decoding nothing trims. The base scheduler schedules
+        one token, and the JF tokens go in afterwards. The bound holds on
+        capacity instead. The model assigns the active K/V into the last
+        ``1 + width`` slots of the KV window, and this value keeps
+        ``num_computed + 1 + width`` inside a window of ``max_model_len`` slots.
+        A window smaller than ``max_model_len``, such as a sliding-window frame,
+        is out of scope.
+        """
+        width = self._multi_token_decode_width()
+        return self.max_model_len - 3 - 2 * width
+
+    def _mark_and_check_multi_token_decode(self, requests: list[Request]) -> bool:
+        """Mark each request that is too close to ``max_model_len``.
+
+        Return True if any request in ``requests`` carries the mark. The mark is
+        sticky. A rejection moves ``num_computed_tokens`` back down, and the
+        decode NEFF must not change bucket on alternate steps.
+        """
+        width = self._multi_token_decode_width()
+        if width <= 0:
+            return False
+
+        safe_num_computed = self._multi_token_decode_safe_num_computed()
+        blocked = False
+        for request in requests:
+            if not getattr(request, _SPEC_DISABLED_ATTR, False):
+                if request.num_computed_tokens <= safe_num_computed:
+                    continue
+                setattr(request, _SPEC_DISABLED_ATTR, True)
+                logger.info(
+                    "The scheduler stopped multi-token decode for req=%s. "
+                    "num_computed=%d is above the safe limit %d "
+                    "(width=%d, max_model_len=%d).",
+                    request.request_id,
+                    request.num_computed_tokens,
+                    safe_num_computed,
+                    width,
+                    self.max_model_len,
+                )
+            blocked = True
+        return blocked
+
+    def _preempt_request(self, request: Request, timestamp: float, *args, **kwargs) -> None:
+        """Drop the sticky mark, then preempt through the base scheduler.
+
+        Preemption restarts the request. The base scheduler sets
+        ``num_computed_tokens`` back to 0 and clears ``spec_token_ids``, so the
+        mark records a context that the request no longer has. The clear is
+        batch-wide, so a stale mark costs every batch mate its speculation for
+        the rest of the restarted request's life.
+
+        ``NeuronAsyncScheduler`` gets this too, and deliberately. The mark
+        guards against an oscillation that needs a context near
+        ``max_model_len``, and a preempted request no longer has one.
+        """
+        if hasattr(request, _SPEC_DISABLED_ATTR):
+            delattr(request, _SPEC_DISABLED_ATTR)
+        super()._preempt_request(request, timestamp, *args, **kwargs)
+
+    def _block_multi_token_decode_near_max_model_len(self) -> None:
+        """Stop multi-token decode steps for the whole batch near the limit.
+
+        Call this before the base scheduler reserves the tokens of the step.
+
+        The decode NEFF gives every request in the batch the same width. The
+        runner therefore pads a batch that holds drafts for only some requests
+        up to ``num_reqs * (1 + width)``. The attention kernel then gets
+        ``s_active = 1 + width`` for every request. The model assigns the active
+        K/V into the last ``s_active`` slots of the KV window, so a request whose
+        valid prior reaches into those slots loses its oldest in-window tokens.
+
+        The scope is the batch because the runner falls back to one token for
+        each request only when NO request in the batch holds drafts. The clear
+        also covers a request that the base scheduler then skips for lack of
+        token budget. That request loses drafts it would not have used, and the
+        worker replaces them on the step it does join.
+        """
+        if self.num_spec_tokens > 0 and not self._applies_spec_disable_in_schedule:
+            # Async SPECULATION only: _update_after_schedule applies the rule
+            # there. Async jump-forward has num_spec_tokens == 0, so it falls
+            # through and gets this pre-pass.
+            return
+
+        self._multi_token_decode_blocked_step = self._mark_and_check_multi_token_decode(
+            self.running
+        )
+        if not self._multi_token_decode_blocked_step:
+            return
+        for request in self.running:
+            request.spec_token_ids = []
+
     def schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
         """Schedule requests with prefill/decode separation and bucket padding.
 
@@ -1598,6 +1725,11 @@ class NeuronScheduler(Scheduler):
                 has_structured_output_waiting,
                 max_num_running_reqs_override,
             )
+
+        # Step 3.4: Near max_model_len, stop multi-token decode steps for the
+        # whole batch. Run this before step 4, because the base scheduler
+        # reserves 1 + len(spec_token_ids) tokens for each request.
+        self._block_multi_token_decode_near_max_model_len()
 
         # Step 3.5: Cap the structured-output grammar waiters the base scheduler
         # can see to ensure <= 1 prefill per batch.
@@ -1732,6 +1864,14 @@ class NeuronScheduler(Scheduler):
         if not self._pending_jf_tokens:
             return
 
+        if self._multi_token_decode_blocked_step:
+            # One request in this batch is near max_model_len, so drop the JF
+            # tokens of this step. update_from_output recomputes them later.
+            # See _block_multi_token_decode_near_max_model_len.
+            for req_id in scheduler_output.num_scheduled_tokens:
+                self._pending_jf_tokens.pop(req_id, None)
+            return
+
         # Reset this request's JF tokens to empty
         scheduler_output._jf_decode_tokens = {}
 
@@ -1864,6 +2004,11 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
     - AsyncScheduler: Output placeholders, async token handling
     """
 
+    # _update_after_schedule below injects the draft placeholders, so it applies
+    # the near-max_model_len disable there. Only that point keeps the
+    # output-placeholder count consistent with the tokens that the worker emits.
+    _applies_spec_disable_in_schedule: bool = False
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -1932,29 +2077,13 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
         # max_model_len, ``spec_token_ids`` placeholder injection) is
         # gated on ``num_spec_tokens > 0``.
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
-        # Scheduler trims when `num_new = min(1 + num_spec, max_model_len - 1 - num_computed)`
-        # falls below `1 + num_spec`. To avoid trim: `num_computed <= max_model_len - 2 - num_spec`.
-        # Note: `num_computed` can TEMPORARILY go back down when
-        # `update_from_output` applies rejection correction from an
-        # in-flight step. That can make a previously-disabled spec
-        # placeholder re-enable, producing positions that regress into
-        # slots already written by later steps. We keep a sticky
-        # ``_async_spec_disabled`` flag per request to prevent that
-        # oscillation: once disabled, stays disabled for the rest of the
-        # request's lifetime.
-        # Extra margin (another 1+num_spec) so we transition to non-spec
-        # before the last "safe" spec step. In async mode, the spec→non-spec
-        # transition step fires the fallback path in the worker because the
-        # previous step's sampled-token future has shape [bs, num_spec+1]
-        # while the current non-spec input_ids is [bs]. That fallback
-        # materializes async output and rebuilds inputs — but reads
-        # input_ids from positions still reflecting the scheduler's
-        # OPTIMISTIC num_computed_tokens (off by the previous step's
-        # rejections). Transitioning earlier avoids the last spec step,
-        # which tends to have heavy rejection near max_model_len.
+        # `_multi_token_decode_safe_num_computed` holds the trim bound and the
+        # extra margin, and the sync path shares it. The margin stops spec decode
+        # one step early, because the async transition step hits a worker fallback
+        # that reads the optimistic `num_computed_tokens`.
         is_spec = self.num_spec_tokens > 0
         safe_num_computed = (
-            self.max_model_len - 3 - 2 * self.num_spec_tokens if is_spec else 0
+            self._multi_token_decode_safe_num_computed() if is_spec else 0
         )
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
@@ -1969,10 +2098,10 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
             if not is_spec:
                 continue
             # Sticky: once disabled for this request, stay disabled.
-            disabled = getattr(request, "_async_spec_disabled", False)
+            disabled = getattr(request, _SPEC_DISABLED_ATTR, False)
             if not disabled and request.num_computed_tokens > safe_num_computed:
                 disabled = True
-                request._async_spec_disabled = True
+                setattr(request, _SPEC_DISABLED_ATTR, True)
             if disabled:
                 request.spec_token_ids = []
             else:
