@@ -121,7 +121,10 @@ TOL = {"fp32": 2e-5, "bf16": 1.5e-2}
 WORST: dict = {}
 
 
-@pytest.mark.parametrize("wire,pack", [("fp32", 576), ("bf16", 576), ("bf16", 513), ("bf16", 0), ("fp32", 0)])
+@pytest.mark.parametrize("mode,wire,pack", [
+    ("keysplit", "fp32", 576), ("keysplit", "bf16", 576), ("keysplit", "bf16", 513),
+    ("keysplit", "bf16", 0), ("keysplit", "fp32", 0), ("gather", "fp32", 576),
+])
 @pytest.mark.parametrize("world,order_seed,chunk_blocks,topk,qblock", [
     (4, 2, 2, 20, 256),  # chunk 32
     (4, 3, 2, 20, 8),  # query blocking
@@ -130,14 +133,17 @@ WORST: dict = {}
 ])
 @torch.no_grad()
 def test_prefill_then_decode_dcp(
-    monkeypatch, world, order_seed, chunk_blocks, topk, qblock, wire, pack
+    monkeypatch, world, order_seed, chunk_blocks, topk, qblock, mode, wire, pack
 ):
     torch.set_num_threads(2)
     cfg = make_config(torch.float32)
     cfg.index_topk = topk
     chunk = chunk_blocks * BS * world
     n_chunks = 3
-    total = n_chunks * chunk + STEPS + 1
+    # A whole number of virtual blocks, so the replicated table spans exactly the
+    # positions the DCP tables do (same key count on both sides).
+    vbs = BS * world
+    total = -(-(n_chunks * chunk + STEPS + 1) // vbs) * vbs
     g = torch.Generator().manual_seed(1000 + world + order_seed)
     seq = Seq(total, world, g)
 
@@ -146,6 +152,7 @@ def test_prefill_then_decode_dcp(
     monkeypatch.setattr(model, "DCP_PREFILL_QBLOCK", qblock)
     monkeypatch.setattr(model, "DCP_RS_DTYPE", wire)
     monkeypatch.setattr(model, "DCP_RS_PACK", pack)
+    monkeypatch.setattr(model, "DCP_PREFILL", mode)
     tol = TOL[wire]
     worst = 0.0
     ref_layers = build_reference(cfg)
@@ -161,6 +168,12 @@ def test_prefill_then_decode_dcp(
     for rk in ranks:
         for a in rk:
             a.kv_pages = torch.randn(seq.dw + 4, 1, BS, a.entry_dim, generator=g) * 1.5
+    rep = None
+    if mode == "gather":
+        # The replicated path on the same W ranks (dcp = 1, each a full copy of
+        # the reference cache): what the gathered prefill must equal bit for bit.
+        rep_hub = Hub(world, order, rs_slot=rs_slot)
+        rep = [[build_rank(cfg, a, world, r, rep_hub) for a in ref_layers] for r in range(world)]
 
     ref_span = seq.ref_w * BS
     for c in range(n_chunks):
@@ -175,9 +188,18 @@ def test_prefill_then_decode_dcp(
             ref_sel.append(selected)
         metas = [seq.dcp_meta(pos, prior, r) for r in range(world)]
         res = run_ranks(ranks, rope, x, pos, metas)
+        if rep is not None:
+            rep_res = run_ranks(rep, rope, x, pos, [ref_meta] * world)
         for li in range(2):
-            sel = assemble_prefill_sel(res, li, world, chunk, ref_span, prior)
-            assert torch.equal(sel, ref_sel[li]), (c, li)
+            if mode == "gather":  # the replicated path itself
+                for r in range(world):
+                    assert torch.equal(res[r][1][li], ref_sel[li]), (c, li)
+                    # Same keys, same code, same ranks: bit-identical.
+                    assert torch.equal(res[r][1][li], rep_res[r][1][li]), (c, li)
+                    assert torch.equal(res[r][0][li], rep_res[r][0][li]), (c, li)
+            else:
+                sel = assemble_prefill_sel(res, li, world, chunk, ref_span, prior)
+                assert torch.equal(sel, ref_sel[li]), (c, li)
             for r in range(world):
                 assert torch.equal(res[r][0][li], res[0][0][li]), "ranks disagree"
                 e = rel(res[r][0][li], ref_out[li])
@@ -201,9 +223,9 @@ def test_prefill_then_decode_dcp(
                 e = rel(res[r][0][li], ref_out[li])
                 worst = max(worst, e)
                 assert e < tol, (step, li, e)
-    key = (wire, pack)
+    key = (mode, wire, pack)
     WORST[key] = max(WORST.get(key, 0.0), worst)
-    print(f"\nDCP prefill+decode {wire}/{pack} W={world}: max rel err {worst:.3e}")
+    print(f"\nDCP prefill+decode {mode} {wire}/{pack} W={world}: max rel err {worst:.3e}")
 
 
 @pytest.mark.parametrize("bits,qblock", [(1, 0), (5, 2), (8, 0), (8, 3), (7, 0)])
@@ -300,3 +322,68 @@ def test_dcp_prefill_collective_count(monkeypatch, pack, want_shared):
             t.join()
         body_sel = res
         assert hub.calls == want, (li, hub.calls, want)
+
+
+@pytest.mark.parametrize("backend", ["v1", "cte"])
+@pytest.mark.parametrize("world,order_seed", [(4, 6), (8, 7)])
+@torch.no_grad()
+def test_gather_mode_sparse_prefill(monkeypatch, backend, world, order_seed):
+    """``HY4_DCP_PREFILL=gather`` through the query-split sparse prefill (v1 and
+    cte backends, all-to-all in shuffled order): bit-identical to the same ranks
+    running it on a replicated cache, chunk after chunk, then decode."""
+    from test_decode_cp import hub_all_to_all
+
+    torch.set_num_threads(2)
+    cfg = make_config(torch.float32)
+    cfg.index_topk = 40
+    chunk = 128
+    n_chunks = 3
+    # Spans in whole 128-key tiles (the sparse path's requirement).
+    total = -(-(n_chunks * chunk + STEPS + 1) // 128) * 128
+    g = torch.Generator().manual_seed(77 + world)
+    seq = Seq(total, world, g)
+    monkeypatch.setattr(model, "DEC_CP", False)
+    monkeypatch.setattr(model, "PREFILL_SPARSE_NKI", True)
+    monkeypatch.setattr(model, "PREFILL_SPARSE_MIN_SPAN", 0)
+    monkeypatch.setattr(model, "PREFILL_KSEL", 128)
+    monkeypatch.setattr(model, "DCP_PREFILL", "gather")
+    monkeypatch.setattr(model, "_all_to_all", hub_all_to_all)
+    ref_layers = build_reference(cfg)
+    for a in ref_layers:
+        a.kv_pages = torch.randn(seq.ref_w + 4, 1, BS, a.entry_dim, generator=g)
+    rope = model.HYV4RotaryEmbedding(cfg)
+    gen = torch.Generator().manual_seed(order_seed)
+    order = torch.randperm(world, generator=gen).tolist()
+    a2a = (torch.randperm(world, generator=gen).tolist(), torch.randperm(world, generator=gen).tolist())
+    hub = Hub(world, order, *a2a)
+    rep_hub = Hub(world, order, *a2a)
+    rep = [[build_rank(cfg, a, world, r, rep_hub) for a in ref_layers] for r in range(world)]
+    monkeypatch.setattr(model, "_dcp_world", lambda: world)
+    ranks = [[build_rank(cfg, a, world, r, hub) for a in ref_layers] for r in range(world)]
+    monkeypatch.setattr(model, "_dcp_world", lambda: 1)
+    for rk, rp in zip(ranks, rep):
+        for a, b in zip(rk, rp):
+            a.kv_pages = torch.randn(seq.dw + 4, 1, BS, a.entry_dim, generator=g)
+            a.prefill_backend = b.prefill_backend = backend
+    for c in range(n_chunks):
+        prior = c * chunk
+        pos = torch.arange(prior, prior + chunk)
+        x = torch.randn(chunk, HIDDEN, generator=g)
+        got = run_ranks(ranks, rope, x, pos, [seq.dcp_meta(pos, prior, r) for r in range(world)])
+        want = run_ranks(rep, rope, x, pos, [seq.ref_meta(pos, prior)] * world)
+        for r in range(world):
+            for li in range(2):
+                assert torch.equal(got[r][0][li], want[r][0][li]), (c, li, r)
+                assert isinstance(got[r][1][li], tuple), "sparse path not taken"
+                for u, v in zip(got[r][1][li], want[r][1][li]):
+                    assert u is None and v is None or torch.equal(u, v)
+    monkeypatch.setattr(model, "PREFILL_SPARSE_NKI", False)
+    for step in range(STEPS):
+        p = n_chunks * chunk + step
+        pos = torch.tensor([p])
+        x = torch.randn(1, HIDDEN, generator=g)
+        got = run_ranks(ranks, rope, x, pos, [seq.dcp_meta(pos, p, r) for r in range(world)])
+        want = run_ranks(rep, rope, x, pos, [seq.ref_meta(pos, p)] * world)
+        for r in range(world):
+            for li in range(2):
+                assert rel(got[r][0][li], want[r][0][li]) < 2e-5, (step, li)

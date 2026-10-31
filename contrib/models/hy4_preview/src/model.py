@@ -193,6 +193,12 @@ DCP_RS_PACK = int(os.environ.get("HY4_DCP_RS_PACK", "576") or 0)
 # (``topk_threshold_dist``): each round all-reduces the counts at all
 # ``2^bits - 1`` midpoints the next ``bits`` steps could test. 1 = one all-reduce
 # per step. The threshold is bit-identical for every value.
+# DCP prefill strategy (read at construction): "keysplit" (default,
+# ``forward_prefill_dcp``) or "gather" (``forward_prefill_gathered``: all-gather
+# the prefix shards, then the replicated prefill paths unchanged).
+DCP_PREFILL = os.environ.get("HY4_DCP_PREFILL", "keysplit")
+if DCP_PREFILL not in ("keysplit", "gather"):
+    raise ValueError(f"HY4_DCP_PREFILL must be keysplit or gather, got {DCP_PREFILL!r}")
 DCP_TOPK_BITS = max(1, int(os.environ.get("HY4_DCP_TOPK_BITS", "8") or 8))
 
 # Prefill prefix bound from ``kv_segment_size`` (see ``prefill_span_bound``).
@@ -983,6 +989,7 @@ class HYV4Attention(nn.Module):
                 f"decode_context_parallel_size={self.dcp} is supported only equal to "
                 f"tensor_parallel_size={self.world_size} (or 1)"
             )
+        self.dcp_prefill = DCP_PREFILL
         self.nope_dim = config.qk_nope_head_dim
         self.rope_dim = config.qk_rope_head_dim
         self.qk_dim = config.qk_head_dim
@@ -1187,8 +1194,8 @@ class HYV4Attention(nn.Module):
     # it), but everything written is a finite entry, so masked keys still get exactly 0.
     _NULL_BLOCK = 0
 
-    def _num_pages(self) -> int:
-        return self.kv_pages.shape[0]
+    def _num_pages(self, cache: torch.Tensor | None = None) -> int:
+        return (self.kv_pages if cache is None else cache).shape[0]
 
     def _block_size(self) -> int:
         return self.kv_pages.shape[2]
@@ -1208,30 +1215,33 @@ class HYV4Attention(nn.Module):
         Padded tokens (``PAD_SLOT_ID`` or out of range) go to the null block, via the
         plugin's ``paged_slot_indices``.
         """
+        cache = self.kv_pages
         blocks, offsets = paged_slot_indices(
-            metadata["slot_mapping"], self._block_size(), self._num_pages()
+            metadata["slot_mapping"], cache.shape[2], cache.shape[0]
         )
         # Index the [pages, 1, block, 704] cache as the plugin's own models do: block,
         # head, position. The head index is an arange, not a literal 0 -- a constant index
         # is folded to rank 0 and fails the graph (NCC_IRRW901) -- and any reshaped view of
         # the cache fails to lower (NCC_ILTO901 "Incorrect reshape basis").
         heads = torch.zeros_like(blocks) + torch.arange(1, device=blocks.device)
-        self.kv_pages.index_put_(
+        cache.index_put_(
             (blocks.to(torch.long), heads.to(torch.long), offsets.to(torch.long)),
-            entry.to(self.kv_pages.dtype),
+            entry.to(cache.dtype),
         )
 
     def _gather(
-        self, block_table: torch.Tensor, live_rows: torch.Tensor
+        self, block_table: torch.Tensor, live_rows: torch.Tensor,
+        cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``[R, W]`` block ids -> ``[R, W * block_size, 704]`` cache entries.
 
         One page gather over ``_rows``. Dead rows and table padding (-1) read the null
         block.
         """
+        cache = self.kv_pages if cache is None else cache
         num_rows = block_table.shape[0]
         bt = block_table.to(torch.long)
-        num_pages, block_size = self._num_pages(), self._block_size()
+        num_pages, block_size = self._num_pages(cache), self._block_size()
         blocks = torch.where(
             live_rows & (bt > 0) & (bt < num_pages), bt, torch.full_like(bt, self._NULL_BLOCK)
         )
@@ -1239,7 +1249,7 @@ class HYV4Attention(nn.Module):
         # Gathered as [pages, 2 * block, 352] (the bytes of _rows' [pages, block * 704]):
         # over the 2-D view, neuronx-cc split the gather into millions of DMA descriptors
         # and one decode layer took 15+ min to compile; this is the shape it handles.
-        half = self.kv_pages.view(num_pages, 2 * block_size, self.cache_head_dim)
+        half = cache.view(num_pages, 2 * block_size, self.cache_head_dim)
         pages = torch.index_select(half, 0, blocks.reshape(-1))
         return pages.reshape(num_rows, ctx_len, self.entry_dim)
 
@@ -1330,6 +1340,10 @@ class HYV4Attention(nn.Module):
             return decode(x, positions, position_embeddings, metadata, selected)
         if self.dcp > 1:
             # This rank's cache holds only its key shard of the prefix.
+            if self.dcp_prefill == "gather":
+                return self.forward_prefill_gathered(
+                    x, position_embeddings, metadata, selected, rank
+                )
             return self.forward_prefill_dcp(x, position_embeddings, metadata, selected, rank)
         return self.forward_prefill(x, position_embeddings, metadata, selected, rank)
 
@@ -1413,8 +1427,12 @@ class HYV4Attention(nn.Module):
         metadata: dict,
         selected: torch.Tensor | None,
         rank: torch.Tensor | None = None,
+        cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One chunk of one sequence: the cached prefix, then causal over the chunk.
+
+        ``cache``: where the prefix is read (default ``kv_pages``; the gathered
+        prefix under ``HY4_DCP_PREFILL=gather``). Writes always go to ``kv_pages``.
 
         The scheduler runs one request per prefill step, and ``cached_seq_len``
         tokens of it are already in the cache -- an earlier chunk, or a prefix
@@ -1447,13 +1465,13 @@ class HYV4Attention(nn.Module):
             self.indexer is not None and self.prefill_sparse_supported(chunk, span)
         ):
             return self.forward_prefill_sparse(
-                x, position_embeddings, metadata, selected, rank, block_table
+                x, position_embeddings, metadata, selected, rank, block_table, cache
             )
         x = x.to(self.dtype)
         query, entry, gate, q_resid = self._project(x, cos, sin)
         self._write_kv(entry, metadata)
         live = torch.ones(1, 1, dtype=torch.bool, device=x.device)
-        ctx = self._gather(block_table, live)[0]  # [ctx_len, 704]
+        ctx = self._gather(block_table, live, cache)[0]  # [ctx_len, 704]
         ctx_len = ctx.shape[0]
         in_prefix = torch.arange(ctx_len, device=x.device).view(1, ctx_len) < prior
         ctx = _zero_beyond(ctx, prior.reshape(1, 1))
@@ -1496,11 +1514,13 @@ class HYV4Attention(nn.Module):
     def _prefill_ksel(self, n_keys: int) -> int:
         return min(n_keys, -(-max(PREFILL_KSEL, 1) // 128) * 128)
 
-    def _prefill_pos_map(self, block_table: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
+    def _prefill_pos_map(
+        self, block_table: torch.Tensor, prior: torch.Tensor, cache: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Flat cache row of each prefix position ``[span]`` int32; positions at or
         past ``cached_seq_len`` (and table padding) get one past the last row,
         which the kernels' DMA skips (zeros, no read)."""
-        bs, num_pages = self._block_size(), self._num_pages()
+        bs, num_pages = self._block_size(), self._num_pages(cache)
         bt = block_table[0].to(torch.long)
         blocks = torch.where(
             (bt > 0) & (bt < num_pages), bt, torch.full_like(bt, self._NULL_BLOCK)
@@ -1508,7 +1528,7 @@ class HYV4Attention(nn.Module):
         span = bt.shape[0] * bs
         j = torch.arange(span, device=bt.device)
         flat = torch.index_select(blocks, 0, j // bs) * bs + j % bs
-        pad = torch.full_like(flat, self._n_cache_rows())
+        pad = torch.full_like(flat, self._n_cache_rows(cache))
         return torch.where(j < prior.reshape(1), flat, pad).to(torch.int32)
 
     def _prefill_rows(
@@ -1641,6 +1661,7 @@ class HYV4Attention(nn.Module):
         selected: tuple | None,
         rank: torch.Tensor | None,
         block_table: torch.Tensor,
+        cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple]:
         """``forward_prefill`` split by query; same keys, same selection.
 
@@ -1661,6 +1682,7 @@ class HYV4Attention(nn.Module):
         4. all-gather the bf16 ``[Q, heads, 512]``, take this rank's heads.
         """
         cos, sin = position_embeddings
+        read = self.kv_pages if cache is None else cache  # the prefix source
         chunk = x.shape[0]
         world, nh = self.world_size, self.num_heads
         per_rank = chunk // world
@@ -1687,14 +1709,14 @@ class HYV4Attention(nn.Module):
         else:
             mine = r * per_rank + torch.arange(per_rank, device=dev)  # this rank's queries
         prior = metadata["cached_seq_len"].reshape(1, 1).to(torch.long)
-        pos_map = self._prefill_pos_map(block_table, prior)  # [P]
+        pos_map = self._prefill_pos_map(block_table, prior, read)  # [P]
         span = pos_map.shape[0]
 
         if self.indexer is not None:
             iq, iw = self.indexer.queries(q_resid, x, cos, sin)
             local_q = torch.index_select(iq, 0, mine)
             local_w = torch.index_select(iw, 0, mine)
-            ik_ctx = self._gather_cols(pos_map.view(1, span), self.index_slice.start, self.index_dim)[0]
+            ik_ctx = self._gather_cols(pos_map.view(1, span), self.index_slice.start, self.index_dim, read)[0]
             rows_q, heads, dim = local_q.shape
             flat_q = local_q.reshape(rows_q * heads, dim)
             s_ctx = torch.relu((flat_q @ ik_ctx.t()).float()).view(rows_q, heads, span)
@@ -1746,7 +1768,7 @@ class HYV4Attention(nn.Module):
         col_off = self.latent_slice.start
         if self.prefill_backend == "cte":
             m, den, num = self._prefill_attn_cte(
-                ql_loc, qr_loc, pos_map, own_lat, own_rope, rows, bound, col_off
+                ql_loc, qr_loc, pos_map, own_lat, own_rope, rows, bound, col_off, read
             )
         elif self._sparse_attn_k is not None and _use_sparse_kernels(ql_loc):
             # Tokens per group bounded so the gathered rows (bf16, 576 wide)
@@ -1760,13 +1782,13 @@ class HYV4Attention(nn.Module):
             pos_full = torch.where(
                 in_ctx,
                 torch.index_select(pos_map, 0, torch.clamp(pos, max=span - 1)),
-                torch.full_like(pos, self._n_cache_rows(), dtype=pos_map.dtype),
+                torch.full_like(pos, self._n_cache_rows(read), dtype=pos_map.dtype),
             )
             own_map = torch.where(in_ctx, torch.full_like(pos, n_own), pos - span).to(torch.int32)
             kt = -(-rows.shape[1] // 128)
             tg = max(1, min(8, 49152 // (kt * self.latent_dim * 2)))
             m, den, num = self._sparse_attn_k[self.sparse_grid](
-                q_all=ql_loc.contiguous(), kv_cache=self.kv_pages,
+                q_all=ql_loc.contiguous(), kv_cache=read,
                 rows=rows.contiguous(), bound=bound.contiguous(),
                 scale=float(self.scaling), col_off=col_off, lat_off=0,
                 lat_dim=self.kv_lora_rank, rope_off=self.kv_lora_rank,
@@ -1778,7 +1800,7 @@ class HYV4Attention(nn.Module):
             )
         else:
             m, den, num = sparse_prefill_ref(
-                ql_loc, qr_loc, self.kv_pages, pos_map, own_lat, own_rope, rows, bound,
+                ql_loc, qr_loc, read, pos_map, own_lat, own_rope, rows, bound,
                 self.scaling, col_off, self.dtype,
             )
         sink = sinks.view(1, -1)
@@ -1829,6 +1851,75 @@ class HYV4Attention(nn.Module):
         bs, world = self._block_size(), self.world_size
         j = torch.arange(n, device=dev)
         return (j // bs) * (world * bs) + r * bs + j % bs
+
+    def _gathered_prefix(self, metadata: dict, rank: torch.Tensor | None) -> torch.Tensor:
+        """Every rank's prefix shard, all-gathered and put in global position order,
+        as a ``[W * nb, 1, bs, 704]`` page tensor read through an identity table.
+
+        Local row ``j`` of rank ``q`` holds position ``(j // bs) * (W * bs) + q * bs
+        + j % bs``, so position ``g`` is local row ``(g // (W * bs)) * bs + g % bs``
+        of rank ``(g // bs) % W``. The all-gather's block order is learnt from a
+        rank tag (it is not tp-rank order on Trn2) and the reorder is one
+        ``index_select`` by the computed row (no concatenation). Rows past
+        ``cached_seq_len`` are whatever the shards hold there; every path masks
+        them, as it does in a replicated cache.
+        """
+        world, bs = self.world_size, self._block_size()
+        dev = self.kv_pages.device
+        block_table = metadata["block_table_tensor"][:1]
+        nc = self.neuron_config
+        bound = prefill_span_bound(
+            metadata.get("kv_segment_size", 0),
+            getattr(nc, "kv_segment_size_buckets", None) if nc is not None else None,
+        )
+        if bound is not None:
+            blocks = -(-bound // (bs * world))  # local blocks holding the bound
+            if blocks < block_table.shape[1]:
+                block_table = block_table[:, :blocks]
+        live = torch.ones(1, 1, dtype=torch.bool, device=dev)
+        local = self._gather(block_table, live)[0]  # [P_loc, 704]
+        p_loc = local.shape[0]
+        if rank is None:
+            rank = torch.tensor(self.tp_group.rank_in_group, device=dev)
+        r = rank.reshape(1).to(torch.float32)
+        if "collectives" in PERF_SKIP:
+            sources = torch.arange(world, dtype=torch.float32, device=dev)
+        else:
+            sources = self.tp_group.all_gather(r, dim=0)  # [world], rank per block
+        every = _all_gather(self.tp_group, local, 0, world)  # [W * P_loc, 704]
+        # slot[q] = the gather block holding rank q (0/1 matmul over small ints: exact).
+        blocks_f = torch.arange(world, dtype=torch.float32, device=dev)
+        at = (blocks_f.view(world, 1) == sources.view(1, world)).to(torch.float32)  # [q, j]
+        slot = (at @ blocks_f.view(world, 1)).view(world).to(torch.long)  # [q]
+        n = world * p_loc
+        g = torch.arange(n, device=dev)
+        owner = (g // bs) % world
+        row = torch.index_select(slot, 0, owner) * p_loc + (g // (world * bs)) * bs + g % bs
+        ordered = torch.index_select(every, 0, row)  # [P, 704], global order
+        return ordered.view(n // bs, 1, bs, self.entry_dim)
+
+    def forward_prefill_gathered(
+        self,
+        x: torch.Tensor,
+        position_embeddings: tuple,
+        metadata: dict,
+        selected,
+        rank: torch.Tensor | None = None,
+    ):
+        """DCP prefill by reconstruction (``HY4_DCP_PREFILL=gather``): the replicated
+        ``forward_prefill`` (dense or sparse / cte, with their own collectives) over
+        the all-gathered prefix (``_gathered_prefix``) through an identity block
+        table; same keys and code as on a replicated cache, so the same result.
+        The chunk's entries are still written to this rank's real (sharded) cache,
+        owned tokens only, through the runner's slot mapping. One extra collective
+        per layer (plus a [W] rank tag): ``[W * P_loc, 704]`` received.
+        """
+        pages = self._gathered_prefix(metadata, rank)
+        meta = dict(metadata)
+        meta["block_table_tensor"] = torch.arange(
+            pages.shape[0], dtype=torch.int32, device=pages.device
+        ).view(1, -1)
+        return self.forward_prefill(x, position_embeddings, meta, selected, rank, pages)
 
     def _dcp_route(self, r: torch.Tensor, dev) -> tuple[torch.Tensor, torch.Tensor]:
         """-> (``sources [world]`` fp32, the rank at each all-gather block;
@@ -2082,6 +2173,7 @@ class HYV4Attention(nn.Module):
         rows: torch.Tensor,
         bound: torch.Tensor,
         col_off: int,
+        cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sparse prefill attention, ``cte`` backend: per-slot flat rows built here.
 
@@ -2092,8 +2184,9 @@ class HYV4Attention(nn.Module):
         a slot's other source (and both, for the pad) is out of range, which
         the kernel's DMA skips.
         """
+        cache = self.kv_pages if cache is None else cache
         span, n_own = pos_map.shape[0], own_lat.shape[0]
-        n_rows = self._n_cache_rows()
+        n_rows = self._n_cache_rows(cache)
         q, ksel = rows.shape
         dev = pos_map.device
         pos = torch.arange(span + n_own + 1, device=dev)
@@ -2114,7 +2207,7 @@ class HYV4Attention(nn.Module):
             qdt = self.kv_pages.dtype
             return self._prefill_attn_k[self.sparse_grid](
                 q_lat=ql_loc.to(qdt).contiguous(), q_rope=qr_loc.to(qdt).contiguous(),
-                kv_cache=self.kv_pages,
+                kv_cache=cache,
                 rows_cache=rows_cache.contiguous(), own_lat=own_lat.contiguous(),
                 own_rope=own_rope.contiguous(), rows_own=rows_own.contiguous(),
                 bound=bound.contiguous(), scale=float(self.scaling), col_off=col_off,
@@ -2122,7 +2215,7 @@ class HYV4Attention(nn.Module):
             )
         qdt = self.kv_pages.dtype
         return sparse_prefill_cte_ref(
-            ql_loc.to(qdt), qr_loc.to(qdt), self.kv_pages, rows_cache, own_lat, own_rope, rows_own, bound,
+            ql_loc.to(qdt), qr_loc.to(qdt), cache, rows_cache, own_lat, own_rope, rows_own, bound,
             self.scaling, col_off, self.dtype,
         )
 
@@ -2285,8 +2378,8 @@ class HYV4Attention(nn.Module):
 
     # ── sparse local attention (HY4_DEC_SPARSE_NKI=1) ──────────────────────
 
-    def _n_cache_rows(self) -> int:
-        return self._num_pages() * self._block_size()
+    def _n_cache_rows(self, cache: torch.Tensor | None = None) -> int:
+        return self._num_pages(cache) * self._block_size()
 
     def _pad_row(self) -> int:
         """Row index for keys the sparse path does not attend (``HY4_SPARSE_PAD_ROW``)."""
@@ -2316,12 +2409,15 @@ class HYV4Attention(nn.Module):
         pad = torch.full_like(flat, self._pad_row())
         return torch.where(in_prefix, flat, pad).to(torch.int32)
 
-    def _gather_cols(self, rows: torch.Tensor, col_off: int, width: int) -> torch.Tensor:
+    def _gather_cols(
+        self, rows: torch.Tensor, col_off: int, width: int, cache: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """``[R, n]`` flat rows -> ``[R, n, width]`` columns ``col_off:`` of each entry."""
+        cache = self.kv_pages if cache is None else cache
         if self._sparse_gather_k is not None and _use_sparse_kernels(rows):
             gather = self._sparse_gather_k
-            return gather[self.sparse_grid](kv_cache=self.kv_pages, rows=rows, col_off=col_off, width=width)
-        return gather_rows_cols_ref(self.kv_pages, rows, col_off, width)
+            return gather[self.sparse_grid](kv_cache=cache, rows=rows, col_off=col_off, width=width)
+        return gather_rows_cols_ref(cache, rows, col_off, width)
 
     def _cp_sparse_rows(
         self, shard_rows: torch.Tensor, sel_ctx: torch.Tensor
