@@ -261,6 +261,70 @@ TP=4, bf16, greedy, 1024-token input and 128-token output, `max_model_len`
   trn2.48xlarge at `world_size=64, ep_degree=8`, 11.93 GiB used per rank, with a
   patched `nkilib` for top-k > 8 (no longer needed, see above).
 
+### Optional: decode megakernel (35B-A3B, TP=4)
+
+`QWEN3_5_DECODE_MEGAKERNEL=1` runs each one-token-per-request decode step of
+Qwen3.5-35B-A3B as one NKI kernel per TP rank (`src/kernels/megakernel/`, called
+from `src/megakernel.py`). The kernel covers the 40 decoder layers, the final
+norm and, with on-device sampling, the vocab-parallel lm_head. The kernel replaces
+the per-layer graph ops and the two all-reduces per layer with in-kernel
+collectives. It reads and writes the model's own paged KV caches and DeltaNet
+state pages in place. Prefill and the fallback path therefore see the same
+state. A few weights are copied once at load into the kernel's layout: the
+per-core DeltaNet in_proj / conv weights, fused qkv, fp32 router / norm weights,
+fused shared-expert gate/up and the lm_head tiles. The routed experts are read
+as loaded.
+
+- **Coverage.** The 35B-A3B shapes, TP=4, no expert parallelism, LNC=2, KV
+  block size 256 and batch buckets up to 8 (tested: `[1, 4, 8]`), with one
+  token per request. Pass `--block-size 256`. Any other checkpoint or
+  configuration logs a warning and keeps the default path, as does any other
+  graph (prefill, buckets above 8). With the flag unset none of this code runs.
+- **Usage:**
+  `QWEN3_5_DECODE_MEGAKERNEL=1 MAX_NUM_SEQS=8 DECODE_BUCKETS="[1, 4, 8]" bash
+  contrib/models/qwen3_5/scripts/serve.sh /path/to/Qwen3.5-35B-A3B --block-size 256`.
+  `scripts/benchmark_latency.py` takes `--block-size`.
+
+Measured on trn2.3xlarge, SDK 2.33 (vllm-neuron 0.29), native route, bf16,
+greedy, TP=4. Both arms ran with the same server settings (`max_model_len`
+9472, `max_num_seqs` 8, decode buckets `[1, 4, 8]`, `--block-size 256`) and
+differ only in the flag.
+
+| | Flag off | Flag on |
+| --- | --- | --- |
+| Greedy tokens equal to HF bf16 (8 prompts x 32) | 188/256 | 218/256 |
+| Prompts identical to HF over all 32 tokens | 4/8 | 5/8 |
+| GSM8K, 100 questions, 8-shot chat, strict / flexible match | 0.88 / 0.91 | 0.87 / 0.88 |
+| Passkey retrieval, ~6.7K-token context (5 depths x 2 keys) | 10/10 | 10/10 |
+
+Every greedy divergence from HF in either arm is at a near-tie (top-2 logit
+margin of 0.125 or less). The GSM8K difference is within the run-to-run noise
+of n=100.
+
+`vllm bench serve`, random 1024-token input, 128-token output, medians:
+
+| Concurrency | TPOT off | TPOT on | Output tok/s off | Output tok/s on |
+| --- | --- | --- | --- | --- |
+| 1 | 21.16 ms | 7.43 ms | 41.7 | 96.8 |
+| 4 | 49.62 ms | 17.04 ms | 70.6 | 165.0 |
+| 8 | 82.53 ms | 31.78 ms | 84.1 | 179.3 |
+
+TTFT is unchanged (prefill does not use the kernel): 379 / 952 / 1688 ms off and
+378 / 939 / 1676 ms on at concurrency 1 / 4 / 8.
+
+`scripts/benchmark_latency.py` (1024-token input, 128-token output,
+`max_model_len` 2048, `--gpu-memory-utilization` 0.72, `--block-size 256`, one
+decode bucket per run), means over 3 rounds:
+
+| Batch | TTFT off | TTFT on | TPOT off | TPOT on | Output tok/s off | Output tok/s on |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 261.1 ms | 264.0 ms | 18.29 ms | 6.43 ms | 49.5 | 118.5 |
+| 4 | 644.5 ms | 643.7 ms | 36.33 ms | 13.91 ms | 97.3 | 212.3 |
+| 8 | 1151.1 ms | 1122.3 ms | 61.81 ms | 23.93 ms | 113.7 | 246.0 |
+
+The flag-off numbers are in line with the 35B-A3B rows of the table above
+(measured there on trn2.48xlarge).
+
 ## Example Checkpoints
 
 - <https://huggingface.co/Qwen/Qwen3.5-2B>
@@ -325,8 +389,10 @@ src/
   model.py         decoder, attention, KV/state cache binding, weights, compiler args
   deltanet.py      gated DeltaNet mixer (prefill chunked delta rule, decode step)
   moe.py           sparse MoE block (NKI moe_cte / moe_block_tkg kernels)
+  megakernel.py    opt-in 35B-A3B decode megakernel: coverage check, load-time weight copies, call
   flags.py         debug and experiment environment switches
   kernels/         NKI kernels: DeltaNet prefill (opt-in), state-page gather / scatter
+  kernels/megakernel/  the decode megakernel (DeltaNet, attention, MoE, lm_head blocks)
 scripts/run.py     offline text generation for all four checkpoints
 test/integration/test_model.py
 ```

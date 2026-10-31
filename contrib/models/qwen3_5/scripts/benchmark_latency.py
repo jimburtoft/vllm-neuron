@@ -93,6 +93,12 @@ def parse_args() -> argparse.Namespace:
         help="expert-parallel degree; requires --expert-parallel",
     )
     parser.add_argument("--sync-scheduling", action="store_true")
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=None,
+        help="KV cache block size (256 for QWEN3_5_DECODE_MEGAKERNEL=1)",
+    )
     return parser.parse_args()
 
 
@@ -145,6 +151,8 @@ async def main_async(args) -> None:
         extra["gpu_memory_utilization"] = args.gpu_memory_utilization
     if args.sync_scheduling:
         extra["async_scheduling"] = False
+    if args.block_size is not None:
+        extra["block_size"] = args.block_size
     if args.expert_parallel:
         extra["enable_expert_parallel"] = True
     if args.ep_degree is not None and not args.expert_parallel:
