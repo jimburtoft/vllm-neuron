@@ -43,15 +43,30 @@ ARCHITECTURE = "MuseGlimmerForConditionalGeneration"
 
 # Merged tokens per on-device encoder-cache block (0 / unset: one attention block).
 ENC_CACHE_BLOCK_ENV = "MUSE_GLIMMER_ENC_CACHE_BLOCK"
+# 128 merged tokens: a 768-token image takes 6 blocks, a 224x224 image 1 (vs one 1024-token block each).
+# The scheduler admits by tokens (encoder_cache_size, 8192 by default), and each item rounds up to whole
+# blocks, so the worst case (many items of just over one block) needs about 2x the token budget in blocks.
+# Set encoder_cache_num_blocks >= 2 * encoder_cache_size / DEFAULT_ENC_CACHE_BLOCK + 1 (129 by default);
+# the runner's own minimum (one budget's worth) is too small at this granularity.
+DEFAULT_ENC_CACHE_BLOCK = 128
 
 
 def resolve_encoder_cache_block_size(attn_block: int, merge_factor: int) -> int:
-    """Merged tokens per encoder-cache block: ``ENC_CACHE_BLOCK_ENV`` if set, else one attention block."""
+    """Merged tokens per encoder-cache block.
+
+    ``ENC_CACHE_BLOCK_ENV`` if set (``0`` = one attention block), else ``DEFAULT_ENC_CACHE_BLOCK``
+    when it divides the merged attention block, else one attention block. Small blocks make the
+    device cache match the scheduler's token-based admission: with one block per attention block,
+    concurrent small images exhaust the cache (``Encoder cache full``) long before the token budget.
+    """
     if attn_block % merge_factor:
         raise ValueError(f"encoder_attention_block_size ({attn_block}) must be divisible by {merge_factor}")
     full = attn_block // merge_factor
     v = os.environ.get(ENC_CACHE_BLOCK_ENV, "").strip()
-    b = int(v) if v else 0
+    if v:
+        b = int(v)
+    else:
+        b = DEFAULT_ENC_CACHE_BLOCK if full % DEFAULT_ENC_CACHE_BLOCK == 0 else 0
     if not b or b == full:
         return full
     if b < 0 or full % b:

@@ -46,12 +46,12 @@ vllm serve meta-models/Muse-Glimmer-30B --tensor-parallel-size 4 \
                       "on_device_sampling_config": {"all_greedy": true}},
     "vision_neuron_config": {"vision_attention_block_size": 4096,
                              "num_vision_tokens_buckets": [1024, 2048, 3072, 4096],
-                             "encoder_cache_num_blocks": 64, "tp_size": 4}}' \
+                             "encoder_cache_num_blocks": 129, "tp_size": 4}}' \
   --port 8000
 ```
 
 - **The ring needs** single-shot prefill (`--max-num-batched-tokens` = `--max-model-len`), prefix caching off, and no speculative decoding.
-- **Encoder cache:** many concurrent small images need about 4 blocks per concurrent image; 24 blocks failed at concurrency 16 with `Encoder cache full`.
+- **Encoder cache:** with the default 128-token cache blocks, 129 blocks (0.2 GiB per core) ran 768 mixed 224x224 / 448x448 image requests at concurrency 128 with no errors. With one 1024-token block per image (`MUSE_GLIMMER_ENC_CACHE_BLOCK=0`), 64 blocks (0.8 GiB) failed the same test with `Encoder cache full`.
 - **Cap:** 0.27 runs everything except long prompts (6000 tokens) late in a full sweep, where runtime DMA buffers no longer fit. 0.21 is clean and has the same peak throughput.
 
 **BF16 (no quantization):**
@@ -148,7 +148,7 @@ The first generated token matched HF on every prompt in all configs. FP8 is clos
 | `MUSE_GLIMMER_MLP_TKG_MAX_T` | 128 | FP8 MLP decode batches of 97 to this many rows use the TKG ROW kernel (bf16 activations, the same kernel as <= 96 rows) instead of the prefill CTE ROW kernel. The 128-row decode step is about 11 % faster. `96` restores the old path. |
 | `MUSE_GLIMMER_FP8_CTE_CHUNK` | 512 | FP8 MLP prefill row chunk, used only with `MUSE_GLIMMER_FP8_CTE_SHARED_ABS=0`. It works around an nkilib 2.33 kernel-validation failure ("Stack out of memory") at > 512 rows. |
 | `MUSE_GLIMMER_FP8_CTE_SHARED_ABS` | 1 | Patch the nkilib CTE ROW kernel at build time so one row-quant scratch buffer is shared (see below). Prefill runs un-chunked: 7-9 % lower TTFT at 1k-6k tokens and +0-6 % peak throughput on trn2, same output as 512-row chunking. `0` restores chunking. |
-| `MUSE_GLIMMER_ENC_CACHE_BLOCK` | unset | Merged tokens per on-device encoder-cache block; must divide the merged attention block (1024). Unset: one block per attention block, so every image takes a whole 1024-token block. A smaller value (e.g. 128) stores an item in `ceil(tokens / value)` blocks, which matches the scheduler's token-based admission; size `encoder_cache_num_blocks` as cached tokens / value + 1. |
+| `MUSE_GLIMMER_ENC_CACHE_BLOCK` | 128 | Merged tokens per on-device encoder-cache block; must divide the merged attention block (1024). An image takes `ceil(tokens / value)` blocks (a 768-token image 6, a 224x224 image 1), so the device cache matches the scheduler's token-based admission. `0` restores one 1024-token block per image, where concurrent small images exhaust the cache. Size `encoder_cache_num_blocks` at about 2x the encoder token budget / value + 1 (129 at the default budget). |
 | `MUSE_GLIMMER_VIS_SMALL_BLOCK` | 0 | `1`: single-block images run the smallest vision bucket that fits, instead of the full block. Needs `num_vision_tokens_buckets` below the block size. |
 | `MUSE_GLIMMER_VIS_MLP` | torch | `nki`: nkilib MLP kernel with exact GELU and the fc1 bias, used while I/rank < 4096. |
 | `MUSE_GLIMMER_VIS_LN` | torch | `fused`: LayerNorms fused into the QKV and MLP kernels. |
