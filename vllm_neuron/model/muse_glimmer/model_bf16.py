@@ -161,6 +161,18 @@ def _graph_block_rows(bucket: int, vnc) -> tuple[int, int]:
     return bs, math.ceil(math.ceil(bucket / bs) / dp) * dp
 
 
+def _enc_cache_block(vnc, mu: int) -> int:
+    """Merged tokens per encoder-cache block (see factory.resolve_encoder_cache_block_size)."""
+    from .factory import resolve_encoder_cache_block_size
+
+    return resolve_encoder_cache_block_size(vnc.encoder_attention_block_size, mu)
+
+
+def _cache_blocks_per_graph_block(rows: int, mu: int, cache_block: int) -> int:
+    """Cache blocks one encoder-graph block of ``rows`` raw rows writes."""
+    return -(-(rows // mu) // cache_block)
+
+
 def _vis_win_chunks(rows: int) -> int:
     """Window-split chunk count for a block of ``rows`` (0 = no split)."""
     if not vision_win_split() or rows <= WIN_CHUNK:
@@ -1406,7 +1418,6 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
 
         if is_video:
             grid_ve, group_ids, tpb = plan_video_items(grid_thw, block_size, vc.merge_size)
-            block_map = [cache.allocate(mm_hashes[i], tpb[i]) for i in range(len(rows))]
         else:
             for t, h, w in rows:
                 if t * h * w > block_size:
@@ -1417,12 +1428,19 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
                     )
             grid_ve = grid_thw
             group_ids = None
-            block_map = [
-                cache.allocate(mm_hashes[i], cache.dense_tokens_per_block(t * h * w // mu, block_size // mu))
-                for i, (t, h, w) in enumerate(rows)
-            ]
+            tpb = [cache.dense_tokens_per_block(t * h * w // mu, block_size // mu) for t, h, w in rows]
+        # tpb[i]: merged tokens per encoder-graph block of item i. A cache block may be
+        # smaller than a graph block (MUSE_GLIMMER_ENC_CACHE_BLOCK): each graph block then
+        # takes ceil(tokens / cache block) cache blocks.
+        cb = cache.block_size
+        split = cb < block_size // mu
+        block_map = [
+            cache.allocate(mm_hashes[i], [n for g in tpb[i] for n in cache.dense_tokens_per_block(g, cb)])
+            if split else cache.allocate(mm_hashes[i], tpb[i])
+            for i in range(len(rows))
+        ]
         tokens = [int(t * h * w) for t, h, w in grid_ve.tolist()]
-        required_blocks = sum(len(b) for b in block_map)
+        required_blocks = sum(len(g) for g in tpb)
         _bucket, num_blocks = select_vision_bucket(
             max(sum(tokens), required_blocks * block_size),
             vnc.num_encoder_input_buckets, block_size, dp_size=vnc.dp_size,
@@ -1449,12 +1467,27 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
             win_chunk=WIN_CHUNK,
         )
         flat = [b for blocks in block_map for b in blocks]
+        cache_write_ids = None
+        if split:
+            # graph block j -> its K cache-block slots (scratch-padded), in item order.
+            K = _cache_blocks_per_graph_block(blk_rows, mu, cb)
+            slots = []
+            for i, graph_tokens in enumerate(tpb):
+                it = iter(block_map[i])
+                for g in graph_tokens:
+                    n = -(-g // cb)
+                    slots += [next(it) for _ in range(n)] + [cache.scratch_block_id] * (K - n)
+            slots += [cache.scratch_block_id] * (num_blocks * K - len(slots))
+            cache_write_ids = torch.tensor(slots, dtype=torch.int64)
+            flat = flat[:0]
         write_ids = torch.tensor(flat + [cache.scratch_block_id] * (num_blocks - len(flat)), dtype=torch.int64)
         t1 = _time.perf_counter()
 
         device = next(self.visual.parameters()).device
         kw = packed.as_kwargs()
         kw["pixel_values"] = kw["pixel_values"].to(self.visual.dtype)
+        if cache_write_ids is not None:
+            kw["cache_write_ids"] = cache_write_ids
         kw = {k: v.to(device) for k, v in kw.items()}
         write_dev = write_ids.to(device)
         timing = _vis_timing()
@@ -1470,7 +1503,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
             # synchronize() can return before the native-backend graph finishes (observed on trn2:
             # 3 ms for a 50-layer encode); a host read of the written cache row waits for it.
             try:
-                cache.buffer[int(write_ids[0])][:1].cpu()
+                cache.buffer[int(flat[0] if flat else block_map[0][0])][:1].cpu()
             except Exception as e:  # noqa: BLE001
                 logger.warning("VIS_TIMING readback failed: %r", e)
             t3 = _time.perf_counter()
@@ -1524,6 +1557,10 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
                 "win_bound_min": z(nb * K, WIN_CHUNK, 1, dtype=torch.int32),
                 "win_bound_max": z(nb * K, WIN_CHUNK, 1, dtype=torch.int32),
             }
+        cw = {}
+        cb = _enc_cache_block(encoder_neuron_config, mu)
+        if cb < encoder_neuron_config.encoder_attention_block_size // mu:
+            cw = {"cache_write_ids": z(nb * _cache_blocks_per_graph_block(bs, mu, cb), dtype=torch.int64)}
         return {
             "pixel_values": z(nb, bs, vc.patch_dim, dtype=self.visual.dtype),
             "pos_emb_idx": z(4, nb, bs, dtype=torch.int32),
@@ -1538,7 +1575,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
             "merged_order": torch.arange(bs // mu, dtype=torch.int64).repeat(nb, 1).to(device)
             if device != torch.device("meta")
             else z(nb, bs // mu, dtype=torch.int64),
-        } | win  # same kwarg order as embed_multimodal (PackedVisionInputs field order)
+        } | win | cw  # same kwarg order as embed_multimodal (PackedVisionInputs field order)
 
     # ── construction ────────────────────────────────────────────────────
 

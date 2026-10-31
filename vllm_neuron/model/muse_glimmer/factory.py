@@ -16,6 +16,7 @@ The same class is registered in two places:
 from __future__ import annotations
 
 import math
+import os
 from typing import ClassVar, Literal
 
 import torch
@@ -39,6 +40,23 @@ from .processing import (
 )
 
 ARCHITECTURE = "MuseGlimmerForConditionalGeneration"
+
+# Merged tokens per on-device encoder-cache block (0 / unset: one attention block).
+ENC_CACHE_BLOCK_ENV = "MUSE_GLIMMER_ENC_CACHE_BLOCK"
+
+
+def resolve_encoder_cache_block_size(attn_block: int, merge_factor: int) -> int:
+    """Merged tokens per encoder-cache block: ``ENC_CACHE_BLOCK_ENV`` if set, else one attention block."""
+    if attn_block % merge_factor:
+        raise ValueError(f"encoder_attention_block_size ({attn_block}) must be divisible by {merge_factor}")
+    full = attn_block // merge_factor
+    v = os.environ.get(ENC_CACHE_BLOCK_ENV, "").strip()
+    b = int(v) if v else 0
+    if not b or b == full:
+        return full
+    if b < 0 or full % b:
+        raise ValueError(f"{ENC_CACHE_BLOCK_ENV}={b} must divide the merged attention block ({full})")
+    return b
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -123,10 +141,23 @@ class MuseGlimmerForConditionalGeneration(
         if not buckets:
             return 0
         mu = cls.get_vision_token_merge_factor(hf_config)
-        cache_block_size = get_encoder_cache_block_size(
-            hf_config, encoder_neuron_config.encoder_attention_block_size
-        )
-        return math.ceil((max(buckets) // mu) / cache_block_size)
+        attn = encoder_neuron_config.encoder_attention_block_size
+        cache_block_size = get_encoder_cache_block_size(hf_config, attn)
+        # Each encoder-graph block (attn raw rows) splits into attn / mu / cache_block_size
+        # cache blocks; a request uses at most ceil(max bucket / attn) graph blocks.
+        return math.ceil(max(buckets) / attn) * math.ceil((attn // mu) / cache_block_size)
+
+    # -- encoder-cache layout ------------------------------------------------
+    # The cache stores merged tokens in blocks of ENC_CACHE_BLOCK_ENV rows (default: one
+    # attention block, attn / merge_size**2). A smaller block lets one item take
+    # ceil(tokens / block) blocks instead of one whole attention block, so the device cache
+    # matches the scheduler's token-based admission. The VE graph splits each of its
+    # blocks into cache blocks at the write; the prefill gather reads per cache block.
+    @classmethod
+    def get_encoder_cache_block_size(cls, hf_config, encoder_attention_block_size) -> int:
+        attn = getattr(encoder_attention_block_size, "encoder_attention_block_size",
+                       encoder_attention_block_size)
+        return resolve_encoder_cache_block_size(attn, cls.get_vision_token_merge_factor(hf_config))
 
     @classmethod
     def get_max_pixels_token_count(cls, hf_config: PretrainedConfig, max_pixels: int) -> int:

@@ -464,6 +464,7 @@ class MuseGlimmerVisionModel(nn.Module):
         win_scatter: torch.Tensor | None = None,
         win_bound_min: torch.Tensor | None = None,
         win_bound_max: torch.Tensor | None = None,
+        cache_write_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # >>> PARALLELISM: DP scatter (each rank takes its slice of blocks) <<<
         if self.dp_size > 1:
@@ -496,8 +497,18 @@ class MuseGlimmerVisionModel(nn.Module):
         # >>> PARALLELISM: DP gather <<<
         if self.dp_size > 1:
             feats = self.dp_group.all_gather(feats, dim=0)
-        # a block of fewer rows than the cache block fills its head.
         cache_rows = encoder_cache_buffer.shape[1]
+        if cache_write_ids is not None:
+            # cache blocks smaller than a graph block: graph block j -> K consecutive
+            # cache-block slots of cache_write_ids (the tail pads into the scratch block).
+            nb, rows = feats.shape[0], feats.shape[1]
+            k = cache_write_ids.shape[0] // nb
+            if k * cache_rows > rows:
+                feats = F.pad(feats, (0, 0, 0, k * cache_rows - rows))
+            feats = feats.reshape(nb * k, cache_rows, feats.shape[-1])
+            encoder_cache_buffer.index_put_((cache_write_ids,), feats.to(encoder_cache_buffer.dtype))
+            return encoder_cache_buffer
+        # a block of fewer rows than the cache block fills its head.
         if feats.shape[1] < cache_rows:
             feats = F.pad(feats, (0, 0, 0, cache_rows - feats.shape[1]))
         encoder_cache_buffer.index_put_((write_block_ids,), feats.to(encoder_cache_buffer.dtype))
