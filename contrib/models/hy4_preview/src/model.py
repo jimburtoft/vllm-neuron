@@ -179,6 +179,21 @@ if SPARSE_PAD_ROW not in ("oob", "null"):
 # holds fp32 ``[block, heads, 512]`` partials and reduce-scatters them; 0 = the
 # whole chunk at once.
 DCP_PREFILL_QBLOCK = int(os.environ.get("HY4_DCP_PREFILL_QBLOCK", "256") or 0)
+# The DCP prefill merge (one reduce-scatter over heads per layer):
+# ``HY4_DCP_RS_DTYPE`` = "bf16" (default) or "fp32", the dtype of the summed
+# partials (accumulated in fp32 locally either way; the maxima are gathered in
+# fp32); ``HY4_DCP_RS_PACK`` = the width of one packed
+# ``[num (512) | den | zero pad]`` row, "576" (default) or "513", or "0" for
+# two reduce-scatters (num in the RS dtype, den in fp32).
+DCP_RS_DTYPE = os.environ.get("HY4_DCP_RS_DTYPE", "bf16")
+if DCP_RS_DTYPE not in ("bf16", "fp32"):
+    raise ValueError(f"HY4_DCP_RS_DTYPE must be bf16 or fp32, got {DCP_RS_DTYPE!r}")
+DCP_RS_PACK = int(os.environ.get("HY4_DCP_RS_PACK", "576") or 0)
+# Bisection levels resolved per all-reduce in the DCP top-k threshold
+# (``topk_threshold_dist``): each round all-reduces the counts at all
+# ``2^bits - 1`` midpoints the next ``bits`` steps could test. 1 = one all-reduce
+# per step. The threshold is bit-identical for every value.
+DCP_TOPK_BITS = max(1, int(os.environ.get("HY4_DCP_TOPK_BITS", "8") or 8))
 
 # Prefill prefix bound from ``kv_segment_size`` (see ``prefill_span_bound``).
 # Inert unless neuron_config.kv_segment_size_buckets has more than one entry;
@@ -270,15 +285,23 @@ def topk_threshold_dist(
     k: int,
     group,
     world: int,
+    bits: int | None = None,
+    qblock: int = 0,
 ) -> torch.Tensor:
     """``topk_threshold`` over the union of every rank's ``[s1 | s2]`` columns.
 
     Each rank holds disjoint keys of the same rows. The bracket (global max and
-    min of the visible scores) comes from one all-gather, and each bisection
-    step all-reduces the per-row counts: integers, so the fp32 sum is exact, and
-    every step (hence ``lo``) is bit-identical to ``topk_threshold`` over the
-    concatenated keys on one rank.
+    min of the visible scores) comes from one all-gather. The bisection then
+    runs in rounds of ``bits`` steps: a round computes every midpoint those
+    steps could test (the ``2^bits - 1`` nodes of the bisection tree from the
+    current bracket, each by the same ``(lo + hi) * 0.5`` from its interval's
+    ends), counts the local keys ``>=`` each, all-reduces the counts (integers:
+    the fp32 sum is exact) and walks the tree with ``topk_threshold``'s rule.
+    Every step's midpoint and decision is the one ``topk_threshold`` makes over
+    the concatenated keys, so ``lo`` is bit-identical. ``qblock`` bounds the
+    ``[rows, nodes, keys]`` comparison temporaries.
     """
+    bits = DCP_TOPK_BITS if bits is None else bits
     hi = torch.maximum(
         s1.masked_fill(~v1, -_BIG).amax(dim=-1, keepdim=True),
         s2.masked_fill(~v2, -_BIG).amax(dim=-1, keepdim=True),
@@ -288,17 +311,56 @@ def topk_threshold_dist(
         s2.masked_fill(~v2, _BIG).amin(dim=-1, keepdim=True),
     )
     rows = hi.shape[0]
-    hi = _all_gather(group, hi.view(1, rows), 0, world).amax(dim=0).view(rows, 1)
-    lo = -_all_gather(group, (-lo).view(1, rows), 0, world).amax(dim=0).view(rows, 1)
-    for _ in range(TOPK_BISECTION_STEPS):
-        mid = (lo + hi) * 0.5
-        count = ((s1 >= mid) & v1).float().sum(dim=-1, keepdim=True) + (
-            (s2 >= mid) & v2
-        ).float().sum(dim=-1, keepdim=True)
-        count = _all_reduce(group, count)
-        up = count >= k
-        lo = torch.where(up, mid, lo)
-        hi = torch.where(up, hi, mid)
+    dev = hi.device
+    ends = torch.zeros(2, rows, dtype=torch.float32, device=dev)
+    ends[0] = hi.view(rows)
+    ends[1] = -lo.view(rows)
+    ends = _all_gather(group, ends.view(1, 2, rows), 0, world).amax(dim=0)  # [2, rows]
+    hi = ends[0].view(rows, 1)
+    lo = -ends[1].view(rows, 1)
+    qb = qblock if 0 < qblock < rows else rows
+    done = 0
+    while done < TOPK_BISECTION_STEPS:
+        b = min(bits, TOPK_BISECTION_STEPS - done)
+        n_nodes = (1 << b) - 1
+        # The tree, level by level: level d has 2^d intervals [L, H] whose
+        # midpoints sit at columns [2^d - 1, 2^(d+1) - 1) of ``nodes``.
+        nodes = torch.zeros(rows, n_nodes, dtype=torch.float32, device=dev)
+        low, high = lo, hi
+        for d in range(b):
+            width = 1 << d
+            mid = (low + high) * 0.5  # [rows, 2^d]
+            nodes[:, width - 1 : 2 * width - 1] = mid
+            if d + 1 < b:
+                cols = torch.arange(2 * width, device=dev)
+                parent = cols // 2
+                upper = (parent * 2 != cols).view(1, 2 * width)
+                low_e = torch.index_select(low, 1, parent)
+                high_e = torch.index_select(high, 1, parent)
+                mid_e = torch.index_select(mid, 1, parent)
+                low = torch.where(upper, mid_e, low_e)
+                high = torch.where(upper, high_e, mid_e)
+        counts = torch.zeros(rows, n_nodes, dtype=torch.float32, device=dev)
+        for start in range(0, rows, qb):
+            stop = min(start + qb, rows)
+            t = nodes[start:stop].unsqueeze(-1)  # [n, nodes, 1]
+            c = ((s1[start:stop].unsqueeze(1) >= t) & v1[start:stop].unsqueeze(1)).float().sum(-1)
+            c = c + ((s2[start:stop].unsqueeze(1) >= t) & v2[start:stop].unsqueeze(1)).float().sum(-1)
+            counts[start:stop] = c
+        counts = _all_reduce(group, counts)
+        # Walk: ``p`` is the node at level d (fp32 index), as topk_threshold steps.
+        p = torch.zeros(rows, 1, dtype=torch.float32, device=dev)
+        for d in range(b):
+            width = 1 << d
+            at = torch.arange(width, dtype=torch.float32, device=dev).view(1, width) == p
+            zero = torch.zeros(1, 1, dtype=torch.float32, device=dev)
+            mid = torch.where(at, nodes[:, width - 1 : 2 * width - 1], zero).sum(-1, keepdim=True)
+            cnt = torch.where(at, counts[:, width - 1 : 2 * width - 1], zero).sum(-1, keepdim=True)
+            up = cnt >= k
+            lo = torch.where(up, mid, lo)
+            hi = torch.where(up, hi, mid)
+            p = p * 2.0 + up.to(torch.float32)
+        done += b
     return lo
 
 
@@ -1829,6 +1891,75 @@ class HYV4Attention(nn.Module):
                 m = m_new
         return m, den, num
 
+    def _dcp_merge(
+        self,
+        q_all: torch.Tensor,
+        pieces: list[tuple[torch.Tensor, torch.Tensor]],
+        route: torch.Tensor,
+        pick: torch.Tensor,
+        qb: int,
+    ) -> torch.Tensor:
+        """This rank's heads of the attention over every rank's keys, ``[C, nh, 512]``.
+
+        Three collectives per layer, whatever ``qb``: an all-gather of the local
+        maxima ``[C, heads]`` (fp32), then the rescaled partials, head blocks
+        reordered into reduce-scatter order (``route``, 0/1), go out in ONE
+        reduce-scatter over heads as a packed ``[num | den | 0]`` row (or two,
+        ``HY4_DCP_RS_PACK=0``). Query blocks of ``qb`` only bound the local
+        temporaries; they write into preallocated buffers (no concatenation).
+        """
+        chunk, heads, _ = q_all.shape
+        world, nh = self.world_size, self.num_heads
+        rank_v = self.kv_lora_rank
+        dev = q_all.device
+        wire = torch.bfloat16 if DCP_RS_DTYPE == "bf16" else torch.float32
+        pack = DCP_RS_PACK
+        if pack and pack <= rank_v:
+            raise ValueError(f"HY4_DCP_RS_PACK={pack} must exceed {rank_v} (or be 0)")
+        m_loc = torch.zeros(chunk, heads, dtype=torch.float32, device=dev)
+        den_l = torch.zeros(chunk, heads, dtype=torch.float32, device=dev)
+        num_l = torch.zeros(chunk, heads, rank_v, dtype=torch.float32, device=dev)
+        for start in range(0, chunk, qb):
+            stop = min(start + qb, chunk)
+            m_b, den_b, num_b = self._dcp_partials(
+                q_all[start:stop].float(), [(k, sel[start:stop]) for k, sel in pieces]
+            )
+            m_loc[start:stop] = m_b
+            den_l[start:stop] = den_b
+            num_l[start:stop] = num_b
+        m = _all_gather(self.tp_group, m_loc.unsqueeze(0), 0, world).amax(dim=0)
+        width = pack if pack else rank_v
+        send = torch.zeros(chunk, heads, width, dtype=wire, device=dev)
+        send_den = None if pack else torch.zeros(chunk, heads, dtype=torch.float32, device=dev)
+        for start in range(0, chunk, qb):
+            stop = min(start + qb, chunk)
+            n = stop - start
+            corr = torch.exp(m_loc[start:stop] - m[start:stop])  # 0 where nothing selected
+            row = torch.zeros(n, heads, width, dtype=torch.float32, device=dev)
+            row[..., :rank_v] = num_l[start:stop] * corr.unsqueeze(-1)
+            den_b = den_l[start:stop] * corr
+            if pack:
+                row[..., rank_v] = den_b
+            # Head blocks from gather order into reduce-scatter order (0/1, exact).
+            row = torch.einsum("kj,qjx->qkx", route, row.view(n, world, nh * width))
+            send[start:stop] = row.reshape(n, heads, width).to(wire)
+            if not pack:
+                d = torch.einsum("kj,qjx->qkx", route, den_b.view(n, world, nh))
+                send_den[start:stop] = d.reshape(n, heads)
+        got = _reduce_scatter(self.tp_group, send, 1).float()  # [C, nh, width]
+        num_mine = got[..., :rank_v]
+        if pack:
+            den_mine = got[..., rank_v]
+        else:
+            den_mine = _reduce_scatter(self.tp_group, send_den, 1)  # [C, nh]
+        m_mine = torch.einsum("jh,qh->qj", pick, m)  # [C, nh]
+        sink = self.sinks.float().view(1, nh)
+        m_f = torch.maximum(m_mine, sink)
+        scale = torch.exp(m_mine - m_f)
+        return num_mine * scale.unsqueeze(-1) / (
+            den_mine * scale + torch.exp(sink - m_f)
+        ).unsqueeze(-1)
+
     def forward_prefill_dcp(
         self,
         x: torch.Tensor,
@@ -1846,12 +1977,15 @@ class HYV4Attention(nn.Module):
         2. full layers: indexer scores of all ``C`` queries against them; the
            global top-k threshold by bisection with all-reduced counts
            (``topk_threshold_dist``, bit-identical to ``select_topk`` over all
-           keys). Shared layers reuse ``(sel_ctx, sel_own)``;
-        3. all-gather the absorbed queries over heads; per query block of
-           ``DCP_PREFILL_QBLOCK``: local partials (``_dcp_partials``), the
-           global max by an all-gather of ``m``, rescale, reorder head blocks
-           into reduce-scatter order, reduce-scatter ``num`` and ``den`` over
-           heads -> this rank's heads summed over all keys; sink once.
+           keys). Shared layers reuse ``(sel_ctx, sel_own, sources, route)``;
+        3. all-gather the absorbed queries over heads, then ``_dcp_merge``:
+           local partials, the global max by one all-gather of ``m``, one
+           packed reduce-scatter over heads -> this rank's heads summed over
+           all keys; sink once.
+
+        Collectives per layer besides ``o_proj``'s all-reduce: full 9 at 8 bits
+        (bracket all-gather, 24 / bits count all-reduces, the 2 route ones, q,
+        m, reduce-scatter), shared 3.
         """
         cos, sin = position_embeddings
         chunk = x.shape[0]
@@ -1916,46 +2050,24 @@ class HYV4Attention(nn.Module):
             sc_ctx = parts_ctx[0] if one else torch.cat(parts_ctx, dim=0)  # [C, P_loc]
             sc_own = parts_own[0] if one else torch.cat(parts_own, dim=0)  # [C, n_own]
             lo = topk_threshold_dist(
-                sc_ctx, vis_ctx, sc_own, vis_own, self.index_topk, self.tp_group, world
+                sc_ctx, vis_ctx, sc_own, vis_own, self.index_topk, self.tp_group, world,
+                qblock=max(1, qb // 4),
             )
-            selected = (vis_ctx & (sc_ctx >= lo), vis_own & (sc_own >= lo))
-        sel_ctx, sel_own = selected
+            # The collective orders are fixed per process: learnt once per step
+            # here, reused by the shared layers with the selection.
+            sources, route = self._dcp_route(r, dev)
+            selected = (vis_ctx & (sc_ctx >= lo), vis_own & (sc_own >= lo), sources, route)
+        sel_ctx, sel_own, sources, route = selected
 
-        sources, route = self._dcp_route(r, dev)
         pick = self._pick_from(sources, r, dev)  # [nh, heads], gather order
         # Gathered in the model dtype (``query`` already is): the fp32 cast per
         # block after it gives the same values at half the collective's bytes.
         q_all = _all_gather(self.tp_group, query, 1, world)  # [C, heads, 576]
         lat_ctx = ctx[:, self.latent_slice]
         lat_own = own[:, self.latent_slice]
-        rank_v = self.kv_lora_rank
-        sink = self.sinks.float().view(1, nh)
-        heads = world * nh
-        o_lat = torch.zeros(chunk, nh, rank_v, dtype=torch.float32, device=dev)
-        for start in range(0, chunk, qb):
-            stop = min(start + qb, chunk)
-            n = stop - start
-            m_loc, den, num = self._dcp_partials(
-                q_all[start:stop].float(),
-                [(lat_ctx, sel_ctx[start:stop]), (lat_own, sel_own[start:stop])],
-            )
-            m = _all_gather(self.tp_group, m_loc.unsqueeze(0), 0, world).amax(dim=0)
-            corr = torch.exp(m_loc - m)  # 0 where this rank selected nothing
-            den = den * corr
-            num = num * corr.unsqueeze(-1)
-            # Head blocks from gather order into reduce-scatter order (0/1, exact).
-            num = torch.einsum("kj,qjx->qkx", route, num.view(n, world, nh * rank_v))
-            den = torch.einsum("kj,qjx->qkx", route, den.view(n, world, nh))
-            num_mine = _reduce_scatter(
-                self.tp_group, num.reshape(n, heads, rank_v), 1
-            )  # [n, nh, 512]
-            den_mine = _reduce_scatter(self.tp_group, den.reshape(n, heads), 1)  # [n, nh]
-            m_mine = torch.einsum("jh,qh->qj", pick, m)  # [n, nh]
-            m_f = torch.maximum(m_mine, sink)
-            scale = torch.exp(m_mine - m_f)
-            o_lat[start:stop] = num_mine * scale.unsqueeze(-1) / (
-                den_mine * scale + torch.exp(sink - m_f)
-            ).unsqueeze(-1)
+        o_lat = self._dcp_merge(
+            q_all, [(lat_ctx, sel_ctx), (lat_own, sel_own)], route, pick, qb
+        )
         out = self._finish(o_lat, gate)
         _capture(self.layer_idx, "attn_out", out)
         return out, selected

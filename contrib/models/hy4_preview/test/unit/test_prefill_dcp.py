@@ -96,7 +96,7 @@ def assemble_prefill_sel(res, li, world, chunk, ref_span, prior):
     """Per-rank ``(sel_ctx, sel_own)`` -> the reference's ``[C, span + C]`` mask."""
     sel = torch.zeros(chunk, ref_span + chunk, dtype=torch.bool)
     for r in range(world):
-        sel_ctx, sel_own = res[r][1][li]
+        sel_ctx, sel_own = res[r][1][li][:2]
         kp = model.HYV4Attention._dcp_key_pos
         # positions as the model computes them (bs and world from a stand-in)
         stub = type("S", (), {"_block_size": lambda self: BS, "world_size": world})()
@@ -112,6 +112,16 @@ def assemble_prefill_sel(res, li, world, chunk, ref_span, prior):
     return sel
 
 
+# Output tolerance per reduce-scatter payload dtype. fp32: the merge is exact up
+# to summation order. bf16: the summed partials (unit-scale after the global-max
+# rescale) are rounded once per rank to 8 mantissa bits (2^-9 relative), and the
+# harness sums the bf16 values rank by rank in bf16; the measured worst case is
+# printed by the test (-s) and stays well under this.
+TOL = {"fp32": 2e-5, "bf16": 1.5e-2}
+WORST: dict = {}
+
+
+@pytest.mark.parametrize("wire,pack", [("fp32", 576), ("bf16", 576), ("bf16", 513), ("bf16", 0), ("fp32", 0)])
 @pytest.mark.parametrize("world,order_seed,chunk_blocks,topk,qblock", [
     (4, 2, 2, 20, 256),  # chunk 32
     (4, 3, 2, 20, 8),  # query blocking
@@ -119,7 +129,9 @@ def assemble_prefill_sel(res, li, world, chunk, ref_span, prior):
     (8, 4, 2, 200, 16),  # top-k beyond the keys: everything visible
 ])
 @torch.no_grad()
-def test_prefill_then_decode_dcp(monkeypatch, world, order_seed, chunk_blocks, topk, qblock):
+def test_prefill_then_decode_dcp(
+    monkeypatch, world, order_seed, chunk_blocks, topk, qblock, wire, pack
+):
     torch.set_num_threads(2)
     cfg = make_config(torch.float32)
     cfg.index_topk = topk
@@ -132,6 +144,10 @@ def test_prefill_then_decode_dcp(monkeypatch, world, order_seed, chunk_blocks, t
     monkeypatch.setattr(model, "DEC_CP", False)
     monkeypatch.setattr(model, "PREFILL_SPARSE_NKI", False)
     monkeypatch.setattr(model, "DCP_PREFILL_QBLOCK", qblock)
+    monkeypatch.setattr(model, "DCP_RS_DTYPE", wire)
+    monkeypatch.setattr(model, "DCP_RS_PACK", pack)
+    tol = TOL[wire]
+    worst = 0.0
     ref_layers = build_reference(cfg)
     for a in ref_layers:
         a.kv_pages = (torch.randn(seq.ref_w + 4, 1, BS, a.entry_dim, generator=g) * 1.5)
@@ -164,7 +180,9 @@ def test_prefill_then_decode_dcp(monkeypatch, world, order_seed, chunk_blocks, t
             assert torch.equal(sel, ref_sel[li]), (c, li)
             for r in range(world):
                 assert torch.equal(res[r][0][li], res[0][0][li]), "ranks disagree"
-                assert rel(res[r][0][li], ref_out[li]) < 2e-5, (c, li)
+                e = rel(res[r][0][li], ref_out[li])
+                worst = max(worst, e)
+                assert e < tol, (c, li, e)
 
     for step in range(STEPS):
         p = n_chunks * chunk + step
@@ -180,15 +198,28 @@ def test_prefill_then_decode_dcp(monkeypatch, world, order_seed, chunk_blocks, t
         for li in range(2):
             for r in range(world):
                 assert torch.equal(res[r][0][li], res[0][0][li]), "ranks disagree"
-                assert rel(res[r][0][li], ref_out[li]) < 2e-5, (step, li)
+                e = rel(res[r][0][li], ref_out[li])
+                worst = max(worst, e)
+                assert e < tol, (step, li, e)
+    key = (wire, pack)
+    WORST[key] = max(WORST.get(key, 0.0), worst)
+    print(f"\nDCP prefill+decode {wire}/{pack} W={world}: max rel err {worst:.3e}")
 
 
-def test_topk_threshold_dist_matches_single():
-    """Disjoint key shards over W ranks give ``topk_threshold`` of their union, bit for bit."""
+@pytest.mark.parametrize("bits,qblock", [(1, 0), (5, 2), (8, 0), (8, 3), (7, 0)])
+@pytest.mark.parametrize("ties", [False, True])
+def test_topk_threshold_dist_matches_single(bits, qblock, ties):
+    """Disjoint key shards over W ranks give ``topk_threshold`` of their union, bit
+    for bit, for any number of bisection steps per all-reduce (24 = 24, 3x8, 5x5-ish
+    rounds); with heavy ties the selected set (all keys >= lo) is the same too."""
     world, rows, n1, n2, k = 4, 5, 24, 8, 30
-    g = torch.Generator().manual_seed(3)
-    s1 = [torch.randn(rows, n1, generator=g) for _ in range(world)]
-    s2 = [torch.randn(rows, n2, generator=g) for _ in range(world)]
+    g = torch.Generator().manual_seed(3 + bits)
+    if ties:  # few distinct values, ties at the k-th score
+        s1 = [torch.randint(0, 6, (rows, n1), generator=g).float() * 0.5 for _ in range(world)]
+        s2 = [torch.randint(0, 6, (rows, n2), generator=g).float() * 0.5 for _ in range(world)]
+    else:
+        s1 = [torch.randn(rows, n1, generator=g) for _ in range(world)]
+        s2 = [torch.randn(rows, n2, generator=g) for _ in range(world)]
     v1 = [torch.rand(rows, n1, generator=g) < 0.7 for _ in range(world)]
     v2 = [torch.rand(rows, n2, generator=g) < 0.7 for _ in range(world)]
     s1[0][0, 0] = s1[1][0, 3] = 0.25  # a tie across ranks
@@ -201,12 +232,71 @@ def test_topk_threshold_dist_matches_single():
     out = [None] * world
 
     def body(r):
-        out[r] = model.topk_threshold_dist(s1[r], v1[r], s2[r], v2[r], k, HubGroup(world, r, hub), world)
+        out[r] = model.topk_threshold_dist(
+            s1[r], v1[r], s2[r], v2[r], k, HubGroup(world, r, hub), world,
+            bits=bits, qblock=qblock,
+        )
 
     ts = [threading.Thread(target=body, args=(r,)) for r in range(world)]
     for t in ts:
         t.start()
     for t in ts:
         t.join()
+    want_sel = v_all & (s_all >= want)
     for r in range(world):
         assert torch.equal(out[r], want)
+        got_sel = torch.cat(
+            [v1[q] & (s1[q] >= out[r]) for q in range(world)]
+            + [v2[q] & (s2[q] >= out[r]) for q in range(world)], dim=1,
+        )
+        assert torch.equal(got_sel, want_sel)
+    # One all-gather for the bracket, one all-reduce per round.
+    assert hub.calls == 1 + -(-model.TOPK_BISECTION_STEPS // bits)
+
+
+@pytest.mark.parametrize("pack,want_shared", [(576, 4), (0, 5)])
+@torch.no_grad()
+def test_dcp_prefill_collective_count(monkeypatch, pack, want_shared):
+    """Collectives per layer: full = bracket + 24 / bits rounds + 2 route + q + m +
+    reduce-scatter(s); shared = q + m + reduce-scatter(s); each plus the o_proj
+    all-reduce every path has; independent of the query blocking."""
+    world, chunk = 4, 2 * BS * 4
+    cfg = make_config(torch.float32)
+    cfg.index_topk = 20
+    g = torch.Generator().manual_seed(5)
+    seq = Seq(3 * chunk, world, g)
+    monkeypatch.setattr(model, "DCP_PREFILL_QBLOCK", 8)
+    monkeypatch.setattr(model, "DCP_RS_PACK", pack)
+    ref_layers = build_reference(cfg)
+    hub = Hub(world, [1, 3, 0, 2], rs_slot=[2, 0, 3, 1])
+    monkeypatch.setattr(model, "_dcp_world", lambda: world)
+    ranks = [[build_rank(cfg, a, world, r, hub) for a in ref_layers] for r in range(world)]
+    for rk in ranks:
+        for a in rk:
+            a.kv_pages = torch.randn(seq.dw + 4, 1, BS, a.entry_dim, generator=g)
+    rope = model.HYV4RotaryEmbedding(cfg)
+    prior = chunk
+    pos = torch.arange(prior, prior + chunk)
+    x = torch.randn(chunk, HIDDEN, generator=g)
+    metas = [seq.dcp_meta(pos, prior, r) for r in range(world)]
+    rs = 1 if pack else 2
+    rounds = -(-model.TOPK_BISECTION_STEPS // model.DCP_TOPK_BITS)
+    for li, want in ((0, 1 + rounds + 2 + 2 + rs + 1), (1, want_shared)):
+        hub.calls = 0
+        res = [None] * world
+
+        def body(r, li=li):
+            a = ranks[r][li]
+            sel = None if li == 0 else body.sel[r]
+            out, sel = a.forward(x, pos, rope(pos), {a.layer_name: metas[r]}, sel, torch.tensor(r))
+            res[r] = sel
+
+        if li == 1:
+            body.sel = body_sel
+        ts = [threading.Thread(target=body, args=(r,)) for r in range(world)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        body_sel = res
+        assert hub.calls == want, (li, hub.calls, want)

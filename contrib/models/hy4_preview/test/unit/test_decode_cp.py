@@ -45,8 +45,13 @@ class Hub:
         self.a2a_slot = a2a_slot if a2a_slot is not None else list(range(world))
         self.slots = [None] * world
         self.barrier = threading.Barrier(world)
+        self.calls = 0  # collectives issued (counted by rank 0)
+        self.bytes_in = 0  # payload bytes rank 0 contributed
 
     def exchange(self, rank, t):
+        if rank == 0:
+            self.calls += 1
+            self.bytes_in += t.numel() * t.element_size()
         self.slots[rank] = t
         self.barrier.wait()
         got = list(self.slots)
@@ -68,7 +73,11 @@ class HubGroup(Group):
 
     def reduce_scatter(self, t, dim=-1):
         got = self.hub.exchange(self.rank_in_group, t)
-        total = torch.stack([g.float() for g in got]).sum(0).to(t.dtype)
+        # Accumulated in the payload dtype, one rank at a time (as a ring
+        # reduction does), not in fp32: a pessimistic model of a bf16 payload.
+        total = got[self.hub.order[0]].clone()
+        for j in self.hub.order[1:]:
+            total = total + got[j]
         return total.chunk(self.world_size, dim=dim)[self.hub.rs_slot[self.rank_in_group]]
 
     def all_to_all(self, t, split, concat):
