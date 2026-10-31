@@ -45,6 +45,12 @@ ABLATE_MIXERS = os.environ.get("VLLM_NEURON_QWEN35_ABLATE_MIXERS", "")
 if ABLATE_MIXERS == "1":
     ABLATE_MIXERS = "all"
 
+# Opt-in decode megakernel (``megakernel.py``): the 40 decoder layers of a one-token-per-request decode step,
+# the final norm and the lm_head as one NKI kernel. Qwen3.5-35B-A3B at TP=4, LNC=2, --block-size 256 only;
+# other configurations and every other graph keep the default path. Read once at import (it changes the
+# compiled decode graph).
+DECODE_MEGAKERNEL = os.environ.get("QWEN3_5_DECODE_MEGAKERNEL") == "1"
+
 
 def nki_delta_rule_enabled() -> bool:
     """Whether to use a vendored NKI kernel for the prefill delta rule.
@@ -73,6 +79,7 @@ def nki_delta_rule_variant() -> str:
 
 __all__ = [
     "ABLATE_MIXERS",
+    "DECODE_MEGAKERNEL",
     "SEQUENCE_PARALLEL",
     "nki_delta_rule_enabled",
     "nki_delta_rule_variant",

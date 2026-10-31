@@ -57,7 +57,7 @@ from vllm_neuron.utils.weight_loader import (
 
 from .config import Qwen3_5Config, Qwen3_5TextConfig
 from .deltanet import Qwen3_5GatedDeltaNet
-from .flags import ABLATE_MIXERS, SEQUENCE_PARALLEL
+from .flags import ABLATE_MIXERS, DECODE_MEGAKERNEL, SEQUENCE_PARALLEL
 from .moe import Qwen3_5SparseMoeBlock
 
 HF_TEXT_PREFIX = "model.language_model"
@@ -786,6 +786,8 @@ class Qwen3_5TextModel(nn.Module):
             config.hidden_size, config.rms_norm_eps, config.torch_dtype
         )
         self.rotary_emb = Qwen3_5RotaryEmbedding(config)
+        # Opt-in decode megakernel, set up by ``Qwen3_5ForCausalLM`` (None = the per-layer path).
+        self.decode_megakernel = None
 
         set_weight_loader(
             self.embed_tokens.weight,
@@ -804,7 +806,8 @@ class Qwen3_5TextModel(nn.Module):
         rotary_position_ids: torch.Tensor | None,
         attn_metadata: dict,
         rank: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        """Final-normed hidden states, or ``(normed hidden, rank logits or None)`` from the decode megakernel."""
         first = self.layers[0].mixer_name
         is_prefill = (
             attn_metadata[first]["max_query_len"]
@@ -819,6 +822,10 @@ class Qwen3_5TextModel(nn.Module):
             rotary_position_ids if rotary_position_ids is not None else positions,
             dtype=self.config.torch_dtype,
         )
+
+        mk = self.decode_megakernel
+        if mk is not None and not is_prefill and mk.applies(input_ids.shape[0], attn_metadata):
+            return mk(hidden_states, positions, position_embeddings, attn_metadata)
 
         for layer in self.layers:
             hidden_states = layer(
@@ -885,6 +892,29 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
                 self.on_device_sampling_config,
                 process_group=self.tp_group.device_group,
             )
+
+        if DECODE_MEGAKERNEL:
+            self._init_decode_megakernel()
+
+    def _init_decode_megakernel(self) -> None:
+        """``QWEN3_5_DECODE_MEGAKERNEL=1``: run supported decode steps as one NKI kernel (``megakernel.py``)."""
+        import logging
+
+        from .megakernel import DecodeMegakernel, config_supported
+
+        log = logging.getLogger(__name__)
+        reason = config_supported(self.text_config, self.world_size)
+        if reason is not None:
+            log.warning("QWEN3_5_DECODE_MEGAKERNEL=1 ignored: %s", reason)
+            return
+        # The in-kernel lm_head emits this rank's vocab shard, the same tensor ``self.lm_head`` returns with
+        # on-device sampling (and the one ``_gather_logits`` gathers); without on-device sampling the model's
+        # lm_head runs after the kernel.
+        use_lm_head = self.on_device_sampling_config is not None
+        self.language_model.decode_megakernel = DecodeMegakernel(
+            self.language_model, self.tp_group, use_lm_head
+        )
+        log.info("Qwen3.5 decode megakernel enabled (in-kernel lm_head: %s)", use_lm_head)
 
     # ── mRoPE ────────────────────────────────────────────────────────────
 
@@ -1034,8 +1064,14 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
             rank=rank,
         )
 
+        mk_logits = None
+        if isinstance(hidden_states, tuple):  # decode megakernel: (normed hidden, rank logits or None)
+            hidden_states, mk_logits = hidden_states
         hidden_states = torch.index_select(hidden_states, 0, sampling_positions)
-        logits = self.lm_head(hidden_states)
+        if mk_logits is not None:
+            logits = torch.index_select(mk_logits, 0, sampling_positions)
+        else:
+            logits = self.lm_head(hidden_states)
 
         gathered_logits = None
         if self._gather_logits:
@@ -1249,6 +1285,8 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
                 rank_sharded[name] = tensor.to(target)
 
         self.load_state_dict(rank_sharded, strict=False, assign=True)
+        if self.language_model.decode_megakernel is not None:
+            self.language_model.decode_megakernel.prepare(self.lm_head)
 
 
 __all__ = ["Qwen3_5ForCausalLM", "Qwen3_5TextModel"]

@@ -15,5 +15,5 @@ requires-python = ">=3.11"
 qwen3_5 = "qwen3_5.plugin:register"
 
 [tool.setuptools]
-package-dir = {"qwen3_5" = "src", "qwen3_5.kernels" = "src/kernels"}
-packages = ["qwen3_5", "qwen3_5.kernels"]
+package-dir = {"qwen3_5" = "src", "qwen3_5.kernels" = "src/kernels", "qwen3_5.kernels.megakernel" = "src/kernels/megakernel"}
+packages = ["qwen3_5", "qwen3_5.kernels", "qwen3_5.kernels.megakernel"]
