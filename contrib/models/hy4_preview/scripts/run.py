@@ -67,6 +67,12 @@ def main() -> None:
     parser.add_argument("--prefill-chunk", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument(
+        "--decode-context-parallel-size",
+        type=int,
+        default=int(os.environ.get("HY4_DCP", "1")),
+        help="shard the latent KV cache across this many ranks (1 or the TP size)",
+    )
+    parser.add_argument(
         "--num-gpu-blocks", type=int, default=None, help="num_gpu_blocks_override (debugging)"
     )
     parser.add_argument(
@@ -169,6 +175,12 @@ def main() -> None:
         extra["async_scheduling"] = False
     if args.hf_overrides:
         extra["hf_overrides"] = json.loads(args.hf_overrides)
+    if args.decode_context_parallel_size > 1:
+        # The latent cache is sharded by token across the TP ranks: one latent
+        # "KV head" for vLLM's DCP checks.
+        extra["decode_context_parallel_size"] = args.decode_context_parallel_size
+        extra.setdefault("hf_overrides", {})["num_key_value_heads"] = 1
+        extra["long_prefill_token_threshold"] = args.prefill_chunk
     if args.num_gpu_blocks:
         extra["num_gpu_blocks_override"] = args.num_gpu_blocks
 
