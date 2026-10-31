@@ -903,7 +903,7 @@ _MLP_CTE_ROW_CHUNK = int(os.environ.get("MUSE_GLIMMER_FP8_CTE_CHUNK", "512") or 
 # (``row_quant_reduction_res``); at I=2560 per core that is 8 x 10 KB and the stack is 1.3 KB
 # short. The |x| output is a discarded destination of tensor_scalar_reduce (only its
 # reduce_res, the row absmax, is used), so one scratch shared by all subtiles is exact.
-# MUSE_GLIMMER_FP8_CTE_SHARED_ABS=1 installs that allocation (kernel output torch.equal to
+# MUSE_GLIMMER_FP8_CTE_SHARED_ABS (default 1) installs that allocation (kernel output torch.equal to
 # chunk 512: simulator T=1024/1536/2048, trn2 T=1024/2048/4096) so the kernel validates
 # without row chunking, and MUSE_GLIMMER_FP8_CTE_CHUNK is then ignored.
 _FP8_CTE_SHARED_ABS_ENV = "MUSE_GLIMMER_FP8_CTE_SHARED_ABS"
@@ -911,7 +911,9 @@ _CTE_SHARED_ABS = [False]  # set once the patched allocation is installed
 
 
 def _install_cte_shared_abs() -> bool:
-    if os.environ.get(_FP8_CTE_SHARED_ABS_ENV, "0") != "1":
+    # Default on: same output as 512-row chunking, 7-9 % lower TTFT and +0-6 % peak throughput at
+    # 1k-6k-token prompts on trn2, 0 allocation errors over a full bucket sweep. 0 restores chunking.
+    if os.environ.get(_FP8_CTE_SHARED_ABS_ENV, "1") != "1":
         return False
     from nkilib.core.mlp.mlp_cte.basic import mlp_cte_basic_quantization as _q
     from nkilib.core.mlp.mlp_cte.basic.mlp_cte_basic_tile_info import (
