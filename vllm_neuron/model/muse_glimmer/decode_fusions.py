@@ -11,7 +11,8 @@ used for decode batch buckets >= ``MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS``, defau
   ``NF.mlp`` (``fused_add_tensor`` + ``RMS_NORM`` with fp32 ``gamma = 1 + w``, ``store_fused_add_result`` for
   the new residual). FP8 ROW MLP decode (TKG) only.
 - ``gate``  (022): sigmoid output gate and o_proj inside the megakernel
-  (``nki_attn_gate_tkg``, ``gate_decode.gated_attention_decode``). BF16 gate / o_proj weights only.
+  (``nki_attn_gate_tkg``, ``gate_decode.gated_attention_decode``). BF16 or FP8 ROW (``MUSE_GLIMMER_FP8=..,attn``)
+  qkv / gate / o_proj weights.
 - ``early_gate`` (022 cheap version): compute ``sigmoid(x @ Wgate)`` before the megakernel call, so the gate
   weight DMA is issued ahead of attention (the compiler may overlap it with the attention KV traffic).
 
@@ -47,8 +48,18 @@ def decode_fuse_flags() -> frozenset:
 GATE_MIN_BS_ENV = "MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS"
 
 
-def gate_min_bs() -> int:
-    """Smallest decode batch bucket that takes the in-kernel gate (+3 % at B=1, -5..-15 % at 16..64 on trn2)."""
+GATE_MIN_BS_FP8_ENV = "MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS_FP8"
+
+
+def gate_min_bs(fp8_attn: bool = False) -> int:
+    """Smallest decode batch bucket that takes the in-kernel gate (+3 % at B=1, -5..-15 % at 16..64 on trn2).
+
+    ``fp8_attn`` (``MUSE_GLIMMER_FP8`` includes ``attn``): separate threshold
+    ``MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS_FP8`` (default 1). With FP8 ROW attention weights the unfused path runs
+    the gate and o_proj as separate qkv / o_proj kernels, so the in-kernel gate is used at every bucket.
+    """
+    if fp8_attn:
+        return int(os.environ.get(GATE_MIN_BS_FP8_ENV, "1"))
     return int(os.environ.get(GATE_MIN_BS_ENV, "16"))
 
 

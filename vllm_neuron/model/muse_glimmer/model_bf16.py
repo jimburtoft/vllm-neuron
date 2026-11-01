@@ -735,8 +735,11 @@ class MuseGlimmerAttention(nn.Module):
         on_kernel = can_run_kernel(X) and not _decode_torch_forced()
         # gate + o_proj inside the megakernel (bf16 attention weights, single B*S tile).
         # Only for decode batch buckets >= MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS (slower at B=1 on trn2).
-        use_gate = ("gate" in self.fuse and not self.fp8 and tokens <= 128 and not _decode_torch_forced()
-                    and B >= _df.gate_min_bs() and (nkh == 1 or on_kernel))
+        # FP8 ROW attention weights (MUSE_GLIMMER_FP8=..,attn) take the in-kernel gate at every bucket from
+        # _df.gate_min_bs(fp8_attn=True) (MUSE_GLIMMER_DECODE_FUSE_GATE_MIN_BS_FP8, default 1): qkv, gate and
+        # o_proj all stream fp8 weights inside one kernel and dequantize on PSUM eviction.
+        use_gate = ("gate" in self.fuse and tokens <= 128 and not _decode_torch_forced()
+                    and B >= _df.gate_min_bs(fp8_attn=self.fp8) and (nkh == 1 or on_kernel))
         # fold the input norm into the kernel (gamma = 1 + w in fp32). Without the in-kernel
         # gate the torch gate still needs the normed input, so the norm is computed in torch as well.
         norm_kw = {}
@@ -858,8 +861,11 @@ class MuseGlimmerAttention(nn.Module):
         if self.kv_fp8 and not _kv_fp8.fused_mask_allowed():
             mask_kw = dict(attention_mask=self._fp8_decode_mask(
                 attn_metadata, pos, swa_start, B, S, table.shape[-1] * block_size, block_size))
+        # FP8 ROW attention weights: gate and o_proj dequantize inside the kernel (qkv via qkv_q; on CPU
+        # kw["W_qkv"] is already dequantized and gate_decode dequantizes gate / o_proj itself).
+        fp8_w = dict(W_gate_scale=self.gate_proj_w_scale, W_out_scale=self.o_proj_w_scale) if self.fp8 else {}
         out, K_new, V_new = gated_attention_decode(
-            X=kw["X"], W_qkv=kw["W_qkv"], W_gate=self.gate_proj_weight, W_out=self.o_proj_weight,
+            X=kw["X"], W_qkv=kw["W_qkv"], W_gate=self.gate_proj_weight, W_out=self.o_proj_weight, **fp8_w,
             K_cache=kw["K_cache"], V_cache=kw["V_cache"], active_blocks_table=table,
             softmax_scale=kw["softmax_scale"], qk_norm_eps=self.qk_norm_eps, cos=kw["cos"], sin=kw["sin"],
             rmsnorm_X_enabled=kw["rmsnorm_X_enabled"], rmsnorm_X_eps=kw.get("rmsnorm_X_eps"),
@@ -867,7 +873,9 @@ class MuseGlimmerAttention(nn.Module):
             # FP8 KV: V dequant folded into the gate (compile-time float; the NEFF then depends on the
             # calibration, unlike the shipping path that reads the kv_v_dq buffer).
             gate_dq=self.v_dq if self.kv_fp8 else 1.0,
-            force_torch=_decode_torch_forced(), **mask_kw, **qkv_q)
+            force_torch=_decode_torch_forced(), **mask_kw,
+            **(dict(quantization_type_qkv=qkv_q["quantization_type"], weight_dequant_scale_qkv=qkv_q["qkv_w_scale"])
+               if qkv_q else {}))
         nkh, d = self.num_key_value_heads_per_rank, self.head_dim
         k_new = K_new.reshape(d, B, nkh, S).permute(2, 1, 3, 0).reshape(nkh, B * S, d)
         v_new = V_new.reshape(B, nkh, S, d).permute(1, 0, 2, 3).reshape(nkh, B * S, d)

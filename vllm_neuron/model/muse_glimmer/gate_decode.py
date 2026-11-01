@@ -59,6 +59,7 @@ def _gated_attention_block_kernel(
     W_gate=None,
     W_gate_scale=None,
     gate_dq: float = 1.0,
+    W_out_scale=None,
 ):
     return _gated_block(
         X=X,
@@ -92,8 +93,8 @@ def _gated_attention_block_kernel(
         kv_cache_update_idx=None,
         W_out=W_out,
         bias_out=None,
-        quantization_type_out=QuantizationType.NONE,
-        weight_dequant_scale_out=None,
+        quantization_type_out=QuantizationType.ROW if W_out_scale is not None else QuantizationType.NONE,
+        weight_dequant_scale_out=W_out_scale,
         input_dequant_scale_out=None,
         transposed_out=False,
         out_in_sb=False,
@@ -137,8 +138,15 @@ def gated_attention_decode(
     v_scale: Optional[torch.Tensor] = None,
     gate_dq: float = 1.0,
     force_torch: bool = False,
+    W_gate_scale: Optional[torch.Tensor] = None,
+    W_out_scale: Optional[torch.Tensor] = None,
 ):
-    """See module docstring. ``pos_ids`` (fused mask) XOR a full ``attention_mask`` [S_ctx, B, N, S]."""
+    """See module docstring. ``pos_ids`` (fused mask) XOR a full ``attention_mask`` [S_ctx, B, N, S].
+
+    FP8 ROW attention weights (fp8 ``W_qkv`` / ``W_gate`` / ``W_out`` with ``[P_MAX, N]`` per-output-channel
+    scales ``weight_dequant_scale_qkv`` / ``W_gate_scale`` / ``W_out_scale``): the kernel dequantizes on PSUM
+    eviction; the torch path dequantizes the weights first.
+    """
     B, S, H = X.shape
     d = V_cache.shape[-1]
     nq = W_gate.shape[1] // d
@@ -173,10 +181,17 @@ def gated_attention_decode(
             v_scale=v_scale,
             W_out=W_out,
             W_gate=W_gate,
+            W_gate_scale=W_gate_scale,
             gate_dq=float(gate_dq),
+            W_out_scale=W_out_scale,
         )
 
     # torch reference (CPU mode): same math, unfused
+    def _dq(w, sc):
+        return w if sc is None else (w.to(torch.float32) * sc[0:1].to(torch.float32)).to(X.dtype)
+
+    W_qkv = _dq(W_qkv, weight_dequant_scale_qkv if quantization_type_qkv != QuantizationType.NONE else None)
+    W_gate, W_out = _dq(W_gate, W_gate_scale), _dq(W_out, W_out_scale)
     if pos_ids is not None:
         attention_mask = gen_attention_decode_mask(
             pos_ids=pos_ids.reshape(1, B * S).to(torch.float32), bs=B, q_head=nq, s_active=S, s_prior=s_prior,
