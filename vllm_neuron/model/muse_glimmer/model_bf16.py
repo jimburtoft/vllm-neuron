@@ -814,7 +814,14 @@ class MuseGlimmerAttention(nn.Module):
         if packed:
             k_cache = _kv_fp8.packed_view(k_cache)
         self._decode_s1 = S == 1
-        if nkh == 1:
+        if self.kv_inkernel and nkh == 1:
+            # In-kernel K/V write: hand the kernel the runner's cache tensors themselves (4-D with the
+            # kv-head dim, packed K 5-D) so its aliased in-place update lands on the bound buffer
+            # without a view in between.
+            k_cache = getattr(self, "k_cache_packed", None) if packed else self.k_cache
+            if k_cache is None:
+                k_cache = _kv_fp8.packed_view(self.k_cache)
+        elif nkh == 1:
             # 3D [blocks, block, d] cache (packed K: 4D [blocks, block/2, d, 2]) + 2D table: kernel-eligible.
             k_cache = k_cache.squeeze(1) if k_cache.dim() == (5 if packed else 4) else k_cache
             v_cache = v_cache.squeeze(1) if v_cache.dim() == 4 else v_cache

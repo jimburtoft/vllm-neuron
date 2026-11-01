@@ -201,6 +201,7 @@ def bind_packed_views(layers) -> None:
             nb, nkh = k5.shape[0], k5.shape[1]
             memo[key] = k5.view(nb, nkh, v.shape[2], v.shape[3])
         a.k_cache = memo[key]
+        a.k_cache_packed = k5  # the runner's packed tensor itself (in-kernel decode write target)
 
 
 def write_kv_blocks(k_cache: torch.Tensor, v_cache: torch.Tensor, k_q: torch.Tensor, v_q: torch.Tensor,
