@@ -86,6 +86,25 @@ def packed_mode() -> str:
     return v
 
 
+INKERNEL_ENV = "MUSE_GLIMMER_KV_INKERNEL"
+
+
+def inkernel_mode() -> str:
+    """``MUSE_GLIMMER_KV_INKERNEL``: ``off`` (default), ``all`` (``1``) or ``packed``.
+
+    Decode writes the new K/V inside the attention megakernel: the kernel runs with
+    ``update_cache=True`` and the step's slot mapping, so the layer's K/V write is an
+    aliased in-place update of its cache (the kernel's parity-split pair write for a
+    packed K cache) instead of the deferred ``index_put_`` scatter after the layer loop.
+    ``packed``: only the layers with a packed K cache; the others keep the deferred write.
+    """
+    v = os.environ.get(INKERNEL_ENV, "0").strip().lower()
+    v = {"": "off", "0": "off", "false": "off", "1": "all", "true": "all", "yes": "all"}.get(v, v)
+    if v not in ("off", "all", "packed"):
+        raise ValueError(f"{INKERNEL_ENV}={v!r} not in (0, all, packed)")
+    return v
+
+
 def packed_requested() -> bool:
     """True when ``MUSE_GLIMMER_KV_PACKED`` asks the runner for the packed K allocation."""
     return packed_mode() != "off"
@@ -345,6 +364,7 @@ def setup(layers) -> bool:
         for l in layers:
             l.self_attn.kv_fp8 = False
             l.self_attn.kv_packed = False
+            l.self_attn.kv_inkernel = inkernel_mode() == "all"
         return False
     if not all(fp8) or not all(is_fp8(l.self_attn.v_cache) for l in layers):
         raise ValueError("MuseGlimmer FP8 KV: every layer's K and V cache must be FP8")
@@ -364,13 +384,17 @@ def setup(layers) -> bool:
     if packed[0] and layers[0].self_attn.k_cache.dtype != torch.float8_e4m3fn:
         raise ValueError("MuseGlimmer packed FP8 KV needs float8_e4m3fn")
     mode = packed_mode()
+    ik = inkernel_mode()
     for l in layers:
         l.self_attn.kv_fp8 = True
         l.self_attn.kv_packed = packed[0] and (mode == "all" or l.self_attn.sliding_window is None)
+        l.self_attn.kv_inkernel = ik == "all" or (ik == "packed" and l.self_attn.kv_packed)
     logger.info(
         "MuseGlimmer FP8 KV: %d layers, k_dq=%.6g (analytic), v_dq range [%.4g, %.4g] "
-        "(margin %s, scales=%s), fused_mask=%s, packed K=%s (%d layers), prefill block write=%s", len(layers),
+        "(margin %s, scales=%s), fused_mask=%s, packed K=%s (%d layers), prefill block write=%s, "
+        "in-kernel decode write=%s", len(layers),
         layers[0].self_attn.k_dq, min(l.self_attn.v_dq for l in layers), max(l.self_attn.v_dq for l in layers),
         margin, src, fused_mask_allowed(), packed_mode() if packed[0] else "off",
-        sum(l.self_attn.kv_packed for l in layers), block_write_mode())
+        sum(l.self_attn.kv_packed for l in layers), block_write_mode(),
+        f"{ik} ({sum(l.self_attn.kv_inkernel for l in layers)} layers)")
     return True

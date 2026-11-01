@@ -482,6 +482,8 @@ class MuseGlimmerAttention(nn.Module):
         self.kv_packed = False
         # decode step with one token per request (trace-time bool, set in forward_decode).
         self._decode_s1 = False
+        # Decode K/V written inside the megakernel (MUSE_GLIMMER_KV_INKERNEL), set in kv_fp8.setup.
+        self.kv_inkernel = False
         self.k_dq = 1.0
         self.v_dq = 1.0
         _kv_fp8.register_buffers(self)
@@ -879,6 +881,14 @@ class MuseGlimmerAttention(nn.Module):
             **kv_q,
         )
         decode_kwargs.update(norm_kw)
+        # In-kernel K/V write: the kernel stores this step's K/V at slot_mapping (update_cache=True) and
+        # the deferred scatter is skipped for this layer. The cache it updates must be the bound cache
+        # (or a view of it): the unswizzled copy of a non-viable packed bucket would drop the write.
+        inkernel = self.kv_inkernel and not (packed and "fp8_packed" not in kv_q and on_kernel)
+        if inkernel:
+            decode_kwargs["update_cache"] = True
+            decode_kwargs["kv_cache_update_idx"] = slot_mapping.view(B, S).to(
+                torch.uint32 if on_kernel else slot_mapping.dtype)
         if use_gate:
             return self._forward_decode_gated(decode_kwargs, qkv_q, attn_metadata, pos, swa_start, B, S, table,
                                               block_size, slot_mapping, kv_writeback)
@@ -897,9 +907,8 @@ class MuseGlimmerAttention(nn.Module):
                 start_pos=swa_start.reshape(1, B * S) if swa_start is not None else None,
                 block_len=block_size,
             )
-            output, K_new, V_new = _torch_attention_decode_impl(
-                attention_mask=mask, **decode_kwargs
-            )
+            res = _torch_attention_decode_impl(attention_mask=mask, **decode_kwargs)
+            output, K_new, V_new = (res, None, None) if inkernel else res
         else:
             if qkv_q:
                 qkv_q = dict(quantization_type_qkv=qkv_q["quantization_type"],
@@ -914,7 +923,7 @@ class MuseGlimmerAttention(nn.Module):
                     # per (sliding, window offset, context) instead of once per layer.
                     mask_kw = dict(attention_mask=self._fp8_decode_mask(
                         attn_metadata, pos, swa_start, B, S, table.shape[-1] * block_size, block_size))
-            output, K_new, V_new = NF.attention_decode(
+            res = NF.attention_decode(
                 **qkv_q,
                 K_cache_transposed=False,
                 transposed_out=False,
@@ -922,6 +931,7 @@ class MuseGlimmerAttention(nn.Module):
                 **mask_kw,
                 **decode_kwargs,
             )
+            output, K_new, V_new = (res, None, None) if inkernel else res
 
         # output: [B, Nq, d, S] -> [B*S, Nq*d]
         attn = output.permute(0, 3, 1, 2).reshape(B * S, self.q_size)
@@ -931,6 +941,10 @@ class MuseGlimmerAttention(nn.Module):
         attn = (attn * gate).to(self.dtype)
         out = self._o_proj_tokens(attn)  # [B*S, H]
 
+        if inkernel:  # the kernel wrote this step's K/V into the cache
+            if self.world_size > 1:
+                self.tp_group.all_reduce(out)
+            return out
         # Manual KV scatter. K_new: [d, B*nkh, S] (torch) / [d, B, nkh, S] or
         # [d, B, S] (kernel); V_new: [B, nkh, S, d].
         k_new = K_new.reshape(d, B, nkh, S).permute(2, 1, 3, 0).reshape(nkh, B * S, d)
@@ -967,7 +981,13 @@ class MuseGlimmerAttention(nn.Module):
             # FP8 KV: V dequant folded into the gate (compile-time float; the NEFF then depends on the
             # calibration, unlike the shipping path that reads the kv_v_dq buffer).
             gate_dq=self.v_dq if self.kv_fp8 else 1.0, fp8_packed=bool(kw.get("fp8_packed", False)),
-            force_torch=_decode_torch_forced(), **mask_kw, **qkv_q)
+            force_torch=_decode_torch_forced(), kv_cache_update_idx=kw.get("kv_cache_update_idx"),
+            **mask_kw, **qkv_q)
+        out = out.reshape(B * S, self.hidden_size)
+        if kw.get("update_cache"):  # in-kernel K/V write (MUSE_GLIMMER_KV_INKERNEL)
+            if self.world_size > 1:
+                self.tp_group.all_reduce(out)
+            return out
         nkh, d = self.num_key_value_heads_per_rank, self.head_dim
         k_new = K_new.reshape(d, B, nkh, S).permute(2, 1, 3, 0).reshape(nkh, B * S, d)
         v_new = V_new.reshape(B, nkh, S, d).permute(1, 0, 2, 3).reshape(nkh, B * S, d)
@@ -975,7 +995,6 @@ class MuseGlimmerAttention(nn.Module):
             kv_writeback.append((self.layer_idx, self, k_new, v_new, slot_mapping, block_size))
         else:
             self._write_paged_kv(k_new, v_new, slot_mapping, block_size, decode=self._decode_s1)
-        out = out.reshape(B * S, self.hidden_size)
         if self.world_size > 1:
             self.tp_group.all_reduce(out)
         return out
