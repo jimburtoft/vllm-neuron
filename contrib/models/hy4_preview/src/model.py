@@ -193,10 +193,12 @@ DCP_RS_PACK = int(os.environ.get("HY4_DCP_RS_PACK", "576") or 0)
 # (``topk_threshold_dist``): each round all-reduces the counts at all
 # ``2^bits - 1`` midpoints the next ``bits`` steps could test. 1 = one all-reduce
 # per step. The threshold is bit-identical for every value.
-# DCP prefill strategy (read at construction): "keysplit" (default,
-# ``forward_prefill_dcp``) or "gather" (``forward_prefill_gathered``: all-gather
-# the prefix shards, then the replicated prefill paths unchanged).
-DCP_PREFILL = os.environ.get("HY4_DCP_PREFILL", "keysplit")
+# DCP prefill strategy (read at construction): "gather" (default,
+# ``forward_prefill_gathered``: all-gather the prefix shards, then the
+# replicated prefill paths unchanged) or "keysplit" (``forward_prefill_dcp``:
+# every rank attends all queries over its own keys, partials merged by a
+# reduce-scatter over heads).
+DCP_PREFILL = os.environ.get("HY4_DCP_PREFILL", "gather")
 if DCP_PREFILL not in ("keysplit", "gather"):
     raise ValueError(f"HY4_DCP_PREFILL must be keysplit or gather, got {DCP_PREFILL!r}")
 DCP_TOPK_BITS = max(1, int(os.environ.get("HY4_DCP_TOPK_BITS", "8") or 8))

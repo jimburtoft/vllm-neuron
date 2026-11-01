@@ -34,15 +34,46 @@ python contrib/models/hy4_preview/scripts/convert_mxfp8_to_neuron_fp8.py \
 
 # 3. Use the XLA compile route (see "Known limitations")
 export VLLM_NEURON_BACKEND=vllm_neuron
-# 4. Attention paths are chosen per platform (see "Layout"): key-sharded
-#    decode (HY4_DEC_CP) and the sparse decode kernel (HY4_DEC_SPARSE_NKI) on
-#    Trn2 and Trn3; the sparse prefill (HY4_PREFILL_SPARSE_NKI) on Trn2 only.
-#    Each variable overrides its default (=1 on, =0 off).
+# 4. Attention paths default on, on Trn2 and Trn3 (see "Layout"): key-sharded
+#    decode (HY4_DEC_CP), the sparse decode kernel (HY4_DEC_SPARSE_NKI) and the
+#    sparse prefill (HY4_PREFILL_SPARSE_NKI). Each variable overrides its
+#    default (=1 on, =0 off).
 # 5. Optional, serving: the plugin sizes the KV cache to 30% of the budget by
 #    default; where HBM allows (e.g. Trn3), raising it lets max_num_seqs requests
 #    run together at max_model_len 32768 instead of in waves
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.5
 ```
+
+### Sharded KV cache (decode context parallelism)
+
+By default the latent cache is replicated on every rank, which caps the KV
+cache at about one 32K request per node. With `--decode-context-parallel-size`
+equal to the TP size (64), each rank stores only its own tokens (interleaved by
+KV block: token t lives on rank `(t // block_size) % 64`), so the cache holds
+64x as many tokens.
+
+```bash
+# run.py: --decode-context-parallel-size 64 (or HY4_DCP=64) sets the three
+# options vllm serve needs
+vllm serve <dir>/Hy4-preview-neuron-fp8 --tensor-parallel-size 64 \
+    --decode-context-parallel-size 64 \
+    --hf-overrides '{"num_key_value_heads": 1}' \
+    --long-prefill-token-threshold 2048 ...
+```
+
+- `num_key_value_heads: 1`: the latent cache is one "KV head" for vLLM's DCP
+  checks (`tp >= dcp * num_kv_heads`).
+- `long_prefill_token_threshold` must be a multiple of `dcp * block_size`
+  (2048 with the default block size 32, which is also the prefill chunk).
+- Segmented prefill (`kv_segment_size_buckets`) is required by the runner.
+- Decode runs key-sharded over each rank's own tokens, with an exact
+  cross-rank softmax merge. `HY4_DEC_CP` is implied.
+- Prefill (`HY4_DCP_PREFILL`, default `gather`) all-gathers the prefix
+  shards per layer, then runs the replicated prefill unchanged. `keysplit`
+  instead attends every query over each rank's own keys and merges partials
+  with one reduce-scatter per layer.
+- Not supported with DCP: 1P1D. The platform accepts only the plugin's own
+  connector class under DCP.
 
 Recommended neuron_config additions (used for the "optimized" numbers under
 "Measured"): decode context buckets, so short contexts decode against a shorter

@@ -287,6 +287,7 @@ def test_dcp_prefill_collective_count(monkeypatch, pack, want_shared):
     cfg.index_topk = 20
     g = torch.Generator().manual_seed(5)
     seq = Seq(3 * chunk, world, g)
+    monkeypatch.setattr(model, "DCP_PREFILL", "keysplit")
     monkeypatch.setattr(model, "DCP_PREFILL_QBLOCK", 8)
     monkeypatch.setattr(model, "DCP_RS_PACK", pack)
     ref_layers = build_reference(cfg)
