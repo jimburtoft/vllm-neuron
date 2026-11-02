@@ -56,13 +56,203 @@ import math
 import os
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor as _FakeTensor
 
 logger = logging.getLogger(__name__)
 
 SCALES_ENV = "MUSE_GLIMMER_KV_SCALES"
 V_MARGIN_ENV = "MUSE_GLIMMER_KV_V_MARGIN"
 FUSED_MASK_ENV = "MUSE_GLIMMER_KV_FP8_FUSED_MASK"
+PACKED_ENV = "MUSE_GLIMMER_KV_PACKED"
+BLOCK_WRITE_ENV = "MUSE_GLIMMER_PREFILL_KV_BLOCK_WRITE"
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def packed_mode() -> str:
+    """``MUSE_GLIMMER_KV_PACKED``: ``off`` (default), ``global`` or ``all`` (``1``).
+
+    The packed layout stores a layer's K blocks as ``[block // 2, d, 2]``: two
+    consecutive slots share one bf16-wide element, so the decode kernel loads K with
+    a DMA transpose instead of an fp8 -> bf16 cast plus a PE transpose. V is never
+    packed and the byte footprint is unchanged. Every layer owns its own blocks of a
+    shared buffer, so the layout is chosen per layer: ``global`` packs the
+    full-attention layers only (the sliding-window kernel is slower packed at small
+    batch on trn2), ``all`` packs every layer.
+    """
+    v = os.environ.get(PACKED_ENV, "0").strip().lower()
+    v = {"": "off", "0": "off", "false": "off", "1": "all", "true": "all", "yes": "all"}.get(v, v)
+    if v not in ("off", "global", "all"):
+        raise ValueError(f"{PACKED_ENV}={v!r} not in (0, global, all)")
+    return v
+
+
+INKERNEL_ENV = "MUSE_GLIMMER_KV_INKERNEL"
+INKERNEL_MAX_BS_ENV = "MUSE_GLIMMER_KV_INKERNEL_MAX_BS"
+
+
+def inkernel_max_bs() -> int:
+    """``MUSE_GLIMMER_KV_INKERNEL_MAX_BS`` (default 8): largest decode batch bucket that writes K/V in the kernel.
+
+    The in-kernel write takes the separate K/V scatter off the serial path (-1.7 ms per step at
+    batch 1 on trn2), but at batch 64-128 with long context it lengthens the attention kernel,
+    which is already the bottleneck, by more than the deferred scatter costs (about +1 ms).
+    Larger buckets keep the deferred write. ``0`` = no limit.
+    """
+    v = os.environ.get(INKERNEL_MAX_BS_ENV, "").strip()
+    return int(v) if v else 8
+
+
+def inkernel_mode() -> str:
+    """``MUSE_GLIMMER_KV_INKERNEL``: ``off`` (``0``), ``all`` (``1``, default) or ``packed``.
+
+    Decode writes the new K/V inside the attention megakernel: the kernel runs with
+    ``update_cache=True`` and the step's slot mapping, so the layer's K/V write is an
+    aliased in-place update of its cache (the kernel's parity-split pair write for a
+    packed K cache) instead of the deferred ``index_put_`` scatter after the layer loop.
+    ``packed``: only the layers with a packed K cache; the others keep the deferred write.
+    """
+    v = os.environ.get(INKERNEL_ENV, "1").strip().lower()
+    v = {"": "off", "0": "off", "false": "off", "1": "all", "true": "all", "yes": "all"}.get(v, v)
+    if v not in ("off", "all", "packed"):
+        raise ValueError(f"{INKERNEL_ENV}={v!r} not in (0, all, packed)")
+    return v
+
+
+def packed_requested() -> bool:
+    """True when ``MUSE_GLIMMER_KV_PACKED`` asks the runner for the packed K allocation."""
+    return packed_mode() != "off"
+
+
+def block_write_mode() -> str:
+    """``MUSE_GLIMMER_PREFILL_KV_BLOCK_WRITE``: ``packed`` (default), ``all`` or ``off``.
+
+    Full-prefill KV write in whole cache blocks (one scatter row per block and head)
+    for layers whose prefill slots are linear (no SWA ring). ``packed``: only for a
+    packed FP8 K cache, where the per-token write must read the stored pairs.
+    """
+    v = os.environ.get(BLOCK_WRITE_ENV, "packed").strip().lower() or "packed"
+    v = {"1": "all", "true": "all", "0": "off", "false": "off"}.get(v, v)
+    if v not in ("packed", "all", "off"):
+        raise ValueError(f"{BLOCK_WRITE_ENV}={v!r} not in (packed, all, off)")
+    return v
+
+
+def packed_view(k4: torch.Tensor) -> torch.Tensor:
+    """Packed K layout ``[blocks, nkh, block // 2, d, 2]`` of the bound 4-D K cache (a view, same bytes)."""
+    nb, nkh, bs, d = k4.shape
+    return k4.view(nb, nkh, bs // 2, d, 2)
+
+
+def write_packed_k(k4: torch.Tensor, k_rows: torch.Tensor, b: torch.Tensor, h: torch.Tensor,
+                   p: torch.Tensor, unique_pairs: bool = False, ring_modulus: int | None = None) -> None:
+    """Write K rows into the packed cache (in place).
+
+    ``k4`` is the packed K cache bound as its 4-D ``[blocks, nkh, block, d]`` view (see
+    :func:`bind_packed_views`): packed element o of a block holds slots 2o / 2o + 1 as
+    ``[d, 2]`` and occupies 4-D rows 2o and 2o + 1. Writing through that view uses the
+    same (block, head, row) scatter as the unpacked cache, so the compiled graph updates
+    the shared KV buffer in place (other views of it made the graph copy the buffer).
+
+    ``k_rows`` [N, d] (cache dtype) go to (block ``b``, head ``h``, slot ``p``): element
+    ``p // 2``, lane ``p % 2``. A single-lane store does not lower on Neuron, so a row
+    writes its whole pair: the other lane comes from the row of this write that targets
+    the partner slot, or else from the cache. Lane parity comes from the slot, so any
+    slot order works. Partner rows are searched at fixed offsets: ``t +- 1``
+    (consecutive slots of one sequence) and, with ``ring_modulus=R``, ``t +- (1 - R)``
+    (the SWA ring maps position q to slot q % R with R odd, so the two slots of a pair
+    can be the first and the last kept position of a prompt). ``unique_pairs=True``
+    (decode, one token per request) skips the search. Rows in the null block (padding)
+    never pair.
+    """
+    o = p // 2
+    lane = p % 2
+    d = k_rows.shape[-1]
+    bb, hh, rr = torch.cat([b, b]), torch.cat([h, h]), torch.cat([2 * o, 2 * o + 1])
+    n = k_rows.shape[0]
+    g = k4[(bb, hh, rr)].to(torch.bfloat16)  # [2N, d]; fp8 -> bf16 -> fp8 is exact
+    old = torch.cat([g[:n], g[n:]], dim=-1).view(n, d, 2)
+    kb = k_rows.to(torch.bfloat16)
+    is0 = (lane == 0).unsqueeze(-1)
+    other0, other1 = old[..., 0], old[..., 1]
+    if not unique_pairs:
+        t = torch.arange(n, device=kb.device)
+        offs = [1] if ring_modulus is None else [1, 1 - int(ring_modulus)]
+        part = torch.zeros_like(kb)
+        found = torch.zeros(n, dtype=torch.bool, device=kb.device)
+        for off in offs:
+            # lane-0 rows look forward by +off, lane-1 rows backward by -off
+            c = torch.where(lane == 0, t + off, t - off)
+            inr = (c >= 0) & (c < n)
+            c = c.clamp(0, n - 1)
+            m = inr & (b[c] == b) & (h[c] == h) & (o[c] == o) & (lane[c] != lane) & (b != 0) & ~found
+            part = torch.where(m.unsqueeze(-1), kb[c], part)
+            found = found | m
+        f = found.unsqueeze(-1)
+        other0 = torch.where(f, part, other0)
+        other1 = torch.where(f, part, other1)
+    lane0 = torch.where(is0, kb, other0)
+    lane1 = torch.where(is0, other1, kb)
+    val = torch.stack([lane0, lane1], dim=-1).reshape(n, 2 * d).to(k4.dtype)  # [N, d, 2] -> rows 2o | 2o + 1
+    k4.index_put_((bb, hh, rr), torch.cat([val[:, :d], val[:, d:]]))
+
+
+def bind_packed_views(layers) -> None:
+    """Rebind each layer's packed 5-D K cache as a 4-D ``[blocks, nkh, block, d]`` view.
+
+    The view object is shared by every layer on the same buffer (as the runner does for its
+    slices): distinct per-layer views of one buffer would be overlapping graph inputs.
+    Called from ``bind_kv_cache`` (outside the trace) after :func:`setup`.
+    """
+    memo: dict = {}
+    for l in layers:
+        a = l.self_attn
+        k5, v = a.k_cache, a.v_cache
+        if k5 is None or v is None or k5.dim() != v.dim() + 1:
+            continue
+        key = (id(k5), tuple(k5.shape))
+        if key not in memo:
+            nb, nkh = k5.shape[0], k5.shape[1]
+            memo[key] = k5.view(nb, nkh, v.shape[2], v.shape[3])
+        a.k_cache = memo[key]
+        a.k_cache_packed = k5  # the runner's packed tensor itself (in-kernel decode write target)
+
+
+def write_kv_blocks(k_cache: torch.Tensor, v_cache: torch.Tensor, k_q: torch.Tensor, v_q: torch.Tensor,
+                    slot_mapping: torch.Tensor, block_size: int, packed: bool) -> None:
+    """Full-prefill KV write in whole blocks (one ``index_put_`` row per block and head).
+
+    ``k_q`` / ``v_q``: [nkh * T, d] head-major, already in the cache dtype; T is a whole
+    number of blocks and the step is one single-shot prefill (tokens start at position
+    0, so token chunk c fills one block, the block of its first slot). Padding chunks go
+    to the null block. The pad tail of the last real block holds pad values at slots past
+    the prompt; the decode mask stops at the sequence length, so they are not read before
+    decode writes them. A packed K block gets both lanes of every pair from the new
+    tokens, so the write does not read the cache. ``k_cache`` is the 4-D K view (packed
+    or not), so one (block, head) row is a contiguous [block, d] slab in both layouts.
+    """
+    T = slot_mapping.shape[0]
+    d = k_q.shape[-1]
+    nkh = k_q.shape[0] // T
+    nblk = T // block_size
+    safe = torch.where(slot_mapping < 0, torch.zeros_like(slot_mapping), slot_mapping)
+    if not torch.compiler.is_dynamo_compiling() and not isinstance(slot_mapping, _FakeTensor):
+        blocks = (safe // block_size).view(nblk, block_size)
+        pos = (safe % block_size).view(nblk, block_size)
+        off = torch.arange(block_size, device=pos.device).view(1, -1)
+        ok = (blocks == 0) | ((blocks == blocks[:, :1]) & (pos == off))
+        assert bool(ok.all()), "MuseGlimmer block KV write: prefill slots are not block-aligned"
+    blk = (safe.view(nblk, block_size)[:, 0] // block_size)
+    index = (blk.repeat(nkh), torch.arange(nkh, dtype=blk.dtype, device=blk.device).repeat_interleave(nblk))
+    v_cache.index_put_(index, v_q.reshape(nkh * nblk, block_size, d))
+    if packed:
+        # packed bytes of a block, written through the 4-D K view as [block, d] rows
+        k_rows = k_q.reshape(nkh * nblk, block_size // 2, 2, d).to(torch.bfloat16)
+        k_rows = k_rows.transpose(-1, -2).contiguous().to(k_cache.dtype).view(nkh * nblk, block_size, d)
+    else:
+        k_rows = k_q.reshape(nkh * nblk, block_size, d)
+    k_cache.index_put_(index, k_rows)
+
+
 
 
 def fp8_max() -> float:
@@ -183,8 +373,13 @@ def setup(layers) -> bool:
     """
     fp8 = [is_fp8(l.self_attn.k_cache) for l in layers]
     if not any(fp8):
+        if packed_requested():
+            logger.warning("MuseGlimmer: %s=1 has no effect with a bf16 KV cache", PACKED_ENV)
         for l in layers:
             l.self_attn.kv_fp8 = False
+            l.self_attn.kv_packed = False
+            # Default-on applies to the FP8 cache (measured); a bf16 cache writes in the kernel only on request.
+            l.self_attn.kv_inkernel = os.environ.get(INKERNEL_ENV) is not None and inkernel_mode() == "all"
         return False
     if not all(fp8) or not all(is_fp8(l.self_attn.v_cache) for l in layers):
         raise ValueError("MuseGlimmer FP8 KV: every layer's K and V cache must be FP8")
@@ -194,11 +389,27 @@ def setup(layers) -> bool:
         logger.warning(
             "MuseGlimmer FP8 KV: %s was not set at weight load; V scale is 1.0 (values below "
             "~2e-3 lose precision). Calibrate the per-layer V absmax offline.", SCALES_ENV)
+    packed = [l.self_attn.k_cache.dim() == l.self_attn.v_cache.dim() + 1 for l in layers]
+    if any(packed) and not all(packed):
+        raise ValueError("MuseGlimmer FP8 KV: the packed K layout must cover every layer")
+    if packed_requested() and not packed[0]:
+        raise ValueError(
+            f"{PACKED_ENV}=1 but the runner allocated an unpacked K cache (the packed layout needs "
+            "--kv-cache-dtype fp8 (e4m3) and the V1 model runner)")
+    if packed[0] and layers[0].self_attn.k_cache.dtype != torch.float8_e4m3fn:
+        raise ValueError("MuseGlimmer packed FP8 KV needs float8_e4m3fn")
+    mode = packed_mode()
+    ik = inkernel_mode()
     for l in layers:
         l.self_attn.kv_fp8 = True
+        l.self_attn.kv_packed = packed[0] and (mode == "all" or l.self_attn.sliding_window is None)
+        l.self_attn.kv_inkernel = ik == "all" or (ik == "packed" and l.self_attn.kv_packed)
     logger.info(
         "MuseGlimmer FP8 KV: %d layers, k_dq=%.6g (analytic), v_dq range [%.4g, %.4g] "
-        "(margin %s, scales=%s), fused_mask=%s", len(layers), layers[0].self_attn.k_dq,
-        min(l.self_attn.v_dq for l in layers), max(l.self_attn.v_dq for l in layers),
-        margin, src, fused_mask_allowed())
+        "(margin %s, scales=%s), fused_mask=%s, packed K=%s (%d layers), prefill block write=%s, "
+        "in-kernel decode write=%s", len(layers),
+        layers[0].self_attn.k_dq, min(l.self_attn.v_dq for l in layers), max(l.self_attn.v_dq for l in layers),
+        margin, src, fused_mask_allowed(), packed_mode() if packed[0] else "off",
+        sum(l.self_attn.kv_packed for l in layers), block_write_mode(),
+        f"{ik} ({sum(l.self_attn.kv_inkernel for l in layers)} layers)")
     return True

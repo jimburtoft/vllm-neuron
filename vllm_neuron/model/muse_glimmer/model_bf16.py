@@ -61,6 +61,8 @@ from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.functional.attention.attention_decode import _unswizzle_packed_k, packed_fp8_viable_for_bucket
+from vllm_neuron.functional.attention.attention_decode_mask import maybe_transpose_mask_for_qk_swap
 from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 from vllm_neuron.utils.weight_loader import (
     fused_qkv_weight_loader,
@@ -180,6 +182,12 @@ def _vis_win_chunks(rows: int) -> int:
     return max_window_chunks(rows, WIN_CHUNK)
 
 
+def _swa_ring_on() -> bool:
+    from vllm_neuron import envs
+
+    return bool(envs.VLLM_NEURON_SWA_RING)
+
+
 def _kv_defer_mode() -> int:
     v = os.environ.get(KV_DEFER_ENV, "2").strip()
     if v not in ("0", "1", "2"):
@@ -269,14 +277,31 @@ def _issue_decode_kv_writes(writeback: list, group_of: list[int] | None) -> None
             continue
         attn0 = items[0][1]
         idx = [attn._paged_kv_indices(slot, bsz, k.device) for _li, attn, k, _v, slot, bsz in items]
-        b = torch.cat([i[0] for i in idx])
-        h = torch.cat([i[1] for i in idx])
-        p = torch.cat([i[2] for i in idx])
         d = attn0.head_dim
         kc, vc = attn0.k_cache, attn0.v_cache
+
+        def cat(sel, j):
+            return torch.cat([idx[i][j] for i in sel])
+
         # FP8 KV -> per-layer quantization before the concat (scales differ per layer).
-        kc.index_put_((b, h, p), torch.cat([_kv_fp8.to_cache(it[1], it[2].reshape(-1, d), "k", kc) for it in items]))
-        vc.index_put_((b, h, p), torch.cat([_kv_fp8.to_cache(it[1], it[3].reshape(-1, d), "v", vc) for it in items]))
+        allr = list(range(len(items)))
+        vc.index_put_((cat(allr, 0), cat(allr, 1), cat(allr, 2)),
+                      torch.cat([_kv_fp8.to_cache(it[1], it[3].reshape(-1, d), "v", vc) for it in items]))
+        # K: the members own disjoint blocks of the buffer, and the layout is per layer
+        # (MUSE_GLIMMER_KV_PACKED=global packs only the full-attention layers): unpacked
+        # members in one scatter, packed members in one pair write.
+        for packed in (False, True):
+            sel = [i for i in allr if items[i][1].kv_packed == packed]
+            if not sel:
+                continue
+            k_rows = torch.cat([_kv_fp8.to_cache(items[i][1], items[i][2].reshape(-1, d), "k", kc) for i in sel])
+            b, h, p = cat(sel, 0), cat(sel, 1), cat(sel, 2)
+            if packed:
+                # decode with one token per request: rows never share a packed pair. Multi-token
+                # decode rows are consecutive positions of one request, found at offset 1.
+                _kv_fp8.write_packed_k(kc, k_rows, b, h, p, unique_pairs=all(items[i][1]._decode_s1 for i in sel))
+            else:
+                kc.index_put_((b, h, p), k_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +477,13 @@ class MuseGlimmerAttention(nn.Module):
         self.v_cache = None
         # FP8 KV state, set in bind_kv_cache by kv_fp8.setup (outside the trace).
         self.kv_fp8 = False
+        # Packed FP8 K layout [blocks, nkh, block // 2, d, 2] (MUSE_GLIMMER_KV_PACKED), set in kv_fp8.setup;
+        # k_cache is then bound as the 4-D [blocks, nkh, block, d] view of the same bytes.
+        self.kv_packed = False
+        # decode step with one token per request (trace-time bool, set in forward_decode).
+        self._decode_s1 = False
+        # Decode K/V written inside the megakernel (MUSE_GLIMMER_KV_INKERNEL), set in kv_fp8.setup.
+        self.kv_inkernel = False
         self.k_dq = 1.0
         self.v_dq = 1.0
         _kv_fp8.register_buffers(self)
@@ -557,21 +589,73 @@ class MuseGlimmerAttention(nn.Module):
         head_idx = torch.arange(nkh, dtype=torch.long, device=device).repeat_interleave(n)
         return block_idx, head_idx, pos_idx
 
-    def _write_paged_kv(self, k, v, slot_mapping, block_size):
-        """k, v: [nkh, T, d] -> 4D paged cache [blocks, nkh, block, d]."""
-        idx = self._paged_kv_indices(slot_mapping, block_size, k.device)
-        # fp8 caches quantize (scale + clamp) here; already-fp8 values pass through.
-        self.k_cache.index_put_(idx, _kv_fp8.to_cache(self, k.reshape(-1, self.head_dim), "k", self.k_cache))
-        self.v_cache.index_put_(idx, _kv_fp8.to_cache(self, v.reshape(-1, self.head_dim), "v", self.v_cache))
+    def _prefill_block_write_ok(self, tokens: int, block_size: int, kv_segment_size) -> bool:
+        """Trace-time choice of the whole-block prefill KV write (``kv_fp8.write_kv_blocks``).
 
-    def _fp8_decode_mask(self, attn_metadata, pos, swa_start, B, S, s_prior, block_size):
+        Needs a single-shot prefill (no ``kv_segment_size``, tokens from position 0)
+        and a whole number of blocks. SWA ring layers map position p to ring slot
+        p % R (R = ring slots - 1), which stays linear only while every position is
+        below R, so they take it only for buckets of <= R tokens.
+        """
+        mode = _kv_fp8.block_write_mode()
+        if mode == "off" or (mode == "packed" and not self.kv_packed) or kv_segment_size:
+            return False
+        if block_size <= 0 or tokens % block_size or (self.kv_packed and block_size % 2):
+            return False
+        if self.sliding_window is not None and _swa_ring_on():
+            from vllm_neuron.vllm.core import swa_ring
+
+            if tokens > swa_ring.ring_modulus(self.sliding_window, block_size):
+                return False
+        return True
+
+    def _ring_modulus(self, block_size: int) -> int | None:
+        if self.sliding_window is None or not _swa_ring_on():
+            return None
+        from vllm_neuron.vllm.core import swa_ring
+
+        return swa_ring.ring_modulus(self.sliding_window, block_size)
+
+    def _write_paged_kv(self, k, v, slot_mapping, block_size, block_write: bool = False, decode: bool = False):
+        """k, v: [nkh, T, d] -> 4D paged cache [blocks, nkh, block, d] (packed K: pair writes into the 4-D view)."""
+        # fp8 caches quantize (scale + clamp) here; already-fp8 values pass through.
+        k_q = _kv_fp8.to_cache(self, k.reshape(-1, self.head_dim), "k", self.k_cache)
+        v_q = _kv_fp8.to_cache(self, v.reshape(-1, self.head_dim), "v", self.v_cache)
+        if block_write:
+            _kv_fp8.write_kv_blocks(self.k_cache, self.v_cache, k_q, v_q, slot_mapping, block_size,
+                                    self.kv_packed)
+            return
+        idx = self._paged_kv_indices(slot_mapping, block_size, k.device)
+        if self.kv_packed:
+            _kv_fp8.write_packed_k(self.k_cache, k_q, *idx, unique_pairs=decode,
+                                   ring_modulus=self._ring_modulus(block_size))
+        else:
+            self.k_cache.index_put_(idx, k_q)
+        self.v_cache.index_put_(idx, v_q)
+
+    def _fp8_decode_mask(self, attn_metadata, pos, swa_start, B, S, s_prior, block_size, kernel_layout=False,
+                         fp8_packed=False):
         """full [s_prior, B, q_heads, S] decode mask for the FP8 path, cached per step.
 
         The mask depends only on (sliding, s_prior) and the positions. Every SWA KV group
         gets the same ``swa_kv_pos_offset`` values (same context lengths, window and
         block size), so one mask serves all sliding layers and one all full layers.
+
+        ``kernel_layout``: the gated kernel reads a pre-generated mask in the QK-swap
+        layout [B, q_heads, S, s_prior] when nkilib selects that path for the shape
+        (packed FP8 K, or bf16 KV); the transposed copy is cached too, so it is built
+        once per step instead of once per layer.
         """
         key = f"_mg_kvfp8_mask_{int(self.is_sliding)}_{s_prior}"
+        if kernel_layout:
+            tkey = key + f"_k{int(fp8_packed)}"
+            m = attn_metadata.get(tkey)
+            if m is None:
+                m = maybe_transpose_mask_for_qk_swap(
+                    self._fp8_decode_mask(attn_metadata, pos, swa_start, B, S, s_prior, block_size),
+                    d_head=self.head_dim, is_fp8_kv=True, fp8_packed=fp8_packed)
+                attn_metadata[tkey] = m
+            return m
         m = attn_metadata.get(key)
         if m is not None:
             return m
@@ -628,15 +712,16 @@ class MuseGlimmerAttention(nn.Module):
         k = k.reshape(tokens, self.num_key_value_heads_per_rank, self.head_dim).transpose(0, 1)
         v = v.reshape(tokens, self.num_key_value_heads_per_rank, self.head_dim).transpose(0, 1)
 
-        self._write_paged_kv(k, v, meta["slot_mapping"], meta["block_size"])
-
         kv_segment_size = meta.get("kv_segment_size")
+        self._write_paged_kv(k, v, meta["slot_mapping"], meta["block_size"],
+                             block_write=self._prefill_block_write_ok(tokens, meta["block_size"], kv_segment_size))
+
         if kv_segment_size:
             # Chunked (segmented) prefill: attend over the paged cache, which
             # now holds prior chunks plus this chunk.
             attn_output = NF.segmented_attention(
                 q,
-                k_cache=self.k_cache,
+                k_cache=_kv_fp8.packed_view(self.k_cache) if self.kv_packed else self.k_cache,
                 v_cache=self.v_cache,
                 block_tables=meta["block_table_tensor"],
                 prior_tokens=meta.get("cached_seq_len"),
@@ -644,6 +729,7 @@ class MuseGlimmerAttention(nn.Module):
                 kv_segment_size=kv_segment_size,
                 # FP8 cache read -> K dequant folded into the scale.
                 scale=self.scaling * self.k_dq if self.kv_fp8 else self.scaling,
+                fp8_packed=self.kv_packed,
                 sliding_window=self.sliding_window,
                 tp_q=True,
                 tp_out=True,
@@ -724,9 +810,22 @@ class MuseGlimmerAttention(nn.Module):
 
         k_cache, v_cache = self.k_cache, self.v_cache
         table = block_table
-        if nkh == 1:
-            # 3D [blocks, block, d] cache + 2D table: kernel-eligible.
-            k_cache = k_cache.squeeze(1) if k_cache.dim() == 4 else k_cache
+        packed = self.kv_packed
+        if packed:
+            k_cache = _kv_fp8.packed_view(k_cache)
+        self._decode_s1 = S == 1
+        ik_max = _kv_fp8.inkernel_max_bs()
+        kv_inkernel = self.kv_inkernel and (ik_max == 0 or B <= ik_max)
+        if kv_inkernel and nkh == 1:
+            # In-kernel K/V write: hand the kernel the runner's cache tensors themselves (4-D with the
+            # kv-head dim, packed K 5-D) so its aliased in-place update lands on the bound buffer
+            # without a view in between.
+            k_cache = getattr(self, "k_cache_packed", None) if packed else self.k_cache
+            if k_cache is None:
+                k_cache = _kv_fp8.packed_view(self.k_cache)
+        elif nkh == 1:
+            # 3D [blocks, block, d] cache (packed K: 4D [blocks, block/2, d, 2]) + 2D table: kernel-eligible.
+            k_cache = k_cache.squeeze(1) if k_cache.dim() == (5 if packed else 4) else k_cache
             v_cache = v_cache.squeeze(1) if v_cache.dim() == 4 else v_cache
         elif can_run_kernel(X) and not _decode_torch_forced():
             # GQA reaches the kernel only with a per-head 3D table.
@@ -764,6 +863,16 @@ class MuseGlimmerAttention(nn.Module):
         if self.kv_fp8:
             softmax_scale = self.scaling * self.k_dq
             kv_q = dict(k_scale=self.kv_k_qscale, v_scale=self.kv_v_qscale)
+        if packed:
+            # The packed decode kernel needs the kernel-resized block to keep >= 2 tokens. A bucket
+            # that resizes it to 1 (static per NEFF) reads an unswizzled copy with the unpacked kernel;
+            # the cache write stays outside the kernel, so the copy is read-only.
+            s_prior = table.shape[-1] * block_size
+            if on_kernel and not packed_fp8_viable_for_bucket(
+                    block_size, B, self.num_attention_heads_per_rank, S, s_prior):
+                k_cache = _unswizzle_packed_k(k_cache)
+            else:
+                kv_q["fp8_packed"] = True
         decode_kwargs = dict(
             X=X,
             W_qkv=qkv_w,
@@ -784,6 +893,14 @@ class MuseGlimmerAttention(nn.Module):
             **kv_q,
         )
         decode_kwargs.update(norm_kw)
+        # In-kernel K/V write: the kernel stores this step's K/V at slot_mapping (update_cache=True) and
+        # the deferred scatter is skipped for this layer. The cache it updates must be the bound cache
+        # (or a view of it): the unswizzled copy of a non-viable packed bucket would drop the write.
+        inkernel = kv_inkernel and not (packed and "fp8_packed" not in kv_q and on_kernel)
+        if inkernel:
+            decode_kwargs["update_cache"] = True
+            decode_kwargs["kv_cache_update_idx"] = slot_mapping.view(B, S).to(
+                torch.uint32 if on_kernel else slot_mapping.dtype)
         if use_gate:
             return self._forward_decode_gated(decode_kwargs, qkv_q, attn_metadata, pos, swa_start, B, S, table,
                                               block_size, slot_mapping, kv_writeback)
@@ -802,9 +919,8 @@ class MuseGlimmerAttention(nn.Module):
                 start_pos=swa_start.reshape(1, B * S) if swa_start is not None else None,
                 block_len=block_size,
             )
-            output, K_new, V_new = _torch_attention_decode_impl(
-                attention_mask=mask, **decode_kwargs
-            )
+            res = _torch_attention_decode_impl(attention_mask=mask, **decode_kwargs)
+            output, K_new, V_new = (res, None, None) if inkernel else res
         else:
             if qkv_q:
                 qkv_q = dict(quantization_type_qkv=qkv_q["quantization_type"],
@@ -819,7 +935,7 @@ class MuseGlimmerAttention(nn.Module):
                     # per (sliding, window offset, context) instead of once per layer.
                     mask_kw = dict(attention_mask=self._fp8_decode_mask(
                         attn_metadata, pos, swa_start, B, S, table.shape[-1] * block_size, block_size))
-            output, K_new, V_new = NF.attention_decode(
+            res = NF.attention_decode(
                 **qkv_q,
                 K_cache_transposed=False,
                 transposed_out=False,
@@ -827,6 +943,7 @@ class MuseGlimmerAttention(nn.Module):
                 **mask_kw,
                 **decode_kwargs,
             )
+            output, K_new, V_new = (res, None, None) if inkernel else res
 
         # output: [B, Nq, d, S] -> [B*S, Nq*d]
         attn = output.permute(0, 3, 1, 2).reshape(B * S, self.q_size)
@@ -836,6 +953,10 @@ class MuseGlimmerAttention(nn.Module):
         attn = (attn * gate).to(self.dtype)
         out = self._o_proj_tokens(attn)  # [B*S, H]
 
+        if inkernel:  # the kernel wrote this step's K/V into the cache
+            if self.world_size > 1:
+                self.tp_group.all_reduce(out)
+            return out
         # Manual KV scatter. K_new: [d, B*nkh, S] (torch) / [d, B, nkh, S] or
         # [d, B, S] (kernel); V_new: [B, nkh, S, d].
         k_new = K_new.reshape(d, B, nkh, S).permute(2, 1, 3, 0).reshape(nkh, B * S, d)
@@ -844,7 +965,7 @@ class MuseGlimmerAttention(nn.Module):
             # defer the write past the layer loop (see _issue_decode_kv_writes).
             kv_writeback.append((self.layer_idx, self, k_new, v_new, slot_mapping, block_size))
         else:
-            self._write_paged_kv(k_new, v_new, slot_mapping, block_size)
+            self._write_paged_kv(k_new, v_new, slot_mapping, block_size, decode=self._decode_s1)
 
         # >>> PARALLELISM: TP all-reduce of o_proj partials <<<
         if self.world_size > 1:
@@ -860,7 +981,9 @@ class MuseGlimmerAttention(nn.Module):
         mask_kw = dict(pos_ids=pos, swa_start_pos_ids=swa_start)
         if self.kv_fp8 and not _kv_fp8.fused_mask_allowed():
             mask_kw = dict(attention_mask=self._fp8_decode_mask(
-                attn_metadata, pos, swa_start, B, S, table.shape[-1] * block_size, block_size))
+                attn_metadata, pos, swa_start, B, S, table.shape[-1] * block_size, block_size,
+                kernel_layout=can_run_kernel(kw["X"]) and not _decode_torch_forced(),
+                fp8_packed=bool(kw.get("fp8_packed", False))))
         # FP8 ROW attention weights: gate and o_proj dequantize inside the kernel (qkv via qkv_q; on CPU
         # kw["W_qkv"] is already dequantized and gate_decode dequantizes gate / o_proj itself).
         fp8_w = dict(W_gate_scale=self.gate_proj_w_scale, W_out_scale=self.o_proj_w_scale) if self.fp8 else {}
@@ -872,18 +995,22 @@ class MuseGlimmerAttention(nn.Module):
             rmsnorm_X_gamma=kw.get("rmsnorm_X_gamma"), k_scale=kw.get("k_scale"), v_scale=kw.get("v_scale"),
             # FP8 KV: V dequant folded into the gate (compile-time float; the NEFF then depends on the
             # calibration, unlike the shipping path that reads the kv_v_dq buffer).
-            gate_dq=self.v_dq if self.kv_fp8 else 1.0,
-            force_torch=_decode_torch_forced(), **mask_kw,
+            gate_dq=self.v_dq if self.kv_fp8 else 1.0, fp8_packed=bool(kw.get("fp8_packed", False)),
+            force_torch=_decode_torch_forced(), kv_cache_update_idx=kw.get("kv_cache_update_idx"), **mask_kw,
             **(dict(quantization_type_qkv=qkv_q["quantization_type"], weight_dequant_scale_qkv=qkv_q["qkv_w_scale"])
                if qkv_q else {}))
+        out = out.reshape(B * S, self.hidden_size)
+        if kw.get("update_cache"):  # in-kernel K/V write (MUSE_GLIMMER_KV_INKERNEL)
+            if self.world_size > 1:
+                self.tp_group.all_reduce(out)
+            return out
         nkh, d = self.num_key_value_heads_per_rank, self.head_dim
         k_new = K_new.reshape(d, B, nkh, S).permute(2, 1, 3, 0).reshape(nkh, B * S, d)
         v_new = V_new.reshape(B, nkh, S, d).permute(1, 0, 2, 3).reshape(nkh, B * S, d)
         if kv_writeback is not None:
             kv_writeback.append((self.layer_idx, self, k_new, v_new, slot_mapping, block_size))
         else:
-            self._write_paged_kv(k_new, v_new, slot_mapping, block_size)
-        out = out.reshape(B * S, self.hidden_size)
+            self._write_paged_kv(k_new, v_new, slot_mapping, block_size, decode=self._decode_s1)
         if self.world_size > 1:
             self.tp_group.all_reduce(out)
         return out
@@ -1632,6 +1759,7 @@ class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
         # resolve physical-buffer groups here, never inside the trace.
         lm = self.language_model
         _kv_fp8.setup(lm.layers)  # FP8 KV scales (no-op for a bf16 cache)
+        _kv_fp8.bind_packed_views(lm.layers)  # packed K: bind the 4-D view (writes stay in place)
         lm.kv_ptr_group_of = _resolve_kv_ptr_groups(lm.layers)
         if lm.kv_ptr_group_of is not None:
             groups: dict[int, list[int]] = {}

@@ -59,6 +59,9 @@ def _gated_attention_block_kernel(
     W_gate=None,
     W_gate_scale=None,
     gate_dq: float = 1.0,
+    fp8_packed: bool = False,
+    update_cache: bool = False,
+    kv_cache_update_idx=None,
     W_out_scale=None,
 ):
     return _gated_block(
@@ -89,8 +92,8 @@ def _gated_attention_block_kernel(
         V_cache=V_cache,
         attention_mask=attention_mask,
         sink=None,
-        update_cache=False,
-        kv_cache_update_idx=None,
+        update_cache=update_cache,
+        kv_cache_update_idx=kv_cache_update_idx,
         W_out=W_out,
         bias_out=None,
         quantization_type_out=QuantizationType.ROW if W_out_scale is not None else QuantizationType.NONE,
@@ -101,6 +104,7 @@ def _gated_attention_block_kernel(
         softmax_scale=softmax_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        fp8_packed=fp8_packed,
         sbm=None,
         KVDP=1,
         KVDP_replica_group=None,
@@ -137,12 +141,19 @@ def gated_attention_decode(
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
     gate_dq: float = 1.0,
+    fp8_packed: bool = False,
     force_torch: bool = False,
+    kv_cache_update_idx: Optional[torch.Tensor] = None,
     W_gate_scale: Optional[torch.Tensor] = None,
     W_out_scale: Optional[torch.Tensor] = None,
 ):
-    """See module docstring. ``pos_ids`` (fused mask) XOR a full ``attention_mask`` [S_ctx, B, N, S].
+    """See module docstring. ``pos_ids`` (fused mask) XOR a full ``attention_mask``.
 
+    The full mask is [S_ctx, B, N, S], or [B, N, S, S_ctx] when the kernel takes the QK-swap
+    path for this shape (the caller transposes it, ``maybe_transpose_mask_for_qk_swap``).
+    ``fp8_packed``: K_cache is the packed FP8 layout [blocks, block // 2, d, 2].
+    ``kv_cache_update_idx`` [B, S] (uint32 slots): the kernel writes the new K/V into the caches in place
+    (``update_cache=True``); the returned K/V are then the updated caches, not the new tokens.
     FP8 ROW attention weights (fp8 ``W_qkv`` / ``W_gate`` / ``W_out`` with ``[P_MAX, N]`` per-output-channel
     scales ``weight_dequant_scale_qkv`` / ``W_gate_scale`` / ``W_out_scale``): the kernel dequantizes on PSUM
     eviction; the torch path dequantizes the weights first.
@@ -183,6 +194,9 @@ def gated_attention_decode(
             W_gate=W_gate,
             W_gate_scale=W_gate_scale,
             gate_dq=float(gate_dq),
+            fp8_packed=bool(fp8_packed),
+            update_cache=kv_cache_update_idx is not None,
+            kv_cache_update_idx=kv_cache_update_idx,
             W_out_scale=W_out_scale,
         )
 
@@ -202,11 +216,16 @@ def gated_attention_decode(
         xf = X.to(torch.float32)
         Xn = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + rmsnorm_X_eps)
               * rmsnorm_X_gamma.to(torch.float32)).to(X.dtype)
-    o, K_new, V_new = _torch_attention_decode_impl(
+    o = _torch_attention_decode_impl(
         X=Xn, W_qkv=W_qkv, rmsnorm_QK_pre_rope_enabled=True, rmsnorm_QK_pre_rope_eps=qk_norm_eps,
         cos=cos, sin=sin, rope_contiguous_layout=True, active_blocks_table=active_blocks_table,
         K_cache=K_cache, V_cache=V_cache, attention_mask=attention_mask, softmax_scale=softmax_scale,
-        update_cache=False, W_out=None)
+        update_cache=kv_cache_update_idx is not None, kv_cache_update_idx=kv_cache_update_idx,
+        W_out=None, fp8_packed=fp8_packed)
+    if kv_cache_update_idx is not None:  # torch impl wrote the caches in place and returned only o
+        K_new, V_new = K_cache, V_cache
+    else:
+        o, K_new, V_new = o
     attn = o.permute(0, 3, 1, 2).reshape(B * S, nq * d)  # [B, N, d, S] -> [B*S, N*d]
     gate = torch.sigmoid(Xn.reshape(B * S, H) @ W_gate) * gate_dq
     out = (attn * gate).to(X.dtype) @ W_out
