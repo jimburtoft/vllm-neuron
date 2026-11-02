@@ -87,10 +87,23 @@ def packed_mode() -> str:
 
 
 INKERNEL_ENV = "MUSE_GLIMMER_KV_INKERNEL"
+INKERNEL_MAX_BS_ENV = "MUSE_GLIMMER_KV_INKERNEL_MAX_BS"
+
+
+def inkernel_max_bs() -> int:
+    """``MUSE_GLIMMER_KV_INKERNEL_MAX_BS`` (default 8): largest decode batch bucket that writes K/V in the kernel.
+
+    The in-kernel write takes the separate K/V scatter off the serial path (-1.7 ms per step at
+    batch 1 on trn2), but at batch 64-128 with long context it lengthens the attention kernel,
+    which is already the bottleneck, by more than the deferred scatter costs (about +1 ms).
+    Larger buckets keep the deferred write. ``0`` = no limit.
+    """
+    v = os.environ.get(INKERNEL_MAX_BS_ENV, "").strip()
+    return int(v) if v else 8
 
 
 def inkernel_mode() -> str:
-    """``MUSE_GLIMMER_KV_INKERNEL``: ``off`` (default), ``all`` (``1``) or ``packed``.
+    """``MUSE_GLIMMER_KV_INKERNEL``: ``off`` (``0``), ``all`` (``1``, default) or ``packed``.
 
     Decode writes the new K/V inside the attention megakernel: the kernel runs with
     ``update_cache=True`` and the step's slot mapping, so the layer's K/V write is an
@@ -98,7 +111,7 @@ def inkernel_mode() -> str:
     packed K cache) instead of the deferred ``index_put_`` scatter after the layer loop.
     ``packed``: only the layers with a packed K cache; the others keep the deferred write.
     """
-    v = os.environ.get(INKERNEL_ENV, "0").strip().lower()
+    v = os.environ.get(INKERNEL_ENV, "1").strip().lower()
     v = {"": "off", "0": "off", "false": "off", "1": "all", "true": "all", "yes": "all"}.get(v, v)
     if v not in ("off", "all", "packed"):
         raise ValueError(f"{INKERNEL_ENV}={v!r} not in (0, all, packed)")
@@ -365,7 +378,8 @@ def setup(layers) -> bool:
         for l in layers:
             l.self_attn.kv_fp8 = False
             l.self_attn.kv_packed = False
-            l.self_attn.kv_inkernel = inkernel_mode() == "all"
+            # Default-on applies to the FP8 cache (measured); a bf16 cache writes in the kernel only on request.
+            l.self_attn.kv_inkernel = os.environ.get(INKERNEL_ENV) is not None and inkernel_mode() == "all"
         return False
     if not all(fp8) or not all(is_fp8(l.self_attn.v_cache) for l in layers):
         raise ValueError("MuseGlimmer FP8 KV: every layer's K and V cache must be FP8")

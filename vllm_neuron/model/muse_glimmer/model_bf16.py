@@ -814,7 +814,9 @@ class MuseGlimmerAttention(nn.Module):
         if packed:
             k_cache = _kv_fp8.packed_view(k_cache)
         self._decode_s1 = S == 1
-        if self.kv_inkernel and nkh == 1:
+        ik_max = _kv_fp8.inkernel_max_bs()
+        kv_inkernel = self.kv_inkernel and (ik_max == 0 or B <= ik_max)
+        if kv_inkernel and nkh == 1:
             # In-kernel K/V write: hand the kernel the runner's cache tensors themselves (4-D with the
             # kv-head dim, packed K 5-D) so its aliased in-place update lands on the bound buffer
             # without a view in between.
@@ -894,7 +896,7 @@ class MuseGlimmerAttention(nn.Module):
         # In-kernel K/V write: the kernel stores this step's K/V at slot_mapping (update_cache=True) and
         # the deferred scatter is skipped for this layer. The cache it updates must be the bound cache
         # (or a view of it): the unswizzled copy of a non-viable packed bucket would drop the write.
-        inkernel = self.kv_inkernel and not (packed and "fp8_packed" not in kv_q and on_kernel)
+        inkernel = kv_inkernel and not (packed and "fp8_packed" not in kv_q and on_kernel)
         if inkernel:
             decode_kwargs["update_cache"] = True
             decode_kwargs["kv_cache_update_idx"] = slot_mapping.view(B, S).to(
