@@ -40,7 +40,7 @@ vllm serve meta-models/Muse-Glimmer-30B --tensor-parallel-size 4 \
   --kv-cache-dtype fp8 --max-logprobs 0 --no-enable-prefix-caching \
   --limit-mm-per-prompt '{"image": 1, "video": 0}' --mm-processor-kwargs '{"max_image_tokens": 1024}' \
   --additional-config '{
-    "neuron_config": {"num_batched_tokens_buckets": [512, 1024, 2048, 4096, 8192],
+    "neuron_config": {"num_batched_tokens_buckets": [128, 256, 512, 1024, 2048, 4096, 8192],
                       "num_seqs_buckets": [1, 2, 4, 8, 16, 32, 48, 64, 96, 128],
                       "decode_context_length_buckets": [4096],
                       "on_device_sampling_config": {"all_greedy": true}},
@@ -51,6 +51,7 @@ vllm serve meta-models/Muse-Glimmer-30B --tensor-parallel-size 4 \
 ```
 
 - **The ring needs** single-shot prefill (`--max-num-batched-tokens` = `--max-model-len`), prefix caching off, and no speculative decoding.
+- **Prefill buckets:** the 128 and 256 buckets keep short prompts from padding to 512 tokens. On trn2, a 128-token prompt's time to first token drops from 72 to 54 ms, and peak output at 128 in / 128 out rises from 1,061 to 1,285 tok/s (+21 %; +8 % at 128 / 512). Longer workloads and 6000-token prompts are unchanged, at the same KV size.
 - **Encoder cache:** with the default 128-token cache blocks, 129 blocks (0.2 GiB per core) ran 768 mixed 224x224 / 448x448 image requests at concurrency 128 with no errors. With one 1024-token block per image (`MUSE_GLIMMER_ENC_CACHE_BLOCK=0`), 64 blocks (0.8 GiB) failed the same test with `Encoder cache full`.
 - **Cap:** 0.27 runs everything except long prompts (6000 tokens) late in a full sweep, where runtime DMA buffers no longer fit. 0.21 is clean and has the same peak throughput.
 
