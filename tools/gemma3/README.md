@@ -46,3 +46,26 @@ What the sliding-window settings do (all off by default in the plugin, so other 
   the buckets must be multiples of 256.
 
 The ring refuses segmented prefill, prefix caching and speculative decoding.
+
+## Long context (8K / 16K input)
+
+`run.sh` also has `l8`, `l16`, `s8` and `s16` modes (`offline-l8`, `serve-l16`, `online-s8`, ...), measured on one trn2 device on the public SDK 2.33 DLAMI
+(trn2.3xlarge), greedy, BF16, natural EOS at the cap:
+
+| mode | in / out cap | `--max-model-len` | batch | KV fraction | decode ctx buckets | out tok/s (1 device) | fp32 gate |
+|---|---|---|---|---|---|---:|---|
+| `l8` | 8,192 / 8,192 | 16384 | 38 | 0.60 | [10240,12288,14336] | 901.7 | PASS (max 0.148) |
+| `l16` | 16,384 / 16,384 | 32768 | 20 | 0.55 | [24576] | 409.5-442.8 | PASS (max 0.188, first 2,048 tokens) |
+| `s8` | 8,192 / 512 | 8704 | 60 | 0.60 | - | 531.0 | PASS (max 0.098) |
+| `s16` | 16,384 / 512 | 16896 | 32 | 0.50 | - | 252.5 | PASS (max 0.189) |
+
+The prompts are 8 longer Wikipedia articles (the 2k/4k articles are too short for 16K):
+`python tools/gemma3/long_workload.py prompts-wiki --lengths 8192 16384 --out-prefix <dir>/wiki`, then `PROMPTS_DIR=<dir> bash tools/gemma3/run.sh offline-l8`.
+
+Notes:
+- **Use an even decode batch at >= 8K context.** In our tests, odd `max_num_seqs` / `num_seqs_buckets` (33, 35, 37) at 8K context produced wrong tokens;
+  every even size we tried (32-38) was correct and token-identical.
+- **Compiling the 16K graphs needs a lot of host memory**: about 35-65 GB per compiler process, one per TP rank. On a trn2.3xlarge (128 GB) set `PCW=1`
+  and add a large swap file (the instance NVMe works). The first compile takes several hours. The KV fraction above 0.60 (8K) / 0.50 (16K, short output)
+  fails at model load.
+- The short-output shapes are prefill-bound: one 8K prefill takes about 0.54 s and one 16K prefill about 1.2 s, and prefills run one per step.
