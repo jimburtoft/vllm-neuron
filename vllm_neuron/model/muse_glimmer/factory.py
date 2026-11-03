@@ -90,6 +90,8 @@ class MuseGlimmerForConditionalGeneration(
     supports_encoder_tp_data: ClassVar[bool] = False
     requires_raw_input_tokens: ClassVar[bool] = False
     is_text_generation_model: ClassVar[bool] = True
+    # Several whole prompts per prefill step (vllm_neuron/vllm/core/packed_prefill.py).
+    supports_packed_prefill: ClassVar[bool] = True
 
     def __init__(self, *, vllm_config=None, prefix: str = "", **kwargs) -> None:
         raise RuntimeError(
