@@ -54,7 +54,7 @@ The ring refuses segmented prefill, prefix caching and speculative decoding.
 
 | mode | in / out cap | `--max-model-len` | batch | KV fraction | decode ctx buckets | out tok/s (1 device) | fp32 gate |
 |---|---|---|---|---|---|---:|---|
-| `l8` | 8,192 / 8,192 | 16384 | 38 | 0.60 | [10240,12288,14336] | 901.7 | PASS (max 0.148) |
+| `l8` | 8,192 / 8,192 | 16384 | 37 | 0.58 | [9216,10240,...,15360] (step 1024) | 924.4 | PASS (max 0.243) |
 | `l16` | 16,384 / 16,384 | 32768 | 20 | 0.55 | [24576] | 409.5-442.8 | PASS (max 0.188, first 2,048 tokens) |
 | `s8` | 8,192 / 512 | 8704 | 60 | 0.60 | - | 531.0 | PASS (max 0.098) |
 | `s16` | 16,384 / 512 | 16896 | 32 | 0.50 | - | 252.5 | PASS (max 0.189) |
