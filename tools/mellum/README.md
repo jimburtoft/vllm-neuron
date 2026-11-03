@@ -44,7 +44,7 @@ python tools/mellum/gsm8k_eval.py --backend vllm --model JetBrains/Mellum2.1-12B
 | Check | Result (TP=4, EP=4, one trn2.3xlarge) |
 |---|---|
 | fp32 first-divergence gate, 5 short prompts (to EOS, up to 449 tokens) | PASS, max gap 0.229 |
-| fp32 first-divergence gate, 2 long prompts (3,512 / 2,209 input tokens, 1,024 output) | PASS, max gap 0.192 |
+| fp32 first-divergence gate, 2 long prompts (3,512 / 2,209 input tokens, 1,024 output) | PASS, max gap 0.346 (0.192 in other compiles; bf16 near-ties move between compiles) |
 | Hugging Face bf16 on CPU, same gate (precision floor) | max gap 0.493 |
 | GSM8K, first 100 test questions, greedy, thinking on | 97 % |
 
@@ -52,11 +52,16 @@ python tools/mellum/gsm8k_eval.py --backend vllm --model JetBrains/Mellum2.1-12B
 
 `python tools/mellum/bench.py JetBrains/Mellum2.1-12B-A2.5B-Thinking --ep --n 128 --max-num-seqs 64 --fixed 1024 --max-model-len 2048`
 
-| Batch | Output tok/s (one device) |
+| Batch | Output tok/s (one device, TP=4, EP=4) |
 |---|---|
-| 1 | 102.6 |
-| 32 | 1,743 |
-| 64 | 1,978 |
+| 1 | 102.8 |
+| 32 | 1,818 |
+| 64 | 2,728 |
+| 128 | 2,683 |
 
 GSM8K questions (about 70 input tokens), 1,024 output tokens per request (`--fixed`, EOS ignored), BF16, SDK 2.33
-DLAMI, median of 2 runs after warm-up.
+DLAMI, second of two runs after warm-up. With 4,096 output tokens (`--max-model-len 4608`), batch 64 gives 2,067.
+
+Without `--enable-expert-parallel`, single-request decode is faster (163.8 tok/s) because each token reads 8
+expert slices at 1/4 width, but batch 32 is much slower and prefill falls back to the torch MoE under segmented
+prefill. EP=4 is the recommended layout.
