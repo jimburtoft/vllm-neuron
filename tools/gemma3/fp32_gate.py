@@ -13,7 +13,8 @@ spread of first-divergence gaps across recompiles of one unchanged bf16 configur
 
 Usage: python fp32_gate.py REF.json TARGET.json OUT.json
   REF.json:    {"prompt_token_ids": [...], "generated_token_ids": [...]}  (long_workload.py reference)
-  TARGET.json: the same keys (long_workload.py target)
+  TARGET.json: the same keys (long_workload.py target, or its .variants.json; rows are matched to the
+               reference by prompt)
 Needs ~50 GB RAM for the 12B model in fp32. EQ_THREADS sets the torch thread count.
 """
 import hashlib, json, os, sys, time
@@ -26,7 +27,14 @@ NEAR_TIE = float(os.environ.get("EQ_NEAR_TIE", "0.35"))
 EOS_IDS = (1, 106)
 ref_path, tgt_path, out_path = sys.argv[1:4]
 ref, tgt = json.load(open(ref_path)), json.load(open(tgt_path))
-assert ref["prompt_token_ids"] == tgt["prompt_token_ids"], "target and reference use different prompts"
+if ref["prompt_token_ids"] != tgt["prompt_token_ids"]:
+    # Target rows may be any subset/multiset of the reference prompts (e.g. the <target>.variants.json that
+    # long_workload.py writes): pair each target row with the reference row of the same prompt.
+    idx = {tuple(p): k for k, p in enumerate(ref["prompt_token_ids"])}
+    assert all(tuple(p) in idx for p in tgt["prompt_token_ids"]), "target has prompts that are not in the reference"
+    sel = [idx[tuple(p)] for p in tgt["prompt_token_ids"]]
+    ref = {"prompt_token_ids": [ref["prompt_token_ids"][k] for k in sel],
+           "generated_token_ids": [ref["generated_token_ids"][k] for k in sel]}
 torch.set_num_threads(int(os.environ.get("EQ_THREADS", str(os.cpu_count()))))
 tok = AutoTokenizer.from_pretrained(MODEL)
 

@@ -14,6 +14,8 @@
 # Inputs: PROMPTS_DIR (default tools/gemma3/data, shipped) holding wiki_2048.json / wiki_4096.json. To rebuild them:
 # `python tools/gemma3/long_workload.py prompts-wiki --lengths 2048 4096 --out-prefix <dir>/wiki`.
 # OUT (default ./out) receives the target JSONs and logs. MODEL_ID overrides the checkpoint.
+# offline-*: the gated rows come from a full window of --max-num-seqs requests (the timed decode bucket); every request of
+# every window is checked against them (CORRECTNESS / POINT match_gated_rows; differing copies go to <target>.variants.json).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 MODE=${1:?usage: run.sh offline-|serve-|online- + 2k|4k|l8|l16|s8|s16}

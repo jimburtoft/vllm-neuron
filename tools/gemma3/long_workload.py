@@ -9,7 +9,8 @@ after the first EOS and right-padded with ``<eos>`` so every row has the same le
 
   # 1. build the prompt files (needs `datasets`; downloads part of the Wikipedia dump)
   python long_workload.py prompts-wiki --lengths 2048 4096 --n 8 --out-prefix wiki
-  # 2. vLLM run: correctness rows (the 8 prompts) + timed throughput windows of B requests
+  # 2. vLLM run: a correctness window of B requests (prompts cycled) + timed throughput windows of B requests;
+  #    every request of every window is compared with the gated rows
   python long_workload.py target --prompts wiki_2048.json --out-tokens 2048 --max-model-len 4096 \
       --max-num-seqs 83 --max-num-batched-tokens 2176 --batches 83 --natural-eos --out-file target.json
   # 3. fp32 HF reference on CPU (slow: ~15-60 min per row; use --rows to split across processes)
@@ -115,12 +116,20 @@ def cmd_reference(a):
 
 
 def cmd_target(a):
-    """vLLM run. Correctness pass over the prompt set, then timed windows of B requests (prompts cycled)
-    submitted at once; reports aggregate output tok/s per window."""
+    """vLLM run. A correctness window of B = max(--batches) requests (prompts cycled) submitted at once, then
+    timed windows of B requests; reports aggregate output tok/s per window.
+
+    The gated rows (``generated_token_ids``, one per prompt) come from the correctness window, so they are
+    decoded in the same decode batch bucket as the timed windows (a pass with only the 8 prompts would run
+    in a smaller bucket, i.e. a different compiled graph). Every request of the correctness window and of
+    every timed window is compared with the gated row of its prompt; ``window_check`` records the result.
+    Copies that differ are written to ``<out-file>.variants.json`` (same schema) so they can be gated too.
+    ``--corr-requests`` overrides the correctness window size (``0`` = only the prompt set, the old behavior)."""
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
 
     rows = json.load(open(a.prompts))["prompt_token_ids"]
+    n = len(rows)
     kw = dict(model=MODEL, dtype="bfloat16", max_model_len=a.max_model_len, max_num_seqs=a.max_num_seqs,
               max_num_batched_tokens=a.max_num_batched_tokens, enable_prefix_caching=False,
               gpu_memory_utilization=a.gpu_memory_utilization, tensor_parallel_size=a.tp)
@@ -131,29 +140,56 @@ def cmd_target(a):
         sp = SamplingParams(temperature=0.0, max_tokens=a.out_tokens)
     else:
         sp = SamplingParams(temperature=0.0, max_tokens=a.out_tokens, min_tokens=a.out_tokens, ignore_eos=True)
-    o = llm.generate([TokensPrompt(prompt_token_ids=r) for r in rows], sp, use_tqdm=False)
-    gen = [list(x.outputs[0].token_ids) for x in o]
-    if a.natural_eos:
-        gen = [eos_pad(g, a.out_tokens) for g in gen]
+    norm = (lambda g: eos_pad(g, a.out_tokens)) if a.natural_eos else (lambda g: g)
+    ncorr = max(a.batches) if a.corr_requests is None else max(a.corr_requests, n)
+    ncorr = max(ncorr, n)
+    o = llm.generate([TokensPrompt(prompt_token_ids=rows[i % n]) for i in range(ncorr)], sp, use_tqdm=False)
+    allg = [norm(list(x.outputs[0].token_ids)) for x in o]
+    gen = allg[:n]
+    variants = {}  # (prompt, tuple(tokens)) -> first window it was seen in
+
+    def check(tag, outs):
+        bad = []
+        for j, g in enumerate(outs):
+            if g != gen[j % n]:
+                bad.append(j)
+                variants.setdefault((j % n, tuple(g)), tag)
+        return {"window": tag, "requests": len(outs), "match_gated_rows": len(outs) - len(bad), "mismatch_requests": bad}
+
+    window_check = [check("correctness", allg)]
+    print("CORRECTNESS", json.dumps({"requests": ncorr, "match_gated_rows": window_check[0]["match_gated_rows"]}), flush=True)
     res = {"build_s": round(build_s, 1), "points": []}
     for b in a.batches:
-        batch = [TokensPrompt(prompt_token_ids=rows[i % len(rows)]) for i in range(b)]
+        batch = [TokensPrompt(prompt_token_ids=rows[i % n]) for i in range(b)]
         llm.generate(batch[: min(b, 8)], SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True), use_tqdm=False)
         for rep in range(a.reps):
             t = time.time(); oo = llm.generate(batch, sp, use_tqdm=False); dt = time.time() - t
             lens = [len(x.outputs[0].token_ids) for x in oo]
+            wc = check(f"b{b}_rep{rep}", [norm(list(x.outputs[0].token_ids)) for x in oo])
+            window_check.append(wc)
             pt = {"batch": b, "rep": rep, "wall_s": round(dt, 3), "out_tokens": sum(lens),
                   "out_tokens_per_req_min": min(lens), "out_tokens_per_req_max": max(lens),
                   "out_tok_s": round(sum(lens) / dt, 1), "in_tokens_per_req": len(rows[0]),
-                  "out_tokens_cap": a.out_tokens, "natural_eos": bool(a.natural_eos)}
+                  "out_tokens_cap": a.out_tokens, "natural_eos": bool(a.natural_eos),
+                  "match_gated_rows": wc["match_gated_rows"]}
             res["points"].append(pt)
             print("POINT", json.dumps(pt), flush=True)
     out = {"model": MODEL, "prompt_token_ids": rows, "generated_token_ids": gen, "throughput": res,
+           "correctness_requests": ncorr, "window_check": window_check,
+           "all_requests_match_gated_rows": not variants, "variant_count": len(variants),
            "config": {"tp": a.tp, "max_model_len": a.max_model_len, "max_num_seqs": a.max_num_seqs,
                       "max_num_batched_tokens": a.max_num_batched_tokens, "neuron_config": a.neuron_config},
            "env": {k: v for k, v in os.environ.items() if k.startswith(("VLLM_NEURON_", "GEMMA3_", "NEURON_"))}}
     json.dump(out, open(a.out_file, "w"))
-    print("target written", a.out_file)
+    if variants:
+        vs = sorted(variants.items())
+        json.dump({"model": MODEL, "prompt_token_ids": [rows[p] for (p, _), _ in vs],
+                   "generated_token_ids": [list(g) for (_, g), _ in vs],
+                   "variants": [{"prompt": p, "first_seen": w} for (p, _), w in vs]},
+                  open(a.out_file + ".variants.json", "w"))
+        print("WARNING", len(variants), "request outputs differ from the gated rows; gate", a.out_file + ".variants.json",
+              "as well (its reference rows are the matching prompts of the reference file)", flush=True)
+    print("target written", a.out_file, "all requests match gated rows:", not variants, flush=True)
 
 
 if __name__ == "__main__":
@@ -173,6 +209,8 @@ if __name__ == "__main__":
     t.add_argument("--batches", type=int, nargs="+", required=True); t.add_argument("--reps", type=int, default=2)
     t.add_argument("--neuron-config", default=""); t.add_argument("--out-file", required=True)
     t.add_argument("--natural-eos", action="store_true")
+    t.add_argument("--corr-requests", type=int, default=None,
+                   help="correctness window size (default: max(--batches), the timed window; 0 = the prompt set only)")
     a = ap.parse_args()
     if a.model:
         MODEL = a.model

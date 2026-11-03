@@ -10,6 +10,11 @@ for full speed. The model also runs on the stock NKI Library, more slowly.
 | `run.sh` | The recommended settings: `offline-2k`, `offline-4k`, `serve-2k`, `serve-4k`, `online-2k`, `online-4k` |
 | `long_workload.py` | Builds the Wikipedia prompts, runs the offline benchmark (`target`), builds the fp32 CPU reference (`reference`) |
 | `fp32_gate.py` | Accuracy gate: fp32 HF logits at the first greedy divergence of each prompt |
+
+`long_workload.py target` takes the gated rows from a correctness window of the same size as the timed windows
+(`--batches`), so they are decoded in the same decode batch bucket as the measurement. It compares every request of every
+window with those rows (`window_check` in the output) and writes any differing copies to `<out-file>.variants.json`, which
+`fp32_gate.py` accepts as a target (rows are matched to the reference by prompt).
 | `online_client.py` | Streaming `/v1/completions` client at fixed concurrency (token-ID prompts) |
 | `data/` | The 2,048- and 4,096-token prompts and their fp32 reference outputs (Wikipedia text, CC BY-SA 4.0; see `data/README.md`) |
 
