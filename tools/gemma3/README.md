@@ -63,8 +63,8 @@ The prompts are 8 longer Wikipedia articles (the 2k/4k articles are too short fo
 `python tools/gemma3/long_workload.py prompts-wiki --lengths 8192 16384 --out-prefix <dir>/wiki`, then `PROMPTS_DIR=<dir> bash tools/gemma3/run.sh offline-l8`.
 
 Notes:
-- **Use an even decode batch at >= 8K context.** In our tests, odd `max_num_seqs` / `num_seqs_buckets` (33, 35, 37) at 8K context produced wrong tokens;
-  every even size we tried (32-38) was correct and token-identical.
+- Odd decode batches are supported. Before the GQA-folded decode mask fix (`GEMMA3_MASK_FOLD_KV`, default on), odd batch sizes
+  with 2 KV heads per rank (TP4) gave wrong tokens; the error was largest at >= 8K context.
 - **Compiling the 16K graphs needs a lot of host memory**: about 35-65 GB per compiler process, one per TP rank. On a trn2.3xlarge (128 GB) set `PCW=1`
   and add a large swap file (the instance NVMe works). The first compile takes several hours. The KV fraction above 0.60 (8K) / 0.50 (16K, short output)
   fails at model load.

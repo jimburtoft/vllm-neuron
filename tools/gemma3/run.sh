@@ -34,8 +34,7 @@ export VLLM_NEURON_SWA_ALIGN_TOKENS=1024
 export GEMMA3_PACKED_PREFILL=1
 export VLLM_NEURON_MAX_PREFILLS_PER_BATCH=1
 
-# NSB (num_seqs_buckets): the long-context shapes compile a single decode batch size. At >= 8K context use an EVEN batch:
-# odd decode batches (33, 35, 37) gave wrong tokens at 8K context in our tests.
+# NSB (num_seqs_buckets): the long-context shapes compile a single decode batch size.
 NSB=""; NBT=""
 case "$MODE" in
   *-2k) IN=2048; OUTN=2048; ML=4096; MNS=83; MNBT=2176; FRAC=0.55; BUCKETS="[2560,3072,3584]"; CONC_DEFAULT="32 56 83" ;;
