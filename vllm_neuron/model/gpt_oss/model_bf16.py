@@ -764,6 +764,17 @@ class GptOssAttention(nn.Module):
             k_flash = k.transpose(1, 2)  # [Nh, Dh, T]
             v_flash = v  # [Nh, T, Dh]
 
+            # Packed prefill (several prompts back to back, see
+            # vllm_neuron/vllm/core/packed_prefill.py): per-token [start, end).
+            bounds = {}
+            bmin = attn_metadata[layer_name].get("packed_bound_min")
+            if bmin is not None:
+                bmax = attn_metadata[layer_name]["packed_bound_max"]
+                nh = q_flash.shape[0]
+                bounds = dict(
+                    bound_min=bmin.view(1, tokens, 1).expand(nh, tokens, 1).contiguous(),
+                    bound_max=bmax.view(1, tokens, 1).expand(nh, tokens, 1).contiguous(),
+                )
             attn_output = NF.flash_attention(
                 q_flash,
                 k_flash,
@@ -773,6 +784,7 @@ class GptOssAttention(nn.Module):
                 sink=self.sinks.unsqueeze(1),
                 tp_q=False,
                 tp_out=True,
+                **bounds,
             )  # [Nh, Dh, T]
 
         # ── Step 5: Output Projection ────────────────────────────────────
@@ -1225,11 +1237,12 @@ class GptOssExperts(nn.Module):
         is_decode: bool,
         rank: torch.Tensor,
         rsag_dispatch: bool = False,
+        real_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if is_decode:
             return self.forward_decode(hidden_states, rank, rsag_dispatch=rsag_dispatch)
         else:
-            return self.forward_prefill(hidden_states, positions, rank)
+            return self.forward_prefill(hidden_states, positions, rank, real_tokens)
 
     def _ep_rank_id(self, rank: torch.Tensor):
         """Return the ``[[ep_rank]]`` int32 kernel input as a runtime tensor.
@@ -1349,6 +1362,7 @@ class GptOssExperts(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         rank: torch.Tensor,
+        real_tokens: torch.Tensor | None = None,
     ):
         """Prefill: blockwise MoE with CTE kernel.
 
@@ -1378,7 +1392,12 @@ class GptOssExperts(nn.Module):
         # Must be computed before cross-DP gather since positions from different
         # DP replicas are not monotonically increasing when concatenated.
         padding_mask = None
-        if positions is not None:
+        if real_tokens is not None:
+            # Packed prefill: several prompts, so positions are not monotonic. The
+            # runner passes the number of real tokens (the padding comes last).
+            token_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+            padding_mask = token_indices < real_tokens
+        elif positions is not None:
             last_real_idx = torch.argmax(positions)
             token_indices = torch.arange(positions.shape[0], device=positions.device)
             padding_mask = token_indices <= last_real_idx
@@ -1507,14 +1526,17 @@ class GptOssMLP(nn.Module):
         is_decode: bool,
         rank: torch.Tensor,
         rsag_dispatch: bool = False,
+        real_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states = hidden_states.to(self.dtype)
+        kw = {"real_tokens": real_tokens} if real_tokens is not None else {}
         return self.experts(
             hidden_states,
             positions=positions,
             is_decode=is_decode,
             rank=rank,
             rsag_dispatch=rsag_dispatch,
+            **kw,
         )
 
 
@@ -1836,11 +1858,16 @@ class GptOssDecoderLayer(nn.Module):
 
         # ── MoE Feed-Forward ─────────────────────────────────────────────
         residual = hidden_states
+        # Packed prefill: positions restart per prompt, so the MoE padding mask
+        # comes from the real-token count instead of argmax(positions).
+        meta = attn_metadata.get(f"layers.{self.layer_idx}.self_attn") if attn_metadata else None
+        real_tokens = meta.get("packed_real_tokens") if meta is not None else None
         hidden_states = self.mlp(
             hidden_states,
             positions=positions,
             is_decode=False,
             rank=rank,
+            real_tokens=real_tokens,
         )
         hidden_states = residual + hidden_states
 

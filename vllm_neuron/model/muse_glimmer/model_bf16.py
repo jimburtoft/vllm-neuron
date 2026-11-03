@@ -713,8 +713,15 @@ class MuseGlimmerAttention(nn.Module):
         v = v.reshape(tokens, self.num_key_value_heads_per_rank, self.head_dim).transpose(0, 1)
 
         kv_segment_size = meta.get("kv_segment_size")
+        # Packed prefill (several prompts back to back): per-token [start, end) of the
+        # token's prompt. Attention is block-diagonal; the whole-block KV write needs one
+        # prompt from position 0, so packed steps use the per-token write.
+        bmin = meta.get("packed_bound_min")
+        bmax = meta.get("packed_bound_max")
+        packed = bmin is not None and not kv_segment_size
         self._write_paged_kv(k, v, meta["slot_mapping"], meta["block_size"],
-                             block_write=self._prefill_block_write_ok(tokens, meta["block_size"], kv_segment_size))
+                             block_write=not packed and self._prefill_block_write_ok(
+                                 tokens, meta["block_size"], kv_segment_size))
 
         if kv_segment_size:
             # Chunked (segmented) prefill: attend over the paged cache, which
@@ -738,6 +745,13 @@ class MuseGlimmerAttention(nn.Module):
                 attn_output = (attn_output * self.kv_v_dq).to(self.dtype)  # V dequant, before the gate
         else:
             # attention_cte handles GQA natively (q batch N, kv batch N/groups): no K/V replication.
+            bounds = {}
+            if packed:
+                nq = self.num_attention_heads_per_rank
+                bounds = dict(
+                    bound_min=bmin.view(1, tokens, 1).expand(nq, tokens, 1).contiguous(),
+                    bound_max=bmax.view(1, tokens, 1).expand(nq, tokens, 1).contiguous(),
+                )
             attn_output = NF.flash_attention(
                 q.transpose(1, 2),  # [N, D, T]
                 k.transpose(1, 2),  # [N, D, T]
@@ -746,6 +760,7 @@ class MuseGlimmerAttention(nn.Module):
                 sliding_window=self.sliding_window,
                 tp_q=False,
                 tp_out=True,
+                **bounds,
             )  # [N, D, T]
 
         # <-- MODEL-SPECIFIC: sigmoid output gate before o_proj.
@@ -1336,6 +1351,9 @@ HF_TEXT_PREFIX = "model.language_model"
 @async_speculative_decoding
 class MuseGlimmerForConditionalGeneration(nn.Module, SupportsEagle3):
     """MuseGlimmer multimodal model: text decoder + perception encoder."""
+
+    # Prefill attention honours per-token segment bounds (vllm_neuron/vllm/core/packed_prefill.py).
+    supports_packed_prefill = True
 
     def __init__(self, config: MuseGlimmerConfig):
         super().__init__()

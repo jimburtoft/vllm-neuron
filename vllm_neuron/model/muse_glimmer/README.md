@@ -33,6 +33,8 @@ export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.21
 export VLLM_NEURON_BARRIER_TIMEOUT=14400                  # FP8 prefill graphs compile slowly
 # Sliding-window KV: admit by each request's real peak, free out-of-window blocks after prefill, ring per SWA group
 export VLLM_NEURON_SWA_REAL_ADMISSION=1 VLLM_NEURON_SWA_EARLY_FREE=1 VLLM_NEURON_SWA_RING=1
+# Up to 8 short text prompts share one prefill step (whole prompts, <= 2048 tokens in total)
+export VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8
 export MUSE_GLIMMER_VIS_SMALL_BLOCK=1 MUSE_GLIMMER_VIS_MLP=nki MUSE_GLIMMER_VIS_LN=fused
 
 vllm serve meta-models/Muse-Glimmer-30B --tensor-parallel-size 4 \
@@ -52,6 +54,7 @@ vllm serve meta-models/Muse-Glimmer-30B --tensor-parallel-size 4 \
 
 - **The ring needs** single-shot prefill (`--max-num-batched-tokens` = `--max-model-len`), prefix caching off, and no speculative decoding.
 - **Prefill buckets:** the 128 and 256 buckets keep short prompts from padding to 512 tokens. On trn2, a 128-token prompt's time to first token drops from 72 to 54 ms, and peak output at 128 in / 128 out rises from 1,061 to 1,285 tok/s (+21 %; +8 % at 128 / 512). Longer workloads and 6000-token prompts are unchanged, at the same KV size.
+- **Packed prefill** (`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8`): a prefill step has a large fixed cost, so up to 8 waiting text prompts are prefilled together in one bucket, each with its own positions, KV slots and last-token logits (block-diagonal causal + sliding-window attention). On trn2, peak output at 128 in / 128 out rises from 1,295 to 1,916 tok/s (+48 %) and at 128 / 512 from 2,012 to 2,300 tok/s (+14 %), measured side by side. 1024 / 256 is +3.5 %, 6000-token prompts and c=1 TTFT are unchanged, and greedy accuracy is unchanged (goldens identical, gsm8k within noise). Image, video and structured-output requests still prefill alone. It needs the ring's single-shot prefill (no prefix caching, no speculative decoding).
 - **Encoder cache:** with the default 128-token cache blocks, 129 blocks (0.2 GiB per core) ran 768 mixed 224x224 / 448x448 image requests at concurrency 128 with no errors. With one 1024-token block per image (`MUSE_GLIMMER_ENC_CACHE_BLOCK=0`), 64 blocks (0.8 GiB) failed the same test with `Encoder cache full`.
 - **Cap:** 0.27 runs everything except long prompts (6000 tokens) late in a full sweep, where runtime DMA buffers no longer fit. 0.21 is clean and has the same peak throughput.
 
@@ -146,6 +149,8 @@ The first generated token matched HF on every prompt in all configs. FP8 is clos
 | `VLLM_NEURON_SWA_REAL_ADMISSION` | 0 (set 1) | Admit requests by their real peak KV blocks (sliding-window groups capped at the window) instead of vLLM's worst case, which charges every SWA group the full context |
 | `VLLM_NEURON_SWA_EARLY_FREE` | 0 (set 1) | Free out-of-window sliding-window blocks at the end of prefill (needs REAL_ADMISSION) |
 | `VLLM_NEURON_SWA_RING` | 0 (set 1) | Each sliding-window group keeps a fixed ring of cdiv(window, block) blocks. Decode reads half the KV of the trimmed table, so steps are 12-14 % faster at batch >= 32. Refuses spec decode, prefix caching and chunked prefill. |
+| `VLLM_NEURON_MAX_PREFILLS_PER_BATCH` | 1 (set 8) | Prefill up to N whole text prompts in one step. Prefill buckets up to the packed limit compile one graph with N request rows. Needs single-shot prefill (`--max-num-batched-tokens` = `--max-model-len`), no prefix caching, no speculative decoding, no KV connector. |
+| `VLLM_NEURON_PACKED_PREFILL_MAX_TOKENS` | 2048 | Largest total of real tokens in a packed step, rounded down to a prefill bucket. Larger prompts and larger buckets keep the one-prompt graph. `0` = the largest bucket. |
 | `MUSE_GLIMMER_KV_DEFER` | 2 | Decode KV writes run after the layer loop, one write per physical KV buffer. This avoids a per-step copy of the shared hybrid KV buffers. `0` restores per-layer writes. |
 | `MUSE_GLIMMER_KV_INKERNEL` | 1 (FP8 KV) | Decode writes the step's K/V into the FP8 cache inside the attention kernel instead of a separate scatter after the layer loop: about -1.7 ms per step at batch 1 (20.6 -> 18.9 ms on trn2), output bit-identical. `0` = deferred write everywhere; `packed` = only layers with a packed K cache. With a bf16 cache it is used only when set explicitly. |
 | `MUSE_GLIMMER_KV_INKERNEL_MAX_BS` | 8 | Largest decode batch bucket that uses the in-kernel write. At batch 64-128 with long context the in-kernel write lengthens the attention kernel by about 1 ms, so larger buckets keep the deferred write. `0` = all buckets. |
