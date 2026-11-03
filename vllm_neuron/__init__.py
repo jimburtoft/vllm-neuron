@@ -258,6 +258,10 @@ from vllm_neuron.vllm.patches.port_hold_patch import apply_port_hold_patch
 
 apply_port_hold_patch()
 
+from vllm_neuron.vllm.patches.mellum_config_patch import apply_mellum_config_patch
+
+apply_mellum_config_patch()
+
 # vLLM's pooling path pins host memory via a cached PIN_MEMORY constant; force
 # it off to match NeuronPlatform.is_pin_memory_available() (privateuse1 has no
 # pinned-memory hooks in CPU mode). See the patch module docstring.

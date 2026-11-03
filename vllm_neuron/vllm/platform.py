@@ -276,6 +276,14 @@ class NeuronPlatform(Platform):
         # the Neuron policy before ModelConfig validation constructs the config.
         patch_vllm_config_for_neuron()
 
+        # Mellum: use transformers' MellumConfig (nested per-layer-type RoPE) instead of
+        # vLLM's Qwen3MoeConfig shim. Must run before ModelConfig builds the HF config.
+        from vllm_neuron.vllm.patches.mellum_config_patch import (
+            apply_mellum_config_patch,
+        )
+
+        apply_mellum_config_patch()
+
         if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             from vllm.model_executor.models.registry import ModelRegistry
 

@@ -2,6 +2,7 @@
 import os
 
 from .gemma3 import Gemma3ForCausalLM
+from .mellum import MellumForCausalLM
 from .llama3 import LlamaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM, PEagleLlamaForCausalLM
@@ -32,6 +33,8 @@ def get_models() -> list[tuple[str, type]]:
         # multimodal wrapper name in config.json; both names map to the text-decoder implementation.
         ("Gemma3ForConditionalGeneration", Gemma3ForCausalLM),
         ("Gemma3ForCausalLM", Gemma3ForCausalLM),
+        # Mellum (Qwen3-MoE attention + MoE, 3:1 sliding-window / full schedule).
+        ("MellumForCausalLM", MellumForCausalLM),
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural
