@@ -1582,6 +1582,8 @@ def _precompute_decode_attn_masks(
     num_q_heads_per_rank: int,
     sliding_probe_layer: int,
     global_probe_layer: int,
+    kv_heads_per_rank: int = 1,
+    fold_kv_heads: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(sliding_mask, global_mask)`` for one decode step.
 
@@ -1626,28 +1628,57 @@ def _precompute_decode_attn_masks(
         swa_pos_ids = torch.clamp(swa_pos_ids, min=0)
     swa_start_pos_ids = torch.clamp(swa_pos_ids - config.sliding_window + 1, min=0)
 
-    sliding_mask = NF.gen_attention_decode_mask(
-        pos_ids=swa_pos_ids.to(torch.float32),
-        bs=B_local,
-        q_head=num_q_heads_per_rank,
-        s_active=S_decode,
-        s_prior=S_ctx_swa,
-        start_pos=swa_start_pos_ids.to(torch.float32),
-        block_len=block_size,
+    # GQA fold. With kv_heads_per_rank > 1 the stock decode kernel folds the KV heads
+    # into the batch and runs attention_tkg at (bs = B * kv_heads, q_head = q_heads / kv_heads).
+    # The block-KV mask row order depends on the block_len resize, which depends on whether
+    # the batch is LNC-sharded (bs even) or s_prior-sharded (bs odd). At odd B the unfolded
+    # mask (bs = B, s_prior-sharded) uses half the kernel's resized block_len (bs = 2B, even,
+    # batch-sharded), so every row past the first 128 * block_len positions points at a
+    # different KV slot: recent tokens are dropped and stale slots are attended. Build the
+    # mask in the folded shape the kernel consumes; its memory layout is the same
+    # [S_ctx, B, q_heads, S] (folded batch b * kv_heads + h, head h * q_per_group + j).
+    nkh = kv_heads_per_rank if fold_kv_heads else 1
+    mask_bs = B_local * nkh
+    mask_qh = num_q_heads_per_rank // nkh
+
+    def _fold(p):
+        if nkh == 1:
+            return p
+        return (
+            p.reshape(B_local, 1, S_decode)
+            .expand(B_local, nkh, S_decode)
+            .reshape(1, mask_bs * S_decode)
+        )
+
+    def _unfold(m):
+        return m.reshape(m.shape[0], B_local, num_q_heads_per_rank, S_decode)
+
+    sliding_mask = _unfold(
+        NF.gen_attention_decode_mask(
+            pos_ids=_fold(swa_pos_ids.to(torch.float32)),
+            bs=mask_bs,
+            q_head=mask_qh,
+            s_active=S_decode,
+            s_prior=S_ctx_swa,
+            start_pos=_fold(swa_start_pos_ids.to(torch.float32)),
+            block_len=block_size,
+        )
     )
 
     # --- Full causal mask (the 1-of-6 global layers) ---
     full_max_blocks = attn_metadata[global_layer_name]["max_blocks_per_seq"]
     S_ctx_full = full_max_blocks * block_size
 
-    global_mask = NF.gen_attention_decode_mask(
-        pos_ids=pos_ids_flat.to(torch.float32),
-        bs=B_local,
-        q_head=num_q_heads_per_rank,
-        s_active=S_decode,
-        s_prior=S_ctx_full,
-        start_pos=None,
-        block_len=block_size,
+    global_mask = _unfold(
+        NF.gen_attention_decode_mask(
+            pos_ids=_fold(pos_ids_flat.to(torch.float32)),
+            bs=mask_bs,
+            q_head=mask_qh,
+            s_active=S_decode,
+            s_prior=S_ctx_full,
+            start_pos=None,
+            block_len=block_size,
+        )
     )
 
     return sliding_mask, global_mask
@@ -2075,15 +2106,25 @@ class Gemma3Model(nn.Module):
         sliding_mask = None
         global_mask = None
         if not is_prefill:
+            _attn0 = self.layers[0].self_attn
+            # Fold the mask only for the stock kernel (the torch decode fallback
+            # consumes the unfolded mask). Same selection as forward_decode.
+            _sd = os.environ.get("GEMMA3_STOCK_DECODE", "auto")
+            _B = attn_metadata[f"layers.{self.sliding_probe_layer}.self_attn"][
+                "block_table_tensor"
+            ].shape[0]
+            _stock = (_B >= 2) if _sd == "auto" else (_sd == "1")
+            _stock = _stock and os.environ.get("GEMMA3_DECODE_TORCH", "0") != "1"
             sliding_mask, global_mask = _precompute_decode_attn_masks(
                 config=self.config,
                 attn_metadata=attn_metadata,
                 positions=positions,
-                num_q_heads_per_rank=self.layers[
-                    0
-                ].self_attn.num_attention_heads_per_rank,
+                num_q_heads_per_rank=_attn0.num_attention_heads_per_rank,
                 sliding_probe_layer=self.sliding_probe_layer,
                 global_probe_layer=self.global_probe_layer,
+                kv_heads_per_rank=_attn0.num_key_value_heads_per_rank,
+                fold_kv_heads=_stock
+                and os.environ.get("GEMMA3_MASK_FOLD_KV", "1") == "1",
             )
 
         # <-- X5: DEFERRED + COALESCED KV WRITE-BACK (see _coalesce_kv_writes).
