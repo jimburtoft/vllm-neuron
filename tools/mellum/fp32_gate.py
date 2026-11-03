@@ -9,6 +9,7 @@ bf16 model on CPU reaches a gap of 0.49 on one of these prompts, so 0.35 is a st
 
     python tools/mellum/fp32_gate.py --model JetBrains/Mellum2.1-12B-A2.5B-Thinking --enable-expert-parallel
     python tools/mellum/fp32_gate.py --results out.json          # gate a saved run
+    VLLM_NEURON_SWA_RING=0 python tools/mellum/fp32_gate.py --enable-expert-parallel --sets xlong   # 20k / 40k prompts
 """
 
 import argparse
@@ -47,16 +48,24 @@ def main():
     ap.add_argument("--max-gap", type=float, default=0.35)
     ap.add_argument("--tensor-parallel-size", type=int, default=4)
     ap.add_argument("--enable-expert-parallel", action="store_true")
+    ap.add_argument("--sets", default="short,long", help="comma list of short, long, xlong (20k / 40k-token prompts)")
     a = ap.parse_args()
-    sets = {k: json.load(open(os.path.join(HERE, "data", f"ref_fp32_{k}.json")))["rows"] for k in ("short", "long")}
+    names = a.sets.split(",")
+    sets = {k: json.load(open(os.path.join(HERE, "data", f"ref_fp32_{k}.json")))["rows"] for k in names}
+    xlong = "xlong" in names
+    if xlong and os.environ.get("VLLM_NEURON_SWA_RING", "0") == "1":
+        raise SystemExit("--sets xlong uses segmented prefill: set VLLM_NEURON_SWA_RING=0")
     if a.results:
         out = json.load(open(a.results))
     else:
         from vllm import LLM, SamplingParams
 
+        # 20k / 40k prompts: 48k context with segmented prefill (4,096-token chunks). A single-shot 48k prefill
+        # graph needs more host memory to compile than a trn2.3xlarge has.
+        ml, mnbt = (49152, 4096) if xlong else (8192, 8192)
         llm = LLM(model=a.model, tensor_parallel_size=a.tensor_parallel_size,
-                  enable_expert_parallel=a.enable_expert_parallel, max_model_len=8192, max_num_seqs=8,
-                  max_num_batched_tokens=8192, enable_prefix_caching=False)
+                  enable_expert_parallel=a.enable_expert_parallel, max_model_len=ml, max_num_seqs=2 if xlong else 8,
+                  max_num_batched_tokens=mnbt, enable_prefix_caching=False)
         out = {}
         for k, rows in sets.items():
             n = max(len(r["gen_ids"]) for r in rows)
