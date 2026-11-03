@@ -207,8 +207,10 @@ class MellumAttention(Gemma3Attention):
 # =============================================================================
 
 
-def _per_expert_gate_up_loader(intermediate: int, hidden: int, i_tp: int, num_shards: int, hidden_padded: int):
-    """``[gate_0..gate_{E-1}, up_0..up_{E-1}]`` each ``[I, H]`` -> ``[E, Hp, 2 * I_tp]`` (gate slice first, H zero-padded)."""
+def _per_expert_gate_up_loader(
+    intermediate: int, hidden: int, i_tp: int, num_shards: int, hidden_padded: int, i_padded: int
+):
+    """``[gate_0..gate_{E-1}, up_0..up_{E-1}]`` each ``[I, H]`` -> ``[E, Hp, 2 * Ip]`` (gate slice first; H and I_tp zero-padded)."""
 
     def transform(slices, rank):
         n = len(slices) // 2
@@ -219,7 +221,11 @@ def _per_expert_gate_up_loader(intermediate: int, hidden: int, i_tp: int, num_sh
             for s in (g, u):
                 if tuple(s.get_shape()) != (intermediate, hidden):
                     raise ValueError(f"expert gate/up shape {list(s.get_shape())} != [{intermediate}, {hidden}]")
-            w = torch.cat([g[start : start + i_tp, :], u[start : start + i_tp, :]], dim=0).t()
+            gs, us = g[start : start + i_tp, :], u[start : start + i_tp, :]
+            if i_padded > i_tp:
+                gs = torch.nn.functional.pad(gs, (0, 0, 0, i_padded - i_tp))
+                us = torch.nn.functional.pad(us, (0, 0, 0, i_padded - i_tp))
+            w = torch.cat([gs, us], dim=0).t()
             if hidden_padded > hidden:
                 w = torch.nn.functional.pad(w, (0, 0, 0, hidden_padded - hidden))
             out.append(w)
@@ -228,8 +234,10 @@ def _per_expert_gate_up_loader(intermediate: int, hidden: int, i_tp: int, num_sh
     return SafetensorsWeightLoader(transform=transform)
 
 
-def _per_expert_down_loader(intermediate: int, hidden: int, i_tp: int, num_shards: int, hidden_padded: int):
-    """``[down_0..down_{E-1}]`` each ``[H, I]`` -> ``[E, I_tp, Hp]`` (H zero-padded)."""
+def _per_expert_down_loader(
+    intermediate: int, hidden: int, i_tp: int, num_shards: int, hidden_padded: int, i_padded: int
+):
+    """``[down_0..down_{E-1}]`` each ``[H, I]`` -> ``[E, Ip, Hp]`` (H and I_tp zero-padded)."""
 
     def transform(slices, rank):
         start = (rank % num_shards) * i_tp
@@ -238,8 +246,8 @@ def _per_expert_down_loader(intermediate: int, hidden: int, i_tp: int, num_shard
             if tuple(s.get_shape()) != (hidden, intermediate):
                 raise ValueError(f"expert down shape {list(s.get_shape())} != [{hidden}, {intermediate}]")
             w = s[:, start : start + i_tp].t()
-            if hidden_padded > hidden:
-                w = torch.nn.functional.pad(w, (0, hidden_padded - hidden))
+            if hidden_padded > hidden or i_padded > i_tp:
+                w = torch.nn.functional.pad(w, (0, hidden_padded - hidden, 0, i_padded - i_tp))
             out.append(w)
         return torch.stack(out, 0).contiguous()
 
@@ -304,6 +312,11 @@ class MellumSparseMoeBlock(nn.Module):
         # MELLUM_MOE_PAD_H=0 keeps H unpadded (then prefill must use MELLUM_MOE_PREFILL=torch).
         pad = os.environ.get("MELLUM_MOE_PAD_H", "1") == "1"
         self.hp = ((self.hidden_size + _H_ALIGN - 1) // _H_ALIGN) * _H_ALIGN if pad else self.hidden_size
+        # MELLUM_MOE_PAD_I=1: zero-pad the expert width per rank to a multiple of 128 (exact: silu(0) * 0 = 0).
+        # Off by default: it adds decode bytes and did not fix the TP-sharded prefill kernel issue below.
+        self.i_real = self.i_tp
+        if os.environ.get("MELLUM_MOE_PAD_I", "0") == "1" and self.i_tp % _DECODE_KERNEL_I_ALIGNMENT:
+            self.i_tp = ((self.i_tp + _DECODE_KERNEL_I_ALIGNMENT - 1) // _DECODE_KERNEL_I_ALIGNMENT) * _DECODE_KERNEL_I_ALIGNMENT
 
         self.post_attention_layernorm = MellumRMSNorm(self.hidden_size, self.rms_norm_eps, self.dtype)
         # >>> PARALLELISM: router replicated on every rank <<<
@@ -315,8 +328,12 @@ class MellumSparseMoeBlock(nn.Module):
             torch.empty(self.num_local_experts, self.i_tp, self.hp, dtype=self.dtype)
         )
 
-        gu = _per_expert_gate_up_loader(self.intermediate_size, self.hidden_size, self.i_tp, self.tp_degree, self.hp)
-        dn = _per_expert_down_loader(self.intermediate_size, self.hidden_size, self.i_tp, self.tp_degree, self.hp)
+        gu = _per_expert_gate_up_loader(
+            self.intermediate_size, self.hidden_size, self.i_real, self.tp_degree, self.hp, self.i_tp
+        )
+        dn = _per_expert_down_loader(
+            self.intermediate_size, self.hidden_size, self.i_real, self.tp_degree, self.hp, self.i_tp
+        )
         if self.ep_degree > 1:
             local = list(range(self.ep_rank * self.num_local_experts, (self.ep_rank + 1) * self.num_local_experts))
             gu = expert_parallel_grouped_loader(local, gu, self.num_experts)
@@ -330,6 +347,19 @@ class MellumSparseMoeBlock(nn.Module):
         from vllm_neuron.parallel.neuron_parallel_state import get_neuron_ep_group
 
         return get_neuron_ep_group().rank_in_group_tensor
+
+    def _decode_weights(self, path: str):
+        """Expert weights for the torch decode paths, without the zero H padding when that is faster.
+
+        MELLUM_MOE_DECODE_HSLICE: "auto" (default) slices H for the dense path only; "1" / "0" force it.
+        Measured on trn2 (EP4, TP4): dense at batch 64 2,728 tok/s sliced vs 1,980 padded; the gather at
+        batch 1 36 tok/s sliced (index_select over a non-contiguous view) vs 103 padded.
+        """
+        hs = os.environ.get("MELLUM_MOE_DECODE_HSLICE", "auto")
+        use = (path == "dense") if hs == "auto" else hs == "1"
+        if self.hp > self.hidden_size and use:
+            return self.gate_up_proj_weight[:, : self.hidden_size, :], self.down_proj_weight[..., : self.hidden_size], False
+        return self.gate_up_proj_weight, self.down_proj_weight, True
 
     def _pad_h(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.pad(x, (0, self.hp - self.hidden_size)) if self.hp > self.hidden_size else x
@@ -358,7 +388,13 @@ class MellumSparseMoeBlock(nn.Module):
 
     # ── forward ──────────────────────────────────────────────────────────
 
-    def forward(self, hidden_states: torch.Tensor, is_decode: bool, positions: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        is_decode: bool,
+        positions: torch.Tensor | None = None,
+        segmented: bool = False,
+    ) -> torch.Tensor:
         hidden_states = hidden_states.to(self.dtype)
         if is_decode:
             mode = self._decode_mode(hidden_states.shape[0])
@@ -371,7 +407,7 @@ class MellumSparseMoeBlock(nn.Module):
             if self.world_size > 1:
                 out = self.tp_group.all_reduce(out)
             return out
-        return self._prefill(hidden_states, positions)
+        return self._prefill(hidden_states, positions, segmented)
 
     def _decode_kernel(self, hidden_states):
         """Fused RMSNorm + router + all local experts (nkilib moe_block_tkg)."""
@@ -420,19 +456,23 @@ class MellumSparseMoeBlock(nn.Module):
         x = self.post_attention_layernorm(hidden_states)
         T = x.shape[0]
         topv, topi = self._local_route(*self._route(x))
-        x = self._pad_h(x)
+        w_gu, w_dn, padded = self._decode_weights("gather")
+        if padded:
+            x = self._pad_h(x)
+        hx = x.shape[-1]
         idx = topi.reshape(-1)
         n = T * self.top_k
-        xr = x.unsqueeze(1).expand(T, self.top_k, self.hp).reshape(n, 1, self.hp)
+        xr = x.unsqueeze(1).expand(T, self.top_k, hx).reshape(n, 1, hx)
         ys = []
         for c0 in range(0, n, _GATHER_CHUNK):
             c1 = min(c0 + _GATHER_CHUNK, n)
             ic = idx[c0:c1]
-            gu = torch.bmm(xr[c0:c1], self.gate_up_proj_weight.index_select(0, ic))
+            gu = torch.bmm(xr[c0:c1], w_gu.index_select(0, ic))
             h = torch.nn.functional.silu(gu[..., : self.i_tp]) * gu[..., self.i_tp :]
-            ys.append(torch.bmm(h, self.down_proj_weight.index_select(0, ic)))
-        y = (torch.cat(ys, 0) if len(ys) > 1 else ys[0]).reshape(T, self.top_k, self.hp)
-        return self._unpad_h((y.float() * topv.unsqueeze(-1)).sum(1).to(self.dtype))
+            ys.append(torch.bmm(h, w_dn.index_select(0, ic)))
+        y = (torch.cat(ys, 0) if len(ys) > 1 else ys[0]).reshape(T, self.top_k, hx)
+        out = (y.float() * topv.unsqueeze(-1)).sum(1).to(self.dtype)
+        return self._unpad_h(out) if padded else out
 
     def _dense(self, x, topv, topi):
         """Every local expert on every token, weighted by the (local) affinity."""
@@ -442,25 +482,28 @@ class MellumSparseMoeBlock(nn.Module):
             lo = self._ep_rank_tensor().to(torch.long) * self.num_local_experts
             cols = torch.arange(self.num_local_experts, device=x.device, dtype=torch.long) + lo
             aff = aff.index_select(1, cols)
-        gu = torch.einsum("th,ehi->eti", self._pad_h(x), self.gate_up_proj_weight)
+        w_gu, w_dn, padded = self._decode_weights("dense")
+        gu = torch.einsum("th,ehi->eti", self._pad_h(x) if padded else x, w_gu)
         h = torch.nn.functional.silu(gu[..., : self.i_tp]) * gu[..., self.i_tp :]
-        y = torch.einsum("eti,eih->eth", h, self.down_proj_weight)
-        return self._unpad_h((y.float() * aff.t().unsqueeze(-1)).sum(0).to(self.dtype))
+        y = torch.einsum("eti,eih->eth", h, w_dn)
+        out = (y.float() * aff.t().unsqueeze(-1)).sum(0).to(self.dtype)
+        return self._unpad_h(out) if padded else out
 
     def _decode_dense(self, hidden_states):
         x = self.post_attention_layernorm(hidden_states)
         topv, topi = self._route(x)
         return self._dense(x, topv, topi)
 
-    def _prefill(self, hidden_states, positions=None):
+    def _prefill(self, hidden_states, positions=None, segmented=False):
         """SP shard -> norm + router -> all-gather -> experts -> reduce-scatter."""
         x = self.post_attention_layernorm(hidden_states)
-        # The blockwise kernel gave wrong prefill output on trn2 with I/rank = 224 (TP4 without EP) under
-        # segmented prefill, while the torch MoE and the kernel at I/rank = 896 (EP4) passed. Default to the
-        # torch MoE when I/rank is not a multiple of 128.
+        # The blockwise kernel gave wrong prefill output on trn2 at TP4 without EP (experts' I sharded 4 ways,
+        # I/rank 224, also with I zero-padded to 256) under segmented prefill with 1,024-token chunks. It passed
+        # single-shot prefill at the same layout, and every case with whole experts per rank (EP4). "auto" uses
+        # the kernel unless the experts are I-sharded AND the prefill is segmented.
         mode = os.environ.get("MELLUM_MOE_PREFILL", "auto")
         if mode == "auto":
-            mode = "kernel" if self.i_tp % _DECODE_KERNEL_I_ALIGNMENT == 0 else "torch"
+            mode = "torch" if (self.tp_degree > 1 and segmented) else "kernel"
         if mode == "torch":
             topv, topi = self._route(x)
             if self.world_size > 1:
@@ -557,7 +600,8 @@ class MellumDecoderLayer(nn.Module):
             kv_writeback=kv_writeback,
         )
         hidden_states = residual + hidden_states
-        return hidden_states + self.mlp(hidden_states, is_decode=is_decode, positions=positions)
+        segmented = bool(m.get("kv_segment_size"))
+        return hidden_states + self.mlp(hidden_states, is_decode=is_decode, positions=positions, segmented=segmented)
 
 
 # =============================================================================
