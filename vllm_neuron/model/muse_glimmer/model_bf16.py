@@ -673,6 +673,54 @@ class MuseGlimmerAttention(nn.Module):
 
     # ── prefill ─────────────────────────────────────────────────────────
 
+    def _fp8_chunked_prefill(self, q, k, v, meta, kv_segment_size, tokens):
+        """Chunked prefill over an unpacked FP8 KV cache (the segmented kernel cannot read it).
+
+        q: [N, T, D]; k, v: [nkh, T, D] for this chunk (bf16, already written to the cache).
+        The prior tokens are read back from the paged cache: the blocks just before this chunk
+        (the sliding window for sliding layers, the whole table for global layers), gathered by
+        block with a static shape and dequantized to the compute dtype. They are passed to flash
+        attention as the prefix, left-aligned: slot j of the prefix is token first*block + j, and
+        ``prior_used_len`` = the number of real prior tokens in the window, so slots past it
+        (unwritten, or this chunk's own tokens) are ignored and the relative positions of prefix
+        and chunk tokens are exact. Returns [N, D, T].
+        """
+        bsz = meta["block_size"]
+        prior = meta["cached_seq_len"].reshape(-1)[0].to(torch.int64)
+        table = meta["block_table_tensor"][0]  # prefill is one request per step
+        span_blocks = table.shape[0]
+        if self.sliding_window:
+            # Queries see at most W-1 prior tokens: whole blocks, plus one for an unaligned prior.
+            nblk = min(-(-(self.sliding_window - 1) // bsz) + 1, span_blocks)
+        else:
+            nblk = span_blocks
+        end_blk = torch.div(prior + bsz - 1, bsz, rounding_mode="floor")  # blocks holding [0, prior)
+        first = torch.clamp(end_blk - nblk, min=0)
+        idx = torch.clamp(first + torch.arange(nblk, device=table.device, dtype=torch.int64),
+                          max=span_blocks - 1)
+        blocks = table.index_select(0, idx).clamp_min(0).to(torch.int64)
+        kc = self.k_cache.index_select(0, blocks)  # [nblk, nkh, bsz, D] fp8
+        vc = self.v_cache.index_select(0, blocks)
+        nkh, D = kc.shape[1], kc.shape[-1]
+        L = nblk * bsz
+        kp = kc.permute(1, 0, 2, 3).reshape(nkh, L, D)
+        vp = vc.permute(1, 0, 2, 3).reshape(nkh, L, D)
+        kp = (kp.to(torch.float32) * self.k_dq).to(self.dtype)
+        vp = (vp.to(torch.float32) * self.kv_v_dq.reshape(1, 1, 1)).to(self.dtype)
+        valid = torch.clamp(prior - first * bsz, min=0, max=L).to(torch.int32).reshape(1)
+        return NF.flash_attention(
+            q.transpose(1, 2),  # [N, D, T]
+            k.transpose(1, 2),  # [nkh, D, T]
+            v,  # [nkh, T, D]
+            scale=self.scaling,
+            sliding_window=self.sliding_window,
+            tp_q=False,
+            tp_out=True,
+            k_prior=kp.transpose(1, 2).contiguous(),  # [nkh, D, L]
+            v_prior=vp.contiguous(),  # [nkh, L, D]
+            prior_used_len=valid,
+        )  # [N, D, T]
+
     def forward_prefill(
         self,
         hidden_states: torch.Tensor,
@@ -723,7 +771,13 @@ class MuseGlimmerAttention(nn.Module):
                              block_write=not packed and self._prefill_block_write_ok(
                                  tokens, meta["block_size"], kv_segment_size))
 
-        if kv_segment_size:
+        if kv_segment_size and self.kv_fp8 and not self.kv_packed:
+            # Chunked prefill over an unpacked FP8 cache (MUSE_GLIMMER_KV_FP8_CHUNKED): the
+            # segmented kernel cannot read it, so gather the prior chunks' K/V from the cache,
+            # dequantize to the compute dtype and run flash attention with them as the prefix.
+            # This chunk's K/V come straight from the projection (bf16), as in single-shot prefill.
+            attn_output = self._fp8_chunked_prefill(q, k, v, meta, kv_segment_size, tokens)
+        elif kv_segment_size:
             # Chunked (segmented) prefill: attend over the paged cache, which
             # now holds prior chunks plus this chunk.
             attn_output = NF.segmented_attention(

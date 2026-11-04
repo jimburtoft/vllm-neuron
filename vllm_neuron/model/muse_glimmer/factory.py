@@ -145,6 +145,13 @@ class MuseGlimmerForConditionalGeneration(
         )
 
     @classmethod
+    def supports_fp8_kv_chunked_prefill(cls, hf_config: PretrainedConfig) -> bool:
+        """Chunked prefill reads the unpacked FP8 KV cache in the model (``MUSE_GLIMMER_KV_FP8_CHUNKED``)."""
+        from .kv_fp8 import fp8_chunked_enabled
+
+        return fp8_chunked_enabled()
+
+    @classmethod
     def get_vision_token_merge_factor(cls, hf_config: PretrainedConfig) -> int:
         return hf_config.vision_config.merge_size**2
 

@@ -329,6 +329,19 @@ def to_cache(attn, x: torch.Tensor, which: str, cache: torch.Tensor) -> torch.Te
     return quantize(x, attn.kv_k_qscale if which == "k" else attn.kv_v_qscale, cache.dtype)
 
 
+CHUNKED_ENV = "MUSE_GLIMMER_KV_FP8_CHUNKED"
+
+
+def fp8_chunked_enabled() -> bool:
+    """``MUSE_GLIMMER_KV_FP8_CHUNKED`` (default 1): chunked prefill over the unpacked FP8 cache.
+
+    Later prefill chunks gather the prior K/V from the FP8 cache, dequantize them and run flash
+    attention with them as the prefix (``model_bf16._fp8_chunked_prefill``), so the FP8 cache
+    no longer needs ``max_num_batched_tokens >= max_model_len``. ``0`` keeps the old rule.
+    """
+    return os.environ.get(CHUNKED_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 def _check_single_shot_prefill() -> None:
     """FP8 KV needs single-shot prefill (max_num_batched_tokens >= max_model_len).
 
@@ -344,7 +357,18 @@ def _check_single_shot_prefill() -> None:
         mml = vc.model_config.max_model_len
     except Exception:  # pragma: no cover - config not available (unit use)
         return
-    if mnbt is not None and mml is not None and mnbt < mml:
+    if mnbt is not None and mml is not None and mnbt < mml and fp8_chunked_enabled():
+        # Chunked prefill reads the prior chunks through the segmented path, which the runner
+        # turns on only when mnbt is a supported segment size (its default). Without it later
+        # chunks would attend to themselves alone (wrong tokens, no error).
+        from vllm_neuron.utils.bucket_utils import SUPPORTED_KV_SEGMENT_SIZES
+
+        if mnbt not in SUPPORTED_KV_SEGMENT_SIZES:
+            raise ValueError(
+                f"MuseGlimmer FP8 KV chunked prefill needs max_num_batched_tokens in "
+                f"{sorted(SUPPORTED_KV_SEGMENT_SIZES)} (the segment size); got {mnbt} < "
+                f"max_model_len={mml}.")
+    if mnbt is not None and mml is not None and mnbt < mml and not fp8_chunked_enabled():
         raise ValueError(
             f"MuseGlimmer FP8 KV cache needs single-shot prefill: max_num_batched_tokens={mnbt} < "
             f"max_model_len={mml}. Chunked prefill would need segmented attention over the FP8 "
@@ -358,7 +382,7 @@ def _check_single_shot_prefill() -> None:
     # prefill buckets and makes the scheduler budget mml.
     spec = getattr(vc, "speculative_config", None)
     draft = int(getattr(spec, "max_num_new_slots_for_drafting", 0) or 0) if spec is not None else 0
-    if draft and mnbt is not None and mml is not None and (mnbt - draft) // 64 * 64 < mml:
+    if draft and not fp8_chunked_enabled() and mnbt is not None and mml is not None and (mnbt - draft) // 64 * 64 < mml:
         raise ValueError(
             f"MuseGlimmer FP8 KV cache with speculative decoding needs max_num_batched_tokens >= "
             f"max_model_len + 64 (draft slots {draft}, rounded to the KV block), e.g. "
