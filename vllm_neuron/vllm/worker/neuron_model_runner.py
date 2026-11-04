@@ -11192,7 +11192,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """
         cache_dtype = self.vllm_config.cache_config.cache_dtype
         kv_is_fp8 = isinstance(cache_dtype, str) and cache_dtype.startswith("fp8")
-        return kv_is_fp8 and not self.neuron_config.fp8_packed_kv
+        if not kv_is_fp8 or self.neuron_config.fp8_packed_kv:
+            return False
+        # A model whose prefill attention reads an unpacked FP8 cache itself (instead
+        # of through the segmented kernel) opts in with
+        # ``supports_fp8_kv_chunked_prefill(hf_config) -> bool``.
+        try:
+            from vllm_neuron.model.registry import get_models
+
+            hf_config = self.vllm_config.model_config.hf_config
+            model_cls = dict(get_models()).get(hf_config.architectures[0])
+            hook = getattr(model_cls, "supports_fp8_kv_chunked_prefill", None)
+            if hook is not None and hook(hf_config):
+                return False
+        except Exception:  # pragma: no cover - registry unavailable (unit use)
+            pass
+        return True
 
     @staticmethod
     def _k_cache_alloc_shape(
