@@ -68,6 +68,7 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 from vllm_neuron.model.kv_cache import build_per_head_slot_mapping
+from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
 
 from .config import LlamaConfig
@@ -991,10 +992,12 @@ class LlamaAttention(nn.Module):
         nkh = self.num_key_value_heads_per_rank
         if (
             nkh > 1
+            and S_decode == 1
             and self.attention_dp_size == 1
             and not dcp_active
             and not self.fp8_packed
             and self.k_cache.dim() == 4
+            and can_run_kernel(hidden_states)
         ):
             active_blocks_table = build_per_head_block_table(block_table, nkh).to(
                 torch.int32
