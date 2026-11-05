@@ -251,6 +251,21 @@ class Qwen3ASRConfig:
     audio_end_token_id: int = 151670
     tie_word_embeddings: bool = True
 
+    # Text-decoder fields at the top level. The runner and the speculative
+    # decoding hooks read ``model.config.hidden_size`` / ``.vocab_size`` (the
+    # padded hidden size the target emits, the vocab of the rejection sampler).
+    @property
+    def hidden_size(self) -> int:
+        return self.text_config.hidden_size
+
+    @property
+    def vocab_size(self) -> int:
+        return self.text_config.vocab_size
+
+    @property
+    def num_hidden_layers(self) -> int:
+        return self.text_config.num_hidden_layers
+
     @classmethod
     def from_configs(
         cls,

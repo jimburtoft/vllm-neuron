@@ -164,7 +164,7 @@ def test_forward_consumes_the_reorder_arguments():
     def language_model(input_ids, positions, **kw):
         seen["ids"] = input_ids.clone()
         seen["kw"] = set(kw)
-        return torch.zeros(input_ids.shape[0], 4)
+        return torch.zeros(input_ids.shape[0], 4), []
 
     stub = SimpleNamespace(
         world_size=1,
@@ -179,7 +179,7 @@ def test_forward_consumes_the_reorder_arguments():
     out = Qwen3ASRForConditionalGeneration.forward(
         stub,
         host,
-        torch.zeros(4, dtype=torch.int32),
+        positions=torch.zeros(4, dtype=torch.int32),
         attn_metadata=meta,
         sampling_positions=torch.arange(4),
         async_reorder_future=torch.tensor([101, 102, 103, 0], dtype=torch.int32),
@@ -191,7 +191,7 @@ def test_forward_consumes_the_reorder_arguments():
     assert out.shape == (4, 4)
     # Without the arguments the host ids pass through (prefill / no-reorder steps).
     Qwen3ASRForConditionalGeneration.forward(
-        stub, host, torch.zeros(4, dtype=torch.int32), attn_metadata=meta,
+        stub, host, positions=torch.zeros(4, dtype=torch.int32), attn_metadata=meta,
         sampling_positions=torch.arange(4),
     )
     assert seen["ids"].tolist() == host.tolist()

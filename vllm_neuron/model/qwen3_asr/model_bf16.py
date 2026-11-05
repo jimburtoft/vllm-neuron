@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.model_executor.models.interfaces import SupportsEagle3
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
@@ -55,6 +56,7 @@ from .config import Qwen3ASRConfig, Qwen3ASRTextConfig
 from .utils.audio_preprocessing import plan_audio_blocks
 from .utils.merge_audio_embeds import merge_audio_embeddings
 from vllm_neuron.functional.lmhead_argmax import lmhead_argmax
+from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 
 logger = logging.getLogger(__name__)
 
@@ -1101,6 +1103,10 @@ class Qwen3ASRTextModel(nn.Module):
             tp_group=self.tp_group.device_group,
         )
 
+        # Speculative decoding target: the runner sets the layers whose input
+        # (pre-layer residual stream) is captured, via set_aux_hidden_state_layers.
+        self.aux_hidden_state_layers: list[int] = []
+
         # <-- MODEL-SPECIFIC: 28 decoder layers (Qwen3-ASR-1.7B)
         self.layers = nn.ModuleList(
             [
@@ -1138,7 +1144,14 @@ class Qwen3ASRTextModel(nn.Module):
         encoder_embedding_buffer: torch.Tensor | None = None,
         encoder_block_ids: torch.Tensor | None = None,
         encoder_positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Run the text decoder.
+
+        Returns ``(hidden_states, aux_hidden_states)``. ``aux_hidden_states`` holds
+        the input of each layer in ``aux_hidden_state_layers`` (empty unless a
+        speculative draft is configured). The audio rows are merged into the
+        residual before layer 0, so the captured states carry the audio context.
+        """
         first_layer_name = "layers.0.self_attn"
         max_query_len = attn_metadata[first_layer_name]["max_query_len"]
         decode_token_threshold = attn_metadata[first_layer_name][
@@ -1186,7 +1199,10 @@ class Qwen3ASRTextModel(nn.Module):
             positions, device=hidden_states.device, dtype=hidden_states.dtype
         )
 
-        for decoder_layer in self.layers:
+        aux_hidden_states = []
+        for idx, decoder_layer in enumerate(self.layers):
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states)
             hidden_states = decoder_layer(
                 hidden_states,
                 positions=positions,
@@ -1199,8 +1215,11 @@ class Qwen3ASRTextModel(nn.Module):
         # >>> PARALLELISM: SP — all-gather to reconstruct full sequence <<<
         if is_prefill and self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
+            aux_hidden_states = [
+                self.tp_group.all_gather(aux, dim=0) for aux in aux_hidden_states
+            ]
 
-        return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 # =============================================================================
@@ -1208,11 +1227,16 @@ class Qwen3ASRTextModel(nn.Module):
 # =============================================================================
 
 
-class Qwen3ASRForConditionalGeneration(nn.Module):
+@async_speculative_decoding
+class Qwen3ASRForConditionalGeneration(nn.Module, SupportsEagle3):
     """Composed Qwen3-ASR model: audio encoder + Qwen3 text decoder.
 
-    Decode-only today (see module docstring). ``SupportsEncoderWarmup`` and the
-    audio-fusion path are added in the fusion/bucket follow-up commits.
+    Speculative decoding target (DFlash): ``SupportsEagle3`` lets the runner set
+    the aux hidden-state layers. ``forward`` then returns the captured layer
+    inputs concatenated on the hidden dim, and on a verify step (``S = 1 + K``
+    tokens per request) runs the greedy rejection sampler on device. The
+    drafter aliases ``language_model.embed_tokens`` and ``lm_head`` through the
+    ``model`` alias below. The hidden dim is not padded (tail layout).
     """
 
     # Bare flag, not the SupportsTranscription protocol: the upstream Qwen3-ASR
@@ -1448,9 +1472,18 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         encoder_embedding_buffer: torch.Tensor | None = None,
         encoder_block_ids: torch.Tensor | None = None,
         encoder_positions: torch.Tensor | None = None,
+        spec_decode_metadata=None,
         **kwargs,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Audio-prefill / text-decode step."""
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Audio-prefill / text-decode / speculative-verify step.
+
+        Returns, with on-device sampling:
+          * no draft configured: ``(sampled_tokens, gathered_logits)``
+          * draft configured, no verify: ``(sampled_tokens, aux, gathered_logits)``
+          * verify step: ``(rejection_sampled_tokens, aux, gathered_logits)``; the
+            ``@async_speculative_decoding`` wrapper appends the last accepted token.
+        ``aux`` is the concatenation of the captured layer inputs, ``[T, n * H]``.
+        """
         positions = positions.to(torch.int32)
 
         first_layer_name = "layers.0.self_attn"
@@ -1501,7 +1534,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 f"Use a prompt with length > {self.world_size} and divisible by {self.world_size}."
             )
 
-        hidden_states = self.language_model(
+        hidden_states, aux_hidden_states = self.language_model(
             input_ids,
             positions,
             attn_metadata=attn_metadata,
@@ -1513,27 +1546,60 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             encoder_positions=encoder_positions,
         )
 
+        # One tensor out of the NEFF, not a list (the drafter reads [T, n * H]).
+        aux = torch.cat(aux_hidden_states, dim=-1) if aux_hidden_states else None
+
         hidden_states_for_logits = torch.index_select(
             hidden_states, dim=0, index=sampling_positions
         )
+        gathered_logits = None
         if self._fused_lmhead and logit_mask is None:
             # greedy token ids straight from the hidden states; the [B, V] logits never exist
             sampled_tokens = lmhead_argmax(hidden_states_for_logits, self.lm_head.weight)
-            return sampled_tokens, None
-        logits = self.lm_head(hidden_states_for_logits)
+        else:
+            logits = self.lm_head(hidden_states_for_logits)
 
-        gathered_logits = None
-        if self._gather_logits:
-            gathered_logits = self.tp_group.all_gather(logits, dim=1)
+            if self._gather_logits:
+                gathered_logits = self.tp_group.all_gather(logits, dim=1)
 
-        if self.on_device_sampling_config is None:
-            return logits
+            if self.on_device_sampling_config is None:
+                return logits if aux is None else (logits, aux)
 
-        sampled_tokens = self.sampler(
-            logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
-        )
+            sampled_tokens = self.sampler(
+                logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
+            )
 
+        if spec_decode_metadata is not None:
+            from vllm_neuron.nn.rejection_sampler import rejection_sampler
+
+            sampled_tokens = rejection_sampler(spec_decode_metadata, sampled_tokens)
+        if aux is not None:
+            return sampled_tokens, aux, gathered_logits
         return sampled_tokens, gathered_logits
+
+    # ------------------------------------------------------------------
+    # Speculative decoding target interface (Eagle3 / DFlash)
+    # ------------------------------------------------------------------
+
+    @property
+    def model(self) -> nn.Module:
+        """The text decoder, under the name the drafters alias from (``embed_tokens``)."""
+        return self.language_model
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Capture the input of each layer in ``layers`` (pre-layer convention)."""
+        if layers is not None and self.language_model is not None:
+            n = len(self.language_model.layers)
+            bad = [i for i in layers if not 0 <= i < n]
+            if bad:
+                raise ValueError(f"aux hidden-state layers {bad} out of range [0, {n})")
+            self.language_model.aux_hidden_state_layers = list(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        if self.language_model.aux_hidden_state_layers:
+            return tuple(self.language_model.aux_hidden_state_layers)
+        n = len(self.language_model.layers)
+        return (2, n // 2, n - 3)
 
     # ------------------------------------------------------------------
     # KV cache wiring (text layers)
