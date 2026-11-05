@@ -44,6 +44,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+from vllm.model_executor.models.interfaces import SupportsEagle3
+
 from vllm_neuron.model.kv_cache import (
     KVSpec,
     LayerSpec,
@@ -1763,6 +1765,9 @@ class WhisperDecoder(nn.Module):
         self.cross_active = os.environ.get("WHISPER_CROSS_ACTIVE", "0") == "1"
         # Read one time (see DecoderLayer.__init__).
         self.spec_rows = spec_rows_mode()
+        # Speculative decoding (DFlash): capture the residual stream before these
+        # layers (== the output of layer id - 1, before the final layer norm).
+        self.aux_layers: tuple[int, ...] = ()
 
     def bind_cross_kv(self, owner: WhisperCrossKVEncoder) -> None:
         """Point the cross-KV reads at the module that owns the buffers.
@@ -1886,7 +1891,10 @@ class WhisperDecoder(nn.Module):
         sa0 = self.layers[0].self_attn
         if sa0.self_kernel and not is_prefill:
             self_meta = self._self_kernel_inputs(x, sa0, meta, positions)
+        aux = []
         for i, layer in enumerate(self.layers):
+            if i in self.aux_layers:
+                aux.append(x)
             cross_k = getattr(owner, f"cross_k_{i}")
             cross_v = getattr(owner, f"cross_v_{i}")
             if mode in ("kernel", "mqa", "xkernel"):
@@ -1953,6 +1961,8 @@ class WhisperDecoder(nn.Module):
                 slots=slots if all_slots else None, cross_meta=cross_meta,
                 perm=onehot if mode == "perm" else None, self_meta=self_meta,
             )
+        if self.aux_layers:
+            return self.layer_norm(x), aux
         return self.layer_norm(x)
 
     def _self_kernel_inputs(self, x, sa, meta, positions):
@@ -2075,7 +2085,7 @@ class WhisperDecoder(nn.Module):
 # --------------------------------------------------------------------------- #
 # Top-level model
 # --------------------------------------------------------------------------- #
-class WhisperForConditionalGeneration(nn.Module):
+class WhisperForConditionalGeneration(nn.Module, SupportsEagle3):
     """Native Whisper large-v3 (encoder-decoder) for the vLLM Neuron runner.
 
     The runner reads ``supports_transcription`` and
@@ -2157,7 +2167,8 @@ class WhisperForConditionalGeneration(nn.Module):
             self.sampler = Sampler(self.on_device_sampling_config, process_group=tp_group)
         # Speculative decoding: the model is the target of a draft-model proposer.
         # Read one time: a read in forward adds a guard.
-        self.spec_decode = _current_spec_method() == "draft_model" and config.layer_name_prefix == "decoder"
+        self.spec_method = _current_spec_method() if config.layer_name_prefix == "decoder" else None
+        self.spec_decode = self.spec_method in ("draft_model", "dflash")
         self.aux_hidden_state_layers = ()
         object.__setattr__(self, "_draft_cross_kv", None)
         # The runner sends the previous step's rejection output to a model with this
@@ -2364,11 +2375,18 @@ class WhisperForConditionalGeneration(nn.Module):
 
     # ── speculative decoding (target side) ────────────────────────────────
     def set_aux_hidden_state_layers(self, layers) -> None:
-        """The draft-model proposer reads no target hidden states. Accept and ignore the layers."""
-        self.aux_hidden_state_layers = tuple(layers or ())
+        """Capture the decoder residual stream before each of ``layers`` (DFlash).
+
+        The runner passes ``target_layer_id + 1`` for each DFlash target layer, so the
+        captured state is the output of that layer before the final layer norm, the
+        HF ``hidden_states[target_layer_id + 1]``. The draft-model proposer reads no
+        target hidden states and sets no layers.
+        """
+        self.aux_hidden_state_layers = tuple(int(x) for x in (layers or ()))
+        self.decoder.aux_layers = self.aux_hidden_state_layers
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        return ()
+        return self.aux_hidden_state_layers
 
     # ── KV cache ──────────────────────────────────────────────────────────
     def get_kv_spec(self) -> KVSpec:
@@ -2529,6 +2547,11 @@ class WhisperForConditionalGeneration(nn.Module):
         is_prefill = meta["max_query_len"] > meta["decode_token_threshold"]
 
         hidden_states = self.decoder(input_ids, positions, attn_metadata, is_prefill)
+        aux_states = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_list = hidden_states
+            # One [T, n_layers * d] tensor, concatenated inside the graph.
+            aux_states = torch.cat(aux_list, dim=-1)
         if sampling_positions is not None:
             hidden_states = torch.index_select(hidden_states, 0, sampling_positions)
 
@@ -2545,9 +2568,11 @@ class WhisperForConditionalGeneration(nn.Module):
         if not self.spec_decode:
             return sampled, None
         # Speculative decoding target: the runner expects (tokens, aux hidden
-        # states, gathered logits). The draft reads no hidden states, so give a
-        # one-element placeholder.
-        aux = torch.zeros(1, dtype=torch.int32, device=sampled.device)
+        # states, gathered logits). DFlash reads the captured decoder states; the
+        # draft-model proposer reads none, so give it a one-element placeholder.
+        aux = aux_states
+        if aux is None:
+            aux = torch.zeros(1, dtype=torch.int32, device=sampled.device)
         if spec_decode_metadata is not None:
             from vllm_neuron.nn.rejection_sampler import rejection_sampler
 

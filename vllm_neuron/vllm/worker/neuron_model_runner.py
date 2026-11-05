@@ -96,6 +96,10 @@ from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.dflash import DFlashProposer
 from vllm_neuron.vllm.spec_decode.draft_model import DraftModelProposer
+from vllm_neuron.vllm.spec_decode.whisper_dflash import (
+    WhisperDFlashProposer,
+    is_whisper_target,
+)
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
@@ -1238,7 +1242,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             elif self.speculative_config.method == "dflash":
                 self.is_dflash_spec = True
-                self.drafter = DFlashProposer(
+                # An encoder-decoder Whisper target has its own DFlash draft (audio context,
+                # model-owned K/V slots, the target's tied head).
+                proposer_cls = (
+                    WhisperDFlashProposer
+                    if is_whisper_target(self.vllm_config)
+                    else DFlashProposer
+                )
+                self.drafter = proposer_cls(
                     self.vllm_config, self.device, self.on_device_sampling
                 )
             elif self.speculative_config.method == "draft_model":
@@ -1852,6 +1863,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     **drafter.compile_kwargs,
                 )
                 drafter.attach_target(self.model)
+            elif isinstance(drafter, WhisperDFlashProposer):
+                drafter.recompile()
+                drafter.attach_target(self.model)
 
     def load_model(self) -> None:
         """Load the NeuronModel."""
@@ -2284,7 +2298,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 target_hidden_pad_groups=target_hidden_pad_groups,
                 compile_options=self.compile_options,
             )
-            if isinstance(self.drafter, DraftModelProposer):
+            if isinstance(self.drafter, (DraftModelProposer, WhisperDFlashProposer)):
                 self.drafter.attach_target(self.model)
             logger.info("Draft model loading complete (moved to device and compiled)")
 
