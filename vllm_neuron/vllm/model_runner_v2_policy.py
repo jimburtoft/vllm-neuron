@@ -43,7 +43,9 @@ UNSUPPORTED_V2_NEURON_RUNNER_ARCHITECTURES = frozenset(
 
 # Architectures whose V2 debug-logits emission path has been validated
 # (adapter returns gathered logits and the writer's row selection is correct).
-_DEBUG_LOGITS_V2_ARCHITECTURES = frozenset({"LlamaForCausalLM", "GptOssForCausalLM"})
+_DEBUG_LOGITS_V2_ARCHITECTURES = frozenset(
+    {"LlamaForCausalLM", "MistralForCausalLM", "GptOssForCausalLM"}
+)
 
 # Neuron component data-parallel fields. These shard attention/embedding/MLP/LM-head work across cores
 # and are NOT covered by vLLM's data_parallel_size, so a DI decode server can set them with
