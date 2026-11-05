@@ -31,8 +31,8 @@ MODEL ENV GATES (read at trace time; Dynamo folds them):
                       T * top_k <= local experts, else every local expert on every token ("dense").
                       "gather" / "dense" force one; "kernel": fused moe_block_tkg (bf16 router;
                       needs I/rank % 128 == 0).
-  MELLUM_MOE_PREFILL  "auto" (default): blockwise moe_cte kernel when I/rank % 128 == 0 (EP4 on one
-                      device), else the dense torch MoE. "kernel" / "torch" force a path.
+  MELLUM_MOE_PREFILL  "kernel" (default): blockwise moe_cte kernel (MELLUM_MOE_CTE_IO picks its
+                      hidden-state dtype). "torch": dense torch MoE.
   MELLUM_DECODE_ATTN  "stock" (default): fused attention_block_tkg decode kernel.
                       "torch": the plugin's torch reference of the same kernel.
 """
@@ -497,13 +497,12 @@ class MellumSparseMoeBlock(nn.Module):
     def _prefill(self, hidden_states, positions=None, segmented=False):
         """SP shard -> norm + router -> all-gather -> experts -> reduce-scatter."""
         x = self.post_attention_layernorm(hidden_states)
-        # The blockwise kernel gave wrong prefill output on trn2 at TP4 without EP (experts' I sharded 4 ways,
-        # I/rank 224, also with I zero-padded to 256) under segmented prefill with 1,024-token chunks. It passed
-        # single-shot prefill at the same layout, and every case with whole experts per rank (EP4). "auto" uses
-        # the kernel unless the experts are I-sharded AND the prefill is segmented.
-        mode = os.environ.get("MELLUM_MOE_PREFILL", "auto")
-        if mode == "auto":
-            mode = "torch" if (self.tp_degree > 1 and segmented) else "kernel"
+        # MELLUM_MOE_PREFILL: "kernel" (default, nkilib blockwise moe_cte) or "torch" (dense torch MoE).
+        mode = os.environ.get("MELLUM_MOE_PREFILL", "kernel")
+        if mode == "diff":
+            # Diagnostic: the kernel on layers MELLUM_MOE_DIFF_LAYER="lo:hi" only, the torch MoE elsewhere.
+            lo, hi = (int(v) for v in os.environ.get("MELLUM_MOE_DIFF_LAYER", "-1:-1").split(":"))
+            mode = "kernel" if lo <= self._layer_idx <= hi else "torch"
         if mode == "torch":
             topv, topi = self._route(x)
             if self.world_size > 1:
@@ -549,13 +548,22 @@ class MellumSparseMoeBlock(nn.Module):
             num_experts_per_token=self.top_k,
             block_size=self.block_size,
             moe_group=self.ep_tp_group,
-            tp_degree=self.tp_degree,
+            # MELLUM_MOE_MAP_SHARD=1: split the mapping across the MoE TP ranks. Default 0: every rank maps
+            # all local experts (identical result, measured on trn2).
+            tp_degree=self.tp_degree if os.environ.get("MELLUM_MOE_MAP_SHARD", "0") == "1" else 1,
             padding_mask=padding_mask,
         )
+        # MELLUM_MOE_CTE_IO: hidden-state dtype in and out of the blockwise kernel. The kernel accumulates a token's
+        # top-k expert contributions by read-modify-write on its output buffer, so with bf16 I/O the sum is rounded
+        # to bf16 up to top_k (8) times. With the experts' I sharded across ranks (TP4 without EP) that moved a real
+        # near-tie on trn2 (fp32 gap 1.74 under segmented prefill); fp32 I/O removed it. "auto" (default): fp32 when
+        # the experts are I-sharded, bf16 with whole experts per rank (EP4, validated in bf16). "fp32" / "bf16" force.
+        io = os.environ.get("MELLUM_MOE_CTE_IO", "auto")
+        cte_io_fp32 = io == "fp32" or (io == "auto" and self.tp_degree > 1)
         out = NF.moe_cte(
             implementation=MoECTEImplementation.shard_on_block,
             conditions=conditions,
-            hidden_states=self._pad_h(x),
+            hidden_states=self._pad_h(x).float() if cte_io_fp32 else self._pad_h(x),
             expert_affinities_masked=aff_masked,
             gate_up_proj_weight=self.gate_up_proj_weight.reshape(self.num_local_experts, self.hp, 2, self.i_tp),
             down_proj_weight=self.down_proj_weight,
@@ -566,9 +574,12 @@ class MellumSparseMoeBlock(nn.Module):
             expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
             skip_token=True,
             is_tensor_update_accumulating=True,
+            # compute_dtype=fp32 gave up to 30 % per-token error at I=896 on trn2 (nkilib 2.33); keep bf16.
             compute_dtype=nl.bfloat16,
         )
         out = self._unpad_h(out)
+        if cte_io_fp32:
+            out = out.to(self.dtype)
         if self.world_size > 1:
             out = self.tp_group.reduce_scatter(out, dim=0)
         return out
@@ -585,6 +596,7 @@ class MellumDecoderLayer(nn.Module):
         self.input_layernorm = MellumRMSNorm(config.hidden_size, config.rms_norm_eps, config.torch_dtype)
         self.self_attn = MellumAttention(config, layer_idx=layer_idx)
         self.mlp = MellumSparseMoeBlock(config)
+        self.mlp._layer_idx = layer_idx
         self.layer_idx = layer_idx
 
     def forward(self, hidden_states, positions, position_embeddings, attn_mask=None, attn_metadata=None, kv_writeback=None):

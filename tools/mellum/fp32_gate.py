@@ -49,6 +49,7 @@ def main():
     ap.add_argument("--tensor-parallel-size", type=int, default=4)
     ap.add_argument("--enable-expert-parallel", action="store_true")
     ap.add_argument("--sets", default="short,long", help="comma list of short, long, xlong (20k / 40k-token prompts)")
+    ap.add_argument("--max-num-batched-tokens", type=int, default=0, help="override (e.g. 1024: segmented prefill)")
     a = ap.parse_args()
     names = a.sets.split(",")
     sets = {k: json.load(open(os.path.join(HERE, "data", f"ref_fp32_{k}.json")))["rows"] for k in names}
@@ -63,6 +64,7 @@ def main():
         # 20k / 40k prompts: 48k context with segmented prefill (4,096-token chunks). A single-shot 48k prefill
         # graph needs more host memory to compile than a trn2.3xlarge has.
         ml, mnbt = (49152, 4096) if xlong else (8192, 8192)
+        mnbt = a.max_num_batched_tokens or mnbt
         llm = LLM(model=a.model, tensor_parallel_size=a.tensor_parallel_size,
                   enable_expert_parallel=a.enable_expert_parallel, max_model_len=ml, max_num_seqs=2 if xlong else 8,
                   max_num_batched_tokens=mnbt, enable_prefix_caching=False)
