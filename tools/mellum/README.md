@@ -28,8 +28,8 @@ vllm serve JetBrains/Mellum2.1-12B-A2.5B-Thinking --tensor-parallel-size 4 --ena
   sliding-window layers keep a fixed ring of window blocks per request and are charged their real KV peak. The ring
   refuses segmented prefill and prefix caching: set `VLLM_NEURON_SWA_RING=0` to use them (and then pick a
   `--max-num-batched-tokens` below `--max-model-len`).
-- `--enable-expert-parallel`: 16 experts per rank with the full expert width (896), which lets the prefill
-  expert kernel run. Without it each rank holds all 64 experts at width 224, and prefill uses the torch MoE.
+- `--enable-expert-parallel`: 16 experts per rank with the full expert width (896). Without it each rank holds all
+  64 experts at width 224; the prefill expert kernel then runs with fp32 hidden-state I/O (see the model README).
 - The thinking traces are long (GSM8K: about 550 tokens on average, up to several thousand). Size
   `--max-model-len` for the output you allow.
 
@@ -64,8 +64,9 @@ GSM8K questions (about 70 input tokens), 1,024 output tokens per request (`--fix
 DLAMI, second of two runs after warm-up. With 4,096 output tokens (`--max-model-len 4608`), batch 64 gives 2,067.
 
 Without `--enable-expert-parallel`, single-request decode is faster (163.8 tok/s) because each token reads 8
-expert slices at 1/4 width, but batch 32 is much slower and prefill falls back to the torch MoE under segmented
-prefill. EP=4 is the recommended layout.
+expert slices at 1/4 width, and long-prompt prefill is faster (`vllm serve`, 4,096-token prompts, 64 concurrent:
+TTFT p50 6.6 s vs 16.8 s with EP=4), but decode at 16-32 concurrent requests is about half as fast. Pick EP=4 for
+mixed traffic and short prompts, no EP for long prompts or single-stream latency.
 
 ## Online serving (`vllm bench serve`)
 
