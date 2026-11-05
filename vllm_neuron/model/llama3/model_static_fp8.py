@@ -67,6 +67,9 @@ from vllm_neuron.utils.weight_loader import (
     with_rank_override,
 )
 
+from vllm_neuron.model.kv_cache import build_per_head_slot_mapping
+from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
+
 from .config import LlamaConfig
 from .model import (
     _DECODE_MASK_CACHE_KEY,
@@ -981,6 +984,25 @@ class LlamaAttention(nn.Module):
             _unswizzle_packed_k(self.k_cache) if packed_fallback else self.k_cache
         )
 
+        # GQA with more than one KV head per rank reaches the fused decode
+        # kernel only with a per-head 3D block table and per-head update slots
+        # (see LlamaAttention.forward_decode).
+        kv_cache_update_idx = slot_mapping.view(B_local, S_decode).to(torch.uint32)
+        nkh = self.num_key_value_heads_per_rank
+        if (
+            nkh > 1
+            and self.attention_dp_size == 1
+            and not dcp_active
+            and not self.fp8_packed
+            and self.k_cache.dim() == 4
+        ):
+            active_blocks_table = build_per_head_block_table(block_table, nkh).to(
+                torch.int32
+            )
+            kv_cache_update_idx = build_per_head_slot_mapping(
+                slot_mapping, block_size, nkh, B_local
+            ).to(torch.uint32)
+
         # The packed-fallback bucket hands the kernel a COMPUTED TEMPORARY, whose
         # aliased in-kernel write is dropped; consume the alias OUTPUT instead.
         _needs_k_back = packed_fallback
@@ -1009,7 +1031,7 @@ class LlamaAttention(nn.Module):
             softmax_scale=self.scaling / self.k_scale_float,
             sink=None,
             update_cache=True,
-            kv_cache_update_idx=slot_mapping.view(B_local, S_decode).to(torch.uint32),
+            kv_cache_update_idx=kv_cache_update_idx,
             W_out=self.o_proj_weight,
             bias_out=None,
             quantization_type_out=QuantizationType.STATIC,
