@@ -59,6 +59,7 @@ One Trn2 device, LNC=2: `--tensor-parallel-size 4`, with or without `--enable-ex
 | SWA ring / real admission / early free | ✅ | `VLLM_NEURON_SWA_RING=1` etc. The ring refuses segmented prefill and prefix caching |
 | Segmented prefill / prefix caching | ✅ | With the ring off. Gate PASS at EP=4 with APC on, three repeats |
 | Reasoning parser (`qwen3`), tool calls (`hermes`) | ✅ | `vllm serve` |
+| Packed prefill (several prompts per prefill step) | ✅ | `VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8`. Whole-prompt prefill only (`--max-num-batched-tokens` >= `--max-model-len`, no prefix caching, no speculation, no DP); the model refuses other configurations |
 | MTP speculative decoding | ❌ | The checkpoint has no MTP head |
 | FP8 weights / KV | ❌ | Not implemented |
 
@@ -75,4 +76,5 @@ One Trn2 device, LNC=2: `--tensor-parallel-size 4`, with or without `--enable-ex
 | `MELLUM_MOE_DECODE_HSLICE` | `auto` | The dense decode path reads only the real 2,304 H rows of the padded experts. `1` / `0` force it for both paths |
 | `MELLUM_MOE_PAD_I` | `0` | `1`: zero-pad the expert width per rank to a multiple of 128 |
 | `MELLUM_MOE_PAD_MASK` | `1` | Padding rows take no expert blocks in prefill |
+| `VLLM_NEURON_MAX_PREFILLS_PER_BATCH` | `1` | `N > 1`: pack up to N waiting prompts into one prefill step (per-request attention bounds and MoE padding mask) |
 | `MELLUM_DECODE_ATTN` | `stock` | `torch`: torch reference of the decode attention kernel (CPU mode at TP=1) |

@@ -68,6 +68,26 @@ expert slices at 1/4 width, and long-prompt prefill is faster (`vllm serve`, 4,0
 TTFT p50 6.6 s vs 16.8 s with EP=4), but decode at 16-32 concurrent requests is about half as fast. Pick EP=4 for
 mixed traffic and short prompts, no EP for long prompts or single-stream latency.
 
+## Packed prefill
+
+`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8` lets one prefill step take up to 8 waiting prompts (whole-prompt prefill
+only: keep `--max-num-batched-tokens` = `--max-model-len` and prefix caching off). Same server as below, TP=4,
+EP=4, 64 concurrent requests unless noted:
+
+| Input / output | Output tok/s, 1 -> 8 per step | TTFT p50 (ms) | TPOT p50 (ms) |
+|---|---:|---:|---:|
+| 128 / 128 | 946 -> 1,542 (+63 %) | 2,472 -> 816 | 48.7 -> 35.4 |
+| 512 / 128 | 728 -> 1,014 (+39 %) | 3,783 -> 2,216 | 58.8 -> 46.2 |
+| 128 / 1,024 | 1,852 -> 2,046 (+10 %) | 2,465 -> 808 | 32.2 -> 30.5 |
+| 128 / 1,024, concurrency 16 | 993 -> 1,040 (+5 %) | 666 -> 312 | 15.5 -> 15.1 |
+| 512 / 1,024 | 1,728 -> 1,885 (+9 %) | 3,780 -> 2,220 | 33.4 -> 31.8 |
+| 1,024 / 1,024 | 1,575 -> 1,699 (+8 %) | 5,646 -> 4,161 | 35.1 -> 33.6 |
+| 4,096 / 1,024 | 1,032 -> 1,054 (+2 %) | 16,761 -> 16,330 | 45.7 -> 44.8 |
+
+GSM8K-100 97 % -> 96 % (within noise; 3 vs 4 misses, 2 in common). Packing changes which requests share a step,
+so greedy tokens move at bf16 near-ties (fp32 gate max gap 0.66 vs 0.35 unpacked; every divergence is a near-tie
+with the token in the fp32 top 5).
+
 ## Online serving (`vllm bench serve`)
 
 One server, `--max-model-len 8192 --max-num-seqs 64 --max-num-batched-tokens 8192 --no-enable-prefix-caching`,
