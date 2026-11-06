@@ -207,7 +207,7 @@ def test_forward_appends_the_ext_slot():
     def language_model(input_ids, positions, **kw):
         seen["ids"] = input_ids.clone()
         seen["kw"] = set(kw)
-        return torch.zeros(input_ids.shape[0], 4)
+        return torch.zeros(input_ids.shape[0], 4), []
 
     stub = SimpleNamespace(
         world_size=1,
@@ -222,7 +222,7 @@ def test_forward_appends_the_ext_slot():
     Qwen3ASRForConditionalGeneration.forward(
         stub,
         host,
-        torch.zeros(3, dtype=torch.int32),
+        positions=torch.zeros(3, dtype=torch.int32),
         attn_metadata=meta,
         sampling_positions=torch.arange(3),
         async_reorder_future=torch.zeros(3, dtype=torch.int32),

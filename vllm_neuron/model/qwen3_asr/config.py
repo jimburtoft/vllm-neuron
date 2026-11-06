@@ -15,6 +15,7 @@ from dataclasses import dataclass, fields
 import torch
 from transformers import PretrainedConfig
 
+from vllm_neuron.model.config_utils import hoist_rope_parameters
 from vllm_neuron.model.neuron_config import EncoderNeuronConfig, NeuronConfig
 from vllm_neuron.model.qwen3_asr.utils.audio_preprocessing import (
     _ATTN_SEQ_ALIGN,
@@ -48,6 +49,7 @@ def _from_hf_sub_config(cls, hf_sub_config, neuron_config=None):
     else:
         raise TypeError(f"Unsupported config type: {type(hf_sub_config)}")
 
+    config_dict = hoist_rope_parameters(config_dict)
     field_names = {f.name for f in fields(cls)}
     filtered = {k: v for k, v in config_dict.items() if k in field_names}
 
@@ -248,6 +250,21 @@ class Qwen3ASRConfig:
     audio_start_token_id: int = 151669
     audio_end_token_id: int = 151670
     tie_word_embeddings: bool = True
+
+    # Text-decoder fields at the top level. The runner and the speculative
+    # decoding hooks read ``model.config.hidden_size`` / ``.vocab_size`` (the
+    # padded hidden size the target emits, the vocab of the rejection sampler).
+    @property
+    def hidden_size(self) -> int:
+        return self.text_config.hidden_size
+
+    @property
+    def vocab_size(self) -> int:
+        return self.text_config.vocab_size
+
+    @property
+    def num_hidden_layers(self) -> int:
+        return self.text_config.num_hidden_layers
 
     @classmethod
     def from_configs(

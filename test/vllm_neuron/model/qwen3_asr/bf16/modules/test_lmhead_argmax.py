@@ -81,7 +81,7 @@ class _StandIn(torch.nn.Module):
         self._gather_logits = False
         self._fused_lmhead = fused
         self.on_device_sampling_config = SimpleNamespace(all_greedy=True)
-        self.language_model = lambda *a, **k: hidden
+        self.language_model = lambda *a, **k: (hidden, [])
         self.lm_head = lambda x: torch.matmul(x, w)
         self.sampler = lambda logits, *a, **k: torch.argmax(logits, -1).to(torch.int32)
 
@@ -92,7 +92,7 @@ def _forward(stand_in, T, B, is_prefill, logit_mask=None):
     pos = torch.arange(T)
     sp = torch.tensor([T - 1]) if is_prefill else torch.arange(B)
     return Qwen3ASRForConditionalGeneration.forward(
-        stand_in, torch.zeros(T, dtype=torch.long), pos, attn_metadata=md, sampling_positions=sp,
+        stand_in, torch.zeros(T, dtype=torch.long), positions=pos, attn_metadata=md, sampling_positions=sp,
         logit_mask=logit_mask, rank=torch.tensor(0)
     )
 
