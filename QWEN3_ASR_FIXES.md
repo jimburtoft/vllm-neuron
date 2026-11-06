@@ -63,6 +63,15 @@ These are for the full champion stack: this branch plus the champion nkilib. The
 | **champion + low-latency completion off + async decode + prefill reorder** (same session as the default row: 317.7–318.8 ms) | 44.8–45.5 ms | 3.12 ms | 316–318 ms (neutral) |
 | **same + prefill bucket 416** (same session with bucket 512: 318.3–321.2 ms) | 45.4–46.0 ms | 3.12 ms | 317–318 ms (neutral) |
 
+**8 s clips** (2026-11-05, same stack, 8,192 × 8 s Earnings22 per run, C=384, 3 interleaved reps):
+
+| config | RTFx | TTFT p50 |
+|---|---|---|
+| the 30 s config above (prefill buckets incl. 416, decode bucket [512]) | 1,828–1,836 | 166–171 ms |
+| **8 s-tuned**: `num_batched_tokens_buckets [128,256,512,1024]`, `decode_context_length_buckets [256,512]` | **1,840–1,847** | 188–197 ms |
+
+An 8 s clip is a 117-token prompt, so it already fits the 128 prefill bucket, and the 8 s-tuned buckets add only ~0.7 %. A larger max_num_seqs (64 / 96) did not help: at LNC=1 the decode step grows with batch size, and TTFT rises.
+
 - **Earnings22 WER** (upstream `run_accuracy_asr`, 341 chunks): champion TP1 × DP4 **6.01 %** with the decode bucket [512] (5.99 % without). With FP8 KV: 6.01 % (TP1 × DP4), 6.07 % (TP1 × DP8 MNS48), 6.06 % (MNS96); with FP8 KV + fused encoder attention 5.97 % (TP1 × DP8 MNS48); with `--max-logprobs 0` and the fused lm_head 5.98 %. Reference gate: 6.24 %.
 - **API-server balance:** the largest per-worker request share was 0.26–0.29 with 4 servers and 0.15 with 8, so the load is even (fair share is 0.25 and 0.125).
 - **`decode_context_length_buckets`:** depends on the workload.
