@@ -44,6 +44,38 @@ def _can_use_flash_attention_kernel(
     return True
 
 
+def _packed_causal_segments(
+    bound_min: Tensor, bound_max: Tensor, seqlen: int
+) -> Optional[list]:
+    """Contiguous [start, end) segments when causal bounds describe packed sequences.
+
+    Packed prefill gives every token the [start, end) of its own sequence. The
+    torch reference then runs plain causal attention on each segment's slice, so a
+    sequence's result does not depend on where in the step it sits (CPU float
+    reductions depend on the layout). Returns None for any other bound pattern.
+    """
+    if torch.compiler.is_compiling() or bound_min.device.type == "meta":
+        return None
+    lo = bound_min[0, :, 0].to(torch.int64)
+    hi = bound_max[0, :, 0].to(torch.int64)
+    if lo.shape[0] != seqlen or not (
+        torch.equal(bound_min[..., 0].to(torch.int64), lo.expand_as(bound_min[..., 0]))
+        and torch.equal(bound_max[..., 0].to(torch.int64), hi.expand_as(bound_max[..., 0]))
+    ):
+        return None
+    segs = []
+    s = 0
+    while s < seqlen:
+        a, b = int(lo[s]), int(hi[s])
+        if a != s or b <= s or b > seqlen:
+            return None
+        if not (bool((lo[s:b] == a).all()) and bool((hi[s:b] == b).all())):
+            return None
+        segs.append((a, b))
+        s = b
+    return segs
+
+
 def _torch_attention_impl(
     q: Tensor,
     k: Tensor,
@@ -327,6 +359,56 @@ def flash_attention(
             allow_vector_exp=allow_vector_exp,
         )
     else:
+        segs = None
+        if (
+            bound_min is not None
+            and bound_max is not None
+            and causal_mask
+            and k_prior is None
+            and cp_offset is None
+            and not tp_k
+        ):
+            segs = _packed_causal_segments(
+                bound_min, bound_max, q.shape[1] if tp_q else q.shape[2]
+            )
+        if segs is not None and len(segs) > 1:
+            parts = []
+            for a, b in segs:
+                n = b - a
+                # Zero-pad the segment to the one-prompt prefill shape (power of
+                # two, >= 128): CPU GEMMs round by shape, and the padding keys are
+                # causal-after every real query, so the real rows are unchanged.
+                p = max(128, 1 << (n - 1).bit_length()) - n
+                qs = q[:, a:b, :] if tp_q else q[:, :, a:b]
+                ks, vs = k[:, :, a:b], v[:, a:b, :]
+                if p:
+                    qs = torch.cat(
+                        [qs, qs.new_zeros(qs.shape[0], p, qs.shape[2])]
+                        if tp_q
+                        else [qs, qs.new_zeros(qs.shape[0], qs.shape[1], p)],
+                        dim=1 if tp_q else 2,
+                    )
+                    ks = torch.cat([ks, ks.new_zeros(ks.shape[0], ks.shape[1], p)], 2)
+                    vs = torch.cat([vs, vs.new_zeros(vs.shape[0], p, vs.shape[2])], 1)
+                o = _torch_attention_impl(
+                    q=qs.contiguous(),
+                    k=ks.contiguous(),
+                    v=vs.contiguous(),
+                    scale=scale,
+                    causal_mask=True,
+                    sliding_window=sliding_window,
+                    sink=sink,
+                    tp_q=tp_q,
+                    tp_k=tp_k,
+                    tp_out=tp_out,
+                )
+                parts.append(o.transpose(-2, -1)[:, :n] if tp_out else o[:, :n])
+            # Same memory layout as the one-prompt result (a transposed view when
+            # tp_out): CPU GEMMs downstream round by input strides.
+            out = torch.cat(parts, dim=1)
+            return out.transpose(-2, -1) if tp_out else out
+        if segs is not None:
+            bound_min = bound_max = None
         return _torch_attention_impl(
             q=q,
             k=k,
