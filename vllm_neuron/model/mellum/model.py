@@ -529,13 +529,14 @@ class MellumSparseMoeBlock(nn.Module):
         if self.world_size > 1:
             aff = self.tp_group.all_gather(aff, dim=0)
             x = self.tp_group.all_gather(x, dim=0)
-        # Padding rows (after the last real token) take no expert blocks (gpt_oss pattern). Positions are
-        # increasing over the real tokens of a single-request prefill chunk and zero-padded after them.
+        # Padding rows take no expert blocks (gpt_oss pattern). The runner pads a prefill step by repeating
+        # the last real position, and with packed prefill (several prompts per step) positions restart at 0
+        # for each prompt. So a token is padding when it repeats the previous token's position, unless that
+        # position is 0 (a prompt boundary after a one-token prompt). A one-token final prompt leaves its
+        # padding marked real, which only costs compute.
         padding_mask = None
         if positions is not None and os.environ.get("MELLUM_MOE_PAD_MASK", "1") == "1":
-            pos = positions.reshape(-1)
-            last_real = torch.argmax(pos)
-            padding_mask = torch.arange(pos.shape[0], device=pos.device) <= last_real
+            padding_mask = _real_token_mask(positions.reshape(-1))
         if self.ep_degree > 1:
             ep_rank = self._ep_rank_tensor().to(torch.int32)
             local_ids = torch.arange(self.num_local_experts, device=x.device, dtype=torch.int32) + (
@@ -583,6 +584,13 @@ class MellumSparseMoeBlock(nn.Module):
         if self.world_size > 1:
             out = self.tp_group.reduce_scatter(out, dim=0)
         return out
+
+
+def _real_token_mask(pos: torch.Tensor) -> torch.Tensor:
+    """[T] bool: False for padding tokens (repeated position after the last real token of a prefill step)."""
+    rep = torch.zeros_like(pos, dtype=torch.bool)
+    rep[1:] = (pos[1:] == pos[:-1]) & (pos[1:] != 0)
+    return ~rep
 
 
 # =============================================================================
@@ -712,6 +720,41 @@ class MellumModel(nn.Module):
 # =============================================================================
 
 
+def _check_packed_prefill() -> None:
+    """Packed prefill (VLLM_NEURON_MAX_PREFILLS_PER_BATCH > 1) needs per-request attention bounds and whole prompts.
+
+    Turns on the per-request attention bounds of the shared Gemma3 prefill attention, and rejects the
+    configurations where a prompt can be split across steps or share cached blocks (the bounds assume every
+    packed prompt starts at position 0 of the step).
+    """
+    n = int(os.environ.get("VLLM_NEURON_MAX_PREFILLS_PER_BATCH", "1") or 1)
+    if n <= 1:
+        return
+    from vllm.config import get_current_vllm_config
+
+    vc = get_current_vllm_config()
+    sc, mc = vc.scheduler_config, vc.model_config
+    problems = []
+    if sc.max_num_batched_tokens < mc.max_model_len:
+        problems.append(
+            f"max_num_batched_tokens ({sc.max_num_batched_tokens}) < max_model_len ({mc.max_model_len}) "
+            "allows segmented prefill"
+        )
+    if getattr(vc.cache_config, "enable_prefix_caching", False):
+        problems.append("prefix caching is enabled")
+    if vc.speculative_config is not None:
+        problems.append("speculative decoding is configured")
+    if getattr(vc.parallel_config, "data_parallel_size", 1) > 1:
+        problems.append("data parallelism is enabled")
+    if problems:
+        raise ValueError(
+            "Mellum packed prefill (VLLM_NEURON_MAX_PREFILLS_PER_BATCH="
+            f"{n}) needs whole-prompt prefill: " + "; ".join(problems)
+        )
+    os.environ["GEMMA3_PACKED_PREFILL"] = "1"
+    logger.info("Mellum packed prefill: up to %d prompts per prefill step", n)
+
+
 class MellumForCausalLM(Gemma3ForCausalLM):
     def __init__(self, config: MellumConfig):
         nn.Module.__init__(self)
@@ -744,6 +787,7 @@ class MellumForCausalLM(Gemma3ForCausalLM):
         )
         if self.on_device_sampling_config is not None:
             self.sampler = Sampler(self.on_device_sampling_config, process_group=self.tp_group.device_group)
+        _check_packed_prefill()
         logger.info("Mellum config: %s", config.summary())
 
     @classmethod
