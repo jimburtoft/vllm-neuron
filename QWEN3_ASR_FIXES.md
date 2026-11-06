@@ -132,7 +132,11 @@ Measured with an English read-speech pilot draft (TP4 LNC2, MNS 16, `vllm bench 
 | LibriSpeech test-clean (in-domain for the draft) | 4.6-4.9 | 124 -> **71 ms (1.75x)** | 275 -> 236 ms | 428 -> 400 ms (break-even) |
 | Earnings22 30 s (out of domain) | 1.3 | 313 -> 466 ms (slower) | 571 -> 957 ms | slower |
 
-Earnings22 WER (341 chunks): 6.06 % with speculation vs 6.02 % without. **Whether it helps depends on the draft's
+Earnings22 WER (341 chunks): 6.06 % with speculation vs 6.02 % without.
+
+**With speculation off, this branch is the same as before it** (2026-11-06, same session, champion config TP1 × DP8
+LNC1 FP8 KV, 4,096 × 30 s, C=384, 3 interleaved reps): 2,446-2,452 RTFx vs 2,443-2,461 before the merge; WER 6.01 %
+both (conc 128); TP4 single stream E2E p50 318 vs 317 ms, ITL 3.12 ms both. **Whether it helps depends on the draft's
 acceptance on your audio**: break-even is about 1.9 accepted tokens per step at TP4 single stream. Read the
 acceptance from the server metrics: `1 + vllm:spec_decode_num_accepted_tokens_total / vllm:spec_decode_num_drafts_total`.
 
