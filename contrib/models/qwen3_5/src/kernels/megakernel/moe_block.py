@@ -28,7 +28,7 @@ TOPK = 8
 DEDUP_MIN = 8   # rows (batch) from which routed experts are deduplicated
 DEDUP_NBUF = 4  # rotating expert weight buffers of the dedup path
 # static unique-expert slots per batch size (about the p80-p90 unique count of real traffic); overflow -> loop
-DEDUP_CAP = {8: 56, 16: 80, 32: 128}
+DEDUP_CAP = {8: 56, 16: 96, 32: 128, 64: 192}   # larger R: all 256 local experts
 
 
 def _i2(Wgu):
@@ -279,14 +279,15 @@ def moe_block(xn, Wr, Wgu, Wd, Wsgu, Wsd, Wsg, ident, ones_f, bmask, B, NC, pid,
     nisa.reciprocal(dst=er, data=es)
     aff = sb((B, TOPK))
     nisa.tensor_scalar(dst=aff, data=ev, op0=nl.multiply, operand0=er)
-    # broadcast affinities to all partitions: wb[p, b*8+k] = aff[b, k]
-    ablk = sb((B, TOPK * B))
-    nisa.tensor_tensor(dst=ablk, data1=aff.ap(pattern=[[TOPK, B], [0, B], [1, TOPK]], offset=0), data2=bmask,
-                       op=nl.multiply)
-    pwb = nl.ndarray((128, TOPK * B), dtype=F32, buffer=nl.psum)
-    nisa.nc_matmul(pwb, ones_f, ablk)
-    wb = sb((128, TOPK * B))
-    nisa.tensor_copy(dst=wb, src=pwb)
+    # hit-list path only (B < DEDUP_MIN): broadcast affinities to all partitions, wb[p, b*8+k] = aff[b, k]
+    if not dedup_on(B):
+        ablk = sb((B, TOPK * B))
+        nisa.tensor_tensor(dst=ablk, data1=aff.ap(pattern=[[TOPK, B], [0, B], [1, TOPK]], offset=0), data2=bmask,
+                           op=nl.multiply)
+        pwb = nl.ndarray((128, TOPK * B), dtype=F32, buffer=nl.psum)
+        nisa.nc_matmul(pwb, ones_f, ablk)
+        wb = sb((128, TOPK * B))
+        nisa.tensor_copy(dst=wb, src=pwb)
 
     NT = H // 512
     py = [nl.ndarray((B, 512), dtype=F32, buffer=nl.psum) for _ in range(NT)]

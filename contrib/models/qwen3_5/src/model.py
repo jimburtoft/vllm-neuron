@@ -1008,6 +1008,16 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
                 raise KeyError(f"State cache for layer {mixer.layer_name} not initialized")
             mixer.bind_state(*state_caches[mixer.layer_name])
 
+    def use_state_slot_rows(self) -> bool:
+        """Runner opt-in (dedicated state pool, one page per slot, page = 1 + slot): run decode with batch row
+        k = state slot k so the decode megakernel streams the DeltaNet state contiguously. True if the model
+        uses it; the runner then allocates the lowest free slot and pads the decode batch to the largest slot + 1."""
+        mk = self.language_model.decode_megakernel
+        if mk is None:
+            return False
+        mk.slot_rows = True
+        return True
+
     def set_runner_clears_kv_blocks(self, value: bool) -> None:
         """The runner zeroes newly allocated attention blocks (and the null block),
         so stale state bytes recycled into a KV block never reach the gather."""

@@ -200,6 +200,13 @@ def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:
     grid = 1 if envs.VLLM_NEURON_CPU_MODE else get_logical_nc_config()
     if shape[-2] > nl.tile_size.pmax * grid:
         return False
+    # cascaded_max asserts nc_find_index8 <= 16384 elements per partition
+    # (e.g. 128 rows x a 62080-entry vocab shard at TP=4 overflows).
+    rows = 1
+    for s in shape[:-1]:
+        rows *= s
+    if rows * shape[-1] > 16384 * nl.tile_size.pmax * grid:
+        return False
 
     return True
 

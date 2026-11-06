@@ -16,8 +16,15 @@ What the kernel reads and writes, all in place and zero-copy:
   and the lm_head tile layout; the routed experts, out projections and caches are read as they are.
 
 Coverage (checked at trace time by ``DecodeMegakernel.applies``; anything else falls back): the 35B-A3B shapes,
-TP=4 without expert parallelism, LNC=2, KV block size 256 (``--block-size 256``), batch buckets up to 8, one
-token per request (no speculative decoding).
+TP=4 without expert parallelism, LNC=2, KV block size 256 (``--block-size 256``), batch buckets up to 128 with
+state-slot rows (below; up to 8 without), one token per request (no speculative decoding).
+
+State-slot rows: with the dedicated state pool (no prefix caching, no speculative decoding) and a largest decode
+bucket >= ``--max-num-seqs``, the runner asks the model to run decode with "kernel row k = state slot k"
+(``use_state_slot_rows``). It then hands out the lowest free slot and pads the decode batch to cover the largest
+slot in it, and the kernel reads and writes the state of pages 1..B with static contiguous DMAs instead of one
+runtime-offset DMA per request. Here the batch rows are permuted into slot order (small per-row tensors only; no
+state moves) and the outputs gathered back; kernel rows without a request keep their state bit-exactly.
 """
 
 from __future__ import annotations
@@ -41,7 +48,8 @@ _PATTERN = ["linear_attention"] * 3 + ["full_attention"]
 TP = 4
 LNC = 2
 KV_BLOCK = 256
-MAX_BATCH = 8
+MAX_BATCH = 128       # with state-slot rows
+PAGE_MAX_BATCH = 8    # per-request state pages (no state-slot rows)
 _GDN_KEYS = ("Win", "Wout", "cw", "alog", "dtb", "nw", "sa", "sb")
 
 
@@ -81,6 +89,7 @@ class DecodeMegakernel:
         self.tp_group = tp_group
         self.use_lm_head = use_lm_head
         self.lm_head = None
+        self.slot_rows = False   # set by the runner (``Qwen3_5ForCausalLM.use_state_slot_rows``)
 
     # ── load time ────────────────────────────────────────────────────────
 
@@ -148,7 +157,7 @@ class DecodeMegakernel:
         attn = next(L.self_attn for L in layers if not L.is_linear_attention)
         gdn = next(L.linear_attn for L in layers if L.is_linear_attention)
         num_reqs = attn_metadata[attn.layer_name]["block_table_tensor"].shape[0]
-        if num_tokens != num_reqs or num_reqs > MAX_BATCH:
+        if num_tokens != num_reqs or num_reqs > (MAX_BATCH if self._slot_rows_apply(num_reqs) else PAGE_MAX_BATCH):
             return False
         if attn.k_cache is None or attn.k_cache.shape[1:] != (1, KV_BLOCK, 256):
             return False
@@ -183,33 +192,54 @@ class DecodeMegakernel:
         slot = torch.where(live_kv, sm, torch.zeros_like(sm))
         pos = positions.reshape(B).to(torch.int32).clamp(min=0, max=ctx - 1)
 
-        # DeltaNet state pages per KV-cache group (each group has its own block table), as in
-        # ``Qwen3_5GatedDeltaNet.state_indices``: dead rows read the null page 0 and write an out-of-range page,
-        # which the kernel's DMA drops, so the null page stays zero.
-        groups: dict[int, int] = {}
-        gmap, page_rows = [], []
-        for L in layers:
-            if not L.is_linear_attention:
-                continue
-            g = L.linear_attn
-            gmd = attn_metadata[g.layer_name]
-            key = id(gmd)
-            if key not in groups:
-                groups[key] = len(groups)
-                idx, live = g.state_indices(gmd, B)
-                idx = idx.to(torch.int32)
-                widx = torch.where(live, idx, torch.full_like(idx, g.state_a.shape[0]))
-                page_rows.append(torch.stack([idx, widx], 0))
-            gmap.append(groups[key])
-        pages = torch.stack(page_rows, 0).contiguous()   # [groups, 2 (read, write), B]
-
         cos, sin = position_embeddings
+        gdn0 = next(L.linear_attn for L in layers if L.is_linear_attention)
+        gat = None
+        if self._slot_rows_apply(B):
+            # Kernel row k = state slot k = state page 1 + k (``use_state_slot_rows``; the runner pads the batch
+            # to cover the largest slot). Permute the per-row inputs into slot order; act[k] = 1 if slot k decodes.
+            idx, live = gdn0.state_indices(attn_metadata[gdn0.layer_name], B)
+            ks = idx.to(torch.long) - 1
+            ar = torch.arange(B, device=dev, dtype=torch.long)
+            perm = ((ks.reshape(1, B) == ar.reshape(B, 1)) & live.reshape(1, B)).to(torch.float32)   # [k, b]
+            act = perm.sum(dim=1)
+            inv = (perm * ar.reshape(1, B).to(torch.float32)).sum(dim=1).to(torch.long)   # batch row of k
+            gat = torch.where(live & (ks < B), ks, torch.zeros_like(ks))                   # kernel row of b
+            hidden_states = torch.index_select(hidden_states, 0, inv)
+            bt = torch.index_select(bt, 0, inv)
+            slot = torch.where(act > 0.5, torch.index_select(slot, 0, inv), torch.zeros_like(slot))
+            pos = torch.index_select(pos, 0, inv)
+            cos = torch.index_select(cos, 0, inv)
+            sin = torch.index_select(sin, 0, inv)
+            gmap = [0] * sum(1 for L in layers if L.is_linear_attention)
+            pages = act.contiguous()
+        else:
+            # DeltaNet state pages per KV-cache group (each group has its own block table), as in
+            # ``Qwen3_5GatedDeltaNet.state_indices``: dead rows read the null page 0 and write an out-of-range
+            # page, which the kernel's DMA drops, so the null page stays zero.
+            groups: dict[int, int] = {}
+            gmap, page_rows = [], []
+            for L in layers:
+                if not L.is_linear_attention:
+                    continue
+                g = L.linear_attn
+                gmd = attn_metadata[g.layer_name]
+                key = id(gmd)
+                if key not in groups:
+                    groups[key] = len(groups)
+                    idx, live = g.state_indices(gmd, B)
+                    idx = idx.to(torch.int32)
+                    widx = torch.where(live, idx, torch.full_like(idx, g.state_a.shape[0]))
+                    page_rows.append(torch.stack([idx, widx], 0))
+                gmap.append(groups[key])
+            pages = torch.stack(page_rows, 0).contiguous()   # [groups, 2 (read, write), B]
+
         cosb = torch.cat([cos, cos], dim=-1).float().contiguous()
         sinb = torch.cat([sin, sin], dim=-1).float().contiguous()
-        hv_c = layers[0].linear_attn.num_v_heads // LNC
-        J = hv_c * B
+        hv_c = gdn0.num_v_heads // LNC
+        JM = min(hv_c * B, 128)   # block mask rows (the recurrence runs in groups of <= 128 state columns)
         ident = torch.eye(128, dtype=dt, device=dev)
-        blk = torch.eye(J, dtype=dt, device=dev).repeat_interleave(128, dim=1).contiguous()
+        blk = torch.eye(JM, dtype=dt, device=dev).repeat_interleave(128, dim=1).contiguous()
         bmask = torch.eye(B, dtype=torch.float32, device=dev).repeat_interleave(8, dim=1).contiguous()
 
         kw = {}
@@ -236,6 +266,15 @@ class DecodeMegakernel:
             lmw = self.lm_head.mk_lmw
             outs = wrap_nki(decode_step_lm)[LNC](lnf=self.text_model.norm.mk_lnf, lmw=lmw,
                                                  vocab=self.lm_head.weight.shape[0], **common)
+            if gat is not None:
+                return torch.index_select(outs[0], 0, gat), torch.index_select(outs[1], 0, gat)
             return outs[0], outs[1]
         outs = wrap_nki(decode_step)[LNC](**common)
-        return self.text_model.norm(outs[0]), None
+        h = outs[0] if gat is None else torch.index_select(outs[0], 0, gat)
+        return self.text_model.norm(h), None
+
+    def _slot_rows_apply(self, B: int) -> bool:
+        """Slot-row mode for this graph: enabled by the runner, and pages 1..B exist in every state pool."""
+        if not self.slot_rows:
+            return False
+        return all(L.linear_attn.state_a.shape[0] > B for L in self.text_model.layers if L.is_linear_attention)

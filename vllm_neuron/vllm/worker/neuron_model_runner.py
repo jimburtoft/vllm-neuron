@@ -3060,7 +3060,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     raise RuntimeError(
                         "Recurrent-state pool exhausted: more live requests than max_num_seqs"
                     )
-                slots[req_id] = self._state_pool_free.pop(0)
+                slots[req_id] = self._state_pool_take()
             table[i] = 0
             table[i, :pages] = (
                 1
@@ -3068,6 +3068,32 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 + torch.arange(pages, dtype=torch.int32)
             )
         return table.to(self.device)
+
+    def _state_pool_take(self) -> int:
+        """Next free state-pool slot: the oldest freed one, or the lowest one in state-slot-row mode."""
+        free = self._state_pool_free
+        if getattr(self, "_state_slot_rows", False):
+            return free.pop(free.index(min(free)))
+        return free.pop(0)
+
+    def _state_slot_rows_pad(self, num_reqs: int, padded_num_reqs: int, max_query_len: int) -> int:
+        """State-slot-row mode (the model opted in via ``use_state_slot_rows``): decode batch row k is state slot
+        k, so a decode batch must cover the largest slot in it. Pads to the bucket of max slot + 1."""
+        if not getattr(self, "_state_slot_rows", False) or max_query_len != 1:
+            return padded_num_reqs
+        slots = self._state_pool_slots
+        for req_id in [r for r in slots if r not in self.requests]:
+            self._state_pool_free.append(slots.pop(req_id))
+        need = 0
+        for req_id in self.input_batch.req_ids[:num_reqs]:
+            if req_id not in slots:
+                slots[req_id] = self._state_pool_take()
+            need = max(need, slots[req_id] + 1)
+        if need <= padded_num_reqs:
+            return padded_num_reqs
+        from vllm_neuron.utils.bucket_utils import get_bucket_for_count
+
+        return get_bucket_for_count(need, self.neuron_config.num_seqs_buckets)
 
     def _release_state_pool_slots(self, scheduler_output: "SchedulerOutput") -> None:
         """Free the state-pool slots of finished and preempted requests (a preempted request
@@ -4368,6 +4394,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             pre_strip_max_query_len,
             self.neuron_config.num_seqs_buckets,
             decode_token_threshold=self._decode_token_threshold(),
+        )
+        padded_num_reqs = self._state_slot_rows_pad(
+            num_reqs, padded_num_reqs, pre_strip_max_query_len
         )
 
         if reuse_dp_padding:
@@ -11822,6 +11851,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 default=0,
             )
             self.model.bind_state_cache(state_caches)
+            # Decode batch row k = state slot k (page 1 + k), if the model wants it: needs the dedicated pool with
+            # one page per slot and a decode bucket that covers every slot.
+            buckets = self.neuron_config.num_seqs_buckets or []
+            self._state_slot_rows = bool(
+                self._state_pool_groups
+                and self._state_pool_slot_pages == 1
+                and not self.speculative_config
+                and buckets
+                and max(buckets) >= self.max_num_reqs
+                and hasattr(self.model, "use_state_slot_rows")
+                and self.model.use_state_slot_rows()
+            )
+            if self._state_slot_rows:
+                logger.info("Recurrent state: decode batch row k = state slot k (model opt-in)")
             self._setup_kv_block_clearing(kv_cache_config, block_sizes, kv_caches)
             self._setup_mamba_align(kv_cache_config, state_caches)
             self._mamba_spec_groups = [

@@ -13,6 +13,12 @@ float32 halves A / B of shape [pages, rows, 128]; one page per request holds the
 followed by the recurrent state [Hv, Dk, Dv], back to back across A then B. The page id of request b is
 pages[b] (dead batch rows point at the null page 0). Each pcore reads and writes only its own channel tiles and
 heads, so the two pcores never touch the same bytes.
+
+Slot-row mode (``slot_row_tiles``): kernel row k IS state page 1 + k, so the batch's state is pages 1..B and every
+state read / write is a static DMA over B pages (no per-request runtime offsets). An active mask keeps the state of
+rows that do not decode this step bit-exact (decay 1 and update 0 for the recurrent state; a blend for the conv
+window). Above 128 state columns (J = HV_C * B, i.e. B >= 64) the recurrence runs in request groups of
+128 / HV_C requests, state streamed per group.
 """
 import math
 
@@ -33,6 +39,30 @@ def dims(nc, b):
     ct = 2 * hk_c + hv_c
     nin_c = 128 * (ct + hv_c) + 2 * hv_c
     return hk_c, hv_c, ct, nin_c, hv_c * b, H // nc
+
+
+def load_mk(mk_in):
+    """Block mask kron(eye(J), ones(1, 128)) -> SBUF, capped at 128 rows (the grouped recurrence uses the top-left
+    [JL, JL * 128] block, JL <= 128)."""
+    J0, W0 = mk_in.shape
+    JM = min(J0, 128)
+    mk = _sb((JM, JM * 128), BF)
+    nisa.dma_copy(dst=mk, src=mk_in.ap(pattern=[[W0, JM], [1, JM * 128]], offset=0))
+    return mk
+
+
+def slot_row_tiles(act, B):
+    """Slot-row mode: act [B] fp32 HBM, 1 = kernel row k (state page 1 + k) decodes this step, 0 = its state is
+    kept. Returns the mask broadcast to all partitions [128, B] and per partition [B, 1], and 1 - mask."""
+    a = _sb((128, B))
+    nisa.dma_copy(dst=a, src=act.ap(pattern=[[0, 128], [1, B]], offset=0))
+    na = _sb((128, B))
+    nisa.tensor_scalar(dst=na, data=a, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=1.0)
+    ac = _sb((B, 1))
+    nisa.dma_copy(dst=ac, src=act.ap(pattern=[[1, B], [1, 1]], offset=0))
+    nac = _sb((B, 1))
+    nisa.tensor_scalar(dst=nac, data=ac, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=1.0)
+    return dict(act=a, nact=na, actc=ac, nactc=nac)
 
 
 def tile_runs(pid, nc):
@@ -118,49 +148,136 @@ def _rec_segments(rows, pid, nc):
     return out
 
 
+def _rec_io(S, JL, b0, nb, halves, segs, rows, pr, B, store):
+    """Recurrent state of requests [b0, b0 + nb) <-> S[k, (i * nb + bl) * 128 + v] (JL = HV_C * nb columns).
+    pr None: slot-row mode, request b = state page 1 + b (one static DMA per head over the nb pages); else the
+    page tile of the page mode (one runtime-offset DMA per request; writes drop out-of-range pages)."""
+    for hf, r0, i0, nh, k0, nk in segs:
+        if pr is None:
+            for ih in range(nh):
+                hbm = halves[hf].ap(pattern=[[128, nk], [rows * 128, nb], [1, 128]],
+                                    offset=(1 + b0) * rows * 128 + (r0 + ih * D) * 128)
+                sbv = S[k0:k0 + nk, :].ap(pattern=[[JL * 128, nk], [128, nb], [1, 128]], offset=(i0 + ih) * nb * 128)
+                if store:
+                    nisa.dma_copy(dst=hbm, src=sbv)
+                else:
+                    nisa.dma_copy(dst=sbv, src=hbm)
+            continue
+        for bl in range(nb):
+            hbm = halves[hf].ap(pattern=[[128, nk], [D * 128, nh], [1, 128]], offset=r0 * 128,
+                                scalar_offset=_ix(pr, b0 + bl, B), indirect_dim=0)
+            sbv = S[k0:k0 + nk, :].ap(pattern=[[JL * 128, nk], [nb * 128, nh], [1, 128]], offset=(i0 * nb + bl) * 128)
+            if store:
+                nisa.dma_copy(dst=hbm, src=sbv, oob_mode=nisa.oob_mode.skip)
+            else:
+                nisa.dma_copy(dst=sbv, src=hbm)
+
+
+def _recur(S, QK2, eg, beta, vcol, qkd, Ke_bf, ident, mk, JL):
+    """Delta-rule step for JL state columns: returns the readout o [128, JL]; S updated in SBUF
+    (S = S * eg + k (x) delta)."""
+    S_bf = _sb((128, JL * 128), BF)
+    nisa.tensor_copy(dst=S_bf, src=S, engine=nisa.scalar_engine)
+    psA = nl.ndarray((128, JL, 2), dtype=F32, buffer=nl.psum)
+    for j in range(JL):
+        nisa.nc_matmul(psA[:, j, 0:2], S_bf[:, j * 128:(j + 1) * 128], QK2[:, j, 0:2])
+    kq = _sb((128, JL, 2))
+    nisa.tensor_copy(dst=kq, src=psA)
+    kv = _sb((128, JL))
+    nisa.tensor_tensor(dst=kv, data1=kq[:, :, 0], data2=eg, op=nl.multiply)
+    delta = _sb((128, JL))
+    nisa.tensor_tensor(dst=delta, data1=vcol, data2=kv, op=nl.subtract)
+    nisa.tensor_tensor(dst=delta, data1=delta, data2=beta, op=nl.multiply)
+    o = _sb((128, JL))
+    nisa.tensor_tensor(dst=o, data1=kq[:, :, 1], data2=eg, op=nl.multiply)
+    t2 = _sb((128, JL))
+    nisa.tensor_tensor(dst=t2, data1=qkd, data2=delta, op=nl.multiply)
+    nisa.tensor_tensor(dst=o, data1=o, data2=t2, op=nl.add)
+    d_bf = _sb((128, JL), BF)
+    nisa.tensor_copy(dst=d_bf, src=delta)
+    pT = nl.ndarray((JL, 128), dtype=F32, buffer=nl.psum)
+    nisa.nc_matmul(pT, d_bf, ident)
+    Drows = _sb((JL, 128), BF)
+    nisa.tensor_copy(dst=Drows, src=pT)
+    pK = nl.ndarray((JL, 128), dtype=F32, buffer=nl.psum)
+    nisa.nc_matmul(pK, Ke_bf, ident)
+    Krows = _sb((JL, 128), BF)
+    nisa.tensor_copy(dst=Krows, src=pK)
+    Dblk = _sb((JL, JL * 128), BF)
+    nisa.tensor_tensor(dst=Dblk, data1=Drows.ap(pattern=[[128, JL], [0, JL], [1, 128]], offset=0),
+                       data2=mk[0:JL, 0:JL * 128], op=nl.multiply)
+    for c in range(JL // 4):
+        po = nl.ndarray((128, 512), dtype=F32, buffer=nl.psum)
+        nisa.nc_matmul(po, Krows, Dblk[0:JL, c * 512:(c + 1) * 512])
+        Sc = S[:, c * 512:(c + 1) * 512]
+        nisa.tensor_tensor(dst=Sc, data1=Sc, data2=eg.ap(pattern=[[JL, 128], [1, 4], [0, 128]], offset=c * 4),
+                           op=nl.multiply)
+        nisa.tensor_tensor(dst=Sc, data1=Sc, data2=po, op=nl.add)
+    return o
+
+
 def gdn_mixer(xT, Win, Wout, cw, sa, sbh, alog, dtb, nw, ident, ones, mk, gsc, pg, B, NC, pid, w_pre=()):
     """xT std column layout of the normed input. Win [NC, H, NIN_C] flat bf16 (per pcore [q_c|k_c|v_c|z_c|b_c|a_c]),
     Wout [1024, H] bf16, cw [NC, 128, K, CT] flat fp32, sa / sbh state halves [pages, rows, 128] fp32 (in place),
-    alog / dtb [HV] fp32, nw [128] fp32, gsc HBM scratch [NC * B * 2 * HV_C] bf16, pg = page_tiles(...).
-    Returns (y_rows [B, H/NC] bf16, (sa, sbh))."""
+    alog / dtb [HV] fp32, nw [128] fp32, gsc HBM scratch [NC * B * 2 * HV_C] bf16, pg = page_tiles(...) (page mode)
+    or slot_row_tiles(...) (slot-row mode). Returns y_rows [B, H/NC] bf16."""
     HK_C, HV_C, CT, NIN_C, J, NOUT_C = dims(NC, B)
     rows = sa.shape[1]
     runs = tile_runs(pid, NC)
-    pr_, pw_ = pg
+    srow = pg if isinstance(pg, dict) else None
+    pr_, pw_ = (None, None) if srow is not None else pg
     skip = {"oob_mode": nisa.oob_mode.skip}
     halves = (sa, sbh)
+    NT_R = CONV_ROWS // K1
+    # request groups for the recurrence: its J = HV_C * B state columns sit on <= 128 partitions
+    BG = B if J <= 128 else max(1, 128 // HV_C)
+    assert B % BG == 0, (B, BG)
+    NGR = B // BG
 
     # ---------------- state / param loads ----------------
-    # conv window: page rows w*16 + T (all 16 rank tiles; only this pcore's are used) -> rows tile [16, B, K1*128]
-    NT_R = CONV_ROWS // K1
-    crow = _sb((NT_R, B * K1 * 128))
-    for b in range(B):
-        nisa.dma_copy(dst=crow.ap(pattern=[[B * K1 * 128, NT_R], [128, K1], [1, 128]], offset=b * K1 * 128),
-                      src=sa.ap(pattern=[[128, NT_R], [NT_R * 128, K1], [1, 128]], offset=0,
-                                scalar_offset=_ix(pr_, b, B), indirect_dim=0))
-    crow_bf = _sb((NT_R, B * K1 * 128), BF)  # the window holds bf16 values: exact
-    nisa.tensor_copy(dst=crow_bf, src=crow)
     hs = _sb((128, 4 * CT * B))   # column w*CT*B + t*B + b (w = 3 is the new token)
-    for b in range(B):
-        pcv = nl.ndarray((128, K1 * NT_R), dtype=F32, buffer=nl.psum)   # column w*16 + T
-        for w in range(K1):
-            c0 = (b * K1 + w) * 128
-            nisa.nc_matmul(pcv[:, w * NT_R:(w + 1) * NT_R], crow_bf[0:NT_R, c0:c0 + 128], ident[0:NT_R, 0:NT_R])
+    if srow is not None:
+        # conv window of pages 1..B, this pcore's tiles, rows layout [b, w, t*128 + c] (one DMA per tile run)
+        crow = _sb((B, K1 * CT * 128))
         for T0, t0, n in runs:
-            nisa.tensor_copy(dst=hs.ap(pattern=[[4 * CT * B, 128], [CT * B, K1], [B, n]], offset=t0 * B + b),
-                             src=pcv.ap(pattern=[[K1 * NT_R, 128], [NT_R, K1], [1, n]], offset=T0))
+            nisa.dma_copy(dst=crow.ap(pattern=[[K1 * CT * 128, B], [CT * 128, K1], [1, n * 128]], offset=t0 * 128),
+                          src=sa.ap(pattern=[[rows * 128, B], [NT_R * 128, K1], [1, n * 128]],
+                                    offset=rows * 128 + T0 * 128))
+        crow_bf = _sb((B, K1 * CT * 128), BF)  # the window holds bf16 values: exact
+        nisa.tensor_copy(dst=crow_bf, src=crow)
+        for w in range(K1):
+            for t in range(CT):
+                tp = nl.ndarray((128, B), dtype=F32, buffer=nl.psum)
+                c0 = (w * CT + t) * 128
+                nisa.nc_matmul(tp, crow_bf[0:B, c0:c0 + 128], ident[0:B, 0:B])
+                nisa.tensor_copy(dst=hs[:, (w * CT + t) * B:(w * CT + t + 1) * B], src=tp)
+    else:
+        # conv window: page rows w*16 + T (all 16 rank tiles; only this pcore's are used) -> rows tile [16, B, K1*128]
+        crow = _sb((NT_R, B * K1 * 128))
+        for b in range(B):
+            nisa.dma_copy(dst=crow.ap(pattern=[[B * K1 * 128, NT_R], [128, K1], [1, 128]], offset=b * K1 * 128),
+                          src=sa.ap(pattern=[[128, NT_R], [NT_R * 128, K1], [1, 128]], offset=0,
+                                    scalar_offset=_ix(pr_, b, B), indirect_dim=0))
+        crow_bf = _sb((NT_R, B * K1 * 128), BF)  # the window holds bf16 values: exact
+        nisa.tensor_copy(dst=crow_bf, src=crow)
+        for b in range(B):
+            pcv = nl.ndarray((128, K1 * NT_R), dtype=F32, buffer=nl.psum)   # column w*16 + T
+            for w in range(K1):
+                c0 = (b * K1 + w) * 128
+                nisa.nc_matmul(pcv[:, w * NT_R:(w + 1) * NT_R], crow_bf[0:NT_R, c0:c0 + 128], ident[0:NT_R, 0:NT_R])
+            for T0, t0, n in runs:
+                nisa.tensor_copy(dst=hs.ap(pattern=[[4 * CT * B, 128], [CT * B, K1], [B, n]], offset=t0 * B + b),
+                                 src=pcv.ap(pattern=[[K1 * NT_R, 128], [NT_R, K1], [1, n]], offset=T0))
     wraw = _sb((128, 4 * CT))
     nisa.dma_copy(dst=wraw, src=cw.ap(pattern=[[4 * CT, 128], [1, 4 * CT]], offset=pid * 128 * 4 * CT))
     wexp = _sb((128, 4 * CT * B))
     nisa.tensor_copy(dst=wexp, src=wraw.ap(pattern=[[4 * CT, 128], [1, 4 * CT], [0, B]], offset=0))
-    # recurrent state [Hv, Dk, Dv] -> S[k, (hv_local*B + b)*128 + v]
-    S = _sb((128, J * 128))
+    # recurrent state [Hv, Dk, Dv] -> S[k, (hv_local*B + b)*128 + v] (grouped: loaded per group below)
     segs = _rec_segments(rows, pid, NC)
-    for b in range(B):
-        for hf, r0, i0, nh, k0, nk in segs:
-            nisa.dma_copy(dst=S[k0:k0 + nk, :].ap(pattern=[[J * 128, nk], [B * 128, nh], [1, 128]], offset=(i0 * B + b) * 128),
-                          src=halves[hf].ap(pattern=[[128, nk], [D * 128, nh], [1, 128]], offset=r0 * 128,
-                                            scalar_offset=_ix(pr_, b, B), indirect_dim=0))
+    S = None
+    if NGR == 1:
+        S = _sb((128, J * 128))
+        _rec_io(S, J, 0, B, halves, segs, rows, pr_, B, store=False)
     al = _sb((128, J))
     dt = _sb((128, J))
     adr = _sb((128, 2 * HV_C))
@@ -202,6 +319,12 @@ def gdn_mixer(xT, Win, Wout, cw, sa, sbh, alog, dtb, nw, ident, ones, mk, gsc, p
     nisa.scalar_tensor_tensor(dst=gg, data=t1, op0=nl.multiply, operand0=-1.0, op1=nl.multiply, operand1=ea)
     eg = _sb((128, J))
     nisa.activation(dst=eg, data=gg, op=nl.exp)
+    if srow is not None:  # rows that do not decode: decay 1, update 0 -> S * 1 + 0 = S (bit-exact)
+        actJ = srow["act"].ap(pattern=[[B, 128], [0, HV_C], [1, B]], offset=0)
+        nactJ = srow["nact"].ap(pattern=[[B, 128], [0, HV_C], [1, B]], offset=0)
+        nisa.tensor_tensor(dst=eg, data1=eg, data2=actJ, op=nl.multiply)
+        nisa.tensor_tensor(dst=eg, data1=eg, data2=nactJ, op=nl.add)
+        nisa.tensor_tensor(dst=beta, data1=beta, data2=actJ, op=nl.multiply)
 
     # ---------------- channel layout + conv1d + silu ----------------
     xz = _sb((128, (CT + HV_C) * B))
@@ -213,15 +336,30 @@ def gdn_mixer(xT, Win, Wout, cw, sa, sbh, alog, dtb, nw, ident, ones, mk, gsc, p
     # conv window update, this pcore's tiles only: rows w' = 0, 1 <- old w = 1, 2; row w' = 2 <- this token
     a32 = _sb((B, CT * 128))
     nisa.tensor_copy(dst=a32, src=a_rows[0:B, 0:CT * 128])
-    for b in range(B):
+    if srow is not None:
+        # new window = act * shifted + (1 - act) * old, per row (partition) b; one DMA per tile run
+        WC = CT * 128
+        cnew = _sb((B, K1 * WC))
+        cold = _sb((B, K1 * WC))
+        nisa.tensor_scalar(dst=cold, data=crow, op0=nl.multiply, operand0=srow["nactc"])
+        nisa.scalar_tensor_tensor(dst=cnew[:, 0:(K1 - 1) * WC], data=crow[:, WC:K1 * WC], op0=nl.multiply,
+                                  operand0=srow["actc"], op1=nl.add, operand1=cold[:, 0:(K1 - 1) * WC])
+        nisa.scalar_tensor_tensor(dst=cnew[:, (K1 - 1) * WC:K1 * WC], data=a32, op0=nl.multiply,
+                                  operand0=srow["actc"], op1=nl.add, operand1=cold[:, (K1 - 1) * WC:K1 * WC])
         for T0, t0, n in runs:
-            nisa.dma_copy(dst=sa.ap(pattern=[[128, n], [NT_R * 128, K1 - 1], [1, 128]], offset=T0 * 128,
-                                    scalar_offset=_ix(pw_, b, B), indirect_dim=0),
-                          src=crow[T0:T0 + n, :].ap(pattern=[[B * K1 * 128, n], [128, K1 - 1], [1, 128]],
-                                                    offset=b * K1 * 128 + 128), **skip)
-            nisa.dma_copy(dst=sa.ap(pattern=[[n * 128, 1], [1, n * 128]], offset=((K1 - 1) * NT_R + T0) * 128,
-                                    scalar_offset=_ix(pw_, b, B), indirect_dim=0),
-                          src=a32[b:b + 1, :].ap(pattern=[[CT * 128, 1], [1, n * 128]], offset=t0 * 128), **skip)
+            nisa.dma_copy(dst=sa.ap(pattern=[[rows * 128, B], [NT_R * 128, K1], [1, n * 128]],
+                                    offset=rows * 128 + T0 * 128),
+                          src=cnew.ap(pattern=[[K1 * WC, B], [WC, K1], [1, n * 128]], offset=t0 * 128))
+    else:
+        for b in range(B):
+            for T0, t0, n in runs:
+                nisa.dma_copy(dst=sa.ap(pattern=[[128, n], [NT_R * 128, K1 - 1], [1, 128]], offset=T0 * 128,
+                                        scalar_offset=_ix(pw_, b, B), indirect_dim=0),
+                              src=crow[T0:T0 + n, :].ap(pattern=[[B * K1 * 128, n], [128, K1 - 1], [1, 128]],
+                                                        offset=b * K1 * 128 + 128), **skip)
+                nisa.dma_copy(dst=sa.ap(pattern=[[n * 128, 1], [1, n * 128]], offset=((K1 - 1) * NT_R + T0) * 128,
+                                        scalar_offset=_ix(pw_, b, B), indirect_dim=0),
+                              src=a32[b:b + 1, :].ap(pattern=[[CT * 128, 1], [1, n * 128]], offset=t0 * 128), **skip)
     prod = _sb((128, 4 * CT * B))
     nisa.tensor_tensor(dst=prod, data1=hs, data2=wexp, op=nl.multiply)
     n = CT * B
@@ -259,51 +397,33 @@ def gdn_mixer(xT, Win, Wout, cw, sa, sbh, alog, dtb, nw, ident, ones, mk, gsc, p
     qkd = _sb((128, J))
     _colsum(qkd, pqk, J, ones)
 
-    # ---------------- recurrence ----------------
-    S_bf = _sb((128, J * 128), BF)
-    nisa.tensor_copy(dst=S_bf, src=S, engine=nisa.scalar_engine)
-    psA = nl.ndarray((128, J, 2), dtype=F32, buffer=nl.psum)
-    for j in range(J):
-        nisa.nc_matmul(psA[:, j, 0:2], S_bf[:, j * 128:(j + 1) * 128], QK2[:, j, 0:2])
-    kq = _sb((128, J, 2))
-    nisa.tensor_copy(dst=kq, src=psA)
-    kv = _sb((128, J))
-    nisa.tensor_tensor(dst=kv, data1=kq[:, :, 0], data2=eg, op=nl.multiply)
+    # ---------------- recurrence + state update (per request group above 128 state columns) ----------------
     vcol = xc[:, 2 * HK_C * B:CT * B]
-    delta = _sb((128, J))
-    nisa.tensor_tensor(dst=delta, data1=vcol, data2=kv, op=nl.subtract)
-    nisa.tensor_tensor(dst=delta, data1=delta, data2=beta, op=nl.multiply)
-    o = _sb((128, J))
-    nisa.tensor_tensor(dst=o, data1=kq[:, :, 1], data2=eg, op=nl.multiply)
-    t2 = _sb((128, J))
-    nisa.tensor_tensor(dst=t2, data1=qkd, data2=delta, op=nl.multiply)
-    nisa.tensor_tensor(dst=o, data1=o, data2=t2, op=nl.add)
-
-    # ---------------- state update S = S*eg + k (x) delta ----------------
-    d_bf = _sb((128, J), BF)
-    nisa.tensor_copy(dst=d_bf, src=delta)
-    pT = nl.ndarray((J, 128), dtype=F32, buffer=nl.psum)
-    nisa.nc_matmul(pT, d_bf, ident)
-    Drows = _sb((J, 128), BF)
-    nisa.tensor_copy(dst=Drows, src=pT)
-    pK = nl.ndarray((J, 128), dtype=F32, buffer=nl.psum)
-    nisa.nc_matmul(pK, Ke_bf, ident)
-    Krows = _sb((J, 128), BF)
-    nisa.tensor_copy(dst=Krows, src=pK)
-    Dblk = _sb((J, J * 128), BF)
-    nisa.tensor_tensor(dst=Dblk, data1=Drows.ap(pattern=[[128, J], [0, J], [1, 128]], offset=0), data2=mk, op=nl.multiply)
-    for c in range(J // 4):
-        po = nl.ndarray((128, 512), dtype=F32, buffer=nl.psum)
-        nisa.nc_matmul(po, Krows, Dblk[0:J, c * 512:(c + 1) * 512])
-        Sc = S[:, c * 512:(c + 1) * 512]
-        nisa.tensor_tensor(dst=Sc, data1=Sc, data2=eg.ap(pattern=[[J, 128], [1, 4], [0, 128]], offset=c * 4), op=nl.multiply)
-        nisa.tensor_tensor(dst=Sc, data1=Sc, data2=po, op=nl.add)
-    for b in range(B):
-        for hf, r0, i0, nh, k0, nk in segs:
-            nisa.dma_copy(dst=halves[hf].ap(pattern=[[128, nk], [D * 128, nh], [1, 128]], offset=r0 * 128,
-                                            scalar_offset=_ix(pw_, b, B), indirect_dim=0),
-                          src=S[k0:k0 + nk, :].ap(pattern=[[J * 128, nk], [B * 128, nh], [1, 128]], offset=(i0 * B + b) * 128),
-                          **skip)
+    if NGR == 1:
+        o = _recur(S, QK2, eg, beta, vcol, qkd, Ke_bf, ident, mk, J)
+        _rec_io(S, J, 0, B, halves, segs, rows, pw_, B, store=True)
+    else:
+        JG = HV_C * BG
+        o = _sb((128, J))
+        for g in range(NGR):
+            def gpat(t, w):   # columns hv*B + g*BG + bl -> hv*BG + bl
+                return t.ap(pattern=[[w, 128], [B, HV_C], [1, BG]], offset=g * BG)
+            Sg = _sb((128, JG * 128))
+            _rec_io(Sg, JG, g * BG, BG, halves, segs, rows, pr_, B, store=False)
+            QKg = _sb((128, JG, 2), BF)
+            nisa.tensor_copy(dst=QKg, src=QK2.ap(pattern=[[2 * J, 128], [2 * B, HV_C], [1, 2 * BG]], offset=g * BG * 2))
+            loc = []
+            for t_ in (eg, beta, qkd):
+                u_ = _sb((128, JG))
+                nisa.tensor_copy(dst=u_, src=gpat(t_, J))
+                loc.append(u_)
+            vg = _sb((128, JG))
+            nisa.tensor_copy(dst=vg, src=xc.ap(pattern=[[CT * B, 128], [B, HV_C], [1, BG]], offset=2 * HK_C * B + g * BG))
+            kg = _sb((128, JG), BF)
+            nisa.tensor_copy(dst=kg, src=gpat(Ke_bf, J))
+            og = _recur(Sg, QKg, loc[0], loc[1], vg, loc[2], kg, ident, mk, JG)
+            nisa.tensor_copy(dst=gpat(o, J), src=og)
+            _rec_io(Sg, JG, g * BG, BG, halves, segs, rows, pw_, B, store=True)
 
     # ---------------- gated RMSNorm ----------------
     o2 = _sb((128, J), BF)

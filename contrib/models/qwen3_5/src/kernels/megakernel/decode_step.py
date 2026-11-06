@@ -11,11 +11,11 @@ the kernel over ``ranks``.
 import nki.isa as nisa
 import nki.language as nl
 
-from .gdn_block import dims, gdn_mixer, gdn_win_load, page_tiles
+from .gdn_block import dims, gdn_mixer, gdn_win_load, load_mk, page_tiles, slot_row_tiles
 from .mk_common import BF, H, KT, reduce_residual, row_rstd, rows_to_std, rs_cols, sb, store_rows, w_cols
 from .mk_gqa import gqa_mixer
 from .mk_lmhead import lm_head_tail, lm_tile_load
-from .moe_block import TOPK, moe_block
+from .moe_block import TOPK, dedup_on, moe_block
 
 PATTERN = "GGGA" * 10
 WIN_PREFETCH = 2   # in_proj k-groups of the next DeltaNet layer loaded before the MoE all-reduce
@@ -25,7 +25,8 @@ LM_PREFETCH = 4    # lm_head tiles loaded before the last MoE all-reduce
 def step_body(x_rows, cosb, sinb, bt, slot, pos, pages, ident_in, mk_in, bmask_in, W, gmap, pattern=PATTERN,
               ranks=None, lm=None):
     """W: dict group -> tuple of per-layer tensors (entry.py). gmap[g] = state page group of DeltaNet layer g
-    (row of ``pages``). Returns (h_out, [logits,] *state_a, *state_b, *k_caches, *v_caches); the state / KV
+    (row of ``pages``). ``pages``: int32 [groups, 2, B] state pages per request (page mode), or float32 [B] the
+    active-row mask of the slot-row mode (kernel row k = state page 1 + k in every DeltaNet layer). Returns (h_out, [logits,] *state_a, *state_b, *k_caches, *v_caches); the state / KV
     outputs ARE the inputs (in-place writes)."""
     NC = nl.num_programs(0)
     pid = nl.program_id(0) if NC > 1 else 0
@@ -40,14 +41,17 @@ def step_body(x_rows, cosb, sinb, bt, slot, pos, pages, ident_in, mk_in, bmask_i
     nisa.memset(ones, 1.0)
     ones_f = sb((B, 128))
     nisa.memset(ones_f, 1.0)
-    J = HV_C * B
-    mk = sb((J, J * 128), BF)
-    nisa.dma_copy(dst=mk, src=mk_in)
-    bmask = sb((B, TOPK * B))
-    nisa.dma_copy(dst=bmask, src=bmask_in)
+    mk = load_mk(mk_in)
+    bmask = None
+    if not dedup_on(B):
+        bmask = sb((B, TOPK * B))
+        nisa.dma_copy(dst=bmask, src=bmask_in)
     hR = sb((B, H), BF)
     nisa.dma_copy(dst=hR, src=x_rows)
-    pgs = [page_tiles(pages, g, B) for g in range(max(gmap) + 1)]
+    if "float32" in str(pages.dtype):   # slot-row mode: pages = active mask [B], kernel row k = state page 1 + k
+        pgs = [slot_row_tiles(pages, B)] * (max(gmap) + 1)
+    else:
+        pgs = [page_tiles(pages, g, B) for g in range(max(gmap) + 1)]
 
     ig = ia = 0
     wnext = ()
