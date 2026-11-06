@@ -14,6 +14,10 @@ class LlamaForCausalLM(nn.Module):
     The factory stores the selected implementation and delegates forward() calls to it.
     """
 
+    # Several whole prompts per prefill step (vllm_neuron/vllm/core/packed_prefill.py):
+    # the bf16 full-prefill attention takes per-token segment bounds. Mistral inherits.
+    supports_packed_prefill = True
+
     def __init__(
         self, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
     ) -> None:
