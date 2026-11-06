@@ -278,8 +278,44 @@ class NeuronScheduler(Scheduler):
                 self.num_batched_tokens_buckets,
             )
 
-        # Prefill batch size limit (currently 1, may expand in future)
-        self.max_prefills_per_batch: int = 1
+        # Prefill batch size limit. 1 unless VLLM_NEURON_MAX_PREFILLS_PER_BATCH asks
+        # for packed prefill and the configuration supports it (packed_prefill.py).
+        from vllm_neuron.vllm.core import packed_prefill
+
+        self.max_prefills_per_batch, packed_off_reason = (
+            packed_prefill.resolve_max_prefills(vllm_config)
+        )
+        if packed_off_reason is not None:
+            logger.warning(
+                "%s=%d ignored (%s); one prefill per step.",
+                packed_prefill.ENV,
+                packed_prefill.requested_max_prefills(),
+                packed_off_reason,
+            )
+        # Real-token cap of a packed prefill step: the largest bucket, the step
+        # token budget and the optional VLLM_NEURON_PACKED_PREFILL_MAX_TOKENS.
+        self.max_prefills_per_batch = packed_prefill.effective_rows(
+            self.max_prefills_per_batch, self.num_batched_tokens_buckets
+        )
+        self._packed_token_budget: int = 0
+        if self.max_prefills_per_batch > 1:
+            self._packed_token_budget = packed_prefill.packed_bucket_limit(
+                self.num_batched_tokens_buckets,
+                min(
+                    self.max_num_scheduled_tokens,
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                ),
+            )
+            if self._packed_token_budget == 0:
+                self.max_prefills_per_batch = 1
+        if self.max_prefills_per_batch > 1:
+            logger.info(
+                "Packed prefill: up to %d whole prompts per prefill step, %d real "
+                "tokens at most (buckets %s).",
+                self.max_prefills_per_batch,
+                self._packed_token_budget,
+                self.num_batched_tokens_buckets,
+            )
 
         # Parse num_seqs_buckets for decode batch size buckets
         if "num_seqs_buckets" in neuron_config:
@@ -822,8 +858,10 @@ class NeuronScheduler(Scheduler):
         if self.has_prefill_in_running:
             return False
 
-        # Check prefill batch capacity (only 1 prefill at a time)
+        # Check prefill batch capacity (only 1 prefill at a time unless packed)
         if len(self.waiting) >= self.max_prefills_per_batch:
+            return False
+        if self.waiting and not self._can_pack_with_waiting(request):
             return False
 
         # Prevent livelock: don't admit a new prefill if running requests
@@ -852,6 +890,38 @@ class NeuronScheduler(Scheduler):
             return False
 
         return True
+
+    @staticmethod
+    def _is_packable_prefill(request: Request) -> bool:
+        """A fresh, whole, text-only prompt that may share a prefill step."""
+        return (
+            request.num_computed_tokens == 0
+            and request.num_tokens == request.num_prompt_tokens
+            and not request.mm_features
+            and not request.use_structured_output
+            and getattr(request, "prompt_embeds", None) is None
+            and getattr(request, "lora_request", None) is None
+            and request.kv_transfer_params is None
+            and request.status == RequestStatus.WAITING
+        )
+
+    def _can_pack_with_waiting(self, request: Request) -> bool:
+        """Packed prefill: may ``request`` join the prompts already in ``waiting``?
+
+        Every prompt of the step must be packable, and their tokens must fit the
+        packed budget whole. Running + admitted requests stay under the caps.
+        """
+        if self.max_prefills_per_batch <= 1:
+            return False
+        if not self._is_packable_prefill(request):
+            return False
+        if not all(self._is_packable_prefill(r) for r in self.waiting):
+            return False
+        total = request.num_tokens + sum(r.num_tokens for r in self.waiting)
+        if total > self._packed_token_budget:
+            return False
+        live = self._kv_in_use() + len(self.waiting) + 1
+        return live <= min(self.max_num_seqs, self._max_kv_concurrent)
 
     @staticmethod
     def _is_structured_output_grammar_waiter(request: Request) -> bool:
@@ -992,8 +1062,17 @@ class NeuronScheduler(Scheduler):
                 padded_tokens = self._calculate_padded_count(num_tokens)
                 padding_added = padded_tokens - num_tokens
 
-                # Store padded count separately
-                scheduler_output.num_scheduled_tokens_padded[req_id] = padded_tokens
+                # Store padded count separately. A prompt that may be packed
+                # (bucket <= the packed limit) keeps its real count: the runner
+                # lays the step out back to back and pads only the last row to
+                # the bucket of the total (packed_prefill.pack_padding).
+                # A 1-token prompt keeps its bucket so the step still reads as
+                # prefill (the runner overwrites the counts either way).
+                scheduler_output.num_scheduled_tokens_padded[req_id] = (
+                    num_tokens
+                    if num_tokens > 1 and padded_tokens <= self._packed_token_budget
+                    else padded_tokens
+                )
 
                 # Observe padded token count metric
                 bucket_name = f"prefill_s{padded_tokens}"
@@ -1224,9 +1303,11 @@ class NeuronScheduler(Scheduler):
             # becomes ready mid-call would mix prefill+decode in one batch, which
             # Neuron forbids. In that case defer every grammar waiter to a later,
             # dedicated prefill step -- mirroring the ready-at-entry guard in step 3.
+            # A grammar waiter is never packed with other prompts, so it stays
+            # visible only when no other prompt waits this step.
             can_admit = (
                 not self.running
-                and len(self.waiting) < self.max_prefills_per_batch
+                and not self.waiting
                 and not self.at_capacity
                 and not self.has_prefill_in_running
                 and len(self.running) < self._max_kv_concurrent

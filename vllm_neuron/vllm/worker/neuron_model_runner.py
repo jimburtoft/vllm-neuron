@@ -1160,6 +1160,32 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             )
 
+        # Packed prefill (VLLM_NEURON_MAX_PREFILLS_PER_BATCH, see
+        # vllm_neuron/vllm/core/packed_prefill.py). Same resolution as the
+        # scheduler, so both agree on the number of prefill rows per step.
+        from vllm_neuron.vllm.core import packed_prefill as _packed_prefill
+
+        self.packed_prefill_rows = _packed_prefill.effective_rows(
+            _packed_prefill.resolve_max_prefills(vllm_config)[0],
+            self.neuron_config.num_batched_tokens_buckets,
+        )
+        self.packed_prefill_limit = (
+            _packed_prefill.packed_bucket_limit(
+                self.neuron_config.num_batched_tokens_buckets,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+            )
+            if self.packed_prefill_rows > 1
+            else 0
+        )
+        if self.packed_prefill_limit == 0:
+            self.packed_prefill_rows = 1
+        if self.packed_prefill_rows > 1:
+            logger.info(
+                "Packed prefill: prefill buckets <= %d take %d request rows.",
+                self.packed_prefill_limit,
+                self.packed_prefill_rows,
+            )
+
         # Ensure max_num_batched_tokens is large enough for the largest prefill bucket
         # This is required because slot_mapping buffer is sized by max_num_batched_tokens
         max_bucket_size = max(self.neuron_config.num_batched_tokens_buckets)
@@ -3455,7 +3481,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
               encoder_positions[i, j] = batch position for token j in block i.
               Sentinel value = num_tokens for don't-care positions.
         """
-        assert len(req_ids) == 1, (
+        # A packed prefill step (several text prompts) has no multimodal items; the
+        # loop below then fills nothing. Multimodal requests are never packed.
+        assert (
+            sum(1 for r in req_ids if self.requests[r].mm_features) <= 1
+            and (len(req_ids) == 1 or not any(self.requests[r].mm_features for r in req_ids))
+        ), (
             f"_gather_mm_embeddings expects single-request prefill but got "
             f"{len(req_ids)} requests. The prefill NEFF input is sized for "
             f"max_encoder_blocks_per_request={self.max_encoder_blocks_per_request} "
@@ -4021,6 +4052,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 padded_num_reqs,
             )
 
+        # Packed prefill: every prefill graph takes packed_prefill_rows request rows
+        # (block table, sampling positions and params), however many prompts it packs.
+        packed_step = self._is_packed_prefill_step(scheduler_output)
+        if packed_step:
+            padded_num_reqs = max(padded_num_reqs, self.packed_prefill_rows)
+
         # Record draft-lockstep state for sample_tokens. group_force_nonspec
         # wins over any_rank_spec_decode (same rule as execute_dummy_batch), so
         # a skip-propose rank only runs a dummy draft when the group actually
@@ -4053,6 +4090,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         tokens = [
             scheduler_output.num_scheduled_tokens_padded[req_id] for req_id in req_ids
         ]
+        # Packed prefill: the scheduler pads each prompt to its own bucket. Lay
+        # the prompts out back to back instead and pad only the last row, to the
+        # bucket of the total (packed_prefill.py). Idempotent on the re-prep.
+        if packed_step:
+            from vllm_neuron.vllm.core import packed_prefill as _packed_prefill
+
+            tokens = _packed_prefill.pack_padding(
+                [scheduler_output.num_scheduled_tokens[r] for r in req_ids],
+                self.neuron_config.num_batched_tokens_buckets,
+            )
+            for req_id, n in zip(req_ids, tokens):
+                scheduler_output.num_scheduled_tokens_padded[req_id] = n
         num_scheduled_tokens_padded = np.array(tokens, dtype=np.int64)
         total_num_scheduled_tokens_padded = int(num_scheduled_tokens_padded.sum())
         max_num_scheduled_tokens_padded = max(tokens)
@@ -4234,15 +4283,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Compute cached_seq_len for segmented prefill
         cached_seq_len = self._compute_cached_seq_len()
 
-        # Build attention metadata
+        # Build attention metadata. A packed prefill graph is keyed on the bucket,
+        # not on its longest row, so give the bucket as max_query_len (warmup too).
         attn_metadata = self._build_attention_metadata(
             padded_num_reqs,
             total_num_scheduled_tokens_padded,  # Includes decode padding
-            max_num_scheduled_tokens_padded,
+            total_num_scheduled_tokens_padded
+            if packed_step
+            else max_num_scheduled_tokens_padded,
             max_num_draft_tokens,
             cached_seq_len,
             max_decode_ctx_len=max_decode_ctx_len,
         )
+        if packed_step:
+            self._add_packed_prefill_bounds(
+                attn_metadata, actual_num_tokens, total_num_scheduled_tokens_padded
+            )
 
         # Spec decoding
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
@@ -4262,6 +4318,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     actual_last_token_idx = end_idx - req_padding
                     logits_indices_list.append(actual_last_token_idx)
 
+                if packed_step:
+                    # Unused request rows repeat the last real index; their
+                    # samples are dropped with the padding rows.
+                    logits_indices_list += [logits_indices_list[-1]] * (
+                        padded_num_reqs - len(logits_indices_list)
+                    )
                 logits_indices = torch.tensor(logits_indices_list, dtype=torch.long)
                 logger.debug(
                     "Computed logits_indices with padding: "
@@ -4622,6 +4684,41 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
         )
+
+    def _is_packed_prefill_step(self, scheduler_output: Any) -> bool:
+        """True on a prefill step whose real tokens fit the packed bucket limit.
+
+        With packed prefill on, every such step uses the packed layout and the
+        packed graph, also with one prompt, so the graph does not depend on how
+        many prompts it packs. Larger prefills keep the one-prompt path.
+        """
+        if getattr(self, "packed_prefill_rows", 1) <= 1:
+            return False
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0 or self._is_decode():
+            return False
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        if any(self._is_decode_row(i) for i in range(num_reqs)):
+            return False
+        total = sum(scheduler_output.num_scheduled_tokens[r] for r in req_ids)
+        return total <= self.packed_prefill_limit
+
+    def _add_packed_prefill_bounds(
+        self, attn_metadata: dict, actual_num_tokens: np.ndarray, total: int
+    ) -> None:
+        """Attach per-token segment bounds (packed_prefill.segment_bounds) to every group."""
+        from vllm_neuron.vllm.core import packed_prefill as _packed_prefill
+
+        lo, hi = _packed_prefill.segment_bounds(actual_num_tokens, total)
+        lo_t = torch.from_numpy(lo).to(self.device)
+        hi_t = torch.from_numpy(hi).to(self.device)
+        real_t = torch.tensor(
+            [int(np.sum(actual_num_tokens))], dtype=torch.int64, device=self.device
+        )
+        for meta in {id(m): m for m in attn_metadata.values()}.values():
+            meta[_packed_prefill.BOUND_MIN_KEY] = lo_t
+            meta[_packed_prefill.BOUND_MAX_KEY] = hi_t
+            meta[_packed_prefill.REAL_TOKENS_KEY] = real_t
 
     def _decode_token_threshold(self) -> int:
         """Largest `max_query_len` still classified as decode.
@@ -5899,7 +5996,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if device is None:
             device = self.device
         cached_seq_len = 0
-        num_reqs = 1
+        # Packed prefill: the graph takes packed_prefill_rows request rows (one
+        # real prompt over the whole bucket here) and the bucket as max_query_len.
+        packed = (
+            getattr(self, "packed_prefill_rows", 1) > 1
+            and not kv_segment_size
+            and bucket_size <= self.packed_prefill_limit
+        )
+        num_reqs = self.packed_prefill_rows if packed else 1
         num_tokens = bucket_size
 
         # Create synthetic inputs: 1 request with bucket_size tokens
@@ -5916,7 +6020,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             rotary_position_ids = None
         positions = positions.to(device)
         # Sample from last token only
-        logits_indices = torch.tensor([num_tokens - 1], dtype=torch.long).to(device)
+        logits_indices = torch.full((num_reqs,), num_tokens - 1, dtype=torch.long).to(
+            device
+        )
 
         attn_metadata = self._build_warmup_attention_metadata(
             num_tokens=num_tokens,
@@ -5928,10 +6034,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             device=device,
             kv_segment_size=kv_segment_size,
         )
+        if packed:
+            from vllm_neuron.vllm.core import packed_prefill as _packed_prefill
+
+            lo, hi = _packed_prefill.segment_bounds([num_tokens], num_tokens)
+            lo_t = torch.from_numpy(lo).to(device)
+            hi_t = torch.from_numpy(hi).to(device)
+            real_t = torch.tensor([num_tokens], dtype=torch.int64, device=device)
+            for meta in {id(m): m for m in attn_metadata.values()}.values():
+                meta["max_query_len"] = num_tokens
+                meta[_packed_prefill.BOUND_MIN_KEY] = lo_t
+                meta[_packed_prefill.BOUND_MAX_KEY] = hi_t
+                meta[_packed_prefill.REAL_TOKENS_KEY] = real_t
 
         # Create dummy sampling params for warmup
         dummy_sampling_params = torch.tensor(
-            [[0, 1.0, 1.0]],  # [top_k, top_p, temperature]
+            [[0, 1.0, 1.0]] * num_reqs,  # [top_k, top_p, temperature]
             dtype=torch.float32,
             device=device,
         )
