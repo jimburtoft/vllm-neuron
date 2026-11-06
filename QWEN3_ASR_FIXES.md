@@ -102,6 +102,51 @@ vllm serve Qwen/Qwen3-ASR-1.7B --tensor-parallel-size 1 --data-parallel-size 4 -
 # LNC=1, 8 replicas: NEURON_LOGICAL_NC_CONFIG=1 VLLM_NEURON_RESERVED_HEADROOM_GIB=2 VLLM_NEURON_DISABLE_PARALLEL_TRACE=1, --data-parallel-size 8
 ```
 
+## Speculative decoding with a DFlash draft (opt-in, off by default)
+
+Qwen3-ASR is a DFlash speculative decoding target on this branch. Speculation runs **only** when the server gets
+`--speculative-config`. Without it, the graphs and outputs are the same as before (the aux hidden-state capture is
+empty, and the verify path is not compiled).
+
+What it is for: **lower single-stream and low-concurrency latency.** Each step proposes 15 tokens with a small draft
+model and checks them in one 16-token verify step of the target. Under greedy decoding the output is the target's own
+(up to bf16 ties between the 16-token verify graph and the 1-token decode graph: a comma or a spelling, WER unchanged).
+It is not a throughput feature: the verify step costs about 2x a decode step, so at high concurrency (C >= 16-32)
+the non-speculative settings above are faster.
+
+```bash
+# Single stream / low concurrency (TP4, LNC=2, bf16 KV). DRAFT = a Qwen3-ASR-1.7B DFlash draft (public DFlash format,
+# block size 16). Keep num_speculative_tokens = block_size - 1 = 15: truncating the block lowers acceptance sharply.
+vllm serve Qwen/Qwen3-ASR-1.7B --tensor-parallel-size 4 --max-num-seqs 16 \
+  --max-model-len 1024 --max-num-batched-tokens 1024 --no-enable-prefix-caching --dtype bfloat16 --max-logprobs 0 \
+  --additional-config '{"neuron_config":{"quantization":"bf16","num_batched_tokens_buckets":[128,256,416,512,1024],"num_seqs_buckets":[1,2,4,8,16],"on_device_sampling_config":{"all_greedy":true}},"encoder_neuron_config":{"num_encoder_input_buckets":[1,2,4],"encoder_attention_block_size":128,"dp_size":4,"encoder_cache_num_blocks":64}}' \
+  --speculative-config '{"method":"dflash","model":"'"$DRAFT"'","num_speculative_tokens":15}'
+# Optional: "spec_decode_max_prompt_len": N in neuron_config decodes requests with longer prompts without drafts
+#   (acceptance usually drops on long contexts).
+```
+
+Measured with an English read-speech pilot draft (TP4 LNC2, MNS 16, `vllm bench serve`, 128 requests per point):
+
+| audio | tokens accepted per step | C=1 E2E p50, off -> on | C=8 | C=16 |
+|---|--:|---|---|---|
+| LibriSpeech test-clean (in-domain for the draft) | 4.6-4.9 | 124 -> **71 ms (1.75x)** | 275 -> 236 ms | 428 -> 400 ms (break-even) |
+| Earnings22 30 s (out of domain) | 1.3 | 313 -> 466 ms (slower) | 571 -> 957 ms | slower |
+
+Earnings22 WER (341 chunks): 6.06 % with speculation vs 6.02 % without. **Whether it helps depends on the draft's
+acceptance on your audio**: break-even is about 1.9 accepted tokens per step at TP4 single stream. Read the
+acceptance from the server metrics: `1 + vllm:spec_decode_num_accepted_tokens_total / vllm:spec_decode_num_drafts_total`.
+
+Notes:
+- Fixes on this branch that speculation needs (not in the 0.29.0.1.2.0 release): the GQA decode mask is moved to
+  the kernel's folded layout (without it, a 16-token verify step with more than one KV head per rank, e.g. TP <= 4,
+  gives wrong attention and degenerate output); `kv_heads` is passed to the QK-swap check; the draft block mask is
+  built with torch ops; `rope_parameters` is read for the draft and target configs; `hf_text_config` gives the
+  target layer count of a multimodal model; reduced draft vocabularies (`d2t`) and mask embeddings load; more
+  than 256 verify tokens per step are allowed.
+- Not validated with speculation: FP8 KV, `VLLM_NEURON_QWEN3_ASR_LMHEAD=fused`, LNC=1 layouts. Use bf16 KV and the
+  default lm_head with a draft.
+- K < 15 with a block-16 draft (truncated block): acceptance 4.6 -> 2.0 (K=8) -> 1.8 (K=4), slower than K=15.
+
 ## API-server load (vLLM 0.29)
 
 vLLM 0.29 has every API process accept from one shared socket. A client's keep-alive pool can then land mostly on one process, which becomes CPU-bound, and throughput drops at random. With TP1 × DP8, 5 of 22 runs were up to 30 % low.

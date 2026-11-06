@@ -41,6 +41,7 @@ The following table shows the Qwen3-ASR feature status. See the
 | | Audio encoder tensor parallelism (TP) | ✅ |
 | | Pipeline parallelism (PP) | ❌ |
 | **Performance** | Greedy decoding | ✅ |
+| | Speculative decoding (DFlash draft, opt-in; see `QWEN3_ASR_FIXES.md`) | ✅ (this branch) |
 | | Prefix caching (APC) | ❌ |
 | | Disaggregated encoder inference | ❌ |
 | **Compilation** | `torch.compile` | ✅ |

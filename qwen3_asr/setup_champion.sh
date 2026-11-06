@@ -41,6 +41,8 @@ export UNSAFE_FP8FNCAST=${UNSAFE_FP8FNCAST:-1}
 # 512 makes each prefill 11 % faster, +3.9 % RTFx). The full-prefill KV cache write in whole blocks (+3.3 % RTFx,
 # transcripts unchanged) is on by default; VLLM_NEURON_QWEN3_ASR_PREFILL_OPT=none turns it off.
 # See QWEN3_ASR_FIXES.md "Recommended settings".
+# Speculative decoding (DFlash draft) is supported and OFF unless you pass --speculative-config; it lowers single-stream
+# latency when the draft's acceptance on your audio is high. Settings: QWEN3_ASR_FIXES.md "Speculative decoding".
 export NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=${NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION:-0}
 python - <<PY
 import nkilib, vllm_neuron
