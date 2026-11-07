@@ -90,6 +90,14 @@ class DecodeMegakernel:
         self.use_lm_head = use_lm_head
         self.lm_head = None
         self.slot_rows = False   # set by the runner (``Qwen3_5ForCausalLM.use_state_slot_rows``)
+        self.state_pool_ok = True   # set at ``bind_state_cache``
+
+    def check_state_pool(self, state_a) -> None:
+        """The kernel updates the state in place. A float32 view of vLLM's shared int8 KV pool
+        (``VLLM_NEURON_SHARED_STATE_POOL=1`` or prefix caching) is a view with another dtype, whose in-place
+        update the compiler does not support; only the dedicated state pool is covered."""
+        base = state_a._base
+        self.state_pool_ok = base is None or base.dtype == state_a.dtype
 
     # ── load time ────────────────────────────────────────────────────────
 
@@ -163,6 +171,8 @@ class DecodeMegakernel:
             return False
         sa = gdn.state_a
         if sa is None or sa.dim() != 3 or sa.shape[2] != 128:
+            return False
+        if not self.state_pool_ok:
             return False
         conv_rows, rec_rows = gdn.conv_numel // 128, gdn.rec_numel // 128
         if not (conv_rows <= sa.shape[1] and conv_rows + rec_rows <= 2 * sa.shape[1]):

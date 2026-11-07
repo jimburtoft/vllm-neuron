@@ -1007,6 +1007,8 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
             if mixer.layer_name not in state_caches:
                 raise KeyError(f"State cache for layer {mixer.layer_name} not initialized")
             mixer.bind_state(*state_caches[mixer.layer_name])
+            if self.language_model.decode_megakernel is not None:
+                self.language_model.decode_megakernel.check_state_pool(mixer.state_a)
 
     def use_state_slot_rows(self) -> bool:
         """Runner opt-in (dedicated state pool, one page per slot, page = 1 + slot): run decode with batch row
