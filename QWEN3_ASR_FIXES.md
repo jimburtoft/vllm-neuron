@@ -99,6 +99,7 @@ vllm serve Qwen/Qwen3-ASR-1.7B --tensor-parallel-size 1 --data-parallel-size 4 -
 #   (TP1 x DP8 LNC1 MNS48: 1,825-1,845 RTFx with the default fused encoder attention, WER 5.97 %).
 # --max-logprobs 0 is needed only for VLLM_NEURON_QWEN3_ASR_LMHEAD=fused. Same-session A/B: no throughput effect
 #   by itself (default 20: 1,874-1,910 RTFx; 0: 1,864-1,909). Larger max_num_seqs (64/96) fit in the doubled KV but are not faster.
+# FP8 KV is for the LNC=1 layout: at LNC=2 TP1 (MNS 33) it was 2.1x slower than bf16 KV (181 vs 383 RTFx, WER 5.98 / 5.99 %).
 # LNC=1, 8 replicas: NEURON_LOGICAL_NC_CONFIG=1 VLLM_NEURON_RESERVED_HEADROOM_GIB=2 VLLM_NEURON_DISABLE_PARALLEL_TRACE=1, --data-parallel-size 8
 ```
 

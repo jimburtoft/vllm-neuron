@@ -21,8 +21,13 @@ PY
 # nkilib ships inside the nki wheel as top-level package "nkilib"; put the champion copy first on the path.
 export PYTHONPATH="$HERE:$NKI_DIR/src/nkilib_src${PYTHONPATH:+:$PYTHONPATH}"
 # A modified nkilib needs PRIVATE NKI caches: the NKI trace-cache key does not hash nkilib source, so a
-# shared cache silently serves the stock kernels. Keep these per nkilib revision.
-REV=$(git -C "$NKI_DIR" rev-parse --short HEAD)
+# shared cache silently serves the stock kernels. The same holds for the NKI kernels in this tree (fused encoder
+# attention, conv frontend, lm_head + argmax) and for the vLLM compile cache (keyed on the FX graph, not on kernel
+# source). Key all three on both revisions, plus a hash of uncommitted changes, so an edit or a branch switch
+# never reuses a stale kernel.
+_rev() { local r d; r=$(git -C "$1" rev-parse --short HEAD 2>/dev/null || echo nogit)
+  d=$(git -C "$1" diff HEAD 2>/dev/null | sha1sum | cut -c1-6); [ "$d" = "da39a3" ] && echo "$r" || echo "$r-$d"; }
+REV="vn$(_rev "$HERE")_nk$(_rev "$NKI_DIR")"
 export NKI_TRACE_CACHE_URL=${NKI_TRACE_CACHE_URL:-$HOME/.cache/qwen3-asr-champion/$REV/nki_trace}
 export NKI_COMPILE_CACHE_URL=${NKI_COMPILE_CACHE_URL:-$HOME/.cache/qwen3-asr-champion/$REV/nki_compile}
 export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$HOME/.cache/qwen3-asr-champion/$REV/vllm}
