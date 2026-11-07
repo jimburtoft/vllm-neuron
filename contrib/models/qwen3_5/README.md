@@ -276,54 +276,116 @@ fused shared-expert gate/up and the lm_head tiles. The routed experts are read
 as loaded.
 
 - **Coverage.** The 35B-A3B shapes, TP=4, no expert parallelism, LNC=2, KV
-  block size 256 and batch buckets up to 8 (tested: `[1, 4, 8]`), with one
-  token per request. Pass `--block-size 256`. Any other checkpoint or
-  configuration logs a warning and keeps the default path, as does any other
-  graph (prefill, buckets above 8). With the flag unset none of this code runs.
-- **Usage:**
-  `QWEN3_5_DECODE_MEGAKERNEL=1 MAX_NUM_SEQS=8 DECODE_BUCKETS="[1, 4, 8]" bash
-  contrib/models/qwen3_5/scripts/serve.sh /path/to/Qwen3.5-35B-A3B --block-size 256`.
+  block size 256 and one token per request. Pass `--block-size 256`. Batch
+  buckets up to 128 run in the kernel when the runner uses state-slot rows
+  (below), up to 8 otherwise. The DeltaNet state must be in the dedicated
+  state pool (the default without prefix caching); with
+  `VLLM_NEURON_SHARED_STATE_POOL=1` decode keeps the default path. Any other
+  checkpoint or configuration logs a
+  warning and keeps the default path, as does any other graph (prefill). With
+  the flag unset none of this code runs.
+- **Large batches.** Routed experts are deduplicated from batch 8 up: each
+  expert the step routes to is loaded once and applied to all rows. Above 128
+  DeltaNet state columns (batch 64 and up) the recurrence runs in groups of
+  requests.
+- **State-slot rows.** With the dedicated recurrent-state pool (no prefix
+  caching, no speculative decoding) and a largest decode bucket of at least
+  `--max-num-seqs`, the runner asks the model whether decode batch row k should
+  be state slot k (`use_state_slot_rows`, true only with the flag on). If so it
+  hands out the lowest free slot and pads a decode batch up to the bucket that
+  covers its largest slot. The kernel then reads and writes the DeltaNet state of
+  the batch as contiguous blocks instead of one indexed DMA per request; batch
+  rows are permuted into slot order in the graph (per-row tensors only, the
+  state never moves), and rows with no request keep their state unchanged.
+- **Long context.** Context buckets above 2048 tokens use a flash-decode
+  attention core (online softmax over KV-block chunks).
+- **Recommended serving config** (trn2.3xlarge, validated below):
+  ```bash
+  QWEN3_5_DECODE_MEGAKERNEL=1 MAX_MODEL_LEN=2048 CHUNK=2048 MAX_NUM_SEQS=64 GMU=0.85 \
+  PREFILL_BUCKETS="[128, 256, 512, 1024, 2048]" DECODE_BUCKETS="[1, 4, 8, 16, 32, 64]" \
+  bash contrib/models/qwen3_5/scripts/serve.sh /path/to/Qwen3.5-35B-A3B --block-size 256
+  ```
+  Small prefill buckets keep short prompts from padding to 2048 tokens. For
+  longer contexts raise `MAX_MODEL_LEN` and keep `CHUNK` 2048; `serve.sh` then
+  adds the KV segment bucket (the long-context table below). Each state slot
+  takes about 30 MiB per rank in the dedicated recurrent-state pool (30 DeltaNet
+  layers x one padded 1 MiB page), taken out of the KV budget: at
+  `max_num_seqs` 64 and GMU 0.85 the KV cache holds 176,500 tokens (86
+  requests of 2048 tokens). `max_num_seqs` 128 (decode buckets up to 128) also
+  runs, but at GMU 0.85 its KV cache holds 33,512 tokens, which caps concurrency
+  at 16 for 2048-token requests, and GMU 0.9 does not leave enough HBM to load
+  the graphs.
   `scripts/benchmark_latency.py` takes `--block-size`.
 
 Measured on trn2.3xlarge, SDK 2.33 (vllm-neuron 0.29), native route, bf16,
-greedy, TP=4. Both arms ran with the same server settings (`max_model_len`
-9472, `max_num_seqs` 8, decode buckets `[1, 4, 8]`, `--block-size 256`) and
-differ only in the flag.
+greedy, TP=4: `max_model_len` 2048, `max_num_batched_tokens` 2048, prefill
+buckets `[128, 256, 512, 1024, 2048]`, `max_num_seqs` 64, decode buckets
+`[1, 4, 8, 16, 32, 64]`, `--block-size 256`. The two arms differ only in the
+flag. They ran at GMU 0.8 (KV cache 85,085 tokens), because with the flag off
+the batch-64 decode graph fails at run time at GMU 0.85 ("Failed to schedule
+neff execution ... Allocation Failure"). The last two columns are the
+recommended config (flag on, GMU 0.85, KV cache 176,500 tokens).
 
 | | Flag off | Flag on |
 | --- | --- | --- |
-| Greedy tokens equal to HF bf16 (8 prompts x 32) | 188/256 | 218/256 |
-| Prompts identical to HF over all 32 tokens | 4/8 | 5/8 |
-| GSM8K, 100 questions, 8-shot chat, strict / flexible match | 0.88 / 0.91 | 0.87 / 0.88 |
-| Passkey retrieval, ~6.7K-token context (5 depths x 2 keys) | 10/10 | 10/10 |
+| Greedy tokens equal to HF bf16 (8 prompts x 32) | 205/256 | 190/256 |
+| Prompts identical to HF over all 32 tokens | 5/8 | 5/8 |
+| GSM8K, 100 questions, 8-shot chat, 100 concurrent, strict / flexible | 0.93 / 0.95 | 0.92 / 0.95 (GMU 0.85: 0.93 / 0.95) |
+| Passkey retrieval, ~1.8K-token context (5 depths x 2 keys) | 10/10 | 10/10 |
 
 Every greedy divergence from HF in either arm is at a near-tie (top-2 logit
-margin of 0.125 or less). The GSM8K difference is within the run-to-run noise
-of n=100.
+margin 0.0 with the flag on). The GSM8K difference is one question.
 
-`vllm bench serve`, random 1024-token input, 128-token output, medians:
+`vllm bench serve`, random input / output lengths, `--ignore-eos`; output
+tok/s and mean TPOT (ms):
 
-| Concurrency | TPOT off | TPOT on | Output tok/s off | Output tok/s on |
-| --- | --- | --- | --- | --- |
-| 1 | 21.16 ms | 7.43 ms | 41.7 | 96.8 |
-| 4 | 49.62 ms | 17.04 ms | 70.6 | 165.0 |
-| 8 | 82.53 ms | 31.78 ms | 84.1 | 179.3 |
+| In / out | Concurrency | tok/s off | tok/s on | TPOT off | TPOT on | tok/s on, GMU 0.85 | TPOT on, GMU 0.85 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 256 / 128 | 1 | 48.6 | 132.4 | 17.81 | 6.31 | 132.0 | 6.32 |
+| 256 / 128 | 16 | 126.2 | 406.6 | 116.77 | 29.13 | 403.7 | 29.27 |
+| 256 / 128 | 32 | 83.7 | 502.3 | 364.70 | 44.00 | 495.6 | 44.39 |
+| 256 / 128 | 64 | 28.5 | 458.5 | 1323.01 | 53.43 | 547.4 | 77.20 |
+| 256 / 128 | 128 | 22.5 | 456.6 | 1793.34 | 60.16 | 548.3 | 77.25 |
+| 256 / 1024 | 64 | 29.2 | 876.8 | 1305.05 | 35.99 | 1322.6 | 43.40 |
+| 256 / 1024 | 128 | not run | 867.4 | not run | 40.07 | 1321.9 | 43.43 |
+| 1024 / 128 | 16 | 115.6 | 313.1 | 122.59 | 34.72 | 311.8 | 34.76 |
+| 1024 / 128 | 64 | 27.9 | 344.7 | 1335.00 | 65.65 | 394.5 | 99.58 |
 
-TTFT is unchanged (prefill does not use the kernel): 379 / 952 / 1688 ms off and
-378 / 939 / 1676 ms on at concurrency 1 / 4 / 8.
+With the flag off, decode at batch 16 and above is slow on this stack; the
+flag-off 256 / 1024 run at concurrency 128 was not run (about 25 tok/s). With
+the flag on at GMU 0.8 the KV cache caps concurrency at 41, which is why
+concurrency 64 and 128 are higher at GMU 0.85. Prefill does not use the
+kernel: mean TTFT at concurrency 16 is 1399 ms off and 1334 ms on (256-token
+prompts), 2147 ms and 2128 ms (1024-token prompts).
 
 `scripts/benchmark_latency.py` (1024-token input, 128-token output,
-`max_model_len` 2048, `--gpu-memory-utilization` 0.72, `--block-size 256`, one
-decode bucket per run), means over 3 rounds:
+`max_model_len` 2048, `--gpu-memory-utilization` 0.72, `--block-size 256`,
+`--max-num-seqs` = batch, one decode bucket per run), means over 3 rounds:
 
 | Batch | TTFT off | TTFT on | TPOT off | TPOT on | Output tok/s off | Output tok/s on |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 261.1 ms | 264.0 ms | 18.29 ms | 6.43 ms | 49.5 | 118.5 |
-| 4 | 644.5 ms | 643.7 ms | 36.33 ms | 13.91 ms | 97.3 | 212.3 |
-| 8 | 1151.1 ms | 1122.3 ms | 61.81 ms | 23.93 ms | 113.7 | 246.0 |
+| 1 | 268.8 ms | 268.1 ms | 18.30 ms | 6.33 ms | 49.4 | 119.3 |
+| 4 | 650.8 ms | 647.0 ms | 36.36 ms | 12.78 ms | 97.1 | 225.4 |
+| 8 | 1171.4 ms | 1148.7 ms | 61.80 ms | 20.21 ms | 113.4 | 275.4 |
 
-The flag-off numbers are in line with the 35B-A3B rows of the table above
-(measured there on trn2.48xlarge).
+The flag-off latency matches the previous base (18.29 / 36.33 / 61.81 ms).
+
+Longer context (`max_model_len` 9472, `max_num_batched_tokens` 2048 with KV
+segments, prefill bucket `[2048]`, `max_num_seqs` 8, decode buckets `[1, 4, 8]`,
+GMU 0.85, `--block-size 256`; context buckets above 2048 tokens use the
+flash-decode core). `vllm bench serve` medians:
+
+| In / out | Concurrency | TPOT off | TPOT on | Output tok/s off | Output tok/s on |
+| --- | --- | --- | --- | --- | --- |
+| 1024 / 128 | 1 | 21.17 ms | 7.18 ms | 41.7 | 99.1 |
+| 1024 / 128 | 4 | 49.62 ms | 16.04 ms | 70.6 | 172.3 |
+| 1024 / 128 | 8 | 82.52 ms | 27.89 ms | 84.2 | 196.5 |
+| 8192 / 256 | 1 | 21.15 ms | 7.16 ms | 37.2 | 77.2 |
+| 8192 / 256 | 4 | 53.70 ms | 20.12 ms | 59.0 | 116.4 |
+
+Passkey retrieval at ~6.7K tokens (5 depths x 2 keys): 10/10 off and on. Greedy
+vs HF with the flag on at this config: 218/256, 5/8 prompts identical.
+
 
 ## Example Checkpoints
 
