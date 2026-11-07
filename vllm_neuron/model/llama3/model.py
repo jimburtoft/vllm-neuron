@@ -640,6 +640,23 @@ class LlamaAttention(nn.Module):
             # fail fast on the unsupported combo (see helper for rationale).
             validate_fp8_segmented_supported(kv_is_fp8, self.fp8_packed)
 
+        # The in-kernel K/V write needs the cache in the kernel's
+        # [blocks, block_size, kv_heads * Dh] layout. For a 4D bf16 cache with
+        # more than one KV head per rank, NF.qkv_proj bridges by permuting the
+        # WHOLE K and V caches into that layout and copying them back -- four
+        # full-cache transposes per layer on every segmented prefill step
+        # (measured: a 128-token prompt at max_model_len 4096 took 187 ms vs
+        # 23 ms single-shot). Scatter only the new tokens instead.
+        inkernel_kv_write = (
+            kv_segment_size
+            and self.dcp_size <= 1
+            and (
+                self.fp8_packed
+                or self.k_cache.dim() != 4
+                or self.num_key_value_heads_per_rank == 1
+            )
+        )
+        if inkernel_kv_write:
             # In-kernel post-RoPE K/V write for the bf16 and the packed-FP8 cache
             # alike; segmented_attention below reads the cache.
             # qkv_cte divides by the scale arg and self.k_scale is the pre-inverted
@@ -746,8 +763,19 @@ class LlamaAttention(nn.Module):
                 scale=self.scaling,
             )
         elif kv_segment_size:
-            # K/V cache write was folded into the qkv kernel above; just
-            # attend over the cache segments here.
+            # K/V cache write was folded into the qkv kernel above, unless the
+            # layout bridge would have transposed the whole cache (see
+            # inkernel_kv_write); then scatter the step's tokens here. Padding
+            # slots (< 0 or out of range) go to the reserved block 0, as in the
+            # in-kernel path.
+            if not inkernel_kv_write:
+                max_slot = self.k_cache.shape[0] * block_size
+                safe_slots = torch.where(
+                    (slot_mapping < 0) | (slot_mapping >= max_slot),
+                    torch.zeros_like(slot_mapping),
+                    slot_mapping,
+                )
+                _write_kv_cache(k, v, safe_slots)
             attn_output = NF.segmented_attention(
                 q,
                 k_cache=self.k_cache,
