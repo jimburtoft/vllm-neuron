@@ -1143,6 +1143,12 @@ def _install_cte_shared_abs() -> bool:
     return True
 
 
+# MUSE_GLIMMER_PREFILL_FUSED_ADD_NORM (default 0): in prefill, fuse each residual add with the following centered
+# RMSNorm (pre-FFN norm, and the next layer's input norm) into one nkilib rmsnorm_residual_prefill call: the add runs in
+# the DMA engines during the load and the sum is returned as the next residual.
+_PREFILL_FUSED_ADD_NORM = os.environ.get("MUSE_GLIMMER_PREFILL_FUSED_ADD_NORM", "0") == "1"
+
+
 class MuseGlimmerMLP(nn.Module):
     def __init__(self, config: MuseGlimmerTextConfig):
         super().__init__()
@@ -1267,9 +1273,20 @@ class MuseGlimmerDecoderLayer(nn.Module):
         self.mlp = MuseGlimmerMLP(config)
 
     def forward(self, hidden_states, positions, position_embeddings, attn_metadata, is_prefill,
-                kv_writeback=None):
+                kv_writeback=None, pending=None):
+        """``pending``: the previous layer's un-added FFN output (MUSE_GLIMMER_PREFILL_FUSED_ADD_NORM, prefill).
+        Then ``hidden_states`` is that layer's residual, and the add is fused into this layer's input norm.
+        With ``return_pending`` set on the layer, the end-of-layer add is left to the next layer the same way:
+        the return value is ``(residual, h)`` instead of ``residual + h``."""
         fuse = self.self_attn.fuse if not is_prefill else ()
         T = hidden_states.shape[0]
+        if pending is not None:
+            x, hidden_states = NF.rmsnorm_residual_prefill(
+                pending, _df.centered_gamma(self.input_layernorm), hidden_states, eps=self.input_layernorm.eps)
+            residual = hidden_states
+            h = self.self_attn(x, positions, position_embeddings, attn_metadata, kv_writeback)
+            h = self.post_attention_layernorm(h)
+            return self._ffn(h, residual, fuse, T, is_prefill)
         residual = hidden_states
         if "norm" in fuse:  # input norm folded into the decode megakernel
             h = self.self_attn(hidden_states, positions, position_embeddings, attn_metadata, kv_writeback,
@@ -1278,15 +1295,25 @@ class MuseGlimmerDecoderLayer(nn.Module):
             h = self.self_attn(self.input_layernorm(hidden_states), positions, position_embeddings,
                                attn_metadata, kv_writeback)
         h = self.post_attention_layernorm(h)
+        return self._ffn(h, residual, fuse, T, is_prefill)
 
+    def _ffn(self, h, residual, fuse, T, is_prefill):
         if "ffn" in fuse and T <= _MLP_TKG_MAX_T:  # residual add + pre-FFN norm inside NF.mlp
             h, residual = self.mlp.forward_fused_decode(residual, h, self.pre_feedforward_layernorm)
+        elif is_prefill and _PREFILL_FUSED_ADD_NORM and T >= 128:
+            # residual add + pre-FFN centered RMSNorm in one nkilib kernel (prefill, SP rows).
+            h, residual = NF.rmsnorm_residual_prefill(
+                h, _df.centered_gamma(self.pre_feedforward_layernorm), residual,
+                eps=self.pre_feedforward_layernorm.eps)
+            h = self.mlp(h, is_prefill=is_prefill)
         else:
             hidden_states = residual + h
             residual = hidden_states
             h = self.pre_feedforward_layernorm(hidden_states)
             h = self.mlp(h, is_prefill=is_prefill)
         h = self.post_feedforward_layernorm(h)
+        if getattr(self, "return_pending", False) and is_prefill:
+            return residual, h
         return residual + h
 
 
@@ -1379,10 +1406,25 @@ class MuseGlimmerTextModel(nn.Module):
         # Spec decode (EAGLE3 / DFlash): capture the residual stream entering each
         # requested layer (= HF output_hidden_states of layer idx - 1).
         aux = []
+        # MUSE_GLIMMER_PREFILL_FUSED_ADD_NORM: in prefill each layer's end-of-layer residual add is fused into
+        # the next layer's input norm (one nkilib rmsnorm_residual_prefill per boundary). Spec-decode aux capture
+        # needs the summed stream, so that layer boundary falls back to the plain add.
+        fuse_bound = is_prefill and _PREFILL_FUSED_ADD_NORM and h.shape[0] >= 128
+        pending = None
+        n = len(self.layers)
         for idx, layer in enumerate(self.layers):
             if idx in self.aux_hidden_state_layers:
+                if pending is not None:
+                    h, pending = h + pending, None
                 aux.append(h)
-            h = layer(h, positions, position_embeddings, attn_metadata, is_prefill, kv_writeback)
+            layer.return_pending = fuse_bound and idx + 1 < n and (idx + 1) not in self.aux_hidden_state_layers
+            out = layer(h, positions, position_embeddings, attn_metadata, is_prefill, kv_writeback, pending=pending)
+            if isinstance(out, tuple):
+                h, pending = out
+            else:
+                h, pending = out, None
+        if pending is not None:
+            h = h + pending
         if kv_writeback:
             _issue_decode_kv_writes(
                 kv_writeback, self.kv_ptr_group_of if self.kv_defer_mode >= 2 else None
