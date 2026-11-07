@@ -21,7 +21,7 @@ BF16 on AWS Trainium2 (`trn2`) and Trainium3 (`trn3`).
 | Model | Hugging Face | Hardware | Quantization | Validated |
 |---|---|---|---|---|
 | Qwen3-ASR-1.7B | [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Trn2, Trn3 | BF16 | ✅ |
-| Qwen3-ASR-0.6B | [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | Trn2, Trn3 | BF16 | ❌ |
+| Qwen3-ASR-0.6B | [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | Trn2, Trn3 | BF16 | ✅ (this branch, Trn2; see `QWEN3_ASR_FIXES.md`) |
 
 ## Features
 

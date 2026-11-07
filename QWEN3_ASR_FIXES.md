@@ -103,6 +103,13 @@ vllm serve Qwen/Qwen3-ASR-1.7B --tensor-parallel-size 1 --data-parallel-size 4 -
 # LNC=1, 8 replicas: NEURON_LOGICAL_NC_CONFIG=1 VLLM_NEURON_RESERVED_HEADROOM_GIB=2 VLLM_NEURON_DISABLE_PARALLEL_TRACE=1, --data-parallel-size 8
 ```
 
+## Qwen3-ASR-0.6B
+
+The same branch and settings run `Qwen/Qwen3-ASR-0.6B` with no changes (2026-11-07, TP1 × DP8 LNC1 MNS48 FP8 KV,
+C=384): **2,889-2,982 RTFx (30 s), 1,886-2,027 (8 s)**; TP4 single stream E2E p50 255 ms (ITL 2.50 ms). Earnings22 WER
+**7.92 %** (1.7B: 6.01 %), in line with the published gap between the two models. It is about 20 % faster than the
+1.7B at 30 s, not 3x: at 8 replicas the decode step is dominated by fixed per-step cost, not weight bandwidth.
+
 ## Speculative decoding with a DFlash draft (opt-in, off by default)
 
 Qwen3-ASR is a DFlash speculative decoding target on this branch. Speculation runs **only** when the server gets
