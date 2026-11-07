@@ -2132,6 +2132,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ]
         if native_gk_decode:
             self.compile_options["compiler_args"].append("--model-type=generic")
+        # VLLM_NEURON_EXTRA_COMPILER_ARGS: extra neuronx-cc argv elements for every graph, '|'-separated
+        # (experiments, e.g. "--tensorizer-options=--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2").
+        _extra_cc = [a for a in os.environ.get("VLLM_NEURON_EXTRA_COMPILER_ARGS", "").split("|") if a]
+        if _extra_cc:
+            self.compile_options["compiler_args"] += _extra_cc
+            logger.info("extra compiler args: %s", _extra_cc)
         # An explicit caller level wins over the model default. Enable the model
         # policy only when the caller did not set the level. The runner then
         # resolves compiler_args_for eagerly, one time per graph, before the
