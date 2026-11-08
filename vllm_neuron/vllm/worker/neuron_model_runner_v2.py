@@ -284,6 +284,30 @@ class NeuronModelRunnerV2:
         self.decode_row_capacity = max(self.num_seqs_buckets)
         segment_buckets = self.neuron_config.kv_segment_size_buckets
         self.kv_segment_size = segment_buckets[0] if segment_buckets else 0
+        # Packed prefill (VLLM_NEURON_MAX_PREFILLS_PER_BATCH, see
+        # vllm_neuron/vllm/core/packed_prefill.py). Use the same resolution as
+        # the scheduler, so both agree on the number of prefill rows of a step.
+        from vllm_neuron.vllm.core import packed_prefill
+
+        self.packed_prefill_rows = packed_prefill.effective_rows(
+            packed_prefill.resolve_max_prefills(vllm_config)[0],
+            self.num_batched_tokens_buckets,
+        )
+        self.packed_prefill_limit = (
+            packed_prefill.packed_bucket_limit(
+                self.num_batched_tokens_buckets, self.max_num_batched_tokens
+            )
+            if self.packed_prefill_rows > 1
+            else 0
+        )
+        if self.packed_prefill_limit == 0:
+            self.packed_prefill_rows = 1
+        if self.packed_prefill_rows > 1:
+            logger.info(
+                "Packed prefill: prefill buckets <= %d take %d request rows.",
+                self.packed_prefill_limit,
+                self.packed_prefill_rows,
+            )
 
         # Placeholder geometry only: vLLM applies the backend block-size default after constructing
         # the worker's model runner. initialize_kv_cache replaces this from the validated per-group
@@ -1293,6 +1317,15 @@ class NeuronModelRunnerV2:
             slot_mappings=model_input.slot_mappings,
             swa_kv_pos_offsets=model_input.swa_kv_pos_offsets,
         )
+        if model_input.packed_bound_min is not None:
+            from vllm_neuron.vllm.core import packed_prefill
+
+            for per_layer in {id(m): m for m in attn_metadata.values()}.values():
+                per_layer[packed_prefill.BOUND_MIN_KEY] = model_input.packed_bound_min
+                per_layer[packed_prefill.BOUND_MAX_KEY] = model_input.packed_bound_max
+                per_layer[packed_prefill.REAL_TOKENS_KEY] = (
+                    model_input.packed_real_tokens
+                )
         rs = self.request_state
 
         def state_tensor(name: str, tensor: torch.Tensor) -> torch.Tensor:
@@ -2438,16 +2471,18 @@ class NeuronModelRunnerV2:
                 "V2 prefill classified (padded>1) but a row has num_computed >= prefill_len: "
                 f"num_computed {num_computed.tolist()}, prefill_len {prefill_lens_active.tolist()}"
             )
-            if num_active != 1:
+            packed = self._is_packed_prefill_step(
+                num_computed, query_lens, prefill_lens_active
+            )
+            if num_active != 1 and not packed:
                 raise RuntimeError(
                     "V2 prefill requires exactly one active request row per "
-                    f"scheduler step; got {num_active}"
+                    f"scheduler step; got {num_active}. Several rows need packed "
+                    "prefill: whole, fresh prompts that fit the packed bucket limit."
                 )
-            assert int(num_computed[0] + query_lens[0]) <= int(
-                prefill_lens_active[0]
-            ), (
-                f"prefill overshoots prefill_len: num_computed {int(num_computed[0])} + query_len "
-                f"{int(query_lens[0])} > prefill_len {int(prefill_lens_active[0])}"
+            assert bool((num_computed + query_lens <= prefill_lens_active).all()), (
+                f"prefill overshoots prefill_len: num_computed {num_computed.tolist()} + query_len "
+                f"{query_lens.tolist()} > prefill_len {prefill_lens_active.tolist()}"
             )
             # Sync the token-bucket INPUT across the DP group, then pick
             # locally (see _dp_sync_shape).
@@ -2459,7 +2494,9 @@ class NeuronModelRunnerV2:
                 self.neuron_config.num_batched_tokens_buckets,
                 "total_num_scheduled_tokens",
             )
-            row_bucket = 1
+            # A packed graph takes packed_prefill_rows request rows, whatever the
+            # number of prompts that it packs.
+            row_bucket = self.packed_prefill_rows if packed else 1
             kv_segment_size = self.kv_segment_size
         else:
             assert bool((num_computed >= prefill_lens_active - 1).all()), (
@@ -2489,6 +2526,29 @@ class NeuronModelRunnerV2:
             row_bucket=row_bucket,
             kv_segment_size=kv_segment_size,
         )
+
+    def _is_packed_prefill_step(
+        self,
+        num_computed: np.ndarray,
+        query_lens: np.ndarray,
+        prefill_lens: np.ndarray,
+    ) -> bool:
+        """Return whether a prefill step uses the packed graph.
+
+        With packed prefill on, a step uses the packed graph when every row is a
+        whole, fresh prompt and the real tokens fit the packed bucket limit. A
+        step with one such prompt also uses it, so the graph does not depend on
+        the number of prompts. A larger prefill keeps the one-row graph.
+        """
+        if self.packed_prefill_rows <= 1:
+            return False
+        if num_computed.shape[0] > self.packed_prefill_rows:
+            return False
+        if bool((num_computed != 0).any()) or bool(
+            (query_lens != prefill_lens).any()
+        ):
+            return False
+        return int(query_lens.sum()) <= self.packed_prefill_limit
 
     def _assemble_model_input(
         self,
@@ -2627,14 +2687,26 @@ class NeuronModelRunnerV2:
         # sampling_positions [R] (row -> FLAT hidden-token row): decode is row-aligned arange(B);
         # prefill (R=1) is the single request's last scored token in the flat [P] layout.
         sampling_positions = np.zeros(num_sample_rows, dtype=np.int64)
-        if is_prefill:
+        packed = is_prefill and row_bucket > 1
+        if packed:
+            # Packed prefill: row r samples the last token of prompt r. Unused
+            # rows repeat the last real index, and valid_rows drops them.
+            ends = np.cumsum(query_lens[:num_active]) - 1
+            sampling_positions[:num_active] = ends
+            sampling_positions[num_active:] = ends[-1] if num_active else 0
+        elif is_prefill:
             sampling_positions[0] = max(total_scored - 1, 0)
         else:
             sampling_positions[:] = np.arange(row_bucket, dtype=np.int64)
 
         # A non-final chunked-prefill row advances its count but discards its
         # sampled token; decode padding rows do not produce output.
-        if is_prefill:
+        if packed:
+            # A packed prompt is whole, so every real row is a final chunk.
+            valid_rows = (True,) * num_active + (False,) * (
+                num_sample_rows - num_active
+            )
+        elif is_prefill:
             final_chunk = num_active == 1 and (
                 int(num_computed[0] + query_lens[0]) >= int(prefill_lens_active[0])
             )
@@ -2687,7 +2759,21 @@ class NeuronModelRunnerV2:
         def _to_dev(arr):
             return torch.from_numpy(np.ascontiguousarray(arr)).to(device)
 
+        packed_operands: dict = {}
+        if packed:
+            from vllm_neuron.vllm.core import packed_prefill
+
+            bound_min, bound_max = packed_prefill.segment_bounds(
+                query_lens[:num_active], padded_num_tokens
+            )
+            packed_operands = dict(
+                packed_bound_min=_to_dev(bound_min),
+                packed_bound_max=_to_dev(bound_max),
+                packed_real_tokens=_to_dev(np.array([total_scored], dtype=np.int64)),
+            )
+
         return NeuronModelInput(
+            **packed_operands,
             positions=_to_dev(positions),
             block_tables=block_tables,
             slot_mapping=_to_dev(slot_mapping),
@@ -2744,6 +2830,8 @@ class NeuronModelRunnerV2:
         query_lens = np.array([bucket_size], dtype=np.int64)
         # prefill_len long enough that the synthetic chunk is "final" (shape is what matters, not value).
         prefill_lens_active = np.array([bucket_size], dtype=np.int64)
+        # A packed prefill bucket compiles the packed graph.
+        packed = self.packed_prefill_rows > 1 and bucket_size <= self.packed_prefill_limit
         return self._assemble_model_input(
             idx_mapping_np=idx_mapping_np,
             num_computed=num_computed,
@@ -2751,7 +2839,7 @@ class NeuronModelRunnerV2:
             prefill_lens_active=prefill_lens_active,
             is_prefill=True,
             token_bucket=bucket_size,
-            row_bucket=1,
+            row_bucket=self.packed_prefill_rows if packed else 1,
             kv_segment_size=kv_segment_size,
             device=device,
         )

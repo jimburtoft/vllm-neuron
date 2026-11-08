@@ -144,11 +144,6 @@ def unsupported_reason(vllm_config: "VllmConfig") -> str | None:
         return "jump-forward decoding is enabled"
     if nc.get("kv_segment_size_buckets") or sc.max_num_batched_tokens < mc.max_model_len:
         return "segmented (chunked) prefill is possible (max_num_batched_tokens < max_model_len)"
-    try:
-        if vllm_config.use_v2_model_runner:
-            return "the V2 model runner is selected"
-    except Exception:  # noqa: BLE001 - property may be unavailable on a partial config
-        pass
     return None
 
 

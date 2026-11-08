@@ -89,6 +89,11 @@ class NeuronModelInput:
     # Per-group per-row KV position offsets for sliding-window groups on
     # decode ([B] int32); None entries for full-attention groups and prefill.
     swa_kv_pos_offsets: tuple[torch.Tensor | None, ...] | None = None
+    # Packed prefill only: the [P] int32 start and end of the prompt of each
+    # token (packed_prefill.segment_bounds), and the [1] int64 real-token count.
+    packed_bound_min: torch.Tensor | None = None
+    packed_bound_max: torch.Tensor | None = None
+    packed_real_tokens: torch.Tensor | None = None
 
 
 def build_flat_positions(
