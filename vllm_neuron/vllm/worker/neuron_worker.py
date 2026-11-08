@@ -2667,8 +2667,11 @@ class NeuronWorker(WorkerBase):
                 encoder_inputs["encoder_cache_buffer"] = (
                     self.model_runner.encoder_cache.buffer
                 )
-                encoder_inputs["write_block_ids"] = torch.zeros(
-                    num_blocks, dtype=torch.int64, device=device
+                # A model whose planner pads differently (Qwen3-ASR) returns its own
+                # write_block_ids; fill in the generic block count for the others.
+                encoder_inputs.setdefault(
+                    "write_block_ids",
+                    torch.zeros(num_blocks, dtype=torch.int64, device=device),
                 )
                 # Scope the "encoder" compiler args, so warmup loads the -O3 NEFF.
                 with (

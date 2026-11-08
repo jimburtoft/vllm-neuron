@@ -27,6 +27,7 @@ from vllm.model_executor.models.interfaces import SupportsEagle3
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
 from nkilib.core.utils.common_types import NormType
+from vllm_neuron.model.interfaces import SupportsEncoderWarmup
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig, EncoderNeuronConfig
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
@@ -1228,7 +1229,7 @@ class Qwen3ASRTextModel(nn.Module):
 
 
 @async_speculative_decoding
-class Qwen3ASRForConditionalGeneration(nn.Module, SupportsEagle3):
+class Qwen3ASRForConditionalGeneration(nn.Module, SupportsEagle3, SupportsEncoderWarmup):
     """Composed Qwen3-ASR model: audio encoder + Qwen3 text decoder.
 
     Speculative decoding target (DFlash): ``SupportsEagle3`` lets the runner set
@@ -1237,6 +1238,9 @@ class Qwen3ASRForConditionalGeneration(nn.Module, SupportsEagle3):
     tokens per request) runs the greedy rejection sampler on device. The
     drafter aliases ``language_model.embed_tokens`` and ``lm_head`` through the
     ``model`` alias below. The hidden dim is not padded (tail layout).
+
+    ``SupportsEncoderWarmup`` lets the shared encoder warmup compile and load the
+    audio tower for each block bucket before the first request.
     """
 
     # Bare flag, not the SupportsTranscription protocol: the upstream Qwen3-ASR
@@ -1424,6 +1428,56 @@ class Qwen3ASRForConditionalGeneration(nn.Module, SupportsEagle3):
         base = getattr(self, "_neuron_base_compiler_args", None)
         args = None if base is None else self.compiler_args_for(graph_type, None, base)
         return scoped_compiler_args(args)
+
+    # ------------------------------------------------------------------
+    # Encoder warmup (SupportsEncoderWarmup)
+    # ------------------------------------------------------------------
+
+    def get_encoder(self) -> torch.nn.Module | None:
+        """Return the audio tower. None on a language-only PD pool."""
+        return self.audio_tower
+
+    def build_encoder_synthetic_inputs(
+        self,
+        bucket: int,
+        encoder_neuron_config: EncoderNeuronConfig,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Build shape-only audio tower inputs for one block-count bucket.
+
+        Uses the planner that ``embed_multimodal`` uses, so the graph shapes match
+        serving. Without this the first request of each bucket compiles and loads
+        the encoder graph while serving. At DP > 1 that stalls every replica
+        (16-26 s per new bucket on trn2.3xlarge at DP8).
+        """
+        audio_config = self.config.audio_config
+        plan = plan_audio_blocks(
+            [2 * audio_config.n_window],
+            block_size=encoder_neuron_config.encoder_attention_block_size,
+            window_tokens=audio_config.window_tokens,
+            n_window=audio_config.n_window,
+            n_window_infer=audio_config.n_window_infer,
+            num_blocks=bucket,
+            one_item_per_block=True,
+            dp_size=encoder_neuron_config.dp_size,
+        )
+        bound_min, bound_max = plan.block_bounds()
+        num_frames = plan.num_slots * plan.num_mel_frames_per_chunk
+        return {
+            "input_features": torch.zeros(
+                1,
+                audio_config.num_mel_bins,
+                num_frames,
+                dtype=audio_config.torch_dtype,
+                device=device,
+            ),
+            "bound_min": bound_min.to(device),
+            "bound_max": bound_max.to(device),
+            "chunk_slots": plan.chunk_slots().to(device),
+            "write_block_ids": torch.zeros(
+                plan.num_blocks, dtype=torch.int64, device=device
+            ),
+        }
 
     # ------------------------------------------------------------------
     # Factory
