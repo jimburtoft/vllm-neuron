@@ -103,6 +103,22 @@ vllm serve Qwen/Qwen3-ASR-1.7B --tensor-parallel-size 1 --data-parallel-size 4 -
 # LNC=1, 8 replicas: NEURON_LOGICAL_NC_CONFIG=1 VLLM_NEURON_RESERVED_HEADROOM_GIB=2 VLLM_NEURON_DISABLE_PARALLEL_TRACE=1, --data-parallel-size 8
 ```
 
+## Long audio, other languages, streaming output
+
+- **Audio longer than 30 s** works two ways. Either send the whole file (vLLM splits it at an energy minimum with
+  1 s overlap), or cut it at low-energy points into chunks of up to 30 s on the client and send the chunks concurrently.
+  On 6 full Earnings22 calls (15-22 min each) the WER was 6.43 % (server split) and 6.14 % (client cuts), against 6.01 %
+  for the 30 s benchmark chunks. For files over 25 MB (about 13 min of 16 kHz 16-bit WAV) raise
+  `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB` and `VLLM_MAX_AUDIO_DECODE_DURATION_S` (defaults 25 MB, 600 s).
+- **Encoder warmup**: this branch warms the audio encoder for every `num_encoder_input_buckets` entry at startup. Before
+  that, each bucket compiled on its first request, which stalled all 8 replicas for 16-26 s (long files and the first
+  requests of a run).
+- **Other languages** (FLEURS test, 200 utterances each, Whisper basic normalizer): WER de 6.2, fr 5.7, es 4.2, it 5.0,
+  pt 6.0, ru 8.7, ar 15.7, hi 8.0 %; CER ja 5.6, ko 2.8, zh 4.0 %; en 4.2 %. Within ±0.9 points of HF transformers fp32
+  on CPU. Language auto-detection costs 0-0.2 points.
+- **`stream=true`** returns the same text as a non-streaming request (32/32); the first text chunk arrives after about
+  70 ms on a 30 s clip.
+
 ## Qwen3-ASR-0.6B
 
 The same branch and settings run `Qwen/Qwen3-ASR-0.6B` with no changes (2026-11-07, TP1 × DP8 LNC1 MNS48 FP8 KV,
