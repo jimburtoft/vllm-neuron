@@ -1147,6 +1147,10 @@ def _install_cte_shared_abs() -> bool:
 # RMSNorm (pre-FFN norm, and the next layer's input norm) into one nkilib rmsnorm_residual_prefill call: the add runs in
 # the DMA engines during the load and the sum is returned as the next residual.
 _PREFILL_FUSED_ADD_NORM = os.environ.get("MUSE_GLIMMER_PREFILL_FUSED_ADD_NORM", "0") == "1"
+# MUSE_GLIMMER_PREFILL_CC_CHUNKS (default 1 = off): split the SP prefill MLP into N token chunks so the all-gather
+# of one chunk and the reduce-scatter of another can overlap the other chunks' MLP compute.
+_PREFILL_CC_CHUNKS = int(os.environ.get("MUSE_GLIMMER_PREFILL_CC_CHUNKS", "1") or 1)
+_PREFILL_CC_CALLS = [0]  # CPU tests only (never read inside a traced graph)
 
 
 class MuseGlimmerMLP(nn.Module):
@@ -1238,7 +1242,32 @@ class MuseGlimmerMLP(nn.Module):
             self.tp_group.all_reduce(out)
         return out, hsum.to(residual.dtype)
 
+    def _forward_prefill_pipelined(self, hidden_states: torch.Tensor, nchunk: int) -> torch.Tensor:
+        """SP prefill MLP in ``nchunk`` token chunks (MUSE_GLIMMER_PREFILL_CC_CHUNKS): chunk k's all-gather and
+        chunk k-1's reduce-scatter are independent of chunk k-1's / k's MLP, so the compiler may overlap them.
+
+        Each rank splits its own SP rows into ``nchunk`` slices; slice k of every rank is all-gathered into one
+        [ws * t/nchunk, H] block, run through the MLP (rows are independent: per-row FP8 activation scales), and
+        reduce-scattered back to [t/nchunk, H]. Concatenating the chunk results restores this rank's rows in order,
+        so the output equals the un-chunked path row for row."""
+        if not torch.compiler.is_compiling():
+            _PREFILL_CC_CALLS[0] += 1
+            if _PREFILL_CC_CALLS[0] == 1:
+                logger.info("MuseGlimmer: pipelined SP prefill MLP, %d chunks, rows/rank %d",
+                            nchunk, hidden_states.shape[0])
+        parts = torch.chunk(hidden_states, nchunk, dim=0)
+        gathered = [self.tp_group.all_gather(p.contiguous(), dim=0) for p in parts]
+        outs = []
+        for g in gathered:
+            o = self._mlp_fp8(g, True) if self.fp8 else NF.mlp(
+                g, self.gate_proj_weight, self.up_proj_weight, self.down_proj_weight)
+            outs.append(self.tp_group.reduce_scatter(o, dim=0))
+        return torch.cat(outs, dim=0)
+
     def forward(self, hidden_states: torch.Tensor, is_prefill: bool) -> torch.Tensor:
+        if (is_prefill and self.world_size > 1 and _PREFILL_CC_CHUNKS > 1
+                and hidden_states.shape[0] % (_PREFILL_CC_CHUNKS * 128) == 0):
+            return self._forward_prefill_pipelined(hidden_states, _PREFILL_CC_CHUNKS)
         if is_prefill and self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
         if self.fp8:
