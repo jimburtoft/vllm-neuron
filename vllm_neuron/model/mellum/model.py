@@ -543,6 +543,12 @@ class MellumSparseMoeBlock(nn.Module):
                 ep_rank * self.num_local_experts
             )
             aff = NF.get_local_expert_affinities(aff, local_ids)
+        mask_pad = os.environ.get("MELLUM_MOE_MASK_PAD_ROUTE", "auto")
+        if mask_pad == "auto":
+            mask_pad = "1" if os.environ.get("MELLUM_MOE_PREFILL_IMPL", "auto") in ("auto", "hybrid") and self.tp_degree == 1 else "0"
+        if padding_mask is not None and mask_pad == "1":
+            # Padding tokens get no routes (build_blockwise_mapping routes them before applying padding_mask).
+            aff = aff * padding_mask.unsqueeze(1).to(aff.dtype)
         aff_masked, tok_pos_to_id, block_to_expert, conditions = NF.build_blockwise_mapping(
             expert_affinities=aff,
             num_local_experts=self.num_local_experts,
@@ -561,8 +567,32 @@ class MellumSparseMoeBlock(nn.Module):
         # the experts are I-sharded, bf16 with whole experts per rank (EP4, validated in bf16). "fp32" / "bf16" force.
         io = os.environ.get("MELLUM_MOE_CTE_IO", "auto")
         cte_io_fp32 = io == "fp32" or (io == "auto" and self.tp_degree > 1)
+        # MELLUM_MOE_PREFILL_IMPL: "auto" (default): "hybrid" with whole experts per rank (EP), "block" when the
+        # experts are I-sharded (TP without EP). "block": bwmm shard_on_block; it computes every allocated block
+        # (worst case: all top-k experts of a token on one rank), so at EP4 about 70 % of its blocks are empty, and
+        # it spills at I = 896. "hybrid": bwmm shard_on_I with a static loop of MELLUM_MOE_PREFILL_NSB blocks, then
+        # a dynamic loop over the non-empty blocks. Measured on trn2 (TP4, one request, TTFT): EP4 4k 534 -> 206 ms,
+        # 1k 182 -> 80 ms; EP1 is slower with hybrid (4k 223 -> 384 ms), so EP1 keeps shard_on_block.
+        impl_name = os.environ.get("MELLUM_MOE_PREFILL_IMPL", "auto")
+        if impl_name == "auto":
+            impl_name = "hybrid" if self.tp_degree == 1 else "block"
+        impl = {
+            "block": MoECTEImplementation.shard_on_block,
+            "shard_on_i": MoECTEImplementation.shard_on_i,
+            "hybrid": MoECTEImplementation.shard_on_i_hybrid,
+        }[impl_name]
+        extra = {}
+        if impl_name == "hybrid":
+            nsb = int(os.environ.get("MELLUM_MOE_PREFILL_NSB", "-1"))
+            if nsb < 0:
+                # expected non-empty blocks per rank, rounded down to even (the 2 cores alternate blocks)
+                T = x.shape[0]  # already all-gathered (full step)
+                exp_blocks = -(-T * self.top_k // (self.ep_degree * self.block_size))
+                nsb = max(2, 2 * (exp_blocks // 2))
+            extra["num_static_block"] = nsb
         out = NF.moe_cte(
-            implementation=MoECTEImplementation.shard_on_block,
+            implementation=impl,
+            **extra,
             conditions=conditions,
             hidden_states=self._pad_h(x).float() if cte_io_fp32 else self._pad_h(x),
             expert_affinities_masked=aff_masked,

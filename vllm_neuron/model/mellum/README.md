@@ -42,7 +42,8 @@ nested RoPE dicts, and `vllm serve` then fails in `validate_rope` with
 | Decode: routed-expert gather (`MELLUM_MOE_DECODE=auto`) | T x 8 <= local experts | fp32 router; reads only the T x top-8 routed experts (`index_select`, chunks of 64) |
 | Decode: dense (`MELLUM_MOE_DECODE=auto`) | T x 8 > local experts | fp32 router; every local expert once, weighted by the affinity |
 | Decode: fused `moe_block_tkg` (`MELLUM_MOE_DECODE=kernel`) | no | Needs I/rank % 128 == 0 (EP=4). Its router runs in bf16 and fails the fp32 gate on some prompts |
-| Prefill: blockwise `moe_cte` kernel (`MELLUM_MOE_PREFILL=kernel`) | yes | The experts' H is zero-padded to 2560 inside the MoE block (the kernel tiles H by 512). Without EP the kernel's hidden-state I/O is fp32 (`MELLUM_MOE_CTE_IO=auto`): its bf16 output accumulation over the 8 experts of a token moved a near-tie under segmented prefill |
+| Prefill with EP: `shard_on_i_hybrid` kernel (`MELLUM_MOE_PREFILL_IMPL=auto`) | yes | Static loop over the expected non-empty blocks per rank, then a dynamic loop over the rest; padding tokens get no routes. 2.6x faster than `shard_on_block` at 4k prompts (534 -> 206 ms), which computes every worst-case block (about 70 % empty at EP4) and spills SBUF at I = 896 |
+| Prefill without EP: blockwise `moe_cte` (`shard_on_block`) kernel | yes | The experts' H is zero-padded to 2560 inside the MoE block (the kernel tiles H by 512). Without EP the kernel's hidden-state I/O is fp32 (`MELLUM_MOE_CTE_IO=auto`): its bf16 output accumulation over the 8 experts of a token moved a near-tie under segmented prefill |
 | Prefill: dense torch MoE | `MELLUM_MOE_PREFILL=torch` | Slower (TTFT about 2x at 4k prompts without EP) |
 
 ## Parallelism
@@ -69,6 +70,9 @@ One Trn2 device, LNC=2: `--tensor-parallel-size 4`, with or without `--enable-ex
 |---|---|---|
 | `MELLUM_MOE_DECODE` | `auto` | `gather` / `dense` force a path; `kernel`: fused moe_block_tkg |
 | `MELLUM_MOE_PREFILL` | `kernel` | `torch`: dense torch MoE in prefill |
+| `MELLUM_MOE_PREFILL_IMPL` | `auto` | `hybrid` (EP default) / `block` (no-EP default) / `shard_on_i` |
+| `MELLUM_MOE_PREFILL_NSB` | expected blocks | Static block count of the hybrid kernel |
+| `MELLUM_MOE_MASK_PAD_ROUTE` | `auto` | Padding tokens get no expert routes (on with the hybrid kernel) |
 | `MELLUM_MOE_CTE_IO` | `auto` | Prefill kernel hidden-state dtype: fp32 without EP, bf16 with EP. `fp32` / `bf16` force |
 | `MELLUM_MOE_MAP_SHARD` | `0` | `1`: split the token-to-block mapping across the MoE TP ranks (same result) |
 | `MELLUM_MOE_ROUTER` | `kernel` | `torch`: fp32 torch router in prefill |
