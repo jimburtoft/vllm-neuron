@@ -1148,9 +1148,10 @@ def _install_cte_shared_abs() -> bool:
 # the DMA engines during the load and the sum is returned as the next residual.
 _PREFILL_FUSED_ADD_NORM = os.environ.get("MUSE_GLIMMER_PREFILL_FUSED_ADD_NORM", "0") == "1"
 # MUSE_GLIMMER_PREFILL_CC_CHUNKS (default 1 = off): split the SP prefill MLP into N token chunks so the all-gather
-# of one chunk and the reduce-scatter of another can overlap the other chunks' MLP compute.
+# of one chunk and the reduce-scatter of another could overlap the other chunks' MLP compute. Exact, but on SDK 2.33
+# neuronx-cc still serializes every collective with the surrounding compute (0.4 ms of 48 ms hidden at 2 chunks,
+# 4k prefill +0.8 %), so it stays off; kept for later compilers.
 _PREFILL_CC_CHUNKS = int(os.environ.get("MUSE_GLIMMER_PREFILL_CC_CHUNKS", "1") or 1)
-_PREFILL_CC_CALLS = [0]  # CPU tests only (never read inside a traced graph)
 
 
 class MuseGlimmerMLP(nn.Module):
@@ -1250,11 +1251,6 @@ class MuseGlimmerMLP(nn.Module):
         [ws * t/nchunk, H] block, run through the MLP (rows are independent: per-row FP8 activation scales), and
         reduce-scattered back to [t/nchunk, H]. Concatenating the chunk results restores this rank's rows in order,
         so the output equals the un-chunked path row for row."""
-        if not torch.compiler.is_compiling():
-            _PREFILL_CC_CALLS[0] += 1
-            if _PREFILL_CC_CALLS[0] == 1:
-                logger.info("MuseGlimmer: pipelined SP prefill MLP, %d chunks, rows/rank %d",
-                            nchunk, hidden_states.shape[0])
         parts = torch.chunk(hidden_states, nchunk, dim=0)
         gathered = [self.tp_group.all_gather(p.contiguous(), dim=0) for p in parts]
         outs = []
