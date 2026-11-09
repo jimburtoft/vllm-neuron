@@ -100,6 +100,30 @@ smaller decode bucket lets requests whose prompt + output fits use a cheaper gra
 
 GSM8K-100 with the 2048 bucket: 98 %. Each extra bucket adds decode graphs (compile time and HBM).
 
+### Low-latency decode with FP8 experts (no expert parallelism)
+
+For latency-sensitive serving at up to ~16 concurrent requests, run without `--enable-expert-parallel` and turn on
+the FP8 routed-expert decode kernel (an extra FP8 copy of the experts; prefill keeps bf16):
+
+```bash
+export MELLUM_MOE_FP8_ROUTED=1 VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.2
+vllm serve JetBrains/Mellum2.1-12B-A2.5B-Thinking --tensor-parallel-size 4 --max-model-len 8192 --max-num-seqs 64 \
+  --max-num-batched-tokens 8192 --no-enable-prefix-caching \
+  --additional-config '{"neuron_config": {"decode_context_length_buckets": [2048]}}'
+```
+
+| 128 / 1,024, concurrency | bf16 (no EP) tok/s, TPOT | FP8 routed kernel tok/s, TPOT |
+|---:|---|---|
+| 1 | 163.2, 6.07 ms | **177.2, 5.59 ms** |
+| 4 | 379.6, 10.4 ms | **522.9, 7.52 ms** (+38 %) |
+| 8 | 465.1, 17.0 ms | **723.2, 10.8 ms** (+56 %) |
+| 16 | 488.7, 32.3 ms | **934.2, 16.7 ms** (+91 %) |
+| 32 | 664.9, 47.3 ms | 664.7, 47.3 ms (above the T <= 24 threshold: same bf16 path) |
+
+GSM8K-100: 97 % (bf16 97-98 %). The FP8 weights move greedy tokens more than bf16 noise on one of the 7 gate
+prompts (fp32 gap 1.14 at token 181, the token still in the fp32 top 5), so treat it as an opt-in accuracy trade.
+For throughput (32+ concurrent requests) use `--enable-expert-parallel` without FP8.
+
 ### High concurrency
 
 `VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8` (packed prefill), TP=4, EP=4. The default KV budget
