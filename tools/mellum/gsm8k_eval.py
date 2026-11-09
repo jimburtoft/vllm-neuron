@@ -4,7 +4,7 @@
 python gsm8k_eval.py --backend vllm|hf --model PATH --n 100 --max-tokens 4096 --out out.json [--tp 4]
 Score = last number in the text after </think> equals the gold answer.
 """
-import argparse, json, re, time
+import argparse, json, os, re, time
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--backend", required=True); ap.add_argument("--model", required=True)
@@ -31,7 +31,9 @@ t0 = time.time()
 if a.backend == "vllm":
     from vllm import LLM, SamplingParams
     llm = LLM(model=a.model, tensor_parallel_size=a.tp, enable_expert_parallel=a.ep, max_model_len=a.max_model_len, max_num_seqs=a.max_num_seqs,
-              enable_prefix_caching=False, max_num_batched_tokens=a.mnbt)
+              enable_prefix_caching=False, max_num_batched_tokens=a.mnbt,
+              **({"additional_config": {"neuron_config": {"decode_context_length_buckets": [int(x) for x in os.environ["DCB"].split(",")]}}}
+                 if os.environ.get("DCB") else {}))
     tok = llm.get_tokenizer()
     ps = [tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False, add_generation_prompt=True) for q in qs]
     t0 = time.time()

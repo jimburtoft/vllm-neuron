@@ -80,6 +80,26 @@ ignored, one prompt per prefill step unless noted.
 | 128 / 1,024 | 64 | 1,969 | 1,384 | 31.2 |
 | 1,024 / 4,096 | 64 | 2,069 | 2,307 | 30.4 |
 
+### Decode context buckets
+
+By default decode compiles only at `--max-model-len`, so every decode step attends over the full 8k bucket. Adding a
+smaller decode bucket lets requests whose prompt + output fits use a cheaper graph:
+
+```bash
+--additional-config '{"neuron_config": {"decode_context_length_buckets": [2048]}}'
+```
+
+(each bucket must be smaller than `--max-model-len`, which stays as the fallback). 8 prompts per prefill step, EP=4:
+
+| Input / output | Concurrency | Output tok/s, 8k only -> + 2048 bucket | TPOT p50 (ms) |
+|---|---:|---|---|
+| 128 / 1,024 | 64 | 2,100 -> 3,268 (+56 %) | 30.1 -> 19.2 |
+| 128 / 1,024 | 128 | 2,829 -> 3,231 (+14 %) | 44.6 -> 38.9 |
+| 128 / 1,024 | 256 | 3,338 -> 3,899 (+17 %) | 75.4 -> 64.3 |
+| 1,024 / 1,024 | 128 | 2,573 -> 2,906 (+13 %) | 46.7 -> 41.0 |
+
+GSM8K-100 with the 2048 bucket: 98 %. Each extra bucket adds decode graphs (compile time and HBM).
+
 ### High concurrency
 
 `VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8` (packed prefill), TP=4, EP=4. The default KV budget
