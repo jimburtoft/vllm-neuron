@@ -476,7 +476,7 @@ class MellumSparseMoeBlock(nn.Module):
             expert_down_weights_scale=self.dn_fp8_scale,
             expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
             activation_fn=ActFnType.SiLU,
-            output_dtype=self.dtype,
+            output_dtype=nl.bfloat16,
         )
         return self._unpad_h(out)
 
