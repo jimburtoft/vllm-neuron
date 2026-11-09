@@ -53,8 +53,9 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
 
 - `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (default 0.30) caps the KV cache; at 0.30 only about 21
   sequences of 10240 tokens are admitted at TP=4.
-- `decode_context_length_buckets` selects Model Runner V1.
-- Packed prefill needs single-shot prefill (`max_num_batched_tokens >= max_model_len`) and no prefix caching.
+- `decode_context_length_buckets` selects Model Runner V1 on this release.
+- Packed prefill runs on both model runners. It needs single-shot prefill (`max_num_batched_tokens >= max_model_len`) and no prefix caching.
+- Model Runner V2, packed N=8, 128/128 (2k server, no decode context buckets): 1,223 / 1,919 / 2,573 tok/s at c=16 / 32 / 64, compared with 1,101 / 1,642 / 2,071 unpacked. GSM8K is the same (59.7 % / 59.8 %).
 
 ## Accuracy (BF16, TP=4)
 
