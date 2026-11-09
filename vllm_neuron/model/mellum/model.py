@@ -454,6 +454,8 @@ class MellumSparseMoeBlock(nn.Module):
         MELLUM_MOE_FP8=1 keeps an FP8 copy of the experts for decode (per-output-channel power-of-two scales,
         TRN2 float8_e4m3 range 240); prefill keeps the bf16 experts. Routing stays fp32 (the fused
         moe_block_tkg router runs in bf16 and failed the accuracy gate).
+        Measured on trn2 (TP4 EP4, 2048 decode bucket, 128/1k): slower than the bf16 dense einsum at every batch
+        that uses it (c64 3,270 -> 1,956 tok/s, c256 3,902 -> 2,078). Off by default; kept for further kernel work.
         """
         x = self.post_attention_layernorm(hidden_states)
         topv, topi = self._route(x)
