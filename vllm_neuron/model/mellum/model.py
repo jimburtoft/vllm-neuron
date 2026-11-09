@@ -321,6 +321,10 @@ class MellumSparseMoeBlock(nn.Module):
         self.post_attention_layernorm = MellumRMSNorm(self.hidden_size, self.rms_norm_eps, self.dtype)
         # MELLUM_MOE_FP8=1: FP8 ROW copy of the experts for decode at large batch (see _decode_fp8).
         self.fp8_decode = os.environ.get("MELLUM_MOE_FP8", "0") == "1"
+        # MELLUM_MOE_FP8_ROUTED=1 (no EP only): FP8 128x128-block-scale copy of the experts for the routed-expert
+        # decode kernel (swiglu_moe_fp8.py) at small decode batches (T <= MELLUM_MOE_FP8_ROUTED_MAX_T, default 24).
+        self.swm_enabled = os.environ.get("MELLUM_MOE_FP8_ROUTED", "0") == "1"
+        self.swm_max_t = int(os.environ.get("MELLUM_MOE_FP8_ROUTED_MAX_T", "24"))
         # >>> PARALLELISM: router replicated on every rank <<<
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, dtype=self.dtype))
         self.gate_up_proj_weight = nn.Parameter(
@@ -385,6 +389,8 @@ class MellumSparseMoeBlock(nn.Module):
         # "auto": the gather reads T * top_k expert slices, the dense path reads each local expert once.
         mode = os.environ.get("MELLUM_MOE_DECODE", "auto")
         if mode == "auto":
+            if self.swm_enabled and self.ep_degree == 1 and T <= self.swm_max_t:
+                return "routed_fp8"
             if self.fp8_decode and T * self.top_k > self.num_local_experts:
                 return "fp8"
             return "gather" if T * self.top_k <= self.num_local_experts else "dense"
@@ -406,6 +412,8 @@ class MellumSparseMoeBlock(nn.Module):
                 out = self._unpad_h(self._decode_kernel(hidden_states))
             elif mode == "fp8":
                 out = self._decode_fp8(hidden_states)
+            elif mode == "routed_fp8":
+                out = self._decode_routed_fp8(hidden_states)
             elif mode == "dense":
                 out = self._decode_dense(hidden_states)
             else:
@@ -503,6 +511,73 @@ class MellumSparseMoeBlock(nn.Module):
         self.dn_fp8 = nn.Parameter(dn_q, requires_grad=False)
         self.gu_fp8_scale = nn.Parameter(gu_s.reshape(self.num_local_experts, 2, self.i_tp).contiguous(), requires_grad=False)
         self.dn_fp8_scale = nn.Parameter(dn_s.contiguous(), requires_grad=False)
+
+    def _decode_routed_fp8(self, hidden_states):
+        """fp32 torch router + the fused FP8 routed-expert SwiGLU decode kernel (swiglu_moe_fp8.py).
+
+        Streams only the T * top_k routed (expert, 64-row block) units, FP8 with 128x128 block scales, at
+        520-630 GB/s on trn2; it has no expert dedupe, so it is used only for small decode batches. No EP: every
+        rank holds all 64 experts with I sharded 4 ways (224, zero-padded to 256 in the FP8 copy: exact).
+        """
+        from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+        from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+        from . import swiglu_moe_fp8 as swm
+
+        x = self.post_attention_layernorm(hidden_states)
+        topv, topi = self._route(x)
+        T = x.shape[0]
+        lnc = get_logical_nc_config()
+        k = wrap_nki(swm.swiglu_moe_fp8)
+        k = k[lnc] if lnc > 1 else k
+        out = k(
+            x.to(torch.bfloat16).contiguous(),
+            topi.to(torch.int32).contiguous(),
+            topv.to(torch.bfloat16).contiguous(),
+            self.swm_blob,
+            NB=self.swm_nb,
+            group=swm.auto_group(T, self.top_k, self.swm_nb),
+            ring=swm.RING,
+            act=0,
+            limit=0.0,
+            split=1,
+        )
+        out = out if isinstance(out, torch.Tensor) else out[0]
+        return out.to(self.dtype)
+
+    def build_routed_fp8_blob(self, device=None):
+        """Quantize this rank's experts to FP8 e4m3 (128x128 block scales amax/240, TRN2 e4m3 max 240) and pack them
+        into the kernel's unit blob. Host-side, once at load."""
+        from . import swiglu_moe_fp8 as swm
+
+        dev = device if device is not None else self.gate_up_proj_weight.device
+        H, I = self.hidden_size, self.i_real
+        Ip = ((I + 127) // 128) * 128
+        gu = self.gate_up_proj_weight.detach().cpu().float()[:, :H, :]
+        dn = self.down_proj_weight.detach().cpu().float()[:, :I, :H]
+        wg = gu[:, :, :I].transpose(1, 2)
+        wu = gu[:, :, self.i_tp : self.i_tp + I].transpose(1, 2)
+        wd = dn.transpose(1, 2)
+        if Ip > I:
+            wg = torch.nn.functional.pad(wg, (0, 0, 0, Ip - I))
+            wu = torch.nn.functional.pad(wu, (0, 0, 0, Ip - I))
+            wd = torch.nn.functional.pad(wd, (0, Ip - I))
+
+        def qblock(w):  # [E, R, C] fp32 -> fp8 codes [E, R, C], scales [E, R/128, C/128] (dequant = q * s)
+            E, R, C = w.shape
+            b = w.view(E, R // 128, 128, C // 128, 128)
+            amax = b.abs().amax(dim=(2, 4)).clamp(min=1e-12)
+            s = amax / 240.0  # full e4m3 range per block (a power-of-two scale only helps MX-sourced weights)
+            q = (b / s[:, :, None, :, None]).clamp(-240.0, 240.0).view(E, R, C).to(torch.float8_e4m3fn)
+            return q, s
+
+        qg, sg = qblock(wg.contiguous())
+        qu, su = qblock(wu.contiguous())
+        qd, sd = qblock(wd.contiguous())
+        blob = swm.pack(qg, qu, qd, sg, su, sd)
+        self.swm_nb = Ip // swm.IB
+        self.swm_blob = nn.Parameter(blob.to(dev), requires_grad=False)
 
     def _local_route(self, topv, topi):
         """With EP: keep only this rank's experts (others get weight 0, slot 0)."""
@@ -941,3 +1016,5 @@ class MellumForCausalLM(Gemma3ForCausalLM):
         for layer in self.model.layers:
             if getattr(layer.mlp, "fp8_decode", False):
                 layer.mlp.quantize_fp8_decode_copy(device)
+            if getattr(layer.mlp, "swm_enabled", False) and layer.mlp.ep_degree == 1:
+                layer.mlp.build_routed_fp8_blob(device)
