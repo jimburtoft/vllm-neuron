@@ -44,84 +44,100 @@ python tools/mellum/gsm8k_eval.py --backend vllm --model JetBrains/Mellum2.1-12B
 | Check | Result (TP=4, EP=4, one trn2.3xlarge) |
 |---|---|
 | fp32 first-divergence gate, 5 short prompts (to EOS, up to 449 tokens) | PASS, max gap 0.229 |
-| fp32 first-divergence gate, 2 long prompts (3,512 / 2,209 input tokens, 1,024 output) | PASS, max gap 0.346 (0.192 in other compiles; bf16 near-ties move between compiles) |
+| fp32 first-divergence gate, 2 long prompts (3,512 / 2,209 input tokens, 1,024 output) | PASS, max gap 0.192 (also with segmented prefill, `--max-num-batched-tokens 1024`) |
 | fp32 first-divergence gate, 2 very long prompts (20,549 / 40,232 input tokens, 256 output; `--sets xlong`) | PASS, max gap 0.154 |
 | Hugging Face bf16 on CPU, same gate (precision floor) | max gap 0.493 |
-| GSM8K, first 100 test questions, greedy, thinking on | 97 % |
+| GSM8K, first 100 test questions, greedy, thinking on | 98 % |
 
-## Throughput
+Packed prefill (`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8`) changes which prompts share a step, so greedy tokens move at
+bf16 near-ties; GSM8K is unchanged within noise (96-97 %).
+
+## Prefill
+
+With `--enable-expert-parallel` the prefill MoE uses nkilib's `shard_on_i_hybrid` kernel (default,
+`MELLUM_MOE_PREFILL_IMPL=auto`). It runs only the expert blocks that hold tokens. One request, `vllm serve`,
+time to first token:
+
+| Prompt | TTFT (ms) |
+|---|---:|
+| 1,024 | 80 |
+| 4,096 | 207 |
+| 8,192 (segmented, see Long context) | 480 |
+| 16,384 | 951 |
+| 30,000 | 1,953 |
+
+## Online serving (`vllm bench serve`)
+
+`--max-model-len 8192 --max-num-batched-tokens 8192 --no-enable-prefix-caching`, TP=4, EP=4, random prompts, EOS
+ignored, one prompt per prefill step unless noted.
+
+| Input / output | Concurrency | Output tok/s | TTFT p50 (ms) | TPOT p50 (ms) |
+|---|---:|---:|---:|---:|
+| 1,024 / 1,024 | 16 | 999 | 629 | 15.4 |
+| 1,024 / 1,024 | 64 | 1,866 | 2,318 | 32.1 |
+| 4,096 / 1,024 | 16 | 896 | 1,628 | 16.3 |
+| 4,096 / 1,024 | 64 | 1,536 | 6,164 | 35.7 |
+| 128 / 1,024 | 64 | 1,969 | 1,384 | 31.2 |
+| 1,024 / 4,096 | 64 | 2,069 | 2,307 | 30.4 |
+
+### High concurrency
+
+`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8` (packed prefill), TP=4, EP=4. The default KV budget
+(`VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.30`, 6.6 GiB per core) holds about 256 requests at 1k/1k; for more,
+raise it to 0.42 and cap `--max-num-seqs 512` (higher fractions do not fit HBM next to the decode graphs).
+
+| Input / output | Concurrency | KV budget | Output tok/s | TTFT p50 (ms) | TPOT p50 (ms) |
+|---|---:|---|---:|---:|---:|
+| 128 / 1,024 | 128 | default | 2,828 | 703 | 44.6 |
+| 128 / 1,024 | 256 | default | 3,333 | 1,411 | 75.5 |
+| 128 / 1,024 | 512 | 0.42, `--max-num-seqs 512` | 3,994 | 2,664 | 125.6 |
+| 1,024 / 1,024 | 128 | default | 2,529 | 3,174 | 47.5 |
+| 1,024 / 1,024 | 256 | default | 2,985 | 6,230 | 79.7 |
+| 1,024 / 1,024 | 512 | 0.42, `--max-num-seqs 512` | 3,483 | 12,095 | 135.3 |
+
+
+## Packed prefill
+
+`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8` lets one prefill step take up to 8 waiting prompts (whole-prompt prefill
+only: keep `--max-num-batched-tokens` = `--max-model-len` and prefix caching off; the model rejects other
+configurations). It mostly cuts time to first token for short prompts under load:
+
+| Input / output | Concurrency | TTFT p50, 1 -> 8 per step (ms) | Output tok/s, 1 -> 8 per step |
+|---|---:|---|---|
+| 128 / 1,024 | 64 | 1,438 -> 388 | 1,960 -> 2,095 |
+| 128 / 1,024 | 256 | 5,619 -> 1,367 | 3,007 -> 3,337 |
+| 1,024 / 1,024 | 64 | 2,333 -> 1,576 | 1,864 -> 1,954 |
+| 1,024 / 1,024 | 256 | 9,427 -> 6,277 | 2,771 -> 2,988 |
+
+## Long context
+
+`VLLM_NEURON_SWA_RING=0`, `--max-model-len 32768` (or 49152) `--max-num-batched-tokens 4096 --no-enable-prefix-caching`
+(segmented prefill in 4,096-token chunks), TP=4, EP=4, 1,024 output tokens.
+
+| Input | Concurrency | Output tok/s | TTFT p50 (ms) | TPOT p50 (ms) |
+|---|---:|---:|---:|---:|
+| 8,192 | 1 | 93.2 | 480 | 10.3 |
+| 8,192 | 4 | 251 | 1,119 | 14.8 |
+| 8,192 | 16 | 644 | 3,724 | 21.2 |
+| 16,384 | 1 | 89.4 | 951 | 10.3 |
+| 16,384 | 4 | 225 | 2,300 | 15.5 |
+| 30,000 | 1 | 82.3 | 1,953 | 10.3 |
+
+Decode cost barely grows with context (TPOT 9.7 ms at 1k, 10.3 ms at 30k for one request): 21 of the 28 layers only
+read a 1,024-token window. A single-shot prefill graph of 24k+ tokens needs more host memory to compile than a
+trn2.3xlarge has, so use segmented prefill for long prompts.
+
+## Offline throughput
 
 `python tools/mellum/bench.py JetBrains/Mellum2.1-12B-A2.5B-Thinking --ep --n 128 --max-num-seqs 64 --fixed 1024 --max-model-len 2048`
+(GSM8K questions, about 70 input tokens, 1,024 output tokens, EOS ignored):
 
-| Batch | Output tok/s (one device, TP=4, EP=4) |
-|---|---|
+| Batch | Output tok/s |
+|---|---:|
 | 1 | 102.8 |
 | 32 | 1,818 |
 | 64 | 2,728 |
 | 128 | 2,683 |
 
-GSM8K questions (about 70 input tokens), 1,024 output tokens per request (`--fixed`, EOS ignored), BF16, SDK 2.33
-DLAMI, second of two runs after warm-up. With 4,096 output tokens (`--max-model-len 4608`), batch 64 gives 2,067.
-
-Without `--enable-expert-parallel`, single-request decode is faster (163.8 tok/s) because each token reads 8
-expert slices at 1/4 width, and long-prompt prefill is faster (`vllm serve`, 4,096-token prompts, 64 concurrent:
-TTFT p50 6.6 s vs 16.8 s with EP=4), but decode at 16-32 concurrent requests is about half as fast. Pick EP=4 for
-mixed traffic and short prompts, no EP for long prompts or single-stream latency.
-
-## Packed prefill
-
-`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8` lets one prefill step take up to 8 waiting prompts (whole-prompt prefill
-only: keep `--max-num-batched-tokens` = `--max-model-len` and prefix caching off). Same server as below, TP=4,
-EP=4, 64 concurrent requests unless noted:
-
-| Input / output | Output tok/s, 1 -> 8 per step | TTFT p50 (ms) | TPOT p50 (ms) |
-|---|---:|---:|---:|
-| 128 / 128 | 946 -> 1,542 (+63 %) | 2,472 -> 816 | 48.7 -> 35.4 |
-| 512 / 128 | 728 -> 1,014 (+39 %) | 3,783 -> 2,216 | 58.8 -> 46.2 |
-| 128 / 1,024 | 1,852 -> 2,046 (+10 %) | 2,465 -> 808 | 32.2 -> 30.5 |
-| 128 / 1,024, concurrency 16 | 993 -> 1,040 (+5 %) | 666 -> 312 | 15.5 -> 15.1 |
-| 512 / 1,024 | 1,728 -> 1,885 (+9 %) | 3,780 -> 2,220 | 33.4 -> 31.8 |
-| 1,024 / 1,024 | 1,575 -> 1,699 (+8 %) | 5,646 -> 4,161 | 35.1 -> 33.6 |
-| 4,096 / 1,024 | 1,032 -> 1,054 (+2 %) | 16,761 -> 16,330 | 45.7 -> 44.8 |
-
-GSM8K-100 97 % -> 96 % (within noise; 3 vs 4 misses, 2 in common). Packing changes which requests share a step,
-so greedy tokens move at bf16 near-ties (fp32 gate max gap 0.66 vs 0.35 unpacked; every divergence is a near-tie
-with the token in the fp32 top 5).
-
-## Online serving (`vllm bench serve`)
-
-One server, `--max-model-len 8192 --max-num-seqs 64 --max-num-batched-tokens 8192 --no-enable-prefix-caching`,
-TP=4, EP=4, random prompts, EOS ignored.
-
-| Input / output | Concurrency | Output tok/s | TTFT p50 (ms) | TPOT p50 / p99 (ms) |
-|---|---:|---:|---:|---:|
-| 128 / 1,024 | 1 | 102.8 | 82 | 9.7 / 9.7 |
-| 128 / 1,024 | 16 | 996 | 659 | 15.4 / 16.0 |
-| 128 / 1,024 | 64 | 1,859 | 2,471 | 32.0 / 34.3 |
-| 1,024 / 1,024 | 1 | 101.8 | 184 | 9.7 / 9.7 |
-| 1,024 / 1,024 | 16 | 910 | 1,493 | 16.1 / 17.4 |
-| 1,024 / 1,024 | 64 | 1,581 | 5,638 | 35.0 / 40.3 |
-| 4,096 / 1,024 | 1 | 98.4 | 534 | 9.7 / 9.7 |
-| 4,096 / 1,024 | 16 | 698 | 4,400 | 18.6 / 22.4 |
-| 4,096 / 1,024 | 64 | 1,034 | 16,780 | 45.5 / 61.2 |
-| 1,024 / 4,096 | 1 | 103.1 | 183 | 9.7 / 9.7 |
-| 1,024 / 4,096 | 16 | 1,030 | 1,487 | 15.2 / 15.5 |
-| 1,024 / 4,096 | 64 | 1,979 | 5,646 | 31.0 / 32.3 |
-
-## Long context
-
-`VLLM_NEURON_SWA_RING=0`, `--max-model-len 49152 --max-num-batched-tokens 4096 --no-enable-prefix-caching`
-(segmented prefill in 4,096-token chunks), TP=4, EP=4, 1,024 output tokens.
-
-| Input | Concurrency | Output tok/s | TTFT p50 (ms) | TPOT p50 (ms) |
-|---|---:|---:|---:|---:|
-| 16,384 | 1 | 77.4 | 2,422 | 10.6 |
-| 16,384 | 4 | 167.6 | 5,933 | 18.1 |
-| 32,768 | 1 | 65.2 | 4,924 | 10.6 |
-| 32,768 | 4 | 119.1 | 12,175 | 21.7 |
-| 45,056 | 1 | 57.9 | 6,909 | 10.5 |
-| 45,056 | 4 | 97.1 | 17,066 | 24.6 |
-
-Decode cost barely grows with context (TPOT 9.7 ms at 1k, 10.5 ms at 45k for one request): 21 of the 28 layers
-only read a 1,024-token window. Use segmented prefill for long prompts. A single-shot prefill graph of 24k+
-tokens needs more host memory to compile than a trn2.3xlarge has (128 GB RAM + swap was not enough).
+Without `--enable-expert-parallel`, single-request decode is faster (163.8 tok/s) but decode at 16-32 concurrent
+requests is about half as fast; EP=4 is the recommended layout.
