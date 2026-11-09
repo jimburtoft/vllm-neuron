@@ -213,4 +213,5 @@ def _can_use_kernel(
     if not can_run_kernel(hidden_input):
         return False
 
-    return expert_down_weights.dtype in (torch.uint16, torch.uint32, torch.bfloat16)
+    # float8_e4m3fn: FP8 ROW weights with per-channel scales (TRN2 maps it to NKI float8_e4m3, max 240).
+    return expert_down_weights.dtype in (torch.uint16, torch.uint32, torch.bfloat16, torch.float8_e4m3fn)

@@ -319,6 +319,8 @@ class MellumSparseMoeBlock(nn.Module):
             self.i_tp = ((self.i_tp + _DECODE_KERNEL_I_ALIGNMENT - 1) // _DECODE_KERNEL_I_ALIGNMENT) * _DECODE_KERNEL_I_ALIGNMENT
 
         self.post_attention_layernorm = MellumRMSNorm(self.hidden_size, self.rms_norm_eps, self.dtype)
+        # MELLUM_MOE_FP8=1: FP8 ROW copy of the experts for decode at large batch (see _decode_fp8).
+        self.fp8_decode = os.environ.get("MELLUM_MOE_FP8", "0") == "1"
         # >>> PARALLELISM: router replicated on every rank <<<
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, dtype=self.dtype))
         self.gate_up_proj_weight = nn.Parameter(
@@ -383,6 +385,8 @@ class MellumSparseMoeBlock(nn.Module):
         # "auto": the gather reads T * top_k expert slices, the dense path reads each local expert once.
         mode = os.environ.get("MELLUM_MOE_DECODE", "auto")
         if mode == "auto":
+            if self.fp8_decode and T * self.top_k > self.num_local_experts:
+                return "fp8"
             return "gather" if T * self.top_k <= self.num_local_experts else "dense"
         return mode
 
@@ -400,6 +404,8 @@ class MellumSparseMoeBlock(nn.Module):
             mode = self._decode_mode(hidden_states.shape[0])
             if mode == "kernel":
                 out = self._unpad_h(self._decode_kernel(hidden_states))
+            elif mode == "fp8":
+                out = self._decode_fp8(hidden_states)
             elif mode == "dense":
                 out = self._decode_dense(hidden_states)
             else:
@@ -441,6 +447,60 @@ class MellumSparseMoeBlock(nn.Module):
             is_all_expert=True,
             skip_router_logits=True,
         )
+
+    def _decode_fp8(self, hidden_states):
+        """fp32 torch router + nkilib moe_tkg (all local experts) on FP8 ROW expert weights.
+
+        MELLUM_MOE_FP8=1 keeps an FP8 copy of the experts for decode (per-output-channel power-of-two scales,
+        TRN2 float8_e4m3 range 240); prefill keeps the bf16 experts. Routing stays fp32 (the fused
+        moe_block_tkg router runs in bf16 and failed the accuracy gate).
+        """
+        x = self.post_attention_layernorm(hidden_states)
+        topv, topi = self._route(x)
+        T = x.shape[0]
+        aff = torch.zeros(T, self.num_experts, dtype=torch.float32, device=x.device).scatter(1, topi, topv)
+        rank_id = (
+            self._ep_rank_tensor().reshape(1, 1).to(torch.int32)
+            if self.ep_degree > 1
+            else torch.zeros((1, 1), dtype=torch.int32, device=x.device)
+        )
+        out = NF.moe_tkg(
+            hidden_input=self._pad_h(x),
+            expert_gate_up_weights=self.gu_fp8.reshape(self.num_local_experts, self.hp, 2, self.i_tp),
+            expert_down_weights=self.dn_fp8,
+            expert_affinities=aff.to(self.dtype),
+            expert_index=topi.to(torch.int32),
+            is_all_expert=True,
+            rank_id=rank_id,
+            expert_gate_up_weights_scale=self.gu_fp8_scale,
+            expert_down_weights_scale=self.dn_fp8_scale,
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            activation_fn=ActFnType.SiLU,
+            output_dtype=self.dtype,
+        )
+        return self._unpad_h(out)
+
+    def quantize_fp8_decode_copy(self, device=None):
+        """Build the FP8 decode copy of the experts (called after the bf16 weights are loaded).
+
+        Quantized on the host (a bf16 -> fp8 cast on the Neuron device fails), then moved to the device.
+        """
+        dev = device if device is not None else self.gate_up_proj_weight.device
+
+        def q(w, red_dim):
+            wf = w.detach().cpu().to(torch.float32)
+            amax = wf.abs().amax(dim=red_dim, keepdim=True).clamp(min=1e-12)
+            scale = torch.exp2(torch.ceil(torch.log2(amax / 240.0)))
+            qw = (wf / scale).clamp(-240.0, 240.0).to(torch.float8_e4m3fn)
+            return qw.to(dev), scale.squeeze(red_dim).to(dev)
+        # gate_up [E, Hp, 2*I] -> per output channel (reduce over H): scale [E, 2*I] -> [E, 2, I]
+        gu_q, gu_s = q(self.gate_up_proj_weight, 1)
+        # down [E, I, Hp] -> per output channel (reduce over I): scale [E, Hp]
+        dn_q, dn_s = q(self.down_proj_weight, 1)
+        self.gu_fp8 = nn.Parameter(gu_q, requires_grad=False)
+        self.dn_fp8 = nn.Parameter(dn_q, requires_grad=False)
+        self.gu_fp8_scale = nn.Parameter(gu_s.reshape(self.num_local_experts, 2, self.i_tp).contiguous(), requires_grad=False)
+        self.dn_fp8_scale = nn.Parameter(dn_s.contiguous(), requires_grad=False)
 
     def _local_route(self, topv, topi):
         """With EP: keep only this rank's experts (others get weight 0, slot 0)."""
@@ -876,3 +936,6 @@ class MellumForCausalLM(Gemma3ForCausalLM):
             if t.dtype != self.config.torch_dtype:
                 sd[k] = t.to(self.config.torch_dtype)
         self.load_state_dict(sd, strict=False, assign=True)
+        for layer in self.model.layers:
+            if getattr(layer.mlp, "fp8_decode", False):
+                layer.mlp.quantize_fp8_decode_copy(device)
