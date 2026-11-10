@@ -77,31 +77,56 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
 | Logprob error vs fp32 on the fp32 top-5, per position (median / p95) | 0.075 / 0.161 | HF bf16: 0.078 / 0.152 |
 | Same, needle prompts of 2k / 8k / 15k tokens | 0.101 / 0.215 | HF bf16: 0.084 / 0.254; default RoPE instead of YaRN: 1.88 / 3.84 |
 | Needle retrieval at 2k / 8k / 15k | 3/3 | HF fp32: 3/3 |
-| GSM8K (1319, zero-shot CoT, greedy) | 89.4 % | HF bf16, first 250: 90.8 % (Neuron on the same 250: 90.0 %) |
+| GSM8K (1319, zero-shot CoT, greedy) | 89.4 % (TP=4 and TP=2 x DP=2) | HF bf16, first 250: 90.8 % (Neuron on the same 250: 90.0 %) |
+| GSM8K, FP8 checkpoint with input-scale compensation | 88.9 % | |
 
-## Performance (trn2.3xlarge, one device, TP=4, BF16; `vllm bench serve`, random data)
+## Performance (trn2.3xlarge, one device, LNC=2; `vllm bench serve`, random data, output tok/s)
 
-Server above (max-model-len 10240):
+Peak throughput (concurrency doubled until the gain is below 5 %):
 
-| Input / output | Concurrency | Output tok/s | TTFT p50 | TPOT p50 |
+| Input / output | Server | Peak | TTFT p50 | TPOT p50 |
 |---|---|---|---|---|
-| 128 / 128 | 1 | 101 | 32 ms | 9.8 ms |
-| 128 / 128 | 32 | 1,474 | 421 ms | 18.6 ms |
-| 1024 / 1024 | 1 | 102 | 63 ms | 9.8 ms |
-| 1024 / 1024 | 32 | 1,852 | 943 ms | 16.4 ms |
-| 4096 / 512 | 32 | 719 | 3.2 s | 38.3 ms |
-| 8192 / 1024 | 32 | 706 | 6.8 s | 38.8 ms |
+| 128 / 128 | short, BF16, TP=4 | 3,110 | 516 ms | 37.8 ms |
+| 128 / 128 | short, BF16, TP=2 x DP=2 | 3,484 | 509 ms | 33.3 ms |
+| 128 / 128 | short, FP8, TP=4 | 3,825 | 381 ms | 30.9 ms |
+| 1024 / 1024 | short, BF16, TP=4 | 2,950 | 3.1 s | 40.4 ms |
+| 1024 / 1024 | short, FP8, TP=4 | 3,349 | 2.2 s | 36.2 ms |
+| 1024 / 1024 | long, BF16, TP=4 | 1,851 | 942 ms | 16.4 ms |
+| 4096 / 512 | long, BF16, TP=4 | 719 | 3.2 s | 38.3 ms |
+| 8192 / 1024 | long, BF16, TP=4 | 707 | 6.7 s | 38.7 ms |
+
+Single request (long server): 1024 / 1024 at 102 tok/s, TTFT 63 ms, TPOT 9.8 ms. FP8 decode TPOT at batch 1: 7.3 ms.
+
+- *long*: the serving command above (max-model-len 10240). Its KV cache holds 39 sequences of 10240 tokens.
+- *short*: `--max-model-len 2048 --max-num-batched-tokens 2048 --max-num-seqs 128 --no-enable-prefix-caching`,
+  `VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8` (packed prefill), `num_batched_tokens_buckets` [128, 256, 512, 1024, 2048],
+  `num_seqs_buckets` [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128], `decode_context_length_buckets` [1024].
+  TP=2 x DP=2 uses `--max-num-seqs 64` per engine and `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.4` (0.6 runs out of
+  device memory under load).
+
+## FP8
+
+The `mistralai/Ministral-3-8B-Instruct-2512` checkpoint is static per-tensor FP8 (`quant_method: fp8`,
+`weight_scale_inv` / `activation_scale`). It runs on the llama3 static-FP8 path after renaming the scales to
+`weight_scale` / `input_scale` and setting a ModelOpt `quantization_config`
+(`{"quant_method": "modelopt", "quantization": {"quant_algo": "FP8", "kv_cache_quant_algo": "FP8",
+"exclude_modules": ["lm_head"]}}`); `weight_scale_inv` is a dequantization multiplier, so the values are used as is.
+
+On trn2 the static-FP8 kernels quantize activations into the 240-range fp8 format, while this checkpoint's input scales
+are calibrated for `float8_e4m3fn` (448). Set `VLLM_NEURON_FP8_INPUT_SCALE_COMPENSATION=1` to scale the input scales by
+448/240; without it activations clip and GSM8K drops from 88.9 % to 88.3 %.
 
 ## Feature status
 
 | Feature | Status | Notes |
 |---|---|---|
-| TP | ✅ | TP=4 validated, TP=2 validated on a 4-layer slice |
+| TP | ✅ | TP=4 validated; TP=2 validated on a 4-layer slice and with DP=2 |
 | TP=1 | ❌ | the decode MLP kernel fails with `NCC_INKI016 Stack out of memory` at intermediate size 14336 |
-| DP | inherited from llama3 | not measured |
+| DP | ✅ | TP=2 x DP=2 |
 | Prefix caching, segmented prefill | ✅ | validated at BS 6 |
-| Packed prefill | inherited from llama3 | |
+| Packed prefill | ✅ | short server |
 | Vision tower (Pixtral) | ❌ | text only |
-| FP8 checkpoint (`quant_method: fp8`) | ❌ | use the `-BF16` repository |
+| FP8 checkpoint | ✅ (after scale renaming) | see FP8 |
 | Llama 4 query scaling (positions >= 16384) | ❌ | `max_model_len > 16384` is rejected |
+| FP8 KV cache | ✅ | with the FP8 checkpoint (scales 1.0) |
 | Eagle3 | not tested | |
