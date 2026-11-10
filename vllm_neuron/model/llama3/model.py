@@ -377,6 +377,14 @@ class LlamaRotaryEmbedding(nn.Module):
 # =============================================================================
 
 
+def llama4_query_scale(
+    positions: torch.Tensor, beta: float, original_max: int
+) -> torch.Tensor:
+    """Llama 4 attention temperature: 1 + beta * log(1 + floor(pos / original_max))."""
+    p = positions.to(torch.float32)
+    return 1.0 + beta * torch.log1p(torch.floor(p / float(original_max)))
+
+
 class LlamaAttention(nn.Module):
     """Multi-head attention with TP head sharding.
 
@@ -401,6 +409,23 @@ class LlamaAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.scaling = config.head_dim**-0.5
+
+        # <-- MODEL-SPECIFIC: Llama 4 query scaling. Exactly 1 below
+        # original_max, so it is only applied when max_model_len exceeds it.
+        self.l4_beta = None
+        self.l4_orig = None
+        beta = getattr(config, "llama_4_scaling_beta", None)
+        orig = getattr(config, "llama_4_scaling_original_max", None)
+        if beta and orig:
+            try:
+                from vllm.config import get_current_vllm_config
+
+                mml = get_current_vllm_config().model_config.max_model_len
+            except Exception:  # noqa: BLE001 - no vLLM context
+                mml = None
+            if mml is None or mml > orig:
+                self.l4_beta = float(beta)
+                self.l4_orig = int(orig)
 
         # >>> PARALLELISM: TP group setup <<<
         from vllm.distributed.parallel_state import get_dcp_group
@@ -807,6 +832,13 @@ class LlamaAttention(nn.Module):
 
         # RoPE is fused into qkv_proj above — no external application needed.
 
+        # <-- MODEL-SPECIFIC: Llama 4 query scaling after RoPE (q: [Nh, T, Dh]).
+        if self.l4_beta is not None:
+            if self.dcp_size > 1:
+                raise NotImplementedError("Llama 4 query scaling with DCP")
+            q_scale = llama4_query_scale(positions, self.l4_beta, self.l4_orig)
+            q = q * q_scale.to(q.dtype).view(1, tokens, 1)
+
         # ── Step 4: Write KV cache + Attention ────────────────────────────
         # <-- MODEL-SPECIFIC: No sinks, no sliding window (standard causal attention)
         if self.dcp_size > 1:
@@ -1115,6 +1147,14 @@ class LlamaAttention(nn.Module):
             kv_needs_a2a=self.kv_needs_a2a,
             dcp_size=self.dcp_size if dcp_decode_active else 1,
             dcp_group=self.dcp_group if dcp_decode_active else None,
+            # <-- MODEL-SPECIFIC: Llama 4 query scaling (runs the torch path).
+            q_scale=(
+                llama4_query_scale(positions, self.l4_beta, self.l4_orig).view(
+                    B_local, S_decode
+                )
+                if self.l4_beta is not None
+                else None
+            ),
         )
 
         # >>> PARALLELISM: Sum O-proj partials across TP * attn_dp supergroup <<<

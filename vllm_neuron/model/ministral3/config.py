@@ -113,6 +113,9 @@ def ministral3_llama_config(
             )
         text["quantization_config"] = quant
     config = LlamaConfig.from_configs(text, neuron_config)
+    beta, orig = llama4_scaling(text)
+    config.llama_4_scaling_beta = beta
+    config.llama_4_scaling_original_max = orig
     # The serving dtype is vLLM's resolved --dtype, not the checkpoint dtype.
     try:
         from vllm.config import get_current_vllm_config

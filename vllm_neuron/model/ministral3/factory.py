@@ -133,21 +133,17 @@ class Ministral3ForCausalLM(LlamaForCausalLM):
         text = text_config_dict(hf_config)
         beta, orig = llama4_scaling(text)
         vllm_config = _current_vllm_config()
-        if vllm_config is None:
-            return
-        model_config = vllm_config.model_config
-        max_model_len = getattr(model_config, "max_model_len", None)
-        # Llama 4 query scaling: factor 1 + beta*log(1 + floor(pos/orig)) is
-        # exactly 1 below orig. It is not implemented, so longer contexts would
-        # be silently wrong.
+        max_model_len = getattr(getattr(vllm_config, "model_config", None), "max_model_len", None)
+        # Llama 4 query scaling (1 + beta*log(1 + floor(pos/orig))) is exactly 1
+        # below orig. Past it, the decode attention runs the torch path with a
+        # per-token query scale (the fused decode kernel scales Q by a scalar).
         if beta and orig and max_model_len and max_model_len > orig:
-            raise NotImplementedError(
-                f"max_model_len={max_model_len} > {orig}: the Llama 4 query "
-                "scaling (llama_4_scaling_beta="
-                f"{beta}) that applies past position {orig} is not implemented. "
-                f"Use --max-model-len <= {orig}."
+            logger.warning(
+                "max_model_len=%d > %d: Llama 4 query scaling is on; decode "
+                "attention uses the PyTorch path (slower than the fused kernel).",
+                max_model_len,
+                orig,
             )
-
 
 
 def _images_enabled() -> bool:

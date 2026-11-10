@@ -45,6 +45,10 @@ class LlamaConfig:
     )
     tie_word_embeddings: bool = True
     torch_dtype: torch.dtype = torch.bfloat16
+    # Llama 4 attention temperature tuning (Ministral 3): after RoPE,
+    # q *= 1 + beta * log(1 + floor(pos / original_max)). None = off.
+    llama_4_scaling_beta: float | None = None
+    llama_4_scaling_original_max: int | None = None
 
     # Framework config
     neuron_config: NeuronConfig | None = None

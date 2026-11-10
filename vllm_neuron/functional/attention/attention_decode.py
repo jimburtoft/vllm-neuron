@@ -786,6 +786,7 @@ def _torch_attention_decode_impl(
     # -- DCP Decode (Gather Q + LSE correction)
     dcp_size: int = 1,
     dcp_group=None,
+    q_scale: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
     PyTorch fallback implementation of the fused attention block for TKG.
@@ -989,6 +990,11 @@ def _torch_attention_decode_impl(
     # ================================================================
     if cos is not None and sin is not None:
         q, k = _torch_apply_rope(q, k, cos, sin, rope_contiguous_layout)
+
+    # Optional per-token query scale after RoPE (e.g. Llama 4 attention
+    # temperature tuning): q_scale [B, S_tkg].
+    if q_scale is not None:
+        q = q * q_scale.to(q.dtype).view(B, 1, S_tkg, 1)
 
     # ================================================================
     # Stage 6.5: Optional post-RoPE RMSNorm on Q/K
@@ -1453,6 +1459,8 @@ def attention_decode(
     dcp_active_owner: Optional[Tensor] = None,
     # -- explicit FP8 fused-mask selection
     fp8_fused_mask_allowed: bool = False,
+    # -- per-token query scale after RoPE [B, S_tkg] (torch path only)
+    q_scale: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
     Fused Attention Block for Token Generation (TKG).
@@ -1703,6 +1711,11 @@ def attention_decode(
         active_blocks_table=active_blocks_table,
         attention_dp=attention_dp,
     )
+    # The kernel scales Q by one scalar; a per-token q_scale runs the torch path.
+    if q_scale is not None:
+        if attention_dp > 1 or dcp_size > 1:
+            raise NotImplementedError("q_scale is not supported with attention DP or DCP")
+        can_use_kernel = False
 
     # 2D-table GQA is already routed to the torch fallback by
     # _can_use_attention_block_kernel.
@@ -1925,6 +1938,7 @@ def attention_decode(
             kv_needs_a2a=kv_needs_a2a,
             dcp_size=dcp_size,
             dcp_group=dcp_group,
+            q_scale=q_scale,
         )
         if update_cache and return_updated_kv:
             # Mirror the NKI contract. The torch path mutates K_cache/V_cache with
