@@ -1078,6 +1078,7 @@ class LlamaAttention(nn.Module):
             and S_decode == 1
             and not self.fp8_packed
             and not dcp_decode_active
+            and self.l4_beta is None  # q_scale runs the torch path (2D table)
             and can_run_kernel(hidden_states)
         ):
             active_blocks_table = build_per_head_block_table(block_table, nkh).to(
