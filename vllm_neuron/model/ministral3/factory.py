@@ -50,10 +50,52 @@ class Ministral3TextModel(LlamaModelImpl):
         return super().load_weights(checkpoint_path, device, cache_dir)
 
 
+def _register_processor(cls):
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+
+    from .processing import (
+        Mistral3DummyInputsBuilder,
+        Mistral3MultiModalProcessor,
+        Mistral3ProcessingInfo,
+    )
+
+    return MULTIMODAL_REGISTRY.register_processor(
+        Mistral3MultiModalProcessor,
+        info=Mistral3ProcessingInfo,
+        dummy_inputs=Mistral3DummyInputsBuilder,
+    )(cls)
+
+
+@_register_processor
 class Ministral3ForCausalLM(LlamaForCausalLM):
-    """Factory: validate the Ministral 3 config, then build the text decoder."""
+    """Factory: validate the Ministral 3 config, then build the text decoder,
+    or the text decoder plus the Pixtral tower when images are enabled."""
 
     supports_packed_prefill = True
+    supports_multimodal = True
+
+    # Encoder sizing (used by the runner/platform through the registry class).
+    @classmethod
+    def get_vision_token_merge_factor(cls, hf_config):
+        return hf_config.spatial_merge_size**2
+
+    @classmethod
+    def get_max_encoder_embed_budget(cls, hf_config, encoder_neuron_config):
+        from .multimodal import Ministral3ForConditionalGeneration as M
+
+        return M.get_max_encoder_embed_budget(hf_config, encoder_neuron_config)
+
+    @classmethod
+    def get_max_encoder_blocks_per_request(cls, hf_config, encoder_neuron_config):
+        from .multimodal import Ministral3ForConditionalGeneration as M
+
+        return M.get_max_encoder_blocks_per_request(hf_config, encoder_neuron_config)
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int):
+        if modality.startswith("image"):
+            return None
+        raise ValueError("Only image modality is supported")
 
     @classmethod
     def from_configs(
@@ -64,9 +106,17 @@ class Ministral3ForCausalLM(LlamaForCausalLM):
         encoder_neuron_config: object | None = None,
         **kwargs,
     ) -> nn.Module:
-        # A multimodal architecture can be called with text_neuron_config /
-        # encoder_neuron_config. This implementation is text-only.
+        # The runner passes text_neuron_config / encoder_neuron_config for a
+        # multimodal architecture. With an encoder config (and image inputs
+        # enabled) build the model with the Pixtral tower; otherwise text only.
         nc = neuron_config if neuron_config is not None else text_neuron_config
+        if encoder_neuron_config is not None and _images_enabled():
+            cls._validate_config(hf_config, nc)
+            from .multimodal import Ministral3ForConditionalGeneration
+
+            return Ministral3ForConditionalGeneration.from_configs(
+                hf_config, nc, encoder_neuron_config
+            )
         return cls._select_implementation(hf_config, nc)
 
     @classmethod
@@ -97,15 +147,13 @@ class Ministral3ForCausalLM(LlamaForCausalLM):
                 f"{beta}) that applies past position {orig} is not implemented. "
                 f"Use --max-model-len <= {orig}."
             )
-        mm_config = getattr(model_config, "multimodal_config", None)
-        if mm_config is not None:
-            if mm_config.get_limit_per_prompt("image") != 0:
-                raise NotImplementedError(
-                    "Ministral 3 on Neuron serves the text decoder only (the "
-                    "Pixtral vision tower is not implemented). Start the server "
-                    "with --language-model-only (or "
-                    "--limit-mm-per-prompt '{\"image\": 0}')."
-                )
+
+
+
+def _images_enabled() -> bool:
+    vllm_config = _current_vllm_config()
+    mm_config = getattr(getattr(vllm_config, "model_config", None), "multimodal_config", None)
+    return mm_config is not None and mm_config.get_limit_per_prompt("image") != 0
 
 
 def _current_vllm_config():

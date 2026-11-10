@@ -15,10 +15,10 @@ RMSNorm, SiLU-gated MLP), with two differences:
   The factor is exactly 1 for positions below ``original_max_position_embeddings``
   (16384). It is not implemented, so ``max_model_len`` above that is rejected.
 
-This module serves the text decoder only. The Pixtral vision tower and the
-multimodal projector are not loaded; serve with ``--language-model-only`` (or
-``--limit-mm-per-prompt '{"image": 0}'``) so that vLLM does not accept image
-inputs.
+With ``--language-model-only`` (or ``--limit-mm-per-prompt '{"image": 0}'``) only
+the text decoder is built and the vision weights are not loaded. With images
+enabled and an ``encoder_neuron_config``, ``multimodal.py`` adds the Pixtral
+vision tower and the projector on the encoder TP / DP groups.
 """
 
 from .factory import Ministral3ForCausalLM

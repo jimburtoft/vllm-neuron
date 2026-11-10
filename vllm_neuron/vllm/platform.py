@@ -282,13 +282,12 @@ class NeuronPlatform(Platform):
         # ModelConfig validation inspects the upstream class before the worker
         # registers the Neuron models (which replace it). The upstream class
         # (mistral3 -> pixtral) does not import with the transformers that
-        # vLLM 0.29 ships with (PixtralRotaryEmbedding was renamed), and the
-        # Neuron port is text-only. Point validation at the upstream text-only
-        # Mistral class, which is what upstream registers for
-        # Ministral3ForCausalLM; the worker then registers the Neuron class.
+        # vLLM 0.29 ships with (PixtralRotaryEmbedding was renamed). Point
+        # validation at a light stand-in with the same interface flags and the
+        # vendored image processor; the worker then registers the Neuron class.
         ModelRegistry.register_model(
             "Mistral3ForConditionalGeneration",
-            "vllm.model_executor.models.mistral:MistralForCausalLM",
+            "vllm_neuron.model.ministral3.validation:Mistral3ForConditionalGeneration",
         )
 
         if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
