@@ -2815,10 +2815,7 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
         _fp8_experts = bool(
             getattr(self.model.layers[0].mlp.experts, "fp8_experts", False)
         )
-        _keep_bf16 = _fp8_experts and keep_bf16_prefill_copy(
-            self.config.neuron_config,
-            getattr(self.model.layers[0].mlp.experts, "intermediate_size_per_rank", None),
-        )
+        _keep_bf16 = _fp8_experts and self._fp8_keep_bf16_prefill_copy()
         if _fp8_experts:
             logger.info(
                 "GPT-OSS FP8 prefill: %s",
@@ -2863,6 +2860,10 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None
     ) -> None:
         """Lightweight weight loading used during CPU compile."""
+        # The FP8 experts change parameter dtypes and add parameters, and the traced graph
+        # depends on both, so declare them before the early return below.
+        self._declare_fp8_experts_for_cpu_compile()
+
         # Scales only exist for quantized KV caches; nothing to load otherwise.
         from vllm_neuron.utils.dtype_utils import QUANTIZED_KV_CACHE_DTYPES
         from vllm.config import get_current_vllm_config
@@ -2875,6 +2876,66 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         checkpoint._ensure_indexed()
         self._load_kv_cache_scales(checkpoint, device)
+
+    def _fp8_keep_bf16_prefill_copy(self) -> bool:
+        """Whether FP8 experts also keep a BF16 copy for prefill.
+
+        The one decision used by both load_weights and the CPU-compile path, so a compiled
+        graph always matches the parameters a real load creates.
+        """
+        return keep_bf16_prefill_copy(
+            self.config.neuron_config,
+            getattr(self.model.layers[0].mlp.experts, "intermediate_size_per_rank", None),
+        )
+
+    def _declare_fp8_experts_for_cpu_compile(self) -> None:
+        """Give the experts the FP8 parameters that load_weights would create, on meta.
+
+        With quantization="fp8", load_weights replaces the BF16 expert weights with FP8 ones
+        and registers ``*_scale`` (and, when keep_bf16_prefill_copy says so, ``*_weight_bf16``)
+        parameters. CPU compile runs only load_weights_lite, so without this the graph is
+        traced with BF16 experts and no scales, and decode fails on ``gate_up_proj_scale``.
+        Tracing needs only shapes and dtypes, so every tensor here is empty on meta.
+        """
+        if not getattr(self.model.layers[0].mlp.experts, "fp8_experts", False):
+            return
+        keep_bf16 = self._fp8_keep_bf16_prefill_copy()
+        meta = torch.device("meta")
+        for layer in self.model.layers:
+            experts = layer.mlp.experts
+            for name in ("gate_up_proj_weight", "down_proj_weight"):
+                w = getattr(experts, name)
+                if w.dtype == FP8_TRN2_DTYPE:
+                    continue
+                # Same shapes as quantize_expert_state_dict: the weight keeps its shape
+                # (the gate/up-major permute is a data reorder), the ROW scale reduces dim 1.
+                E, _, last = w.shape
+                if keep_bf16:
+                    experts.register_parameter(
+                        name.replace("_weight", "_weight_bf16"),
+                        nn.Parameter(
+                            torch.empty(w.shape, dtype=w.dtype, device=meta),
+                            requires_grad=False,
+                        ),
+                    )
+                experts.register_parameter(
+                    name,
+                    nn.Parameter(
+                        torch.empty(w.shape, dtype=FP8_TRN2_DTYPE, device=meta),
+                        requires_grad=False,
+                    ),
+                )
+                experts.register_parameter(
+                    name.replace("_weight", "_scale"),
+                    nn.Parameter(
+                        torch.empty(E, 1, last, dtype=torch.float32, device=meta),
+                        requires_grad=False,
+                    ),
+                )
+        logger.info(
+            "CPU compile: declared FP8 experts on meta (%s)",
+            "with BF16 prefill copy" if keep_bf16 else "no BF16 prefill copy",
+        )
 
     def _load_kv_cache_scales(
         self, checkpoint: SafetensorsCheckpoint, device: torch.device
