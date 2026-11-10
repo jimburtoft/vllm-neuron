@@ -276,8 +276,22 @@ class NeuronPlatform(Platform):
         # the Neuron policy before ModelConfig validation constructs the config.
         patch_vllm_config_for_neuron()
 
+        from vllm.model_executor.models.registry import ModelRegistry
+
+        # Ministral 3 checkpoints declare Mistral3ForConditionalGeneration.
+        # ModelConfig validation inspects the upstream class before the worker
+        # registers the Neuron models (which replace it). The upstream class
+        # (mistral3 -> pixtral) does not import with the transformers that
+        # vLLM 0.29 ships with (PixtralRotaryEmbedding was renamed), and the
+        # Neuron port is text-only. Point validation at the upstream text-only
+        # Mistral class, which is what upstream registers for
+        # Ministral3ForCausalLM; the worker then registers the Neuron class.
+        ModelRegistry.register_model(
+            "Mistral3ForConditionalGeneration",
+            "vllm.model_executor.models.mistral:MistralForCausalLM",
+        )
+
         if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
-            from vllm.model_executor.models.registry import ModelRegistry
 
             ModelRegistry.register_model(
                 "SyntheticNeuronModel",

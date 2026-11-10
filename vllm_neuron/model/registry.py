@@ -5,6 +5,7 @@ from .llama3 import LlamaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM, PEagleLlamaForCausalLM
 from .mistral import MistralForCausalLM
+from .ministral3 import Ministral3ForCausalLM
 from .qwen3 import DFlashQwen3ForCausalLM, Qwen3ForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 from .qwen3_asr import Qwen3ASRForConditionalGeneration
@@ -22,6 +23,10 @@ def get_models() -> list[tuple[str, type]]:
     models = [
         ("LlamaForCausalLM", LlamaForCausalLM),
         ("MistralForCausalLM", MistralForCausalLM),
+        # Ministral 3 text decoder (YaRN Llama). The checkpoints declare the
+        # multimodal wrapper; the vision tower is not implemented.
+        ("Mistral3ForConditionalGeneration", Ministral3ForCausalLM),
+        ("Ministral3ForCausalLM", Ministral3ForCausalLM),
         ("GptOssForCausalLM", GptOssForCausalLM),
         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
         ("PEagleLlamaForCausalLM", PEagleLlamaForCausalLM),

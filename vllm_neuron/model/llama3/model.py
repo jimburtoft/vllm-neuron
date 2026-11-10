@@ -223,6 +223,9 @@ class LlamaRotaryEmbedding(nn.Module):
         self.head_dim = config.head_dim
         self.rope_parameters = config.rope_parameters
 
+        # Multiplies cos/sin (YaRN attention_factor). 1.0 for default / llama3.
+        self.attention_factor = 1.0
+
         rope_type = self.rope_parameters.get("rope_type")
         if rope_type == "llama3":
             self.scaling_factor = self.rope_parameters.get("factor", 1.0)
@@ -231,12 +234,88 @@ class LlamaRotaryEmbedding(nn.Module):
             self.orig_max_position = self.rope_parameters.get(
                 "original_max_position_embeddings", 8192
             )
+        elif rope_type == "yarn":
+            self._init_yarn(config)
         elif rope_type not in (None, "default"):
             raise NotImplementedError(
-                f"rope_type '{rope_type}' is not supported, only 'llama3' is supported."
+                f"rope_type '{rope_type}' is not supported, only 'llama3' and "
+                "'yarn' are supported."
             )
 
+    def _init_yarn(self, config: LlamaConfig) -> None:
+        """<-- MODEL-SPECIFIC: YaRN parameters (transformers
+        ``_compute_yarn_parameters``). Only scalars are stored here; the
+        model is built on the meta device."""
+        rp = self.rope_parameters
+        if rp.get("partial_rotary_factor", 1.0) != 1.0:
+            raise NotImplementedError("YaRN with partial_rotary_factor != 1")
+        orig = rp.get("original_max_position_embeddings")
+        factor = rp.get("factor")
+        if factor is None:
+            factor = config.max_position_embeddings / orig
+        self.yarn_factor = float(factor)
+        self.yarn_orig_max_position = int(orig)
+        self.yarn_beta_fast = float(rp.get("beta_fast") or 32)
+        self.yarn_beta_slow = float(rp.get("beta_slow") or 1)
+        self.yarn_truncate = bool(rp.get("truncate", True))
+
+        def get_mscale(scale, mscale=1.0):
+            if scale <= 1:
+                return 1.0
+            return 0.1 * mscale * math.log(scale) + 1.0
+
+        attention_factor = rp.get("attention_factor")
+        mscale = rp.get("mscale")
+        mscale_all_dim = rp.get("mscale_all_dim")
+        if attention_factor is None:
+            if mscale and mscale_all_dim:
+                attention_factor = get_mscale(self.yarn_factor, mscale) / get_mscale(
+                    self.yarn_factor, mscale_all_dim
+                )
+            else:
+                attention_factor = get_mscale(self.yarn_factor)
+        self.attention_factor = float(attention_factor)
+
+    def _yarn_inv_freq(self, device: torch.device) -> torch.Tensor:
+        """<-- MODEL-SPECIFIC: YaRN inverse frequencies (transformers
+        ``_compute_yarn_parameters``)."""
+        dim = self.head_dim
+        base = self.rope_theta
+        orig = self.yarn_orig_max_position
+
+        def correction_dim(num_rotations):
+            return (dim * math.log(orig / (num_rotations * 2 * math.pi))) / (
+                2 * math.log(base)
+            )
+
+        low = correction_dim(self.yarn_beta_fast)
+        high = correction_dim(self.yarn_beta_slow)
+        if self.yarn_truncate:
+            low, high = math.floor(low), math.ceil(high)
+        low, high = max(low, 0), min(high, dim - 1)
+        if low == high:
+            high += 0.001
+
+        pos_freqs = base ** (
+            torch.arange(0, dim, 2, dtype=torch.float, device=device) / dim
+        )
+        inv_freq_extrapolation = 1.0 / pos_freqs
+        inv_freq_interpolation = 1.0 / (self.yarn_factor * pos_freqs)
+        ramp = torch.clamp(
+            (torch.arange(dim // 2, dtype=torch.float32, device=device) - low)
+            / (high - low),
+            0,
+            1,
+        )
+        extrapolation_factor = 1 - ramp
+        return (
+            inv_freq_interpolation * (1 - extrapolation_factor)
+            + inv_freq_extrapolation * extrapolation_factor
+        )
+
     def _compute_inv_freq(self, device: torch.device) -> torch.Tensor:
+        if self.rope_parameters.get("rope_type") == "yarn":
+            return self._yarn_inv_freq(device)
         inv_freq = 1.0 / (
             self.rope_theta
             ** (
@@ -284,7 +363,11 @@ class LlamaRotaryEmbedding(nn.Module):
         positions_expanded = position_ids[None, :].float()  # [1, T]
         freqs = (inv_freq_expanded @ positions_expanded).transpose(0, 1)  # [T, Hd/2]
         emb = torch.cat((freqs, freqs), dim=-1)  # [T, Hd]
-        return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
+        cos, sin = emb.cos(), emb.sin()
+        if self.attention_factor != 1.0:
+            cos = cos * self.attention_factor
+            sin = sin * self.attention_factor
+        return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
 
 # =============================================================================
@@ -1550,6 +1633,9 @@ class LlamaModel(nn.Module):
         rank: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         is_token_ids: torch.Tensor | None = None,
+        encoder_embedding_buffer: torch.Tensor | None = None,
+        encoder_block_ids: torch.Tensor | None = None,
+        encoder_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         first_layer_name = "layers.0.self_attn"
         max_query_len = attn_metadata[first_layer_name]["max_query_len"]
@@ -1600,6 +1686,22 @@ class LlamaModel(nn.Module):
             hidden_states, inputs_embeds, is_token_ids
         )
 
+        # Multimodal prefill: scatter the encoder cache rows into the placeholder
+        # positions. Decode has no encoder inputs. The merge does the SP remap.
+        if (
+            is_prefill
+            and encoder_embedding_buffer is not None
+            and encoder_block_ids is not None
+            and encoder_positions is not None
+        ):
+            hidden_states, _ = NF.merge_multimodal_embeddings(
+                hidden_states,
+                encoder_embedding_buffer,
+                encoder_block_ids,
+                encoder_positions,
+                self.tp_group.rank_in_group_tensor,
+            )
+
         position_embeddings = self.rotary_emb(
             positions, device=hidden_states.device, dtype=hidden_states.dtype
         )
@@ -1635,6 +1737,34 @@ class LlamaModel(nn.Module):
 # =============================================================================
 
 
+def _prefix_mappings(model: nn.Module, mappings: dict, prefix: str) -> dict:
+    """Add ``prefix`` to every checkpoint name that ``mappings`` gives."""
+    out = {}
+    for name, _ in model.named_parameters():
+        src = mappings.get(name, name)
+        out[name] = [prefix + k for k in src] if isinstance(src, list) else prefix + src
+    return out
+
+
+class _TextOnlyView(nn.Module):
+    """Show only the text parameters of a multimodal wrapper to the loader."""
+
+    def __init__(self, model: nn.Module, skip_prefixes: tuple[str, ...]):
+        super().__init__()
+        object.__setattr__(self, "_model", model)
+        object.__setattr__(self, "_skip_prefixes", skip_prefixes)
+
+    def named_parameters(self, *args, **kwargs):
+        return (
+            (n, p)
+            for n, p in self._model.named_parameters(*args, **kwargs)
+            if not n.startswith(self._skip_prefixes)
+        )
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_model"), name)
+
+
 @async_speculative_decoding
 class LlamaForCausalLM(nn.Module, SupportsEagle3):
     """Llama model with language modeling head.
@@ -1644,6 +1774,12 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
     <-- MODEL-SPECIFIC: Llama-3.2-1B uses tied embeddings (lm_head shares
     weights with the embedding layer).
     """
+
+    # A multimodal subclass sets these. checkpoint_prefix is the checkpoint
+    # prefix of the text weights. load_weights skips parameters that start with
+    # a name in own_weight_prefixes, because the subclass loads them itself.
+    checkpoint_prefix: str = ""
+    own_weight_prefixes: tuple[str, ...] = ()
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
@@ -1738,6 +1874,9 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
         spec_decode_metadata=None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
+        encoder_embedding_buffer: torch.Tensor | None = None,
+        encoder_block_ids: torch.Tensor | None = None,
+        encoder_positions: torch.Tensor | None = None,
         **kwargs,  # @async_speculative_decoding injects async-spec args
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         positions = positions.to(torch.int32)
@@ -1764,6 +1903,9 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
             rank=rank,
             inputs_embeds=inputs_embeds,
             is_token_ids=is_token_ids,
+            encoder_embedding_buffer=encoder_embedding_buffer,
+            encoder_block_ids=encoder_block_ids,
+            encoder_positions=encoder_positions,
         )
 
         # >>> PARALLELISM: Slice to local before sampling position selection <<<
@@ -2053,9 +2195,17 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
         if self.config.tie_word_embeddings:
             mappings["lm_head.weight"] = "model.embed_tokens.weight"
 
+        # A multimodal subclass keeps the text weights under a prefix. It loads
+        # its own encoder weights separately.
+        target = self
+        if self.own_weight_prefixes:
+            target = _TextOnlyView(self, self.own_weight_prefixes)
+        if self.checkpoint_prefix:
+            mappings = _prefix_mappings(target, mappings, self.checkpoint_prefix)
+
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         rank_sharded = checkpoint.load_sharded_pipelined(
-            tp_rank, tp_size, self, mappings, device
+            tp_rank, tp_size, target, mappings, device
         ).state_dict
 
         # <-- QUANTIZATION: load static-FP8 scale buffers from the
