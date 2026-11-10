@@ -131,6 +131,8 @@ class Mistral3ProcessingInfo(BaseProcessingInfo):
     def get_longest_edge(
         self, mm_processor_kwargs: Mapping[str, object] | None = None
     ) -> int:
+        if _tokenizer_expands_images(self):
+            return int(self.ctx.tokenizer.instruct.mm_encoder.mm_config.max_image_size)
         processor = self.get_hf_processor()
         size = processor.image_processor.size
         merged = self.ctx.get_merged_mm_kwargs(mm_processor_kwargs or {})
@@ -144,6 +146,13 @@ class Mistral3ProcessingInfo(BaseProcessingInfo):
         image_height: int,
         mm_processor_kwargs: Mapping[str, object] | None = None,
     ) -> tuple[int, int]:
+        if _tokenizer_expands_images(self):
+            # mistral-common (the chat template in tekken mode) rounds the
+            # merged grid up and resizes the image to exactly that grid.
+            from PIL import Image
+
+            enc = self.ctx.tokenizer.instruct.mm_encoder
+            return enc._image_to_num_tokens(Image.new("RGB", (image_width, image_height)))
         cfg = self.get_hf_config()
         ncols, nrows, _, _ = patch_grid(
             image_width,
@@ -205,6 +214,41 @@ class Mistral3DummyInputsBuilder(BaseDummyInputsBuilder[Mistral3ProcessingInfo])
 class Mistral3MultiModalProcessor(BaseMultiModalProcessor[Mistral3ProcessingInfo]):
     def _get_hf_processor_text(self, mm_counts: Mapping[str, int]) -> str:
         return self.dummy_inputs.get_dummy_text(mm_counts)
+
+    def _apply_hf_processor_main(self, mm_items, hf_processor_mm_kwargs):
+        if _tokenizer_expands_images(self.info):
+            return self._apply_mistral_common(mm_items)
+        return self._apply_hf(mm_items, hf_processor_mm_kwargs)
+
+    def _apply_mistral_common(self, mm_items):
+        """Pixels from the mistral-common image encoder, so the pixel grid
+        equals the [IMG] grid the chat template wrote into the prompt."""
+        import torch
+        from mistral_common.protocol.instruct.messages import ImageChunk
+
+        enc = self.info.ctx.tokenizer.instruct.mm_encoder
+        counts = mm_items.get_all_counts()
+        pixel_values = []
+        if counts.get("image", 0):
+            images = mm_items.get_items("image", ImageProcessorItems)
+            for i in range(images.get_count()):
+                img = images.get(i)
+                pixel_values.append(torch.from_numpy(enc(ImageChunk(image=img)).image))
+        return BatchFeature({"pixel_values": pixel_values})
+
+    def _apply_hf(self, mm_items, hf_processor_mm_kwargs):
+        # The HF Pixtral image processor runs torch ops. If they start torch's
+        # intra-op thread pool in the frontend process, the engine core forked
+        # after it deadlocks the first time it runs the same processor (the
+        # scheduler's encoder-budget profiling). Keep the processor on one thread.
+        import torch
+
+        n = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            return super()._apply_hf_processor_main(mm_items, hf_processor_mm_kwargs)
+        finally:
+            torch.set_num_threads(n)
 
     def _postprocess_hf_mm_data(
         self,
