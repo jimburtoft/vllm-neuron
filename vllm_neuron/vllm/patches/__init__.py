@@ -20,6 +20,20 @@ def apply_patches():
 
     apply_dp_load_balancer_patch()
 
+    # Architecture stand-ins that vLLM inspects in every frontend process
+    # (also the API servers of a DP > 1 deployment) before the Neuron worker
+    # registers the plugin models. See platform.register_validation_models.
+    try:
+        from vllm_neuron.vllm.platform import register_validation_models
+
+        register_validation_models()
+    except Exception:  # noqa: BLE001 - never block plugin loading
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "register_validation_models failed", exc_info=True
+        )
+
     # patches/jf_grammar_patch.py wraps a specific
     # StructuredOutputManager and is applied from NeuronScheduler.__init__.
 

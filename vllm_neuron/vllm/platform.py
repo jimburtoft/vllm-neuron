@@ -201,6 +201,25 @@ def _apply_dcp_patch(ModelConfig):
     ModelConfig.verify_with_parallel_config = _patched_verify
 
 
+def register_validation_models() -> None:
+    """Register architecture stand-ins that vLLM inspects before the worker
+    registers the Neuron models. Runs in every process (plugin ``register``)
+    and again in ``pre_register_and_update``.
+
+    Ministral 3 checkpoints declare Mistral3ForConditionalGeneration. The
+    upstream class (mistral3 -> pixtral) does not import with the
+    transformers that vLLM 0.29 ships with (PixtralRotaryEmbedding was
+    renamed). Point it at a light stand-in with the same interface flags and
+    the vendored image processor; the worker then registers the Neuron class.
+    """
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    ModelRegistry.register_model(
+        "Mistral3ForConditionalGeneration",
+        "vllm_neuron.model.ministral3.validation:Mistral3ForConditionalGeneration",
+    )
+
+
 class NeuronPlatform(Platform):
     # OOT (Out-Of-Tree) refers to hardware platforms that are integrated with vLLM
     # through plugin projects.
@@ -276,21 +295,10 @@ class NeuronPlatform(Platform):
         # the Neuron policy before ModelConfig validation constructs the config.
         patch_vllm_config_for_neuron()
 
-        from vllm.model_executor.models.registry import ModelRegistry
-
-        # Ministral 3 checkpoints declare Mistral3ForConditionalGeneration.
-        # ModelConfig validation inspects the upstream class before the worker
-        # registers the Neuron models (which replace it). The upstream class
-        # (mistral3 -> pixtral) does not import with the transformers that
-        # vLLM 0.29 ships with (PixtralRotaryEmbedding was renamed). Point
-        # validation at a light stand-in with the same interface flags and the
-        # vendored image processor; the worker then registers the Neuron class.
-        ModelRegistry.register_model(
-            "Mistral3ForConditionalGeneration",
-            "vllm_neuron.model.ministral3.validation:Mistral3ForConditionalGeneration",
-        )
+        register_validation_models()
 
         if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
+            from vllm.model_executor.models.registry import ModelRegistry
 
             ModelRegistry.register_model(
                 "SyntheticNeuronModel",
