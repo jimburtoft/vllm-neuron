@@ -1152,6 +1152,9 @@ _PREFILL_FUSED_ADD_NORM = os.environ.get("MUSE_GLIMMER_PREFILL_FUSED_ADD_NORM", 
 # neuronx-cc still serializes every collective with the surrounding compute (0.4 ms of 48 ms hidden at 2 chunks,
 # 4k prefill +0.8 %), so it stays off; kept for later compilers.
 _PREFILL_CC_CHUNKS = int(os.environ.get("MUSE_GLIMMER_PREFILL_CC_CHUNKS", "1") or 1)
+# MUSE_GLIMMER_PREFILL_QUANT_BEFORE_AG (default 0): in the SP prefill MLP, row-quantize this rank's rows to FP8
+# before the all-gather (gather fp8 instead of bf16, quant on T/tp rows instead of T). Bit-exact (per-row quant).
+_PREFILL_QUANT_BEFORE_AG = os.environ.get("MUSE_GLIMMER_PREFILL_QUANT_BEFORE_AG", "0") == "1"
 
 
 class MuseGlimmerMLP(nn.Module):
@@ -1260,7 +1263,24 @@ class MuseGlimmerMLP(nn.Module):
             outs.append(self.tp_group.reduce_scatter(o, dim=0))
         return torch.cat(outs, dim=0)
 
+    def _forward_prefill_quant_then_gather(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """SP prefill MLP with the ROW activation quant moved BEFORE the all-gather
+        (MUSE_GLIMMER_PREFILL_QUANT_BEFORE_AG): quantize this rank's [T/tp, H] rows to [T/tp, H+4] fp8
+        (4x fewer rows for the quant kernel), all-gather the fp8 rows (half the bf16 bytes), then run
+        the CTE MLP on the gathered pre-quantized rows. Per-row quantization commutes with a row gather,
+        so the MLP input is bit-identical to quantizing after the gather."""
+        ones = torch.ones((1, hidden_states.shape[-1]), dtype=hidden_states.dtype, device=hidden_states.device)
+        xq = NF.rmsnorm_quant(hidden_states, ones, None, quantization_type=QuantizationType.ROW,
+                              norm_type=NormType.NO_NORM)
+        # all-gather as raw bytes (fp8 payload + packed fp32 scale): byte-exact, dtype-agnostic
+        xg = self.tp_group.all_gather(xq.view(torch.uint8), dim=0).view(xq.dtype)
+        out = self._mlp_fp8_call(xg)
+        return self.tp_group.reduce_scatter(out, dim=0)
+
     def forward(self, hidden_states: torch.Tensor, is_prefill: bool) -> torch.Tensor:
+        if (is_prefill and self.world_size > 1 and self.fp8 and _PREFILL_QUANT_BEFORE_AG
+                and hidden_states.shape[0] * self.world_size > _MLP_TKG_MAX_T):
+            return self._forward_prefill_quant_then_gather(hidden_states)
         if (is_prefill and self.world_size > 1 and _PREFILL_CC_CHUNKS > 1
                 and hidden_states.shape[0] % (_PREFILL_CC_CHUNKS * 128) == 0):
             return self._forward_prefill_pipelined(hidden_states, _PREFILL_CC_CHUNKS)
