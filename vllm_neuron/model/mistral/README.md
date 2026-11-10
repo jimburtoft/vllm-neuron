@@ -30,7 +30,7 @@ its defaults differ for rope_theta (5e5) and tie_word_embeddings (True).
 Long context (10k), segmented prefill, real-peak KV admission:
 
 ```bash
-export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.6 VLLM_NEURON_SWA_REAL_ADMISSION=1
+export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.6 VLLM_NEURON_SWA_REAL_ADMISSION=1 NEURON_SKIP_EFA_AFFINITY=1
 vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
   --max-model-len 10240 --max-num-batched-tokens 8192 --max-num-seqs 128 --no-enable-prefix-caching \
   --additional-config '{"neuron_config": {
@@ -42,7 +42,7 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
 Short prompts (2k context), packed prefill:
 
 ```bash
-export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.6 VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8
+export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.6 VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8 NEURON_SKIP_EFA_AFFINITY=1
 vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
   --max-model-len 2048 --max-num-batched-tokens 2048 --max-num-seqs 64 --no-enable-prefix-caching \
   --additional-config '{"neuron_config": {
@@ -51,6 +51,7 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
      "decode_context_length_buckets": [1024]}}'
 ```
 
+- `NEURON_SKIP_EFA_AFFINITY=1` is required on a trn2.3xlarge, which has no EFA device. Without it, engine start fails with `No EFA device found ...`.
 - `VLLM_NEURON_SWA_REAL_ADMISSION=1` (opt-in) admits a request only while the real KV peak of every live
   request fits the pool. The real peak is prompt + max_tokens + in-flight tokens, not `max_model_len`. Without
   it, the scheduler charges every request `max_model_len`, so the 10k server runs only 42 requests at once
@@ -100,7 +101,7 @@ without it, a 32k server charges every request 32k tokens and runs only about 13
 prompts.
 
 ```bash
-export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.6 VLLM_NEURON_SWA_REAL_ADMISSION=1
+export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.6 VLLM_NEURON_SWA_REAL_ADMISSION=1 NEURON_SKIP_EFA_AFFINITY=1
 vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
   --max-model-len 32768 --max-num-batched-tokens 8192 --max-num-seqs 32 --no-enable-prefix-caching \
   --additional-config '{"neuron_config": {
