@@ -12,8 +12,10 @@ this package builds the [`llama3`](../llama3/) implementation with two additions
   `_compute_yarn_parameters`, including `attention_factor` on cos/sin). It changes 43 of the 64
   rotary frequencies of Ministral-3-8B, so it matters at every position, not only past the original
   context.
-* **Checkpoint prefix.** The decoder weights are under `language_model.`; the vision tower
-  (`vision_tower.*`) and projector (`multi_modal_projector.*`) are not loaded.
+* **Checkpoint prefix.** The decoder weights are under `language_model.`.
+* **Images (optional).** With images enabled, `multimodal.py` adds the Pixtral vision tower and
+  the Mistral3 projector (`vision.py`) on the encoder TP / DP groups. With
+  `--language-model-only` only the text decoder is built.
 
 ## Architecture (Ministral-3-8B-Instruct-2512)
 
@@ -104,6 +106,39 @@ Single request (long server): 1024 / 1024 at 102 tok/s, TTFT 63 ms, TPOT 9.8 ms.
   TP=2 x DP=2 uses `--max-num-seqs 64` per engine and `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.4` (0.6 runs out of
   device memory under load).
 
+## Images
+
+```bash
+export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.5
+vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 \
+  --tokenizer-mode mistral --limit-mm-per-prompt '{"image": 1}' \
+  --mm-processor-kwargs '{"size": {"longest_edge": 896}}' \
+  --max-model-len 8192 --max-num-batched-tokens 4096 --max-num-seqs 32 --no-enable-prefix-caching \
+  --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [512, 1024, 2048, 4096],
+     "num_seqs_buckets": [1, 2, 4, 8, 16, 32], "decode_context_length_buckets": [2048]},
+   "encoder_neuron_config": {"encoder_attention_block_size": 4096,
+     "num_encoder_input_buckets": [4096, 8192], "encoder_cache_num_blocks": 80}}'
+```
+
+- Each image runs in one encoder attention block, so `encoder_attention_block_size` must hold the
+  image's patches: 896 px longest edge is at most 64 x 64 = 4096 patches. The full 1540 px needs
+  12,100 patches (block 12,288).
+- The image grid and pixels come from mistral-common (the chat template in `--tokenizer-mode
+  mistral`), which rounds the merged grid up and resizes the image to it, so the `[IMG]` count always
+  equals the encoder output.
+- Set `encoder_cache_num_blocks`: every image takes a whole cache block, and the default size (from
+  the scheduler's merged-token budget) can be only a few blocks.
+- The upstream vLLM `Mistral3ForConditionalGeneration` does not import with the transformers in
+  this environment, so the processor is vendored (`processing.py`) and the platform registers a
+  stand-in class (`validation.py`) for config validation.
+
+Online, 640x896 random images, 128 output tokens: c=1 86 tok/s (TTFT 244 ms, TPOT 9.8 ms), c=32 516 tok/s (TTFT 3.0 s,
+TPOT 38.7 ms), plateau about 530 tok/s at `--max-num-seqs 32`.
+
+Accuracy (TP=4, 5 image prompts incl. one with two images, 48 tokens, teacher-forced against HF fp32
+on the same pixels): argmax 98.1 % with 0 non-tie mismatches, against 98.6 % / 0 for HF bf16;
+logprob error 0.085 / 0.225 (median / p95) against 0.089 / 0.236 for HF bf16.
+
 ## FP8
 
 The `mistralai/Ministral-3-8B-Instruct-2512` checkpoint is static per-tensor FP8 (`quant_method: fp8`,
@@ -125,7 +160,7 @@ are calibrated for `float8_e4m3fn` (448). Set `VLLM_NEURON_FP8_INPUT_SCALE_COMPE
 | DP | ✅ | TP=2 x DP=2 |
 | Prefix caching, segmented prefill | ✅ | validated at BS 6 |
 | Packed prefill | ✅ | short server |
-| Vision tower (Pixtral) | ❌ | text only |
+| Vision tower (Pixtral) + projector | ✅ | one image per encoder block; see Images |
 | FP8 checkpoint | ✅ (after scale renaming) | see FP8 |
 | Llama 4 query scaling (positions >= 16384) | ❌ | `max_model_len > 16384` is rejected |
 | FP8 KV cache | ✅ | with the FP8 checkpoint (scales 1.0) |
