@@ -83,7 +83,7 @@ def _vllm_config(mns, ml, mnbt, buckets):
     return cfg
 
 
-def _kv_cache_config(num_blocks):
+def _kv_cache_config(num_blocks, dense=False):
     import torch
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -97,11 +97,13 @@ def _kv_cache_config(num_blocks):
         KVCacheGroupSpec(["swa0"], SlidingWindowSpec(sliding_window=64, **common)),
         KVCacheGroupSpec(["full0"], FullAttentionSpec(**common)),
     ]
+    if dense:
+        groups = [KVCacheGroupSpec(["full0"], FullAttentionSpec(**common))]
     return KVCacheConfig(num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups)
 
 
 def _run(monkeypatch, lens, n_max, out_len=6, mns=16, buckets=(128, 256, 512, 1024, 2048, 4096),
-         limit=None, swa=False):
+         limit=None, swa=False, dense=False, num_blocks=4000):
     from vllm.sampling_params import SamplingParams
     from vllm.v1.outputs import ModelRunnerOutput
     from vllm.v1.request import Request
@@ -121,7 +123,7 @@ def _run(monkeypatch, lens, n_max, out_len=6, mns=16, buckets=(128, 256, 512, 10
     ml = 4096
     cfg = _vllm_config(mns, ml, ml, list(buckets))
     sched = NeuronAsyncScheduler(
-        vllm_config=cfg, kv_cache_config=_kv_cache_config(4000),
+        vllm_config=cfg, kv_cache_config=_kv_cache_config(num_blocks, dense=dense),
         structured_output_manager=Mock(should_advance=Mock(return_value=False)), block_size=BLOCK,
     )
     for i, L in enumerate(lens):
@@ -238,3 +240,15 @@ def test_unsupported_model_stays_single(monkeypatch):
     cfg.scheduler_config.max_num_batched_tokens = 1024
     n, reason = pp.resolve_max_prefills(cfg)
     assert n == 1 and "segmented" in reason
+
+
+def test_real_peak_admission_dense_model(monkeypatch):
+    """VLLM_NEURON_SWA_REAL_ADMISSION on a dense model (full-attention group only):
+    each request is charged prompt + max_tokens, not max_model_len, so more requests
+    run at once than the worst-case count cap, with no preemption."""
+    sched, steps, finished = _run(monkeypatch, [100] * 24, n_max=8, mns=32, swa=True,
+                                  dense=True, num_blocks=1280)
+    assert sched._real_admission is not None
+    assert finished == 24
+    assert sched._real_preemptions == 0
+    assert sched._kv_high_water > sched._real_admission.legacy_cap
