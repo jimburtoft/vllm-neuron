@@ -25,7 +25,7 @@ this package builds the [`llama3`](../llama3/) implementation with two additions
 | num_attention_heads / num_key_value_heads / head_dim | 32 / 8 / 128 |
 | intermediate_size | 14336 |
 | RoPE | YaRN: rope_theta 1e6, factor 16, original_max_position_embeddings 16384, beta_fast 32, beta_slow 1, mscale = mscale_all_dim = 1 (attention_factor 1.0) |
-| Llama 4 query scaling | beta 0.1 above position 16384 (not implemented, see "Feature status") |
+| Llama 4 query scaling | beta 0.1 above position 16384 (implemented; see "Long context") |
 | RMSNorm eps | 1e-5 |
 | tie_word_embeddings | False |
 | sliding_window | null |
@@ -66,7 +66,7 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
   transformers' `apply_chat_template`.
 - `--language-model-only` (or `--limit-mm-per-prompt '{"image": 0}'`) is required; image inputs
   are rejected otherwise.
-- `--max-model-len` must be at most 16384 (Llama 4 query scaling is not implemented).
+- Up to `--max-model-len 16384` decode uses the fused attention kernel. Above it see "Long context".
 - `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (default 0.30) caps the KV cache.
 - `decode_context_length_buckets` selects Model Runner V1 on this release.
 
@@ -105,6 +105,17 @@ Single request (long server): 1024 / 1024 at 102 tok/s, TTFT 63 ms, TPOT 9.8 ms.
   `num_seqs_buckets` [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128], `decode_context_length_buckets` [1024].
   TP=2 x DP=2 uses `--max-num-seqs 64` per engine and `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.4` (0.6 runs out of
   device memory under load).
+
+## Long context (> 16384)
+
+Past `original_max_position_embeddings` (16384) Ministral 3 scales the queries by
+`1 + 0.1 * log(1 + floor(pos / 16384))` after RoPE. The llama3 attention applies it when
+`max_model_len` exceeds 16384: prefill scales the query rows, and decode passes a per-token query
+scale to `NF.attention_decode`. The fused decode kernel only takes a scalar softmax scale, so decode
+attention then runs the PyTorch path: at `--max-model-len 32768` the single-request decode TPOT is
+22.3 ms (9.8 ms on the fused kernel at <= 16384). Needle retrieval at 20k and 24k tokens: 2/2; the
+teacher-forced logprob error vs HF fp32 is 0.086 / 0.190 (median / p95), against 0.089 / 0.168 for HF
+bf16 and 0.33 / 0.53 for HF fp32 without the query scaling.
 
 ## Images
 
@@ -162,6 +173,6 @@ are calibrated for `float8_e4m3fn` (448). Set `VLLM_NEURON_FP8_INPUT_SCALE_COMPE
 | Packed prefill | ✅ | short server |
 | Vision tower (Pixtral) + projector | ✅ | one image per encoder block; see Images |
 | FP8 checkpoint | ✅ (after scale renaming) | see FP8 |
-| Llama 4 query scaling (positions >= 16384) | ❌ | `max_model_len > 16384` is rejected |
+| Llama 4 query scaling (positions >= 16384) | ✅ | decode attention uses the PyTorch path when `max_model_len > 16384` |
 | FP8 KV cache | ✅ | with the FP8 checkpoint (scales 1.0) |
 | Eagle3 | not tested | |

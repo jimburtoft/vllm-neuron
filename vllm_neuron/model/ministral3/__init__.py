@@ -13,7 +13,7 @@ RMSNorm, SiLU-gated MLP), with two differences:
   implements it (:class:`~vllm_neuron.model.llama3.model.LlamaRotaryEmbedding`).
 * Llama 4 query scaling: ``q *= 1 + beta * log(1 + floor(pos / original_max))``.
   The factor is exactly 1 for positions below ``original_max_position_embeddings``
-  (16384). It is not implemented, so ``max_model_len`` above that is rejected.
+  (16384); the llama3 attention applies it when ``max_model_len`` is larger.
 
 With ``--language-model-only`` (or ``--limit-mm-per-prompt '{"image": 0}'``) only
 the text decoder is built and the vision weights are not loaded. With images
