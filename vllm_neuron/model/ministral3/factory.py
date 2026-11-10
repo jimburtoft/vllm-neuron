@@ -30,6 +30,18 @@ class Ministral3TextModel(LlamaModelImpl):
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig):
         return cls(ministral3_llama_config(hf_config, neuron_config))
 
+    def compiler_args_for(self, graph_type, example_inputs, base):
+        """Per-graph compiler arguments (opt-in): VLLM_NEURON_DECODE_O3=1 compiles
+        the plain decode graph at -O3. Prefill / encoder keep the base level."""
+        import os
+
+        base = list(base or [])
+        if graph_type == "decode" and os.environ.get("VLLM_NEURON_DECODE_O3") == "1":
+            from vllm_neuron.utils.compiler_args_ctx import with_optimization_level
+
+            return with_optimization_level(base, 3)
+        return base
+
     def load_weights(self, checkpoint_path, device, cache_dir):
         from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 

@@ -103,6 +103,15 @@ def _model_supports(vllm_config: "VllmConfig") -> bool:
     )
 
 
+# Architectures served by the llama3 model code.
+_LLAMA3_ARCHS = (
+    "LlamaForCausalLM",
+    "MistralForCausalLM",
+    "Mistral3" + "ForConditionalGeneration",
+    "Ministral3" + "ForCausalLM",
+)
+
+
 def unsupported_reason(vllm_config: "VllmConfig") -> str | None:
     """Why packed prefill cannot run with this configuration, or None if it can."""
     mc = vllm_config.model_config
@@ -116,12 +125,12 @@ def unsupported_reason(vllm_config: "VllmConfig") -> str | None:
         # Only the bf16 GPT-OSS module honours the bounds (not mxfp4 / trn3 defaults).
         if nc.get("quantization") != "bf16":
             return "GPT-OSS packed prefill needs neuron_config quantization='bf16'"
-    if {"LlamaForCausalLM", "MistralForCausalLM"} & set(archs):
-        # Only the bf16 llama3 module honours the bounds (not the static-FP8 one).
+    if set(_LLAMA3_ARCHS) & set(archs):
+        # The bf16 and static-FP8 (ModelOpt) llama3 modules honour the bounds.
         hf = getattr(mc, "hf_config", None)
         qc = getattr(hf, "quantization_config", None)
-        if isinstance(qc, dict) and qc.get("quant_method"):
-            return "llama3 packed prefill needs an unquantized (bf16) checkpoint"
+        if isinstance(qc, dict) and qc.get("quant_method") not in (None, "modelopt"):
+            return "llama3 packed prefill needs a bf16 or ModelOpt static-FP8 checkpoint"
     if vllm_config.speculative_config is not None:
         return "speculative decoding is configured"
     if vllm_config.kv_transfer_config is not None:

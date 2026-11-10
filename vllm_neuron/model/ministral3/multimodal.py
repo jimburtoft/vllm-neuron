@@ -186,6 +186,11 @@ class Ministral3ForConditionalGeneration(
             dtype=torch.int64,
         )
         device = next(self.visual.parameters()).device
+        import os
+        import time
+
+        timing = os.environ.get("VLLM_NEURON_ENCODER_TIMING") == "1"
+        t0 = time.perf_counter()
         self.visual(
             patches.to(self.visual.dtype).to(device),
             cos.to(device),
@@ -196,3 +201,12 @@ class Ministral3ForConditionalGeneration(
             encoder_cache.buffer,
             write_ids.to(device),
         )
+        if timing:
+            # Read back one element so the device work is included.
+            float(encoder_cache.buffer[write_ids[0], 0, 0].to("cpu"))
+            logger.warning(
+                "[ministral3 encoder] %d images, %d blocks: %.1f ms",
+                len(per_image),
+                nb,
+                (time.perf_counter() - t0) * 1000,
+            )

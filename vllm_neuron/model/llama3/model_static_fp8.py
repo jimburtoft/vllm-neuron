@@ -844,6 +844,18 @@ class LlamaAttention(nn.Module):
                 k = k.repeat_interleave(self.num_key_value_groups, dim=0)
                 v = v.repeat_interleave(self.num_key_value_groups, dim=0)
 
+                # Packed prefill (several prompts back to back): per-token
+                # [start, end) bounds make the causal attention block-diagonal.
+                bounds = {}
+                bmin = attn_metadata[layer_name].get("packed_bound_min")
+                if bmin is not None:
+                    bmax = attn_metadata[layer_name]["packed_bound_max"]
+                    nh, ntok = q.shape[0], q.shape[1]
+                    bounds = dict(
+                        bound_min=bmin.view(1, ntok, 1).expand(nh, ntok, 1).contiguous(),
+                        bound_max=bmax.view(1, ntok, 1).expand(nh, ntok, 1).contiguous(),
+                    )
+
                 attn_output = NF.flash_attention(
                     q.transpose(1, 2),
                     k.transpose(1, 2),
@@ -852,6 +864,7 @@ class LlamaAttention(nn.Module):
                     tp_q=False,
                     tp_out=True,
                     allow_vector_exp=False,
+                    **bounds,
                 )
 
         # ── Step 5: Output Projection (STATIC) ──────────────────────────

@@ -37,6 +37,12 @@ from vllm_neuron.utils.weight_loader import (
 _ATTN_SEQ_ALIGN = 128
 
 
+def _use_nki_mlp() -> bool:
+    import os
+
+    return os.environ.get("VLLM_NEURON_PIXTRAL_NKI_MLP") == "1"
+
+
 @allow_in_graph_cacheable
 def gelu(x: torch.Tensor) -> torch.Tensor:
     """Exact (erf) GELU, traceable on Neuron."""
@@ -141,8 +147,26 @@ class PixtralMLP(nn.Module):
         set_weight_loader(self.up_weight, _row_shard(self.inter, self.tp))
         set_weight_loader(self.down_weight, _col_shard(self.inter, self.tp))
 
-    def forward(self, x):
-        out = (self.act(x @ self.gate_weight) * (x @ self.up_weight)) @ self.down_weight
+    def forward(self, x, ln_w=None, eps=1e-5):
+        """x: [nb, bs, H]. With ln_w (RMSNorm gamma), the norm is applied first;
+        VLLM_NEURON_PIXTRAL_NKI_MLP=1 fuses it into the nkilib MLP kernel."""
+        if _use_nki_mlp() and self.act is F.silu:
+            from nkilib.core.utils.common_types import NormType
+
+            nb, bs, h = x.shape
+            out = NF.mlp(
+                x.reshape(nb * bs, h),
+                self.gate_weight,
+                self.up_weight,
+                self.down_weight,
+                eps=eps,
+                ln_w=ln_w.view(1, -1) if ln_w is not None else None,
+                norm_type=NormType.RMS_NORM if ln_w is not None else NormType.NO_NORM,
+            ).view(nb, bs, h)
+        else:
+            if ln_w is not None:
+                x = _rms_norm(x, ln_w, eps)
+            out = (self.act(x @ self.gate_weight) * (x @ self.up_weight)) @ self.down_weight
         if self.tp > 1:
             self.tp_group.all_reduce(out)
         return out
@@ -161,7 +185,7 @@ class PixtralLayer(nn.Module):
 
     def forward(self, x, cos, sin, bmin, bmax):
         x = x + self.attention(_rms_norm(x, self.attention_norm, self.eps), cos, sin, bmin, bmax)
-        return x + self.feed_forward(_rms_norm(x, self.ffn_norm, self.eps))
+        return x + self.feed_forward(x, self.ffn_norm, self.eps)
 
 
 class Mistral3Projector(nn.Module):
