@@ -2331,7 +2331,7 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
         from vllm_neuron.utils.weight_loader import get_weight_loader
 
         for layer_id, layer in enumerate(self.model.layers):
-            prefix = f"model.layers.{layer_id}"
+            prefix = f"{self.checkpoint_prefix}model.layers.{layer_id}"
             self._load_scale_group(
                 owner=layer.self_attn,
                 sources=self._FP8_ATTN_SCALE_SOURCES,
@@ -2441,7 +2441,10 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
 
             # Store quantization scale tensors. Default to 1.0 if scales are not in checkpoint
             for scale_name in ("k_scale", "v_scale"):
-                key = f"model.layers.{layer_id}.self_attn.{scale_name}"
+                key = (
+                    f"{self.checkpoint_prefix}model.layers.{layer_id}"
+                    f".self_attn.{scale_name}"
+                )
                 if key in checkpoint._tensor_name_to_file:
                     # Invert scales: checkpoint stores scales for (tensor / scale),
                     # but the kernel quantizes via (tensor * scale), so invert once here.

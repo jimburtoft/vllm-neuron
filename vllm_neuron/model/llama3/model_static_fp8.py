@@ -161,6 +161,22 @@ def _needs_downscale() -> bool:
     return target == "trn2" or target.startswith("trn2-")
 
 
+def _input_scale_mult() -> float:
+    """Multiplier for checkpoint activation (input) scales on trn2.
+
+    The STATIC kernels quantize activations as ``x / input_scale`` into the
+    legacy 240-range fp8 on trn2. A checkpoint calibrated against
+    ``float8_e4m3fn`` (``input_scale = amax / 448``) then clips activations
+    above ``240 * input_scale``. Scaling the input scale by 448/240 keeps the
+    calibrated range. Opt-in with ``VLLM_NEURON_FP8_INPUT_SCALE_COMPENSATION=1``.
+    """
+    import os
+
+    if os.environ.get("VLLM_NEURON_FP8_INPUT_SCALE_COMPENSATION") == "1" and _needs_downscale():
+        return _FP8_SCALE_COMPENSATION
+    return 1.0
+
+
 def _downscale_fp8_weight(w_fp8: torch.Tensor) -> torch.Tensor:
     """Bring a ModelOpt-calibrated fp8 weight tensor into Neuron range (trn2)."""
     return (
@@ -222,9 +238,10 @@ def _broadcast_scalar_scale_loader(
     """
 
     def transform(slices, rank):
-        mult = (
-            _FP8_SCALE_COMPENSATION if (is_weight_scale and _needs_downscale()) else 1.0
-        )
+        if is_weight_scale:
+            mult = _FP8_SCALE_COMPENSATION if _needs_downscale() else 1.0
+        else:
+            mult = _input_scale_mult()
         assert len(slices) == 1, (
             "_broadcast_scalar_scale_loader expects exactly one slice, "
             f"got {len(slices)}"
@@ -280,7 +297,7 @@ def _fused_qkv_input_scale_loader() -> SafetensorsWeightLoader:
                 "Fused QKV with per-projection input scales is not "
                 "supported by the STATIC kernel."
             )
-        return scalars[0].expand(_PMAX, 1).contiguous()
+        return (scalars[0] * _input_scale_mult()).expand(_PMAX, 1).contiguous()
 
     return SafetensorsWeightLoader(transform=transform)
 

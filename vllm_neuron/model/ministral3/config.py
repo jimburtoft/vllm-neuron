@@ -104,10 +104,12 @@ def ministral3_llama_config(
         method = str(quant.get("quant_method", "")).lower()
         if method == "fp8":
             raise NotImplementedError(
-                "Ministral 3 FP8 checkpoints (quant_method 'fp8', "
-                "weight_scale_inv / activation_scale) are not supported yet. "
-                "Use the BF16 checkpoint (e.g. "
-                "mistralai/Ministral-3-8B-Instruct-2512-BF16)."
+                "Ministral 3 FP8 checkpoints in the original format "
+                "(quant_method 'fp8', weight_scale_inv / activation_scale) are "
+                "not loaded directly. Use the BF16 checkpoint (e.g. "
+                "mistralai/Ministral-3-8B-Instruct-2512-BF16), or convert the "
+                "per-tensor scales to the static-FP8 layout (weight_scale / "
+                "input_scale, quant_method 'modelopt')."
             )
         text["quantization_config"] = quant
     config = LlamaConfig.from_configs(text, neuron_config)
