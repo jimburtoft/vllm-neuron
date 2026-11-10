@@ -76,6 +76,10 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
 | 128 / 128 (2k packed server) | 32 | 2,135 | 158 ms | 13.8 ms |
 | 128 / 128 (2k packed server) | 64 | 3,087 | 276 ms | 18.8 ms |
 
+## Full 32k context
+
+`max_position_embeddings` is 32768, and the full context serves correctly: a needle at up to 30k prompt tokens is retrieved 10/10. This was validated on the neuron-staging line with real-peak KV admission. Use `--max-model-len 32768 --max-num-batched-tokens 8192` and `decode_context_length_buckets: [2048, 4096, 8192, 16384]`. The list must not include max_model_len, because max_model_len is the implicit top bucket. One device (TP4) gives 84 tok/s at c=1 for 16k-token prompts (TTFT 0.9 s) and 75 tok/s for 30k (TTFT 2.4 s). The peaks are 281 tok/s at 16k/1k and 181 tok/s at 30k/1k. The KV pool holds about 13 live 31k-token requests.
+
 ## Not supported
 
 - Sliding-window checkpoints (Mistral-7B-v0.1).
