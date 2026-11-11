@@ -118,10 +118,21 @@ class Ministral3ForConditionalGeneration(
 
     @classmethod
     def get_max_encoder_blocks_per_request(cls, hf_config, encoder_neuron_config) -> int:
+        """One cache block per image: the per-request image limit (vLLM
+        --limit-mm-per-prompt), at least the blocks of the largest bucket."""
         buckets = encoder_neuron_config.num_encoder_input_buckets
         if not buckets:
             return 0
-        return math.ceil(max(buckets) / encoder_neuron_config.encoder_attention_block_size)
+        by_bucket = math.ceil(max(buckets) / encoder_neuron_config.encoder_attention_block_size)
+        limit = 1
+        try:
+            from vllm.config import get_current_vllm_config
+
+            mm = get_current_vllm_config().model_config.multimodal_config
+            limit = max(1, int(mm.get_limit_per_prompt("image")))
+        except Exception:  # noqa: BLE001 - no vLLM context
+            pass
+        return max(by_bucket, limit)
 
     # -- warmup -----------------------------------------------------------
     def get_encoder(self):
@@ -204,17 +215,36 @@ class Ministral3ForConditionalGeneration(
             block_ids.extend(encoder_cache.allocate(mm_hash, [mi.shape[0]]))
 
         buckets = sorted(enc.num_encoder_input_buckets)
-        if len(per_image) == 1 and enc.dp_size == 1:
-            # One image: the smallest bucket that holds it (block = image size).
-            need = per_image[0][3]
+        if enc.dp_size == 1:
+            # One image per block of the smallest bucket that holds the largest
+            # image (block = image size); several images run that graph per image.
+            need = max(p[3] for p in per_image)
+            bucket = next((b for b in buckets if b >= need), None)
+            if bucket is None:
+                raise ValueError(f"image of {need} patches > largest bucket {buckets[-1]}")
+            rows_blk, nb = graph_block_rows(bucket, enc)
+            groups = [list(range(i, min(i + nb, len(per_image)))) for i in range(0, len(per_image), nb)]
         else:
             need = len(per_image) * bs
-        bucket = next((b for b in buckets if b >= need), None)
-        if bucket is None:
-            raise ValueError(f"{len(per_image)} images need {need} tokens; largest bucket {buckets[-1]}")
-        rows_blk, nb = graph_block_rows(bucket, enc)
-        if len(per_image) > nb:
-            raise ValueError(f"{len(per_image)} images but bucket {bucket} has {nb} blocks")
+            bucket = next((b for b in buckets if b >= need), None)
+            if bucket is None:
+                raise ValueError(f"{len(per_image)} images need {need} tokens; largest bucket {buckets[-1]}")
+            rows_blk, nb = graph_block_rows(bucket, enc)
+            groups = [list(range(len(per_image)))]
+        for group in groups:
+            self._encode_group(
+                [per_image[i] for i in group],
+                [block_ids[i] for i in group],
+                bucket, rows_blk, nb, encoder_cache, timing, t_host,
+            )
+            t_host = time.perf_counter()
+
+    def _encode_group(self, per_image, block_ids, bucket, rows_blk, nb, encoder_cache, timing, t_host):
+        vc = self.hf_config.vision_config
+        P = vc.patch_size
+        M = self.hf_config.spatial_merge_size
+        mf = M * M
+        hd = vc.hidden_size // vc.num_attention_heads
 
         dtype = self.visual.dtype
         patches = torch.zeros(nb, rows_blk, vc.num_channels * P * P, dtype=dtype)
