@@ -122,13 +122,12 @@ bf16 and 0.33 / 0.53 for HF fp32 without the query scaling.
 ## Images
 
 ```bash
-export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.5
+export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.5 VLLM_NEURON_SWA_REAL_ADMISSION=1
 vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 \
   --tokenizer-mode mistral --limit-mm-per-prompt '{"image": 1}' \
-  --mm-processor-kwargs '{"size": {"longest_edge": 896}}' \
-  --max-model-len 8192 --max-num-batched-tokens 4096 --max-num-seqs 32 --no-enable-prefix-caching \
+  --max-model-len 8192 --max-num-batched-tokens 4096 --max-num-seqs 64 --no-enable-prefix-caching \
   --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [512, 1024, 2048, 4096],
-     "num_seqs_buckets": [1, 2, 4, 8, 16, 32], "decode_context_length_buckets": [2048]},
+     "num_seqs_buckets": [1, 2, 4, 8, 16, 32, 48, 64], "decode_context_length_buckets": [2048]},
    "encoder_neuron_config": {"encoder_attention_block_size": 4096, "tp_size": 4,
      "num_encoder_input_buckets": [4096, 8192], "encoder_cache_num_blocks": 160}}'
 ```
@@ -150,8 +149,8 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
   this environment, so the processor is vendored (`processing.py`) and the platform registers a
   stand-in class (`validation.py`) for config validation.
 
-Online, 640x896 random images, 128 output tokens: c=1 86 tok/s (TTFT 244 ms, TPOT 9.8 ms), c=32 516 tok/s (TTFT 3.0 s,
-TPOT 38.7 ms), plateau about 530 tok/s at `--max-num-seqs 32`.
+Online, 640x896 random images, 128 output tokens, encoder TP=4, `--max-num-seqs 64`,
+`VLLM_NEURON_SWA_REAL_ADMISSION=1`: c=1 90 tok/s (TTFT 168 ms, TPOT 9.8 ms), c=32 752 tok/s, plateau about 848 tok/s.
 
 Accuracy (TP=4, 5 image prompts incl. one with two images, 48 tokens, teacher-forced against HF fp32
 on the same pixels): argmax 98.1 % with 0 non-tie mismatches, against 98.6 % / 0 for HF bf16;
