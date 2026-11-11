@@ -1152,9 +1152,11 @@ _PREFILL_FUSED_ADD_NORM = os.environ.get("MUSE_GLIMMER_PREFILL_FUSED_ADD_NORM", 
 # neuronx-cc still serializes every collective with the surrounding compute (0.4 ms of 48 ms hidden at 2 chunks,
 # 4k prefill +0.8 %), so it stays off; kept for later compilers.
 _PREFILL_CC_CHUNKS = int(os.environ.get("MUSE_GLIMMER_PREFILL_CC_CHUNKS", "1") or 1)
-# MUSE_GLIMMER_PREFILL_QUANT_BEFORE_AG (default 0): in the SP prefill MLP, row-quantize this rank's rows to FP8
-# before the all-gather (gather fp8 instead of bf16, quant on T/tp rows instead of T). Bit-exact (per-row quant).
-_PREFILL_QUANT_BEFORE_AG = os.environ.get("MUSE_GLIMMER_PREFILL_QUANT_BEFORE_AG", "0") == "1"
+# MUSE_GLIMMER_PREFILL_QUANT_BEFORE_AG (default 1): in the SP prefill MLP, row-quantize this rank's rows to FP8
+# before the all-gather (gather fp8 instead of bf16, quant on T/tp rows instead of T). Bit-exact on the CPU path; on
+# trn2 61/66 eq prompts give bit-identical step-0 logits, and the long-prompt differences stay inside the existing
+# Neuron-vs-HF band. TTFT -6.1 / -2.7 / -3.2 % at 1k / 4k / 8k. `0` restores gather-then-quant.
+_PREFILL_QUANT_BEFORE_AG = os.environ.get("MUSE_GLIMMER_PREFILL_QUANT_BEFORE_AG", "1") == "1"
 
 
 class MuseGlimmerMLP(nn.Module):
