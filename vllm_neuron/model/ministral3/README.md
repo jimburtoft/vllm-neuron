@@ -124,37 +124,39 @@ bf16 and 0.33 / 0.53 for HF fp32 without the query scaling.
 ```bash
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.5 VLLM_NEURON_SWA_REAL_ADMISSION=1
 vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 \
-  --tokenizer-mode mistral --limit-mm-per-prompt '{"image": 1}' \
+  --tokenizer-mode mistral --limit-mm-per-prompt '{"image": 2}' \
   --max-model-len 8192 --max-num-batched-tokens 4096 --max-num-seqs 64 --no-enable-prefix-caching \
   --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [512, 1024, 2048, 4096],
      "num_seqs_buckets": [1, 2, 4, 8, 16, 32, 48, 64], "decode_context_length_buckets": [2048]},
-   "encoder_neuron_config": {"encoder_attention_block_size": 4096, "tp_size": 4,
-     "num_encoder_input_buckets": [4096, 8192], "encoder_cache_num_blocks": 160}}'
+   "encoder_neuron_config": {"tp_size": 4, "encoder_attention_block_size": 12288,
+     "num_encoder_input_buckets": [1024, 2048, 3072, 4096, 6144, 8192, 12288],
+     "encoder_cache_num_blocks": 96}}'
 ```
 
-- Each image runs in one encoder attention block, so `encoder_attention_block_size` must hold the
-  image's patches: an image of up to 896 px is at most 64 x 64 = 4096 patches; the full 1540 px needs
-  12,100 patches (block 12,288). With `--tokenizer-mode mistral` the image size is set by mistral-common
-  (largest edge 1540), not by `--mm-processor-kwargs` `size`; an image whose patches exceed the block
-  fails with a clear error, so size the block for the largest image you serve (or resize client-side).
-- The image grid and pixels come from mistral-common (the chat template in `--tokenizer-mode
-  mistral`), which rounds the merged grid up and resizes the image to it, so the `[IMG]` count always
-  equals the encoder output.
-- Use encoder `tp_size` 4. The default (encoder DP over the 4 ranks) runs one real block and three
-  padding blocks for a single image: 640x896 image encoder 100.5 ms at DP4, 33.8 ms at TP4, 23.9 ms at
-  TP4 with `encoder_attention_block_size` 3072 (single-request image TTFT 246 -> 149 ms).
-- Set `encoder_cache_num_blocks`: every image takes a whole cache block, and the default size (from
-  the scheduler's merged-token budget) can be only a few blocks.
+- **Encoder TP 4.** The default (encoder data parallel over the 4 ranks) runs one real block and three
+  padding blocks for a single image (640x896 image: 100.5 ms at DP 4, 33.8 ms at TP 4).
+- **Image-size buckets.** With encoder TP, a bucket smaller than `encoder_attention_block_size` is
+  compiled as one block of `bucket` patches, and every image runs in the smallest bucket that holds
+  it. 640x896 (2,944 patches) runs the 3072 bucket: encoder 25 ms, single-request TTFT 141 ms (155 ms
+  with one 4096 block); 448x448 runs the 1024 bucket (10 ms, TTFT 93 ms); a 1540 px image (up to
+  12,100 patches) runs the 12288 bucket instead of being rejected.
+- Images are sized by mistral-common (the chat template in `--tokenizer-mode mistral`, largest edge
+  1540); `--mm-processor-kwargs` `size` does not change them. The grid and pixels come from the same
+  encoder, so the `[IMG]` count always equals the encoder output.
+- Set `encoder_cache_num_blocks`: every image takes a whole cache block (sized for the largest bucket).
 - The upstream vLLM `Mistral3ForConditionalGeneration` does not import with the transformers in
   this environment, so the processor is vendored (`processing.py`) and the platform registers a
   stand-in class (`validation.py`) for config validation.
+- Measured and left off (opt-in env vars): `VLLM_NEURON_PIXTRAL_FUSED_QKV=1` (NF.qkv_proj with the
+  RMSNorm fused + NF.o_proj; 1-18 ms slower), `VLLM_NEURON_PIXTRAL_NKI_MLP=1` (nkilib MLP; slower),
+  `VLLM_NEURON_ENCODER_O3=1` (encoder -O3; device -5 %, TTFT unchanged).
 
-Online, 640x896 random images, 128 output tokens, encoder TP=4, `--max-num-seqs 64`,
-`VLLM_NEURON_SWA_REAL_ADMISSION=1`: c=1 90 tok/s (TTFT 168 ms, TPOT 9.8 ms), c=32 752 tok/s, plateau about 848 tok/s.
+Online, 640x896 random images, 128 output tokens, server above: c=1 91 tok/s (TTFT 148 ms,
+TPOT 9.9 ms), c=32 792 tok/s, plateau 944 tok/s.
 
 Accuracy (TP=4, 5 image prompts incl. one with two images, 48 tokens, teacher-forced against HF fp32
-on the same pixels): argmax 98.1 % with 0 non-tie mismatches, against 98.6 % / 0 for HF bf16;
-logprob error 0.085 / 0.225 (median / p95) against 0.089 / 0.236 for HF bf16.
+on the same pixels): argmax 98.0 % with 1 non-tie mismatch, against 97.5 % / 1 for HF bf16;
+logprob error 0.091 / 0.210 (median / p95) against 0.092 / 0.241 for HF bf16.
 
 ## FP8
 
