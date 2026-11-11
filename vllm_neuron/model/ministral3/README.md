@@ -64,10 +64,12 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
 - `--tokenizer-mode mistral` is required: the repository has no Jinja chat template for the
   HuggingFace tokenizer. The tekken tokenizer gives the same chat-templated token ids as
   transformers' `apply_chat_template`.
-- `--language-model-only` (or `--limit-mm-per-prompt '{"image": 0}'`) is required; image inputs
-  are rejected otherwise.
+- `--language-model-only` builds the text decoder only (no vision weights). For images see "Images".
 - Up to `--max-model-len 16384` decode uses the fused attention kernel. Above it see "Long context".
 - `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (default 0.30) caps the KV cache.
+- `VLLM_NEURON_SWA_REAL_ADMISSION=1` admits requests by their real KV peak instead of `max_model_len`;
+  with `num_seqs_buckets` up to 128 (`--max-num-seqs 128`) the long server reaches 2,849 tok/s at
+  1024 / 1024 (1,852 without) and 891 at 4096 / 512 (719).
 - `decode_context_length_buckets` selects Model Runner V1 on this release.
 
 ## Accuracy (BF16, TP=4)
@@ -80,7 +82,7 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
 | Same, needle prompts of 2k / 8k / 15k tokens | 0.101 / 0.215 | HF bf16: 0.084 / 0.254; default RoPE instead of YaRN: 1.88 / 3.84 |
 | Needle retrieval at 2k / 8k / 15k | 3/3 | HF fp32: 3/3 |
 | GSM8K (1319, zero-shot CoT, greedy) | 89.4 % (TP=4 and TP=2 x DP=2) | HF bf16, first 250: 90.8 % (Neuron on the same 250: 90.0 %) |
-| GSM8K, FP8 checkpoint with input-scale compensation | 88.9 % | |
+| GSM8K, FP8 checkpoint with input-scale compensation | 88.9 % (89.6 % on the packed server) | |
 
 ## Performance (trn2.3xlarge, one device, LNC=2; `vllm bench serve`, random data, output tok/s)
 
@@ -90,12 +92,12 @@ Peak throughput (concurrency doubled until the gain is below 5 %):
 |---|---|---|---|---|
 | 128 / 128 | short, BF16, TP=4 | 3,110 | 516 ms | 37.8 ms |
 | 128 / 128 | short, BF16, TP=2 x DP=2 | 3,484 | 509 ms | 33.3 ms |
-| 128 / 128 | short, FP8, TP=4 | 3,825 | 381 ms | 30.9 ms |
+| 128 / 128 | short, FP8, TP=4 | 3,770 | 427 ms | 31.4 ms |
 | 1024 / 1024 | short, BF16, TP=4 | 2,950 | 3.1 s | 40.4 ms |
-| 1024 / 1024 | short, FP8, TP=4 | 3,349 | 2.2 s | 36.2 ms |
-| 1024 / 1024 | long, BF16, TP=4 | 1,851 | 942 ms | 16.4 ms |
-| 4096 / 512 | long, BF16, TP=4 | 719 | 3.2 s | 38.3 ms |
-| 8192 / 1024 | long, BF16, TP=4 | 707 | 6.7 s | 38.7 ms |
+| 1024 / 1024 | short, FP8, TP=4 | 3,316 | 2.3 s | 36.4 ms |
+| 1024 / 1024 | long, BF16, TP=4, real-peak admission | 2,849 | 48.5 s (c256 queueing); 3.8 s at c128 | 41.3 ms |
+| 4096 / 512 | long, BF16, TP=4, real-peak admission | 891 | 6.4 s | 59.5 ms |
+| 8192 / 1024 | long, BF16, TP=4, real-peak admission | 705 | 6.7 s | 38.8 ms |
 
 Single request (long server): 1024 / 1024 at 102 tok/s, TTFT 63 ms, TPOT 9.8 ms. FP8 decode TPOT at batch 1: 7.3 ms.
 
@@ -127,8 +129,8 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
   --max-model-len 8192 --max-num-batched-tokens 4096 --max-num-seqs 32 --no-enable-prefix-caching \
   --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [512, 1024, 2048, 4096],
      "num_seqs_buckets": [1, 2, 4, 8, 16, 32], "decode_context_length_buckets": [2048]},
-   "encoder_neuron_config": {"encoder_attention_block_size": 4096,
-     "num_encoder_input_buckets": [4096, 8192], "encoder_cache_num_blocks": 80}}'
+   "encoder_neuron_config": {"encoder_attention_block_size": 4096, "tp_size": 4,
+     "num_encoder_input_buckets": [4096, 8192], "encoder_cache_num_blocks": 160}}'
 ```
 
 - Each image runs in one encoder attention block, so `encoder_attention_block_size` must hold the
@@ -137,6 +139,9 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
 - The image grid and pixels come from mistral-common (the chat template in `--tokenizer-mode
   mistral`), which rounds the merged grid up and resizes the image to it, so the `[IMG]` count always
   equals the encoder output.
+- Use encoder `tp_size` 4. The default (encoder DP over the 4 ranks) runs one real block and three
+  padding blocks for a single image: 640x896 image encoder 100.5 ms at DP4, 33.8 ms at TP4, 23.9 ms at
+  TP4 with `encoder_attention_block_size` 3072 (single-request image TTFT 246 -> 149 ms).
 - Set `encoder_cache_num_blocks`: every image takes a whole cache block, and the default size (from
   the scheduler's merged-token budget) can be only a few blocks.
 - The upstream vLLM `Mistral3ForConditionalGeneration` does not import with the transformers in
