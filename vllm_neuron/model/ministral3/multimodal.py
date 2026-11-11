@@ -142,6 +142,23 @@ class Ministral3ForConditionalGeneration(
             "merge_idx": torch.zeros(nb, bs // m, m, dtype=torch.int64, device=device),
         }
 
+    def _run_visual(self, *args):
+        return self.visual(*args)
+
+    def _scoped_compiler_args(self, graph_type):
+        """Scope the per-graph compiler args (compiler_args_for) around the encoder call,
+        as the worker does for the encoder warmup."""
+        import contextlib
+
+        base = getattr(self, "_neuron_base_compiler_args", None)
+        if base is None:
+            return contextlib.nullcontext()
+        try:
+            from libtorch_neuronx_lite.compile.compiler_args import scoped_compiler_args
+        except ImportError:  # CPU-only environments
+            return contextlib.nullcontext()
+        return scoped_compiler_args(self.compiler_args_for(graph_type, None, base))
+
     # -- weights ----------------------------------------------------------
     def load_weights(self, checkpoint_path, device, cache_dir=None):
         super().load_weights(checkpoint_path, device, cache_dir)
@@ -218,16 +235,17 @@ class Ministral3ForConditionalGeneration(
         device = next(self.visual.parameters()).device
         host_ms = (time.perf_counter() - t_host) * 1000
         t0 = time.perf_counter()
-        self.visual(
-            patches.to(device),
-            cos.to(device),
-            sin.to(device),
-            bmin.to(device),
-            bmax.to(device),
-            midx.to(device),
-            encoder_cache.buffer,
-            write_ids.to(device),
-        )
+        with self._scoped_compiler_args("encoder"):
+            self._run_visual(
+                patches.to(device),
+                cos.to(device),
+                sin.to(device),
+                bmin.to(device),
+                bmax.to(device),
+                midx.to(device),
+                encoder_cache.buffer,
+                write_ids.to(device),
+            )
         if timing:
             # Read back one element so the device work is included.
             float(encoder_cache.buffer[write_ids[0], 0, 0].to("cpu"))

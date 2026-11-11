@@ -42,6 +42,10 @@ class Ministral3TextModel(LlamaModelImpl):
             out = with_optimization_level(base, 3)
             logger.info("ministral3: decode graph compiler args %s", [a for a in out if a.startswith("-O")])
             return out
+        if graph_type == "encoder" and os.environ.get("VLLM_NEURON_ENCODER_O3") == "1":
+            from vllm_neuron.utils.compiler_args_ctx import with_optimization_level
+
+            return with_optimization_level(base, 3)
         return base
 
     def load_weights(self, checkpoint_path, device, cache_dir):
