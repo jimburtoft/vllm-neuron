@@ -43,6 +43,14 @@ def _use_nki_mlp() -> bool:
     return os.environ.get("VLLM_NEURON_PIXTRAL_NKI_MLP") == "1"
 
 
+def _use_fused_attn() -> bool:
+    """VLLM_NEURON_PIXTRAL_FUSED_QKV=1: one NF.qkv_proj with the RMSNorm fused,
+    flash attention with tp_out, NF.o_proj; one gate/up matmul in the MLP."""
+    import os
+
+    return os.environ.get("VLLM_NEURON_PIXTRAL_FUSED_QKV") == "1"
+
+
 @allow_in_graph_cacheable
 def gelu(x: torch.Tensor) -> torch.Tensor:
     """Exact (erf) GELU, traceable on Neuron."""
@@ -100,6 +108,54 @@ class PixtralAttention(nn.Module):
             set_weight_loader(w, _row_shard(local, self.tp))
         set_weight_loader(self.o_weight, _col_shard(local, self.tp))
 
+    def fuse_weights(self) -> None:
+        """Build the concatenated [H, 3*local] QKV weight (after loading)."""
+        self.qkv_weight = nn.Parameter(
+            torch.cat([self.q_weight, self.k_weight, self.v_weight], dim=1).contiguous(),
+            requires_grad=False,
+        )
+
+    def forward_fused(self, x, ln_w, eps, cos, sin, bound_min, bound_max):
+        """x: residual stream [nb, bs, H]; the RMSNorm runs inside NF.qkv_proj."""
+        from nkilib.core.utils.common_types import NormType
+
+        nb, bs, _ = x.shape
+        local = self.heads * self.head_dim
+        qkv = NF.qkv_proj(
+            hidden=x,
+            qkv_weights=self.qkv_weight,
+            norm_weights=ln_w.view(1, -1),
+            eps=eps,
+            norm_type=NormType.RMS_NORM,
+        )
+        q = qkv[..., :local].view(nb, bs, self.heads, self.head_dim)
+        k = qkv[..., local : 2 * local].view(nb, bs, self.heads, self.head_dim)
+        v = qkv[..., 2 * local :].view(nb, bs, self.heads, self.head_dim)
+        c = cos.to(x.dtype).unsqueeze(2)
+        s = sin.to(x.dtype).unsqueeze(2)
+        q = q * c + _rotate_half(q) * s
+        k = k * c + _rotate_half(k) * s
+
+        def heads_first(t):
+            return t.permute(0, 2, 1, 3).reshape(nb * self.heads, bs, self.head_dim)
+
+        out = NF.flash_attention(
+            heads_first(q),
+            heads_first(k),
+            heads_first(v),
+            scale=self.scale,
+            causal_mask=False,
+            tp_q=True,
+            tp_k=True,
+            tp_out=True,  # [nb*N, D, S]: the NF.o_proj layout, no permute
+            bound_min=bound_min.repeat_interleave(self.heads, dim=0),
+            bound_max=bound_max.repeat_interleave(self.heads, dim=0),
+        )
+        out = NF.o_proj(out.view(nb, self.heads, self.head_dim, bs), self.o_weight)
+        if self.tp > 1:
+            self.tp_group.all_reduce(out)
+        return out
+
     def forward(self, x, cos, sin, bound_min, bound_max):
         nb, bs, _ = x.shape
         q = (x @ self.q_weight).view(nb, bs, self.heads, self.head_dim)
@@ -147,6 +203,11 @@ class PixtralMLP(nn.Module):
         set_weight_loader(self.up_weight, _row_shard(self.inter, self.tp))
         set_weight_loader(self.down_weight, _col_shard(self.inter, self.tp))
 
+    def fuse_weights(self) -> None:
+        self.gate_up_weight = nn.Parameter(
+            torch.cat([self.gate_weight, self.up_weight], dim=1).contiguous(), requires_grad=False
+        )
+
     def forward(self, x, ln_w=None, eps=1e-5):
         """x: [nb, bs, H]. With ln_w (RMSNorm gamma), the norm is applied first;
         VLLM_NEURON_PIXTRAL_NKI_MLP=1 fuses it into the nkilib MLP kernel."""
@@ -163,6 +224,11 @@ class PixtralMLP(nn.Module):
                 ln_w=ln_w.view(1, -1) if ln_w is not None else None,
                 norm_type=NormType.RMS_NORM if ln_w is not None else NormType.NO_NORM,
             ).view(nb, bs, h)
+        elif getattr(self, "gate_up_weight", None) is not None:
+            if ln_w is not None:
+                x = _rms_norm(x, ln_w, eps)
+            gu = x @ self.gate_up_weight
+            out = (self.act(gu[..., : self.inter]) * gu[..., self.inter :]) @ self.down_weight
         else:
             if ln_w is not None:
                 x = _rms_norm(x, ln_w, eps)
@@ -184,6 +250,9 @@ class PixtralLayer(nn.Module):
         )
 
     def forward(self, x, cos, sin, bmin, bmax):
+        if getattr(self.attention, "qkv_weight", None) is not None:
+            x = x + self.attention.forward_fused(x, self.attention_norm, self.eps, cos, sin, bmin, bmax)
+            return x + self.feed_forward(x, self.ffn_norm, self.eps)
         x = x + self.attention(_rms_norm(x, self.attention_norm, self.eps), cos, sin, bmin, bmax)
         return x + self.feed_forward(x, self.ffn_norm, self.eps)
 
@@ -294,6 +363,10 @@ class PixtralVisionTower(nn.Module):
         missing, unexpected = self.load_state_dict(sd, strict=False, assign=True)
         if missing or unexpected:
             raise RuntimeError(f"Pixtral weights mismatch. missing={sorted(missing)} unexpected={sorted(unexpected)}")
+        if _use_fused_attn():
+            for layer in self.layers:
+                layer.attention.fuse_weights()
+                layer.feed_forward.fuse_weights()
 
     def forward(
         self,
@@ -333,6 +406,10 @@ class PixtralVisionTower(nn.Module):
         out = self.projector(x, merge_idx)
         if self.dp_size > 1:
             out = self.dp_group.all_gather(out, dim=0)
+        # A block of fewer rows than the cache block (small-image bucket) fills its head.
+        cache_rows = encoder_cache_buffer.shape[1]
+        if out.shape[1] < cache_rows:
+            out = F.pad(out, (0, 0, 0, cache_rows - out.shape[1]))
         encoder_cache_buffer.index_put_((write_block_ids,), out.to(encoder_cache_buffer.dtype))
         return encoder_cache_buffer
 

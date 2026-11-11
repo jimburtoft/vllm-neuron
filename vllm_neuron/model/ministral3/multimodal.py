@@ -11,8 +11,11 @@ decoder merges the cache rows into the ``[IMG]`` positions during prefill
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
+import os
+import time
 
 import torch
 from transformers import PretrainedConfig
@@ -36,6 +39,28 @@ from .vision import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Graph rows per block for a bucket. A bucket smaller than the encoder attention
+# block compiles ONE block of ``bucket`` rows (block = image size, as in the
+# muse-glimmer / Qwen3-VL-derived encoder), so a small image does not pay for
+# a full block. Requires encoder DP 1 (TP over the encoder ranks).
+
+
+def graph_block_rows(bucket: int, enc) -> tuple[int, int]:
+    """(rows per block, num_blocks) of the encoder graph for ``bucket``."""
+    bs, dp = enc.encoder_attention_block_size, enc.dp_size
+    if bucket < bs and dp == 1:
+        if bucket % 128:
+            raise ValueError(f"encoder bucket {bucket} must be a multiple of 128")
+        return bucket, 1
+    return bs, math.ceil(math.ceil(bucket / bs) / dp) * dp
+
+
+@functools.lru_cache(maxsize=256)
+def _image_tables(rows: int, cols: int, hd: int, theta: float, merge: int):
+    """cos, sin [rows*cols, hd] and the merge index for one image grid (cached)."""
+    c, s = pixtral_cos_sin(rows, cols, hd, theta)
+    return c, s, merge_index(rows, cols, merge)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -104,9 +129,7 @@ class Ministral3ForConditionalGeneration(
 
     def build_encoder_synthetic_inputs(self, bucket, encoder_neuron_config, device):
         vc = self.hf_config.vision_config
-        bs = encoder_neuron_config.encoder_attention_block_size
-        dp = encoder_neuron_config.dp_size
-        nb = math.ceil(math.ceil(bucket / bs) / dp) * dp
+        bs, nb = graph_block_rows(bucket, encoder_neuron_config)
         hd = vc.hidden_size // vc.num_attention_heads
         patch_dim = vc.num_channels * vc.patch_size * vc.patch_size
         m = self.get_vision_token_merge_factor(self.hf_config)
@@ -146,39 +169,46 @@ class Ministral3ForConditionalGeneration(
         hd = vc.hidden_size // vc.num_attention_heads
         theta = vc.rope_parameters["rope_theta"] if getattr(vc, "rope_parameters", None) else vc.rope_theta
 
+        timing = os.environ.get("VLLM_NEURON_ENCODER_TIMING") == "1"
+        t_host = time.perf_counter()
         per_image = []
         block_ids = []
         for mm_hash, img in zip(mm_hashes, pixel_values, strict=True):
-            img = img.float().cpu()
+            img = img.cpu()
             rows, cols = img.shape[1] // P, img.shape[2] // P
             n = rows * cols
             if n > bs:
                 raise ValueError(
                     f"Image of {rows}x{cols} patches ({n}) exceeds encoder_attention_block_size={bs}. "
-                    "Raise the block size or lower mm_processor_kwargs size.longest_edge."
+                    "Raise the block size (the largest image is 110x110 = 12100 patches at 1540 px)."
                 )
-            mi = merge_index(rows, cols, M)
-            per_image.append((img, rows, cols, n, mi))
+            c, s_, mi = _image_tables(rows, cols, hd, float(theta), M)
+            per_image.append((img, rows, cols, n, c, s_, mi))
             block_ids.extend(encoder_cache.allocate(mm_hash, [mi.shape[0]]))
 
         buckets = sorted(enc.num_encoder_input_buckets)
-        need = len(per_image) * bs
+        if len(per_image) == 1 and enc.dp_size == 1:
+            # One image: the smallest bucket that holds it (block = image size).
+            need = per_image[0][3]
+        else:
+            need = len(per_image) * bs
         bucket = next((b for b in buckets if b >= need), None)
         if bucket is None:
             raise ValueError(f"{len(per_image)} images need {need} tokens; largest bucket {buckets[-1]}")
-        dp = enc.dp_size
-        nb = math.ceil(math.ceil(bucket / bs) / dp) * dp
+        rows_blk, nb = graph_block_rows(bucket, enc)
+        if len(per_image) > nb:
+            raise ValueError(f"{len(per_image)} images but bucket {bucket} has {nb} blocks")
 
-        patches = torch.zeros(nb, bs, vc.num_channels * P * P)
-        cos = torch.zeros(nb, bs, hd)
-        sin = torch.zeros(nb, bs, hd)
-        bmin = torch.zeros(nb, bs, 1, dtype=torch.int32)
-        bmax = torch.zeros(nb, bs, 1, dtype=torch.int32)
-        midx = torch.zeros(nb, bs // mf, mf, dtype=torch.int64)
-        for i, (img, rows, cols, n, mi) in enumerate(per_image):
-            patches[i, :n] = patchify(img, P, rows, cols)
-            c, s = pixtral_cos_sin(rows, cols, hd, theta)
-            cos[i, :n], sin[i, :n] = c, s
+        dtype = self.visual.dtype
+        patches = torch.zeros(nb, rows_blk, vc.num_channels * P * P, dtype=dtype)
+        cos = torch.zeros(nb, rows_blk, hd)
+        sin = torch.zeros(nb, rows_blk, hd)
+        bmin = torch.zeros(nb, rows_blk, 1, dtype=torch.int32)
+        bmax = torch.zeros(nb, rows_blk, 1, dtype=torch.int32)
+        midx = torch.zeros(nb, rows_blk // mf, mf, dtype=torch.int64)
+        for i, (img, rows, cols, n, c, s_, mi) in enumerate(per_image):
+            patches[i, :n] = patchify(img.to(dtype), P, rows, cols)
+            cos[i, :n], sin[i, :n] = c, s_
             bmax[i, :n] = n
             midx[i, : mi.shape[0]] = mi
         write_ids = torch.tensor(
@@ -186,13 +216,10 @@ class Ministral3ForConditionalGeneration(
             dtype=torch.int64,
         )
         device = next(self.visual.parameters()).device
-        import os
-        import time
-
-        timing = os.environ.get("VLLM_NEURON_ENCODER_TIMING") == "1"
+        host_ms = (time.perf_counter() - t_host) * 1000
         t0 = time.perf_counter()
         self.visual(
-            patches.to(self.visual.dtype).to(device),
+            patches.to(device),
             cos.to(device),
             sin.to(device),
             bmin.to(device),
@@ -205,8 +232,11 @@ class Ministral3ForConditionalGeneration(
             # Read back one element so the device work is included.
             float(encoder_cache.buffer[write_ids[0], 0, 0].to("cpu"))
             logger.warning(
-                "[ministral3 encoder] %d images, %d blocks: %.1f ms",
+                "[ministral3 encoder] %d images, bucket %d (%d x %d rows): host %.1f ms, device %.1f ms",
                 len(per_image),
+                bucket,
                 nb,
+                rows_blk,
+                host_ms,
                 (time.perf_counter() - t0) * 1000,
             )
