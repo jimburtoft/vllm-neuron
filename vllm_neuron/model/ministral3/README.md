@@ -134,8 +134,10 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
 ```
 
 - Each image runs in one encoder attention block, so `encoder_attention_block_size` must hold the
-  image's patches: 896 px longest edge is at most 64 x 64 = 4096 patches. The full 1540 px needs
-  12,100 patches (block 12,288).
+  image's patches: an image of up to 896 px is at most 64 x 64 = 4096 patches; the full 1540 px needs
+  12,100 patches (block 12,288). With `--tokenizer-mode mistral` the image size is set by mistral-common
+  (largest edge 1540), not by `--mm-processor-kwargs` `size`; an image whose patches exceed the block
+  fails with a clear error, so size the block for the largest image you serve (or resize client-side).
 - The image grid and pixels come from mistral-common (the chat template in `--tokenizer-mode
   mistral`), which rounds the merged grid up and resizes the image to it, so the `[IMG]` count always
   equals the encoder output.
