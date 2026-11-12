@@ -130,7 +130,7 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
      "num_seqs_buckets": [1, 2, 4, 8, 16, 32, 48, 64], "decode_context_length_buckets": [2048]},
    "encoder_neuron_config": {"tp_size": 4, "encoder_attention_block_size": 12288,
      "num_encoder_input_buckets": [1024, 2048, 3072, 4096, 6144, 8192, 12288],
-     "encoder_cache_num_blocks": 96}}'
+     "encoder_cache_num_blocks": 256}}'
 ```
 
 - **Encoder TP 4.** The default (encoder data parallel over the 4 ranks) runs one real block and three
@@ -143,7 +143,16 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
 - Images are sized by mistral-common (the chat template in `--tokenizer-mode mistral`, largest edge
   1540); `--mm-processor-kwargs` `size` does not change them. The grid and pixels come from the same
   encoder, so the `[IMG]` count always equals the encoder output.
-- Set `encoder_cache_num_blocks`: every image takes a whole cache block (sized for the largest bucket).
+- Encoder-cache blocks hold 256 merged rows (`VLLM_NEURON_ENC_CACHE_BLOCK`, 0 = one attention block),
+  so an image takes ceil(tokens / 256) blocks (256 blocks = 512 MB per core at hidden 4096). Set
+  `encoder_cache_num_blocks` to about 2 x the token budget / 256 + 1.
+- **Multi-image packing** (opt-in, `VLLM_NEURON_PIXTRAL_PACK=2`): the images of one request share one
+  encoder block of equal slots. The slot layout is passed to the attention kernel as
+  `segment_cu_seqlens`, which skips the cross-image tiles (nkilib attention_cte sequence-packing tile
+  pruning, vendored here until it is released: aws-neuron/nki-library#25). Two 448x448 images: encoder
+  15.9 ms instead of 2 x 10 ms; two 640x896 images: 46 ms instead of 2 x 24 ms (53-60 ms packed
+  without the pruning). The scheduler encodes one request per step, so this helps multi-image
+  prompts only.
 - The upstream vLLM `Mistral3ForConditionalGeneration` does not import with the transformers in
   this environment, so the processor is vendored (`processing.py`) and the platform registers a
   stand-in class (`validation.py`) for config validation.
