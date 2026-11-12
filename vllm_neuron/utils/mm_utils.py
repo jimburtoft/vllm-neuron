@@ -61,6 +61,13 @@ def get_encoder_cache_block_size(
         ValueError: If the attention block size is not divisible by the merge
             factor, which would make a block hold a fractional token count.
     """
+    # A model may store its items in smaller cache blocks than one attention block.
+    from vllm_neuron.model.registry import get_models
+
+    model_cls = dict(get_models()).get(hf_config.architectures[0])
+    hook = getattr(model_cls, "get_encoder_cache_block_size", None)
+    if hook is not None:
+        return hook(hf_config, encoder_attention_block_size)
     merge_factor = get_vision_token_merge_factor(hf_config)
     if encoder_attention_block_size % merge_factor != 0:
         raise ValueError(

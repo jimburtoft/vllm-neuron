@@ -46,6 +46,25 @@ logger = logging.getLogger(__name__)
 # a full block. Requires encoder DP 1 (TP over the encoder ranks).
 
 
+# Merged rows per on-device encoder-cache block. One image takes ceil(rows / B) blocks
+# instead of a whole attention block (pattern from muse-glimmer 5f2834d), so the cache
+# costs ~ the image tokens it holds. VLLM_NEURON_ENC_CACHE_BLOCK=0 -> one attention block.
+DEFAULT_ENC_CACHE_BLOCK = 256
+
+
+def resolve_encoder_cache_block_size(attn_block: int, merge_factor: int) -> int:
+    if attn_block % merge_factor:
+        raise ValueError(f"encoder_attention_block_size ({attn_block}) must be divisible by {merge_factor}")
+    full = attn_block // merge_factor
+    v = os.environ.get("VLLM_NEURON_ENC_CACHE_BLOCK", "").strip()
+    b = int(v) if v else DEFAULT_ENC_CACHE_BLOCK
+    if not b or b >= full:
+        return full
+    if b % 8:
+        raise ValueError(f"VLLM_NEURON_ENC_CACHE_BLOCK={b} must be a multiple of 8")
+    return b
+
+
 def graph_block_rows(bucket: int, enc) -> tuple[int, int]:
     """(rows per block, num_blocks) of the encoder graph for ``bucket``."""
     bs, dp = enc.encoder_attention_block_size, enc.dp_size
@@ -117,13 +136,22 @@ class Ministral3ForConditionalGeneration(
         return max(buckets) // cls.get_vision_token_merge_factor(hf_config)
 
     @classmethod
+    def get_encoder_cache_block_size(cls, hf_config, encoder_attention_block_size) -> int:
+        attn = getattr(encoder_attention_block_size, "encoder_attention_block_size", encoder_attention_block_size)
+        return resolve_encoder_cache_block_size(attn, cls.get_vision_token_merge_factor(hf_config))
+
+    @classmethod
     def get_max_encoder_blocks_per_request(cls, hf_config, encoder_neuron_config) -> int:
-        """One cache block per image: the per-request image limit (vLLM
-        --limit-mm-per-prompt), at least the blocks of the largest bucket."""
+        """Cache blocks one request can use: per image, ceil(largest image rows / B);
+        times the per-request image limit (vLLM --limit-mm-per-prompt)."""
         buckets = encoder_neuron_config.num_encoder_input_buckets
         if not buckets:
             return 0
-        by_bucket = math.ceil(max(buckets) / encoder_neuron_config.encoder_attention_block_size)
+        mu = cls.get_vision_token_merge_factor(hf_config)
+        attn = encoder_neuron_config.encoder_attention_block_size
+        b = cls.get_encoder_cache_block_size(hf_config, attn)
+        per_image = math.ceil(min(max(buckets), attn) // mu / b)
+        by_bucket = math.ceil(max(buckets) / attn) * math.ceil((attn // mu) / b)
         limit = 1
         try:
             from vllm.config import get_current_vllm_config
@@ -132,7 +160,7 @@ class Ministral3ForConditionalGeneration(
             limit = max(1, int(mm.get_limit_per_prompt("image")))
         except Exception:  # noqa: BLE001 - no vLLM context
             pass
-        return max(by_bucket, limit)
+        return max(by_bucket, limit * per_image)
 
     # -- warmup -----------------------------------------------------------
     def get_encoder(self):
@@ -151,7 +179,15 @@ class Ministral3ForConditionalGeneration(
             "bound_min": torch.zeros(nb, bs, 1, dtype=torch.int32, device=device),
             "bound_max": torch.zeros(nb, bs, 1, dtype=torch.int32, device=device),
             "merge_idx": torch.zeros(nb, bs // m, m, dtype=torch.int64, device=device),
+            **self._cache_write_ids_input(bs // m, nb, encoder_neuron_config, device),
         }
+
+    def _cache_write_ids_input(self, merged_rows, nb, enc, device):
+        cb = self.get_encoder_cache_block_size(self.hf_config, enc.encoder_attention_block_size)
+        k = math.ceil(merged_rows / cb)
+        if k <= 1 and cb >= merged_rows:
+            return {}
+        return {"cache_write_ids": torch.zeros(nb * k, dtype=torch.int64, device=device)}
 
     def _run_visual(self, *args):
         return self.visual(*args)
@@ -212,7 +248,10 @@ class Ministral3ForConditionalGeneration(
                 )
             c, s_, mi = _image_tables(rows, cols, hd, float(theta), M)
             per_image.append((img, rows, cols, n, c, s_, mi))
-            block_ids.extend(encoder_cache.allocate(mm_hash, [mi.shape[0]]))
+            cb = encoder_cache.block_size
+            block_ids.append(
+                encoder_cache.allocate(mm_hash, encoder_cache.dense_tokens_per_block(mi.shape[0], cb))
+            )
 
         buckets = sorted(enc.num_encoder_input_buckets)
         if enc.dp_size == 1:
@@ -258,10 +297,15 @@ class Ministral3ForConditionalGeneration(
             cos[i, :n], sin[i, :n] = c, s_
             bmax[i, :n] = n
             midx[i, : mi.shape[0]] = mi
-        write_ids = torch.tensor(
-            block_ids + [encoder_cache.scratch_block_id] * (nb - len(block_ids)),
-            dtype=torch.int64,
-        )
+        cb = encoder_cache.block_size
+        k = math.ceil((rows_blk // mf) / cb)
+        ids = []
+        for j in range(nb):
+            mine = block_ids[j] if j < len(block_ids) else []
+            ids.extend(list(mine) + [encoder_cache.scratch_block_id] * (k - len(mine)))
+        cache_write_ids = torch.tensor(ids, dtype=torch.int64)
+        write_ids = cache_write_ids[::k].contiguous()  # one id per graph block (unused when split)
+        split = bool(self._cache_write_ids_input(rows_blk // mf, nb, self.encoder_neuron_config, "cpu"))
         device = next(self.visual.parameters()).device
         host_ms = (time.perf_counter() - t_host) * 1000
         t0 = time.perf_counter()
@@ -275,10 +319,11 @@ class Ministral3ForConditionalGeneration(
                 midx.to(device),
                 encoder_cache.buffer,
                 write_ids.to(device),
+                cache_write_ids.to(device) if split else None,
             )
         if timing:
             # Read back one element so the device work is included.
-            float(encoder_cache.buffer[write_ids[0], 0, 0].to("cpu"))
+            float(encoder_cache.buffer[int(write_ids[0]), 0, 0].to("cpu"))
             logger.warning(
                 "[ministral3 encoder] %d images, bucket %d (%d x %d rows): host %.1f ms, device %.1f ms",
                 len(per_image),

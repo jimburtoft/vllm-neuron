@@ -378,6 +378,7 @@ class PixtralVisionTower(nn.Module):
         merge_idx: torch.Tensor,
         encoder_cache_buffer: torch.Tensor,
         write_block_ids: torch.Tensor,
+        cache_write_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """pixel_patches [nb, bs, C*p*p]; cos/sin [nb, bs, hd]; bounds [nb, bs, 1] int32;
         merge_idx [nb, bs // 4, 4] int64. Writes [nb, bs // 4, text_hidden] into the cache."""
@@ -406,10 +407,17 @@ class PixtralVisionTower(nn.Module):
         out = self.projector(x, merge_idx)
         if self.dp_size > 1:
             out = self.dp_group.all_gather(out, dim=0)
-        # A block of fewer rows than the cache block (small-image bucket) fills its head.
+        # cache_write_ids (cache blocks smaller than a graph block) holds K cache-block ids per
+        # graph block; graph block j fills cache blocks [j*K, (j+1)*K) (tail padding -> scratch).
+        # Without it, write_block_ids holds one cache block per graph block.
         cache_rows = encoder_cache_buffer.shape[1]
-        if out.shape[1] < cache_rows:
-            out = F.pad(out, (0, 0, 0, cache_rows - out.shape[1]))
+        nb_out, rows = out.shape[0], out.shape[1]
+        if cache_write_ids is not None:
+            write_block_ids = cache_write_ids
+        k = write_block_ids.shape[0] // nb_out
+        if k * cache_rows > rows:
+            out = F.pad(out, (0, 0, 0, k * cache_rows - rows))
+        out = out.reshape(nb_out * k, cache_rows, out.shape[-1])
         encoder_cache_buffer.index_put_((write_block_ids,), out.to(encoder_cache_buffer.dtype))
         return encoder_cache_buffer
 

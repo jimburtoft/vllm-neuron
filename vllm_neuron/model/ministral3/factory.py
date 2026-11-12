@@ -104,6 +104,12 @@ class Ministral3ForCausalLM(LlamaForCausalLM):
         return M.get_max_encoder_embed_budget(hf_config, encoder_neuron_config)
 
     @classmethod
+    def get_encoder_cache_block_size(cls, hf_config, encoder_attention_block_size):
+        from .multimodal import Ministral3ForConditionalGeneration as M
+
+        return M.get_encoder_cache_block_size(hf_config, encoder_attention_block_size)
+
+    @classmethod
     def get_max_encoder_blocks_per_request(cls, hf_config, encoder_neuron_config):
         from .multimodal import Ministral3ForConditionalGeneration as M
 
