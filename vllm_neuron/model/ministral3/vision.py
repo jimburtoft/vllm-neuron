@@ -150,6 +150,7 @@ class PixtralAttention(nn.Module):
             tp_out=True,  # [nb*N, D, S]: the NF.o_proj layout, no permute
             bound_min=bound_min.repeat_interleave(self.heads, dim=0),
             bound_max=bound_max.repeat_interleave(self.heads, dim=0),
+            segment_cu_seqlens=getattr(self, "segment_cu_seqlens", None),
         )
         out = NF.o_proj(out.view(nb, self.heads, self.head_dim, bs), self.o_weight)
         if self.tp > 1:
@@ -179,6 +180,7 @@ class PixtralAttention(nn.Module):
             tp_k=True,
             bound_min=bound_min.repeat_interleave(self.heads, dim=0),
             bound_max=bound_max.repeat_interleave(self.heads, dim=0),
+            segment_cu_seqlens=getattr(self, "segment_cu_seqlens", None),
         )
         out = out.view(nb, self.heads, bs, self.head_dim).permute(0, 2, 1, 3)
         out = out.reshape(nb, bs, self.heads * self.head_dim) @ self.o_weight
@@ -400,6 +402,9 @@ class PixtralVisionTower(nn.Module):
             bound_min = F.pad(bound_min, (0, 0, 0, pad))
             bound_max = F.pad(bound_max, (0, 0, 0, pad))
 
+        seg = getattr(self, "segment_cu_seqlens", None)
+        for layer in self.layers:
+            layer.attention.segment_cu_seqlens = seg
         x = pixel_patches.to(self.dtype) @ self.patch_weight
         x = _rms_norm(x, self.ln_pre, 1e-5)
         for layer in self.layers:

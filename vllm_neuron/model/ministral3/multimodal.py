@@ -75,6 +75,22 @@ def graph_block_rows(bucket: int, enc) -> tuple[int, int]:
     return bs, math.ceil(math.ceil(bucket / bs) / dp) * dp
 
 
+def pack_slots() -> int:
+    """VLLM_NEURON_PIXTRAL_PACK=k (k >= 2): a request with several images packs up to
+    k images into ONE encoder block of k equal slots (slot = block / k patches), with
+    the cross-image attention tiles skipped at trace time (attention_cte
+    ``segment_cu_seqlens``). 0 / unset: one image per block."""
+    v = os.environ.get("VLLM_NEURON_PIXTRAL_PACK", "").strip()
+    return int(v) if v else 0
+
+
+def slot_layout(rows_blk: int, k: int) -> tuple:
+    """Canonical cumulative layout of k equal slots in a block (128-aligned)."""
+    slot = rows_blk // k
+    assert slot % 128 == 0 and slot * k == rows_blk, (rows_blk, k)
+    return tuple(i * slot for i in range(k + 1))
+
+
 @functools.lru_cache(maxsize=256)
 def _image_tables(rows: int, cols: int, hd: int, theta: float, merge: int):
     """cos, sin [rows*cols, hd] and the merge index for one image grid (cached)."""
@@ -254,6 +270,24 @@ class Ministral3ForConditionalGeneration(
             )
 
         buckets = sorted(enc.num_encoder_input_buckets)
+        k_pack = pack_slots()
+        if enc.dp_size == 1 and k_pack >= 2 and len(per_image) >= 2:
+            # Pack up to k images per block: slot = smallest bucket / k that holds the
+            # largest image, block = k slots (must be a compiled bucket).
+            need = max(p[3] for p in per_image)
+            bucket = next((b for b in buckets if b % k_pack == 0 and b // k_pack >= need
+                           and (b // k_pack) % 128 == 0), None)
+            if bucket is not None:
+                rows_blk, nb = graph_block_rows(bucket, enc)
+                if nb == 1:
+                    for i in range(0, len(per_image), k_pack):
+                        grp = list(range(i, min(i + k_pack, len(per_image))))
+                        self._encode_packed(
+                            [per_image[j] for j in grp], [block_ids[j] for j in grp],
+                            bucket, rows_blk, k_pack, encoder_cache, timing, t_host,
+                        )
+                        t_host = time.perf_counter()
+                    return
         if enc.dp_size == 1:
             # One image per block of the smallest bucket that holds the largest
             # image (block = image size); several images run that graph per image.
@@ -277,6 +311,73 @@ class Ministral3ForConditionalGeneration(
                 bucket, rows_blk, nb, encoder_cache, timing, t_host,
             )
             t_host = time.perf_counter()
+
+    def _encode_packed(self, per_image, block_ids, bucket, rows_blk, k, encoder_cache, timing, t_host):
+        """Several images in ONE graph block, image i at slot i (offset i * rows_blk / k).
+
+        Attention: per-image [start, end) bounds, plus the slot layout as a trace-time
+        segment_cu_seqlens so cross-slot tiles are skipped. Projector: merge index rows of
+        image i go to its own run of cache-block-aligned output rows, so each image's merged
+        rows fill whole cache blocks of its own (the prefill gather stays block-aligned).
+        """
+        vc = self.hf_config.vision_config
+        P = vc.patch_size
+        mf = self.hf_config.spatial_merge_size ** 2
+        hd = vc.hidden_size // vc.num_attention_heads
+        dtype = self.visual.dtype
+        slot = rows_blk // k
+        cb = encoder_cache.block_size
+        k_cache_per_slot = math.ceil((slot // mf) / cb)
+        out_rows = k * k_cache_per_slot * cb  # merged output rows of the packed graph
+        patches = torch.zeros(1, rows_blk, vc.num_channels * P * P, dtype=dtype)
+        cos = torch.zeros(1, rows_blk, hd)
+        sin = torch.zeros(1, rows_blk, hd)
+        bmin = torch.zeros(1, rows_blk, 1, dtype=torch.int32)
+        bmax = torch.zeros(1, rows_blk, 1, dtype=torch.int32)
+        midx = torch.zeros(1, out_rows, mf, dtype=torch.int64)
+        ids = []
+        for i in range(k):
+            off = i * slot
+            if i < len(per_image):
+                img, rows, cols, n, c, s_, mi = per_image[i]
+                patches[0, off : off + n] = patchify(img.to(dtype), P, rows, cols)
+                cos[0, off : off + n], sin[0, off : off + n] = c, s_
+                bmin[0, off : off + slot] = off
+                bmax[0, off : off + slot] = off + n
+                o = i * k_cache_per_slot * cb
+                midx[0, o : o + mi.shape[0]] = mi + off
+                mine = list(block_ids[i])
+            else:
+                bmin[0, off : off + slot] = off
+                bmax[0, off : off + slot] = off + 1
+                mine = []
+            ids.extend(mine + [encoder_cache.scratch_block_id] * (k_cache_per_slot - len(mine)))
+        cache_write_ids = torch.tensor(ids, dtype=torch.int64)
+        device = next(self.visual.parameters()).device
+        host_ms = (time.perf_counter() - t_host) * 1000
+        t0 = time.perf_counter()
+        self.visual.segment_cu_seqlens = slot_layout(rows_blk, k)
+        try:
+            with self._scoped_compiler_args("encoder"):
+                self._run_visual(
+                    patches.to(device),
+                    cos.to(device),
+                    sin.to(device),
+                    bmin.to(device),
+                    bmax.to(device),
+                    midx.to(device),
+                    encoder_cache.buffer,
+                    cache_write_ids[:1].to(device),
+                    cache_write_ids.to(device),
+                )
+        finally:
+            self.visual.segment_cu_seqlens = None
+        if timing:
+            float(encoder_cache.buffer[int(cache_write_ids[0]), 0, 0].to("cpu"))
+            logger.warning(
+                "[ministral3 encoder] %d images packed, bucket %d (%d slots x %d rows): host %.1f ms, device %.1f ms",
+                len(per_image), bucket, k, slot, host_ms, (time.perf_counter() - t0) * 1000,
+            )
 
     def _encode_group(self, per_image, block_ids, bucket, rows_blk, nb, encoder_cache, timing, t_host):
         vc = self.hf_config.vision_config

@@ -10,6 +10,25 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 jitted_attention_cte = nki.jit()(attention_cte)
+_jitted_attention_cte_seqpack = None
+
+
+def _seqpack_kernel():
+    """attention_cte with compile-time sequence-packing tile pruning (vendored until
+    the released nkilib has ``segment_cu_seqlens``)."""
+    global _jitted_attention_cte_seqpack
+    if _jitted_attention_cte_seqpack is None:
+        import inspect
+
+        if "segment_cu_seqlens" in inspect.signature(attention_cte).parameters:
+            _jitted_attention_cte_seqpack = jitted_attention_cte
+        else:
+            from vllm_neuron.functional.vendored_kernels.attention_cte_seqpack import (
+                attention_cte as _attention_cte_seqpack,
+            )
+
+            _jitted_attention_cte_seqpack = nki.jit()(_attention_cte_seqpack)
+    return _jitted_attention_cte_seqpack
 
 # Match kernel constraints in attention_cte
 MAX_BS = 512
@@ -238,6 +257,7 @@ def flash_attention(
     bound_min: Optional[Tensor] = None,
     bound_max: Optional[Tensor] = None,
     allow_vector_exp: bool = True,
+    segment_cu_seqlens: Optional[tuple] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
     """
     Flash Attention API using attention_cte kernel with automatic PyTorch fallback.
@@ -332,6 +352,27 @@ def flash_attention(
 
     if can_use_kernel:
         q = q * scale
+
+        if segment_cu_seqlens is not None:
+            # Compile-time packed layout (cumulative segment lengths, same layout as
+            # bound_min/bound_max): fully masked tiles are not computed. Each distinct
+            # layout compiles its own kernel.
+            assert bound_min is not None and bound_max is not None
+            wrapped = wrap_nki(_seqpack_kernel())
+            return wrapped[2](
+                q=q,
+                k=k,
+                v=v,
+                scale=1.0,
+                causal_mask=causal_mask,
+                tp_q=tp_q,
+                tp_k=tp_k,
+                tp_out=tp_out,
+                bound_min=bound_min,
+                bound_max=bound_max,
+                allow_vector_exp=allow_vector_exp,
+                segment_cu_seqlens=tuple(int(x) for x in segment_cu_seqlens),
+            )
 
         wrapped_attention_cte = wrap_nki(jitted_attention_cte)
 
