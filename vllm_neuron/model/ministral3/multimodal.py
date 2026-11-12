@@ -356,7 +356,10 @@ class Ministral3ForConditionalGeneration(
         device = next(self.visual.parameters()).device
         host_ms = (time.perf_counter() - t_host) * 1000
         t0 = time.perf_counter()
-        self.visual.segment_cu_seqlens = slot_layout(rows_blk, k)
+        # VLLM_NEURON_PIXTRAL_PACK_NOPRUNE=1: packed bounds without tile pruning (A/B control).
+        self.visual.segment_cu_seqlens = (
+            None if os.environ.get("VLLM_NEURON_PIXTRAL_PACK_NOPRUNE") == "1" else slot_layout(rows_blk, k)
+        )
         try:
             with self._scoped_compiler_args("encoder"):
                 self._run_visual(
