@@ -2,7 +2,7 @@
 # Vendored nkilib ``core.attention.attention_cte`` (nkilib 2.33, NKI 0.7) with the
 # compile-time sequence-packing tile pruning (``segment_cu_seqlens``) from
 # https://github.com/jimburtoft/nki-library/tree/attention-cte-seqpack-tile-prune
-# (proposed upstream to aws-neuron/nki-library). Remove once the released nkilib
+# (based on nki-library tag 2.33). Remove once the released nkilib
 # carries ``segment_cu_seqlens``. Only the relative imports below were changed.
 #
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.

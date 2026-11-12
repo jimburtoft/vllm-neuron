@@ -149,7 +149,8 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
 - **Multi-image packing** (opt-in, `VLLM_NEURON_PIXTRAL_PACK=2`): the images of one request share one
   encoder block of equal slots. The slot layout is passed to the attention kernel as
   `segment_cu_seqlens`, which skips the cross-image tiles (nkilib attention_cte sequence-packing tile
-  pruning, vendored here until it is released: aws-neuron/nki-library#25). Two 448x448 images: encoder
+  pruning; vendored here from `jimburtoft/nki-library@attention-cte-seqpack-tile-prune`, based on nki-library
+  2.33, until it ships in a release). Two 448x448 images: encoder
   15.9 ms instead of 2 x 10 ms; two 640x896 images: 46 ms instead of 2 x 24 ms (53-60 ms packed
   without the pruning). The scheduler encodes one request per step, so this helps multi-image
   prompts only.
