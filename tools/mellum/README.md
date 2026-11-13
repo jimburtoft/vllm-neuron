@@ -102,7 +102,7 @@ GSM8K-100 with the 2048 bucket: 98 %. Each extra bucket adds decode graphs (comp
 
 ### Low-latency decode with FP8 experts (no expert parallelism)
 
-For latency-sensitive serving at up to ~16 concurrent requests, run without `--enable-expert-parallel` and turn on
+For latency-sensitive serving at up to ~32 concurrent requests, run without `--enable-expert-parallel` and turn on
 the FP8 routed-expert decode kernel (an extra FP8 copy of the experts; prefill keeps bf16):
 
 ```bash
@@ -118,7 +118,8 @@ vllm serve JetBrains/Mellum2.1-12B-A2.5B-Thinking --tensor-parallel-size 4 --max
 | 4 | 379.6, 10.4 ms | **522.9, 7.52 ms** (+38 %) |
 | 8 | 465.1, 17.0 ms | **723.2, 10.8 ms** (+56 %) |
 | 16 | 488.7, 32.3 ms | **934.2, 16.7 ms** (+91 %) |
-| 32 | 664.9, 47.3 ms | 664.7, 47.3 ms (above the T <= 24 threshold: same bf16 path) |
+| 32 | 664.9, 47.3 ms | **1,095, 28.4 ms** (+65 %) |
+| 48 / 64 (64-token decode bucket) | 2,072 / 2,670, 22 ms | same (the dense bf16 path is faster at 64; the kernel stops at 32) |
 
 GSM8K-100: 97 % (bf16 97-98 %). The FP8 weights move greedy tokens more than bf16 noise on one of the 7 gate
 prompts (fp32 gap 1.14 at token 181, the token still in the fp32 top 5), so treat it as an opt-in accuracy trade.

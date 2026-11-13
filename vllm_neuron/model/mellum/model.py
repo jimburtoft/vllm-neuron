@@ -322,9 +322,11 @@ class MellumSparseMoeBlock(nn.Module):
         # MELLUM_MOE_FP8=1: FP8 ROW copy of the experts for decode at large batch (see _decode_fp8).
         self.fp8_decode = os.environ.get("MELLUM_MOE_FP8", "0") == "1"
         # MELLUM_MOE_FP8_ROUTED=1 (no EP only): FP8 128x128-block-scale copy of the experts for the routed-expert
-        # decode kernel (swiglu_moe_fp8.py) at small decode batches (T <= MELLUM_MOE_FP8_ROUTED_MAX_T, default 24).
+        # decode kernel (swiglu_moe_fp8.py) at small decode batches (T <= MELLUM_MOE_FP8_ROUTED_MAX_T, default 32).
         self.swm_enabled = os.environ.get("MELLUM_MOE_FP8_ROUTED", "0") == "1"
-        self.swm_max_t = int(os.environ.get("MELLUM_MOE_FP8_ROUTED_MAX_T", "24"))
+        # Decision is on the padded decode batch (num_seqs bucket 1/2/4/../32/64). Measured (no EP, 128/1k): bucket 32
+        # kernel 1,095 tok/s vs dense 665; bucket 64 kernel 1,196 vs dense 2,670 -> default 32.
+        self.swm_max_t = int(os.environ.get("MELLUM_MOE_FP8_ROUTED_MAX_T", "32"))
         # >>> PARALLELISM: router replicated on every rank <<<
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, dtype=self.dtype))
         self.gate_up_proj_weight = nn.Parameter(
