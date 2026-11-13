@@ -48,6 +48,22 @@ class with the installed transformers (`PixtralRotaryEmbedding` was renamed), an
 validation inspects that class before the worker registers the Neuron models. The platform plugin
 therefore registers the architecture name for validation (`platform.pre_register_and_update`).
 
+## Optimized stack
+
+`examples/vllm_neuron/models/ministral3/setup_optimized.sh` sets up:
+
+- `VLLM_NEURON_FUSE_DECODE_NORMS=1`: the BF16 decode runs both RMSNorms inside the attention and MLP
+  kernels (decode TPOT -8 % at batch 1 and 128).
+- nkilib from `jimburtoft/nki-library@qwen3-asr/2.33-champion` (overlay on the SDK 2.33 nkilib): the
+  batched block-KV decode attention writes the active token once per DMA-batch group and keeps the
+  fast K gather at the 512 decode bucket. With `"decode_context_length_buckets": [512, 1024]` the
+  decode step at batch 64-128 is 11 % faster. These changes go upstream through internal review.
+- Private NKI / vLLM caches per nkilib revision (the NKI trace-cache key does not hash nkilib source).
+- `VLLM_NEURON_SWA_REAL_ADMISSION=1`, KV cap 0.6.
+
+Short server with it (mml 2048, packed prefill): 128 / 128 peak 3,670 tok/s BF16 (3,110 without),
+4,124 FP8 (3,770); GSM8K 90.1 % BF16, 89.4 % FP8.
+
 ## Serving (trn2.3xlarge, TP=4)
 
 ```bash
