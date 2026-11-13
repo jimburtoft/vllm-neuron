@@ -1,4 +1,4 @@
-"""swiglu_moe_fp8: a fused routed-expert SwiGLU MoE for decode (token generation) on Trainium2, in NKI.
+"""swiglu_moe_fp8 (fp8-moe-decode-neuron-kernels): a fused routed-expert SwiGLU MoE for decode (token generation) on Trainium2, in NKI.
 
 out[t] = sum_k w[t, k] * down_e( silu(gate_e(x[t])) * up_e(x[t]) ),  e = idx[t, k]
 
@@ -210,12 +210,15 @@ if nki is not None:
         nisa.tensor_scalar(dst=dd, data=dd, op0=nl.subtract, operand0=ip)
         eye = nl.ndarray((P, P), dtype=bf16, buffer=nl.sbuf)  # eye[p, j] = [j == p]
         nisa.tensor_scalar(dst=eye, data=dd, op0=nl.equal, operand0=0.0)
-        xps = nl.ndarray((P, C, T), dtype=f32, buffer=nl.psum)
-        for c in range(C):
-            nisa.nc_matmul(dst=xps[:, c, :], stationary=xt[0:T, c * P:(c + 1) * P], moving=eye[0:T, 0:T],
-                           accumulate=_acc('xT'))
         xc = nl.ndarray((P, C, T), dtype=bf16, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=xc, src=xps, engine=nisa.vector_engine)
+        CB = max(1, 512 // T)  # tiles c per PSUM bank (2 KB fp32 per partition)
+        for c0 in range(0, C, CB):
+            cn = min(CB, C - c0)
+            xps = nl.ndarray((P, CB, T), dtype=f32, buffer=nl.psum)
+            for c in range(cn):
+                nisa.nc_matmul(dst=xps[:, c, :], stationary=xt[0:T, (c0 + c) * P:(c0 + c + 1) * P],
+                               moving=eye[0:T, 0:T], accumulate=_acc('xT'))
+            nisa.tensor_copy(dst=xc[:, c0:c0 + cn, :], src=xps[:, 0:cn, :], engine=nisa.vector_engine)
 
         # unit ids: work item n = (t K + k) NB + b -> idx[t, k] NB + b, on partition 0 (exact in fp32: < 2^24)
         N0 = T * K
@@ -242,10 +245,12 @@ if nki is not None:
         nisa.dma_copy(dst=wr, src=w.reshape((1, N)), dge_mode=nisa.dge_mode.none)
         one_r = nl.ndarray((1, P), dtype=bf16, buffer=nl.sbuf)
         nisa.memset(dst=one_r, value=1.0)
-        pwb = nl.ndarray((P, N), dtype=f32, buffer=nl.psum)
-        nisa.nc_matmul(dst=pwb, stationary=one_r, moving=wr, accumulate=_acc('wb'))
         wv = nl.ndarray((P, N), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=wv, src=pwb)
+        for n0 in range(0, N, 512):  # one PSUM bank per 512 columns
+            n1 = min(N, n0 + 512)
+            pwb = nl.ndarray((P, n1 - n0), dtype=f32, buffer=nl.psum)
+            nisa.nc_matmul(dst=pwb, stationary=one_r, moving=wr[:, n0:n1], accumulate=_acc('wb'))
+            nisa.tensor_copy(dst=wv[:, n0:n1], src=pwb)
 
         # --- constants: fold[o, q] = [o % 64 == q % 64]; mh = [p < 64, p >= 64]
         fd = nl.ndarray((P, P), dtype=bf16, buffer=nl.sbuf)
