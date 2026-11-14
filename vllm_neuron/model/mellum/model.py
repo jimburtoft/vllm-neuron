@@ -306,7 +306,8 @@ class MellumSparseMoeBlock(nn.Module):
             raise NotImplementedError("Mellum on Neuron implements norm_topk_prob=True routing only")
         self.num_local_experts = self.num_experts // self.ep_degree
         self.i_tp = self.intermediate_size // self.tp_degree
-        self.block_size = 256
+        # MELLUM_MOE_PREFILL_BLOCK: token block size of the blockwise prefill MoE kernels (multiple of 256).
+        self.block_size = int(os.environ.get("MELLUM_MOE_PREFILL_BLOCK", "256"))
         # The prefill expert kernel (bwmm) tiles H by 512 (H=2304 is not a multiple). Like gpt_oss, keep the
         # experts zero-padded to Hp inside the MoE block only; the residual stream stays at H.
         # MELLUM_MOE_PAD_H=0 keeps H unpadded (then prefill must use MELLUM_MOE_PREFILL=torch).
@@ -327,6 +328,7 @@ class MellumSparseMoeBlock(nn.Module):
         # Decision is on the padded decode batch (num_seqs bucket 1/2/4/../32/64). Measured (no EP, 128/1k): bucket 32
         # kernel 1,095 tok/s vs dense 665; bucket 64 kernel 1,196 vs dense 2,670 -> default 32.
         self.swm_max_t = int(os.environ.get("MELLUM_MOE_FP8_ROUTED_MAX_T", "32"))
+        self.swm_ep_kl = int(os.environ.get("MELLUM_MOE_EP_KL", "6"))
         # >>> PARALLELISM: router replicated on every rank <<<
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, dtype=self.dtype))
         self.gate_up_proj_weight = nn.Parameter(
@@ -391,7 +393,7 @@ class MellumSparseMoeBlock(nn.Module):
         # "auto": the gather reads T * top_k expert slices, the dense path reads each local expert once.
         mode = os.environ.get("MELLUM_MOE_DECODE", "auto")
         if mode == "auto":
-            if self.swm_enabled and self.ep_degree == 1 and T <= self.swm_max_t:
+            if self.swm_enabled and T <= self.swm_max_t:
                 return "routed_fp8"
             if self.fp8_decode and T * self.top_k > self.num_local_experts:
                 return "fp8"
@@ -530,6 +532,23 @@ class MellumSparseMoeBlock(nn.Module):
         x = self.post_attention_layernorm(hidden_states)
         topv, topi = self._route(x)
         T = x.shape[0]
+        if self.ep_degree > 1:
+            # EP: keep each token's routes that land on this rank, compacted to a fixed width KL (MELLUM_MOE_EP_KL,
+            # default 6). Local-route counts per token are ~Binomial(8, 1/4): P(> 6) ~ 4e-4 per token-rank. Routes
+            # beyond KL are dropped (weight lost); slots without a local route point at local expert 0 with weight 0
+            # (their units are still streamed).
+            KL = self.swm_ep_kl
+            lo = self._ep_rank_tensor().to(topi.dtype) * self.num_local_experts
+            local = topi - lo
+            mine = (local >= 0) & (local < self.num_local_experts)
+            # stable compaction: order key = (not mine, position) -> mine first
+            pos = torch.arange(self.top_k, device=topi.device, dtype=topi.dtype).unsqueeze(0).expand_as(topi)
+            key = (~mine).to(topi.dtype) * self.top_k + pos
+            order = torch.argsort(key, dim=-1)[:, :KL]
+            m_sel = torch.gather(mine, 1, order)
+            topi = torch.where(m_sel, torch.gather(local, 1, order), torch.zeros_like(order))
+            topv = torch.where(m_sel, torch.gather(topv, 1, order), torch.zeros_like(topv[:, :KL]))
+        K_eff = topi.shape[1]
         lnc = get_logical_nc_config()
         k = wrap_nki(swm.swiglu_moe_fp8)
         k = k[lnc] if lnc > 1 else k
@@ -539,7 +558,7 @@ class MellumSparseMoeBlock(nn.Module):
             topv.to(torch.bfloat16).contiguous(),
             self.swm_blob,
             NB=self.swm_nb,
-            group=swm.auto_group(T, self.top_k, self.swm_nb),
+            group=swm.auto_group(T, K_eff, self.swm_nb),
             ring=swm.RING,
             act=0,
             limit=0.0,
@@ -1018,5 +1037,5 @@ class MellumForCausalLM(Gemma3ForCausalLM):
         for layer in self.model.layers:
             if getattr(layer.mlp, "fp8_decode", False):
                 layer.mlp.quantize_fp8_decode_copy(device)
-            if getattr(layer.mlp, "swm_enabled", False) and layer.mlp.ep_degree == 1:
+            if getattr(layer.mlp, "swm_enabled", False):
                 layer.mlp.build_routed_fp8_blob(device)
