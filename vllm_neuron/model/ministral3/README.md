@@ -74,8 +74,8 @@ Recommended servers with it (one trn2.3xlarge, BF16, output tok/s at the through
 - KV cap: 0.5 on TP=2 x DP=2 and 0.6 on the 10k-context server with 44 decode graphs run out of device
   memory under load (`Allocation Failure`); the caps above are the largest that passed.
 - `max_top_k` 32 supports `top_k` <= 32; it is 3 % faster than the default 256 (131k vocabulary).
-- FP8 (TP=4 short server): 128 / 128 4,124 tok/s. FP8 at TP=2 does not compile yet (lm_head dtype
-  mismatch).
+- FP8 checkpoint, short server at TP=2 x DP=2 (same settings): 1024 / 1024 **3,667** tok/s (the best 1k / 1k
+  configuration: FP8 KV fits twice the requests), 128 / 128 4,295; GSM8K 88.9 %. At TP=4: 4,124 / 3,333.
 
 ## Serving (trn2.3xlarge, TP=4)
 
