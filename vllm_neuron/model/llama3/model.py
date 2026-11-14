@@ -294,6 +294,23 @@ class LlamaRotaryEmbedding(nn.Module):
 # =============================================================================
 
 
+def _fuse_decode_norms() -> bool:
+    """Return whether BF16 decode runs both RMSNorms inside the kernels.
+
+    VLLM_NEURON_FUSE_DECODE_NORMS=1: the pre-attention norm runs inside the
+    attention megakernel (``rmsnorm_X_enabled``) and the pre-MLP norm inside
+    ``NF.mlp`` (``norm_type`` RMS_NORM), as the static-FP8 path already does.
+    Off by default.
+
+    Example:
+        >>> _fuse_decode_norms()  # doctest: +SKIP
+        False
+    """
+    import os
+
+    return os.environ.get("VLLM_NEURON_FUSE_DECODE_NORMS") == "1"
+
+
 class LlamaAttention(nn.Module):
     """Multi-head attention with TP head sharding.
 
@@ -510,6 +527,8 @@ class LlamaAttention(nn.Module):
         positions: torch.LongTensor | None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attn_metadata: object | None = None,
+        decode_ln_w: torch.Tensor | None = None,
+        decode_eps: float = 1e-6,
     ):
         """Dispatch to prefill or decode path based on metadata.
 
@@ -527,6 +546,8 @@ class LlamaAttention(nn.Module):
                 positions,
                 position_embeddings,
                 attn_metadata,
+                ln_w=decode_ln_w,
+                eps=decode_eps,
             )
         else:
             # >>> PARALLELISM: All-gather from SP before attention <<<
@@ -846,8 +867,13 @@ class LlamaAttention(nn.Module):
         positions: torch.LongTensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attn_metadata: object,
+        ln_w: torch.Tensor | None = None,
+        eps: float = 1e-6,
     ):
         """Decode: fused megakernel for single-token generation.
+
+        ``ln_w``: when given, the pre-attention RMSNorm runs inside the megakernel
+        (``rmsnorm_X_enabled``), and ``hidden_states`` is the un-normalized residual.
 
         >>> PARALLELISM: The megakernel handles TP internally. <<<
         >>> PARALLELISM: With attention DP, Q/O are sharded across TP*attention DP. <<<
@@ -989,7 +1015,9 @@ class LlamaAttention(nn.Module):
         output = NF.attention_decode(
             X=X,
             X_hidden_dim_actual=self.hidden_size,
-            rmsnorm_X_enabled=False,
+            rmsnorm_X_enabled=ln_w is not None,
+            rmsnorm_X_eps=eps if ln_w is not None else None,
+            rmsnorm_X_gamma=ln_w.view(1, -1) if ln_w is not None else None,
             W_qkv=self.qkv_proj_weight,
             bias_qkv=None,
             rmsnorm_QK_pre_rope_enabled=False,
@@ -1375,6 +1403,16 @@ class LlamaDecoderLayer(nn.Module):
                 ln_w=self.input_layernorm.weight,
                 eps=self.rms_norm_eps,
             )
+        elif _fuse_decode_norms():
+            # <-- MODEL-SPECIFIC: Pre-attention RMSNorm fused into the megakernel
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                position_embeddings=position_embeddings,
+                attn_metadata=attn_metadata,
+                decode_ln_w=self.input_layernorm.weight,
+                decode_eps=self.rms_norm_eps,
+            )
         else:
             # <-- MODEL-SPECIFIC: Pre-attention RMSNorm
             hidden_states = self.input_layernorm(hidden_states)
@@ -1399,6 +1437,14 @@ class LlamaDecoderLayer(nn.Module):
         # inside :func:`NF.mlp`. The bf16 path keeps the explicit norm
         # call; the FP8 path must skip it here and forward ``ln_w``/``eps``.
         if self._mlp_scheme is QuantScheme.FP8_STATIC_PER_TENSOR:
+            hidden_states = self.mlp(
+                hidden_states,
+                is_prefill=False,
+                ln_w=self.post_attention_layernorm.weight,
+                eps=self.rms_norm_eps,
+            )
+        elif _fuse_decode_norms():
+            # <-- MODEL-SPECIFIC: Pre-MLP RMSNorm fused into the MLP kernel
             hidden_states = self.mlp(
                 hidden_states,
                 is_prefill=False,
