@@ -125,6 +125,18 @@ GSM8K-100: 97 % (bf16 97-98 %). The FP8 weights move greedy tokens more than bf1
 prompts (fp32 gap 1.14 at token 181, the token still in the fp32 top 5), so treat it as an opt-in accuracy trade.
 For throughput (32+ concurrent requests) use `--enable-expert-parallel` without FP8.
 
+### Decode bucket ladder
+
+`"decode_context_length_buckets": [1024, 2048, 4096]` instead of `[2048]` (8 per step, EP=4, default KV):
+
+| Input / output | Concurrency | `[2048]` | `[1024, 2048, 4096]` |
+|---|---:|---:|---:|
+| 128 / 512 | 64 | 3,162 tok/s | 3,213 |
+| 2,048 / 1,024 | 64 | 1,801 (TPOT 32.6 ms) | **2,514 (22.5 ms)** (+40 %) |
+| 128 / 1,024 | 256 | 3,899 | 3,908 |
+
+Contexts between 2k and 4k take the 4096 graph instead of the 8k fallback. Shorter contexts are unchanged.
+
 ### High concurrency
 
 `VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8` (packed prefill), TP=4, EP=4. The default KV budget
@@ -136,9 +148,11 @@ raise it to 0.42 and cap `--max-num-seqs 512` (higher fractions do not fit HBM n
 | 128 / 1,024 | 128 | default | 2,828 | 703 | 44.6 |
 | 128 / 1,024 | 256 | default | 3,333 | 1,411 | 75.5 |
 | 128 / 1,024 | 512 | 0.42, `--max-num-seqs 512` | 3,994 | 2,664 | 125.6 |
+| 128 / 1,024 | 512 | 0.42, `--max-num-seqs 512`, **+ 2048 decode bucket** | **4,845** | 2,767 | 103.0 |
 | 1,024 / 1,024 | 128 | default | 2,529 | 3,174 | 47.5 |
 | 1,024 / 1,024 | 256 | default | 2,985 | 6,230 | 79.7 |
 | 1,024 / 1,024 | 512 | 0.42, `--max-num-seqs 512` | 3,483 | 12,095 | 135.3 |
+| 1,024 / 1,024 | 512 | 0.42, `--max-num-seqs 512`, **+ 2048 decode bucket** | **4,176** | 12,139 | 110.8 |
 
 
 ## Packed prefill
