@@ -58,6 +58,13 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
   (`max_num_seqs ... exceeds worst-case KV cache capacity (42 concurrent requests`). With it, all 128 run, and 0
   requests are preempted. The variable name comes from the sliding-window models the feature was written for;
   dense models use it unchanged.
+- `VLLM_NEURON_FUSE_DECODE_NORMS=1` (opt-in) runs the two decode RMSNorms inside the attention and MLP kernels.
+  Decode time per token is 6 % lower at batch 1-32 (8.79 -> 8.22 ms at batch 1). GSM8K is the same (60.5 %).
+- For short prompts, a 512 decode context bucket (`"decode_context_length_buckets": [512, 2048]`) cuts batch-64
+  decode from 20.4 to 16.4 ms. With it, the optional NKI Library branch
+  [`jimburtoft/nki-library@qwen3-asr/2.33-champion`](https://github.com/jimburtoft/nki-library/tree/qwen3-asr/2.33-champion)
+  gives another -9 % at batch 32 and -11 % at batch 64. Put the branch's `src/nkilib_src` first on `PYTHONPATH`, and use
+  private NKI caches (`NKI_TRACE_CACHE_URL`, `NKI_COMPILE_CACHE_URL` and `VLLM_CACHE_ROOT` in new directories).
 - `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (default 0.30) caps the KV cache. 0.6 is the largest value that
   still leaves HBM for the 8192-token prefill graph; 0.7 fails at load with `Allocation Failure`.
 - `decode_context_length_buckets` selects Model Runner V1 on this release. On the 10k server they double
