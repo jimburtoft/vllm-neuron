@@ -61,8 +61,21 @@ therefore registers the architecture name for validation (`platform.pre_register
 - Private NKI / vLLM caches per nkilib revision (the NKI trace-cache key does not hash nkilib source).
 - `VLLM_NEURON_SWA_REAL_ADMISSION=1`, KV cap 0.6.
 
-Short server with it (mml 2048, packed prefill): 128 / 128 peak 3,670 tok/s BF16 (3,110 without),
-4,124 FP8 (3,770); GSM8K 90.1 % BF16, 89.4 % FP8.
+Recommended servers with it (one trn2.3xlarge, BF16, output tok/s at the throughput peak):
+
+| Use | Layout and settings | 128 / 128 | 1024 / 1024 | 4096 / 512 | 8192 / 1024 |
+|---|---|---|---|---|---|
+| Short prompts | TP=2 x DP=2; `--max-model-len 2048 --max-num-batched-tokens 2048 --max-num-seqs 128`, packed prefill (`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8`), `num_seqs_buckets` to 128, `decode_context_length_buckets` [512, 1024], KV cap 0.4, `on_device_sampling_config` `{"max_top_k": 32}` | **5,151** | 3,121 | | |
+| Long prompts | TP=4; `--max-model-len 10240 --max-num-batched-tokens 8192 --max-num-seqs 128`, `num_batched_tokens_buckets` [256, 1024, 2048, 4096, 8192], `num_seqs_buckets` [1, 4, 8, 16, 32, 64, 96, 128], `decode_context_length_buckets` [2048, 4096, 8192], KV cap 0.5 | | 2,947 | 900 | 723 |
+
+- GSM8K (1319): 89.2 % (short) and 89.6 % (long); 89.4 % BF16 before these changes.
+- Keep a decode bucket at about 2 x the typical context: with [1024, 4096] instead of [2048, 4096, 8192]
+  the long server drops to 2,015 tok/s at 1024 / 1024.
+- KV cap: 0.5 on TP=2 x DP=2 and 0.6 on the 10k-context server with 44 decode graphs run out of device
+  memory under load (`Allocation Failure`); the caps above are the largest that passed.
+- `max_top_k` 32 supports `top_k` <= 32; it is 3 % faster than the default 256 (131k vocabulary).
+- FP8 (TP=4 short server): 128 / 128 4,124 tok/s. FP8 at TP=2 does not compile yet (lm_head dtype
+  mismatch).
 
 ## Serving (trn2.3xlarge, TP=4)
 
