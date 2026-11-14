@@ -345,6 +345,56 @@ def mlp(
         else ComputationMode.AUTO
     )
 
+    # Static-FP8 prefill whose intermediate dim exceeds the CTE PSUM-bank limit (e.g.
+    # I/rank 7168 at TP2): split I into chunks the kernel can tile and sum the partial
+    # down projections, instead of the torch fallback (which has no FP8 dequant).
+    if (
+        quantization_type == QuantizationType.STATIC
+        and computation_mode != ComputationMode.DECODE
+        and not skip_gate
+        and gate_b is None
+        and up_b is None
+        and down_b is None
+        and fused_add_tensor is None
+        and norm_type == NormType.NO_NORM
+        and can_run_kernel(hidden)
+        and not _can_use_kernel(
+            hidden, gate_w, gate_b, up_b, down_b, quantization_type, computation_mode
+        )
+    ):
+        I = gate_w.shape[1]
+        n = 2
+        while n <= 8 and not (
+            I % n == 0
+            and _can_use_kernel(
+                hidden, gate_w[:, : I // n], None, None, None, quantization_type, computation_mode
+            )
+        ):
+            n += 1
+        if n <= 8:
+            c = I // n
+            out = None
+            for j in range(n):
+                part = mlp(
+                    hidden,
+                    gate_w[:, j * c : (j + 1) * c],
+                    up_w[:, j * c : (j + 1) * c],
+                    down_w[j * c : (j + 1) * c, :],
+                    eps=eps,
+                    act_fn=act_fn,
+                    norm_type=NormType.NO_NORM,
+                    quantization_type=quantization_type,
+                    gate_w_scale=gate_w_scale,
+                    up_w_scale=up_w_scale,
+                    down_w_scale=down_w_scale,
+                    gate_up_in_scale=gate_up_in_scale,
+                    down_in_scale=down_in_scale,
+                    quant_clipping_bound=quant_clipping_bound,
+                    output_dtype="bfloat16",
+                ).to(torch.float32)
+                out = part if out is None else out + part
+            return out.to(torch.bfloat16)
+
     if _can_use_kernel(
         hidden, gate_w, gate_b, up_b, down_b, quantization_type, computation_mode
     ):
