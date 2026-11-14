@@ -66,9 +66,10 @@ Recommended servers with it (one trn2.3xlarge, BF16, output tok/s at the through
 | Use | Layout and settings | 128 / 128 | 1024 / 1024 | 4096 / 512 | 8192 / 1024 |
 |---|---|---|---|---|---|
 | Short prompts | TP=2 x DP=2; `--max-model-len 2048 --max-num-batched-tokens 2048 --max-num-seqs 128`, packed prefill (`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8`), `num_seqs_buckets` to 128, `decode_context_length_buckets` [512, 1024], KV cap 0.4, `on_device_sampling_config` `{"max_top_k": 32}` | **5,151** | 3,121 | | |
+| ~1k contexts | as "Short prompts" plus `--kv-cache-dtype fp8_e4m3` (BF16 weights) | 4,109 | **3,661** | | |
 | Long prompts | TP=4; `--max-model-len 10240 --max-num-batched-tokens 8192 --max-num-seqs 128`, `num_batched_tokens_buckets` [256, 1024, 2048, 4096, 8192], `num_seqs_buckets` [1, 4, 8, 16, 32, 64, 96, 128], `decode_context_length_buckets` [2048, 4096, 8192], KV cap 0.5 | | 2,947 | 900 | 723 |
 
-- GSM8K (1319): 89.2 % (short) and 89.6 % (long); 89.4 % BF16 before these changes.
+- GSM8K (1319): 89.2 % (short), 89.5 % (FP8 KV), 89.6 % (long); 89.4 % before these changes.
 - Keep a decode bucket at about 2 x the typical context: with [1024, 4096] instead of [2048, 4096, 8192]
   the long server drops to 2,015 tok/s at 1024 / 1024.
 - KV cap: 0.5 on TP=2 x DP=2 and 0.6 on the 10k-context server with 44 decode graphs run out of device
