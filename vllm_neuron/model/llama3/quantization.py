@@ -214,9 +214,12 @@ def _parse_modelopt(quantization_config: dict[str, Any]) -> QuantizationSpec:
             "Llama3 currently only supports ModelOpt quant_algo='FP8', "
             f"got quant_algo={quant_algo!r}."
         )
-    if kv_cache_algo != "FP8":
+    # kv_cache_quant_algo FP8: FP8 KV cache (vLLM sets cache_dtype fp8). Unset or
+    # NONE: FP8 weights with a BF16 KV cache, which keeps prefix caching and
+    # segmented prefill available.
+    if kv_cache_algo not in ("FP8", "", "NONE"):
         raise ValueError(
-            "Llama3 currently requires ModelOpt kv_cache_quant_algo='FP8', "
+            "Llama3 supports ModelOpt kv_cache_quant_algo='FP8' or unset, "
             f"got kv_cache_quant_algo={kv_cache_algo!r}."
         )
     if not isinstance(exclude_modules_raw, (list, tuple)):
@@ -234,7 +237,11 @@ def _parse_modelopt(quantization_config: dict[str, Any]) -> QuantizationSpec:
 
     return QuantizationSpec(
         linear_scheme=QuantScheme.FP8_STATIC_PER_TENSOR,
-        kv_cache_scheme=QuantScheme.FP8_STATIC_PER_TENSOR,
+        kv_cache_scheme=(
+            QuantScheme.FP8_STATIC_PER_TENSOR
+            if kv_cache_algo == "FP8"
+            else QuantScheme.NONE
+        ),
     )
 
 
