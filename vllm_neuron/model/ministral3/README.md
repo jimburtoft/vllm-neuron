@@ -66,10 +66,11 @@ Recommended servers with it (one trn2.3xlarge, BF16, output tok/s at the through
 | Use | Layout and settings | 128 / 128 | 1024 / 1024 | 4096 / 512 | 8192 / 1024 |
 |---|---|---|---|---|---|
 | Short prompts | TP=2 x DP=2; `--max-model-len 2048 --max-num-batched-tokens 2048 --max-num-seqs 128`, packed prefill (`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8`), `num_seqs_buckets` to 128, `decode_context_length_buckets` [512, 1024], KV cap 0.4, `on_device_sampling_config` `{"max_top_k": 32}` | **5,151** | 3,121 | | |
-| ~1k contexts | as "Short prompts" plus `--kv-cache-dtype fp8_e4m3` and `"fp8_packed_kv": true` (BF16 weights; `UNSAFE_FP8FNCAST=1`) | 4,074 | **4,097** | | |
+| ~1k contexts | as "Short prompts" plus `--kv-cache-dtype fp8_e4m3` and `"fp8_packed_kv": true` (`UNSAFE_FP8FNCAST=1`), BF16 weights | 4,074 | 4,097 | | |
+| ~1k contexts, FP8 weights | same with the FP8 checkpoint (`VLLM_NEURON_FP8_INPUT_SCALE_COMPENSATION=1`) | 4,304 | **4,415** | | |
 | Long prompts | TP=4; `--max-model-len 10240 --max-num-batched-tokens 8192 --max-num-seqs 128`, `num_batched_tokens_buckets` [256, 1024, 2048, 4096, 8192], `num_seqs_buckets` [1, 4, 8, 16, 32, 64, 96, 128], `decode_context_length_buckets` [2048, 4096, 8192], KV cap 0.5 | | 2,947 | 900 | 723 |
 
-- GSM8K (1319): 89.2 % (short), 89.4 % (packed FP8 KV), 89.6 % (long); 89.4 % before these changes. Unpacked FP8 KV
+- GSM8K (1319): 89.2 % (short), 89.4 % (packed FP8 KV), 89.2 % (FP8 weights + packed FP8 KV), 89.6 % (long); 89.4 % before these changes. Unpacked FP8 KV
   (without `fp8_packed_kv`) is slower: 3,661 tok/s at 1024 / 1024, because 1-byte K takes a PE-transpose path in the decode kernel.
 - Keep a decode bucket at about 2 x the typical context: with [1024, 4096] instead of [2048, 4096, 8192]
   the long server drops to 2,015 tok/s at 1024 / 1024.
