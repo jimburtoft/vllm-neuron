@@ -533,6 +533,8 @@ class MellumSparseMoeBlock(nn.Module):
         topv, topi = self._route(x)
         T = x.shape[0]
         if self.ep_degree > 1:
+            # Measured on trn2 (EP4, 2048 bucket, 128/1k): +36 % at c1 (TPOT 9.6 -> 7.0 ms), +9 % at c4, but slower
+            # than bf16 dense at c8 / c16 (-31 % / -58 %), so with EP keep MELLUM_MOE_FP8_ROUTED_MAX_T <= 4.
             # EP: keep each token's routes that land on this rank, compacted to a fixed width KL (MELLUM_MOE_EP_KL,
             # default 6). Local-route counts per token are ~Binomial(8, 1/4): P(> 6) ~ 4e-4 per token-rank. Routes
             # beyond KL are dropped (weight lost); slots without a local route point at local expert 0 with weight 0
