@@ -329,6 +329,10 @@ class MellumSparseMoeBlock(nn.Module):
         # kernel 1,095 tok/s vs dense 665; bucket 64 kernel 1,196 vs dense 2,670 -> default 32.
         self.swm_max_t = int(os.environ.get("MELLUM_MOE_FP8_ROUTED_MAX_T", "32"))
         self.swm_ep_kl = int(os.environ.get("MELLUM_MOE_EP_KL", "6"))
+        # MELLUM_MOE_EM=1: expert-major NKI decode kernel (moe_decode_kernel.py): each local expert loaded once per step,
+        # all decode rows (<= 128) applied; FP8 weights when MELLUM_MOE_EM_FP8=1 (default), else bf16.
+        self.em_enabled = os.environ.get("MELLUM_MOE_EM", "0") == "1"
+        self.em_fp8 = os.environ.get("MELLUM_MOE_EM_FP8", "1") == "1"
         # >>> PARALLELISM: router replicated on every rank <<<
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, dtype=self.dtype))
         self.gate_up_proj_weight = nn.Parameter(
@@ -395,6 +399,8 @@ class MellumSparseMoeBlock(nn.Module):
         if mode == "auto":
             if self.swm_enabled and T <= self.swm_max_t:
                 return "routed_fp8"
+            if self.em_enabled and T <= 128 and T * self.top_k > self.num_local_experts:
+                return "expert_major"
             if self.fp8_decode and T * self.top_k > self.num_local_experts:
                 return "fp8"
             return "gather" if T * self.top_k <= self.num_local_experts else "dense"
@@ -418,6 +424,8 @@ class MellumSparseMoeBlock(nn.Module):
                 out = self._decode_fp8(hidden_states)
             elif mode == "routed_fp8":
                 out = self._decode_routed_fp8(hidden_states)
+            elif mode == "expert_major":
+                out = self._decode_expert_major(hidden_states)
             elif mode == "dense":
                 out = self._decode_dense(hidden_states)
             else:
@@ -568,6 +576,55 @@ class MellumSparseMoeBlock(nn.Module):
         )
         out = out if isinstance(out, torch.Tensor) else out[0]
         return out.to(self.dtype)
+
+    def _decode_expert_major(self, hidden_states):
+        """fp32 torch router -> [T, E_local] affinities -> expert-major NKI kernel (moe_decode_kernel.py)."""
+        from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+        from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+        from .moe_decode_kernel import mellum_moe_decode
+
+        x = self.post_attention_layernorm(hidden_states)
+        topv, topi = self._route(x)
+        T = x.shape[0]
+        aff = torch.zeros(T, self.num_experts, dtype=torch.float32, device=x.device).scatter(1, topi, topv)
+        if self.ep_degree > 1:
+            lo = self._ep_rank_tensor().to(torch.long) * self.num_local_experts
+            cols = torch.arange(self.num_local_experts, device=x.device, dtype=torch.long) + lo
+            aff = aff.index_select(1, cols)
+        lnc = get_logical_nc_config()
+        k = wrap_nki(mellum_moe_decode)
+        k = k[lnc] if lnc > 1 else k
+        kw = dict(nbuf=int(os.environ.get("MELLUM_MOE_EM_NBUF", "2")), dedupe=1)
+        if self.em_fp8:
+            kw.update(gu_scale=self.em_gu_scale, d_scale=self.em_d_scale)
+            out = k(x.to(torch.bfloat16).contiguous(), aff.contiguous(), self.em_gu, self.em_dn, **kw)
+        else:
+            out = k(x.to(torch.bfloat16).contiguous(), aff.contiguous(), self.em_gu, self.em_dn, **kw)
+        out = out if isinstance(out, torch.Tensor) else out[0]
+        return out.to(self.dtype)
+
+    def build_expert_major_weights(self, device=None):
+        """Real-H (2304) expert weights for the expert-major kernel: gate|up [E, H, 2I], down [E, I, H]; FP8 (amax/240
+        per gate/up output column, per-expert scalar for down) or bf16. Host-side, once at load."""
+        dev = device if device is not None else self.gate_up_proj_weight.device
+        H, I = self.hidden_size, self.i_real
+        gu = self.gate_up_proj_weight.detach().cpu()[:, :H, :]
+        gu = torch.cat([gu[:, :, :I], gu[:, :, self.i_tp:self.i_tp + I]], dim=2).float()  # [E, H, 2I]
+        dn = self.down_proj_weight.detach().cpu()[:, :I, :H].float()  # [E, I, H]
+        if self.em_fp8:
+            gs = (gu.abs().amax(1) / 240.0).clamp(min=1e-12)  # [E, 2I]
+            ds = (dn.abs().reshape(dn.shape[0], -1).amax(1, keepdim=True) / 240.0).clamp(min=1e-12)  # [E, 1]
+            gq = (gu / gs[:, None, :]).clamp(-240, 240).to(torch.float8_e4m3fn)
+            dq = (dn / ds[:, :, None]).clamp(-240, 240).to(torch.float8_e4m3fn)
+            self.em_gu = nn.Parameter(gq.contiguous().to(dev), requires_grad=False)
+            self.em_dn = nn.Parameter(dq.contiguous().to(dev), requires_grad=False)
+            self.em_gu_scale = nn.Parameter(gs.contiguous().to(dev), requires_grad=False)
+            self.em_d_scale = nn.Parameter(ds.contiguous().to(dev), requires_grad=False)
+        else:
+            self.em_gu = nn.Parameter(gu.to(torch.bfloat16).contiguous().to(dev), requires_grad=False)
+            self.em_dn = nn.Parameter(dn.to(torch.bfloat16).contiguous().to(dev), requires_grad=False)
 
     def build_routed_fp8_blob(self, device=None):
         """Quantize this rank's experts to FP8 e4m3 (128x128 block scales amax/240, TRN2 e4m3 max 240) and pack them
@@ -1039,5 +1096,7 @@ class MellumForCausalLM(Gemma3ForCausalLM):
         for layer in self.model.layers:
             if getattr(layer.mlp, "fp8_decode", False):
                 layer.mlp.quantize_fp8_decode_copy(device)
+            if getattr(layer.mlp, "em_enabled", False):
+                layer.mlp.build_expert_major_weights(device)
             if getattr(layer.mlp, "swm_enabled", False):
                 layer.mlp.build_routed_fp8_blob(device)
