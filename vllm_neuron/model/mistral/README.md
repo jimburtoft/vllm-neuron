@@ -65,6 +65,10 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
   [`jimburtoft/nki-library@qwen3-asr/2.33-champion`](https://github.com/jimburtoft/nki-library/tree/qwen3-asr/2.33-champion)
   gives another -9 % at batch 32 and -11 % at batch 64. Put the branch's `src/nkilib_src` first on `PYTHONPATH`, and use
   private NKI caches (`NKI_TRACE_CACHE_URL`, `NKI_COMPILE_CACHE_URL` and `VLLM_CACHE_ROOT` in new directories).
+- Greedy-only deployments: add `"on_device_sampling_config": {"all_greedy": true}` to `neuron_config`. The default
+  on-device sampler runs a 256-way top-k over every vocabulary shard on each step, even for greedy requests (~280 us).
+  With `all_greedy` it is a distributed argmax: decode is 2-4 % faster (7.89 -> 7.71 ms at batch 1). It makes **every**
+  request greedy, so do not use it when requests sample with a temperature.
 - `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (default 0.30) caps the KV cache. 0.6 is the largest value that
   still leaves HBM for the 8192-token prefill graph; 0.7 fails at load with `Allocation Failure`.
 - `decode_context_length_buckets` selects Model Runner V1 on this release. On the 10k server they double
