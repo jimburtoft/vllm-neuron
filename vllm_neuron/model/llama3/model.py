@@ -31,6 +31,7 @@ import vllm_neuron.functional as NF
 from vllm_neuron.functional.attention.attention_decode import (
     _swizzle_packed_k,
     _unswizzle_packed_k,
+    packed_fp8_viable_for_bucket,
 )
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
@@ -1090,10 +1091,28 @@ class LlamaAttention(nn.Module):
         # (speculative verify) keeps the 2D table and the path it used before.
         # Without a kernel (CPU mode with the NKI simulator off) keep the 2D table:
         # the torch fallback reads only that layout.
+        # Packed FP8 KV with GQA (nkh > 1): the fused kernel needs the per-head
+        # table too. Without it the packed cache went to the torch fallback, whose
+        # graph (gen_mask + de-interleave + masked softmax over the packed layout)
+        # fails in neuronx-cc 2.28 (NCC_ILSA902). Read the packed cache directly
+        # where the bucket keeps block_len >= 2 after the kernel's resize (checked
+        # at the unfolded and the head-folded batch, as Qwen3-ASR does); otherwise
+        # un-swizzle for the unpacked kernel and re-swizzle the returned K.
+        use_packed_kernel = self.fp8_packed
+        needs_k_back = False
+        if self.fp8_packed and nkh > 1:
+            block_len = self.v_cache.shape[-2]
+            use_packed_kernel = packed_fp8_viable_for_bucket(
+                block_len=block_len, bs=B_local, q_head=mask_q_heads,
+                s_active=S_decode, s_prior=S_ctx,
+            ) and packed_fp8_viable_for_bucket(
+                block_len=block_len, bs=B_local * nkh, q_head=mask_q_heads // nkh,
+                s_active=S_decode, s_prior=S_ctx,
+            )
+            needs_k_back = not use_packed_kernel
         if (
             nkh > 1
             and S_decode == 1
-            and not self.fp8_packed
             and not dcp_decode_active
             and self.l4_beta is None  # q_scale runs the torch path (2D table)
             and can_run_kernel(hidden_states)
@@ -1134,7 +1153,7 @@ class LlamaAttention(nn.Module):
             rope_contiguous_layout=True,
             K_cache_transposed=False,
             active_blocks_table=active_blocks_table,
-            K_cache=self.k_cache,
+            K_cache=_unswizzle_packed_k(self.k_cache) if needs_k_back else self.k_cache,
             V_cache=self.v_cache,
             attention_mask=attention_mask,
             # Kernel currently requires fusing the K scale dequantization into softmax scale for KV quantization
@@ -1142,7 +1161,8 @@ class LlamaAttention(nn.Module):
             sink=None,
             update_cache=True,
             kv_cache_update_idx=kv_cache_update_idx,
-            fp8_packed=self.fp8_packed,
+            fp8_packed=use_packed_kernel,
+            return_updated_kv=needs_k_back,
             # Kernel currently requires fusing the V scale dequantization into W_out for KV quantization
             W_out=self.o_proj_weight / self.v_scale_float,
             bias_out=None,
@@ -1176,6 +1196,10 @@ class LlamaAttention(nn.Module):
                 else None
             ),
         )
+
+        if needs_k_back:
+            output, k_updated, _ = output
+            self.k_cache.copy_(_swizzle_packed_k(k_updated))
 
         # >>> PARALLELISM: Sum O-proj partials across TP * attn_dp supergroup <<<
         self.attn_tp_group.all_reduce(output)
