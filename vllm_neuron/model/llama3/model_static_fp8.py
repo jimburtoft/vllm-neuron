@@ -46,6 +46,8 @@ from torch import nn
 from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
 from nkilib.core.utils.common_types import NormType, QuantizationType
 
+import os
+
 import torch
 import vllm_neuron.functional as NF
 from libtorch_neuronx_lite.compile.platform import get_platform_target
@@ -797,13 +799,24 @@ class LlamaAttention(nn.Module):
                 # size-2 dim. Prefill fills each block contiguously from an even
                 # position, so new K rows are pair-aligned — scatter whole
                 # [d_head, 2] pairs directly into the packed layout.
-                scatter_packed_k(
-                    self.k_cache,
-                    k_flat,
-                    block_indices_for_put,
-                    head_indices_for_put,
-                    position_indices_for_put,
-                )
+                # With more than one KV head per rank the pair scatter goes out of
+                # bounds at runtime (DGE OOB at the first real prefill on Ministral 3
+                # TP2, 2 KV heads/rank); un-swizzle -> scatter -> re-swizzle (the BF16
+                # llama3 path) is correct there. VLLM_NEURON_FP8_PACKED_PREFILL_ROUNDTRIP
+                # forces either way (1 / 0).
+                _rt = os.environ.get("VLLM_NEURON_FP8_PACKED_PREFILL_ROUNDTRIP")
+                if (_rt == "1") or (_rt is None and self.num_key_value_heads_per_rank > 1):
+                    k_unpacked = _unswizzle_packed_k(self.k_cache)
+                    k_unpacked.index_put_(index, k_flat)
+                    self.k_cache.copy_(_swizzle_packed_k(k_unpacked))
+                else:
+                    scatter_packed_k(
+                        self.k_cache,
+                        k_flat,
+                        block_indices_for_put,
+                        head_indices_for_put,
+                        position_indices_for_put,
+                    )
             else:
                 self.k_cache.index_put_(index, k_flat)
 
@@ -975,7 +988,18 @@ class LlamaAttention(nn.Module):
             s_active=S_decode,
             s_prior=S_ctx,
         )
-        fuse_mask = _should_fuse_decode_mask(
+        # GQA (nkh > 1): the kernel folds the KV heads into the batch, so the
+        # resized block_len must also hold at the folded batch (as Qwen3-ASR).
+        _nkh = self.num_key_value_heads_per_rank
+        if use_packed_kernel and _nkh > 1:
+            use_packed_kernel = _packed_fp8_viable_for_bucket(
+                block_len=block_size,
+                bs=B_local * _nkh,
+                q_head=self.num_q_heads_after_attn_dp_a2a // _nkh,
+                s_active=S_decode,
+                s_prior=S_ctx,
+            )
+        fuse_mask = os.environ.get("VLLM_NEURON_FP8_NO_FUSED_MASK") != "1" and _should_fuse_decode_mask(
             S_ctx,
             B_local,
             packed_kv=use_packed_kernel,
@@ -1025,10 +1049,11 @@ class LlamaAttention(nn.Module):
             and S_decode == 1
             and self.attention_dp_size == 1
             and not dcp_active
-            and not self.fp8_packed
-            and self.k_cache.dim() == 4
             and can_run_kernel(hidden_states)
         ):
+            # Packed FP8 too: without the per-head table the packed cache went to
+            # the torch fallback, which cannot run static-FP8 QKV and (unquantized)
+            # fails in neuronx-cc 2.28 with NCC_ILSA902.
             active_blocks_table = build_per_head_block_table(block_table, nkh).to(
                 torch.int32
             )
