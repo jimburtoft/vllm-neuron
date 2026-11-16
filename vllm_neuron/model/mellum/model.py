@@ -333,6 +333,9 @@ class MellumSparseMoeBlock(nn.Module):
         # all decode rows (<= 128) applied; FP8 weights when MELLUM_MOE_EM_FP8=1 (default), else bf16.
         self.em_enabled = os.environ.get("MELLUM_MOE_EM", "0") == "1"
         self.em_fp8 = os.environ.get("MELLUM_MOE_EM_FP8", "1") == "1"
+        # T > 128: the kernel is called once per 128-row chunk (weights re-streamed per chunk; the kernel is
+        # tensor-engine bound with DMA ~9 % busy, so the re-read is cheap). MELLUM_MOE_EM_MAX_T caps its use.
+        self.em_max_t = int(os.environ.get("MELLUM_MOE_EM_MAX_T", "512"))
         # >>> PARALLELISM: router replicated on every rank <<<
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, dtype=self.dtype))
         self.gate_up_proj_weight = nn.Parameter(
@@ -399,7 +402,7 @@ class MellumSparseMoeBlock(nn.Module):
         if mode == "auto":
             if self.swm_enabled and T <= self.swm_max_t:
                 return "routed_fp8"
-            if self.em_enabled and T <= 128 and T * self.top_k > self.num_local_experts:
+            if self.em_enabled and T <= self.em_max_t and T * self.top_k > self.num_local_experts:
                 return "expert_major"
             if self.fp8_decode and T * self.top_k > self.num_local_experts:
                 return "fp8"
@@ -599,10 +602,13 @@ class MellumSparseMoeBlock(nn.Module):
         kw = dict(nbuf=int(os.environ.get("MELLUM_MOE_EM_NBUF", "2")), dedupe=1)
         if self.em_fp8:
             kw.update(gu_scale=self.em_gu_scale, d_scale=self.em_d_scale)
-            out = k(x.to(torch.bfloat16).contiguous(), aff.contiguous(), self.em_gu, self.em_dn, **kw)
-        else:
-            out = k(x.to(torch.bfloat16).contiguous(), aff.contiguous(), self.em_gu, self.em_dn, **kw)
-        out = out if isinstance(out, torch.Tensor) else out[0]
+        xb = x.to(torch.bfloat16).contiguous()
+        outs = []
+        for c0 in range(0, T, 128):
+            c1 = min(T, c0 + 128)
+            o = k(xb[c0:c1].contiguous(), aff[c0:c1].contiguous(), self.em_gu, self.em_dn, **kw)
+            outs.append(o if isinstance(o, torch.Tensor) else o[0])
+        out = outs[0] if len(outs) == 1 else torch.cat(outs, 0)
         return out.to(self.dtype)
 
     def build_expert_major_weights(self, device=None):
