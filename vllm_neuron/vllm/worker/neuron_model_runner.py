@@ -1820,6 +1820,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             and self.speculative_config is None
         )
 
+    def _per_step_greedy_step(self) -> bool:
+        """Return whether the current decode step can use the argmax graph.
+
+        True when every request of the step is greedy (vLLM's
+        ``sampling_metadata.all_greedy``) and no request asks for logprobs. The
+        caller also excludes structured-output steps.
+
+        Example:
+            >>> runner._per_step_greedy_step()  # doctest: +SKIP
+            True
+        """
+        md = self.input_batch.sampling_metadata
+        if not getattr(md, "all_greedy", False):
+            return False
+        return not getattr(md, "max_num_logprobs", None)
+
     def _compile_model(self, model: torch.nn.Module) -> torch.nn.Module:
         """Wrap the model with torch.compile, with the arguments of load_model."""
         from vllm_neuron.envs import (
@@ -6762,12 +6778,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # is the draft-length graph, so use the shared self.model.
         if not spec_decode_enabled:
             with self._plain_decode_forward() as plain_decode_forward:
-                model_output = plain_decode_forward(**kwargs)
                 if self._per_step_greedy_enabled():
-                    # The argmax-sampler graph of this bucket (all-greedy steps).
+                    # Both graphs of this bucket: the full sampler and the
+                    # argmax sampler (all-greedy steps). Same kwarg set.
+                    model_output = plain_decode_forward(**kwargs, greedy_step=False)
                     greedy_output = plain_decode_forward(**kwargs, greedy_step=True)
                     if self.use_async_scheduling:
                         self._materialize_warmup_output(greedy_output)
+                else:
+                    model_output = plain_decode_forward(**kwargs)
         else:
             # TODO(compiler-args): this is the spec-verify (draft-length target)
             # graph. To tune its arguments, wrap this call with
@@ -7639,6 +7658,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 logit_mask=logit_mask,
                 rotary_position_ids=rotary_position_ids,
                 mm_kwargs=mm_kwargs,
+                structured_output_step=(
+                    grammar_bitmask is not None if self.on_device_sampling else False
+                ),
             )
 
         # Store the last-accepted token from the rejection sampler (spec
@@ -9019,6 +9041,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         attn_metadata: AttentionMetadata | None,
         spec_decode_metadata: SpecDecodeMetadata | None = None,
         logit_mask: torch.Tensor | None = None,
+        structured_output_step: bool = False,
         rotary_position_ids: torch.Tensor | None = None,
         mm_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -9132,15 +9155,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             and next(iter(attn_metadata.values()))["max_query_len"]
             <= next(iter(attn_metadata.values()))["decode_token_threshold"]
         )
-        if (
-            is_decode_step
-            and spec_decode_metadata is None
-            and self._per_step_greedy_enabled()
-            and logit_mask is None
-            and getattr(self.input_batch.sampling_metadata, "all_greedy", False)
-            and not getattr(self.input_batch.sampling_metadata, "max_num_logprobs", None)
-        ):
-            model_kwargs["greedy_step"] = True
+        if is_decode_step and spec_decode_metadata is None and self._per_step_greedy_enabled():
+            # Always pass greedy_step on plain decode so both graphs of a bucket
+            # see the same kwargs (Dynamo guards on the kwarg count). The mask
+            # in this path is the all-true no-op mask unless structured output is
+            # active (grammar_bitmask), which _per_step_greedy_step excludes.
+            model_kwargs["greedy_step"] = (
+                not structured_output_step and self._per_step_greedy_step()
+            )
         if self._model_is_async_spec_decoded() and is_decode_step:
             num_reqs_padded = (
                 spec_decode_metadata.bonus_logits_indices.shape[0]

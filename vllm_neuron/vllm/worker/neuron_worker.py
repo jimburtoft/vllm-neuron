@@ -1909,6 +1909,8 @@ class NeuronWorker(WorkerBase):
                 device=device,
                 compiled_graph_input=True,
             )
+            if self.model_runner._per_step_greedy_enabled():
+                kwargs = dict(kwargs, greedy_step=False)
             jobs.append(
                 self._build_trace_job(
                     kwargs,
