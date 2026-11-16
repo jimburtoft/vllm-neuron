@@ -69,6 +69,12 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
   on-device sampler runs a 256-way top-k over every vocabulary shard on each step, even for greedy requests (~280 us).
   With `all_greedy` it is a distributed argmax: decode is 2-4 % faster (7.89 -> 7.71 ms at batch 1). It makes **every**
   request greedy, so do not use it when requests sample with a temperature.
+- Mixed greedy and sampled traffic: `VLLM_NEURON_PER_STEP_GREEDY=1` compiles a second (argmax) graph per decode
+  bucket and uses it on decode steps where every request is greedy and none asks for logprobs or structured output.
+  Other steps use the full sampler. Decode is 1-3 % faster on all-greedy steps (7.89 -> 7.74 ms at batch 1,
+  12.68 -> 12.24 ms at batch 32), and sampled requests are unchanged. It doubles the decode compile time.
+- `VLLM_NEURON_REPLICATED_DECODE_EMBEDDING=1` keeps the full embedding table on each rank for decode (+256 MiB per
+  rank in bf16) and skips the embedding all-reduce: -2.5 % at batch 32, no gain at batch 1-8.
 - `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (default 0.30) caps the KV cache. 0.6 is the largest value that
   still leaves HBM for the 8192-token prefill graph; 0.7 fails at load with `Allocation Failure`.
 - `decode_context_length_buckets` selects Model Runner V1 on this release. On the 10k server they double
