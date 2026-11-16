@@ -335,7 +335,9 @@ class MellumSparseMoeBlock(nn.Module):
         self.em_fp8 = os.environ.get("MELLUM_MOE_EM_FP8", "1") == "1"
         # T > 128: the kernel is called once per 128-row chunk (weights re-streamed per chunk; the kernel is
         # tensor-engine bound with DMA ~9 % busy, so the re-read is cheap). MELLUM_MOE_EM_MAX_T caps its use.
-        self.em_max_t = int(os.environ.get("MELLUM_MOE_EM_MAX_T", "512"))
+        # Measured (trn2, KV cap 0.42, mns 512): through the 256 bucket the chunked kernel wins (c256 +14 %); at the
+        # 512 bucket the 4 kernel copies' scratch plus KV 0.42 ran out of HBM (nrt_tensor_allocate status=4) -> 256.
+        self.em_max_t = int(os.environ.get("MELLUM_MOE_EM_MAX_T", "256"))
         # >>> PARALLELISM: router replicated on every rank <<<
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, dtype=self.dtype))
         self.gate_up_proj_weight = nn.Parameter(
