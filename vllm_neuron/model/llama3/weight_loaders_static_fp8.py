@@ -55,8 +55,26 @@ _QKV_FUSED = 3
 
 _FP8_E4M3FN_MAX = 448.0
 _FP8_E4M3_MAX = 240.0
-_FP8_WEIGHT_DOWNSCALE = _FP8_E4M3_MAX / _FP8_E4M3FN_MAX
-_FP8_SCALE_COMPENSATION = _FP8_E4M3FN_MAX / _FP8_E4M3_MAX
+_FP8_SCALE_COMPENSATION = _FP8_E4M3FN_MAX / _FP8_E4M3_MAX  # input (activation) scales
+
+
+def _weight_downscale() -> float:
+    """Factor that brings e4m3fn (448) weight bytes into the 240 range on trn2.
+
+    0.5 (default): a power of two, so the re-cast is exact (exponent shift; the
+    largest value 448 -> 224 < 240). 240/448 re-rounds every weight a second time
+    (+2.7 % relative weight error measured on Gaussian weights).
+    VLLM_NEURON_FP8_WEIGHT_DOWNSCALE=legacy restores 240/448.
+    """
+    import os
+
+    if os.environ.get("VLLM_NEURON_FP8_WEIGHT_DOWNSCALE") == "legacy":
+        return _FP8_E4M3_MAX / _FP8_E4M3FN_MAX
+    return 0.5
+
+
+_FP8_WEIGHT_DOWNSCALE = _weight_downscale()
+_FP8_WEIGHT_SCALE_COMPENSATION = 1.0 / _FP8_WEIGHT_DOWNSCALE  # weight scales
 
 
 def _needs_downscale() -> bool:
@@ -112,7 +130,7 @@ def _broadcast_scalar_scale_loader(
 
     def transform(slices, rank):
         mult = (
-            _FP8_SCALE_COMPENSATION if (is_weight_scale and _needs_downscale()) else 1.0
+            _FP8_WEIGHT_SCALE_COMPENSATION if (is_weight_scale and _needs_downscale()) else 1.0
         )
         assert len(slices) == 1, (
             f"_broadcast_scalar_scale_loader expects 1 slice, got {len(slices)}"
