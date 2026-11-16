@@ -82,4 +82,5 @@ One Trn2 device, LNC=2: `--tensor-parallel-size 4`, with or without `--enable-ex
 | `MELLUM_MOE_PAD_MASK` | `1` | Padding rows take no expert blocks in prefill |
 | `VLLM_NEURON_MAX_PREFILLS_PER_BATCH` | `1` | `N > 1`: pack up to N waiting prompts into one prefill step (per-request attention bounds and MoE padding mask) |
 | `MELLUM_MOE_FP8_ROUTED` | `0` | `1` (no EP only): FP8 e4m3 (128x128 block scales) copy of the experts and the fused routed-expert SwiGLU decode kernel (`swiglu_moe_fp8.py`) for decode batches up to `MELLUM_MOE_FP8_ROUTED_MAX_T` (32, the padded decode bucket). Needs `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.2` (the FP8 copy is +3.3 GB per core) |
+| `MELLUM_MOE_EM` | `0` | `1`: expert-major NKI decode MoE (`moe_decode_kernel.py`), each local expert loaded once per step; FP8 (`MELLUM_MOE_EM_FP8=1`, default) or bf16; up to `MELLUM_MOE_EM_MAX_T` (256) decode rows, 128-row chunks. Needs `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` <= 0.32 with `--max-num-seqs 512` |
 | `MELLUM_DECODE_ATTN` | `stock` | `torch`: torch reference of the decode attention kernel (CPU mode at TP=1) |

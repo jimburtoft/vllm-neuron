@@ -125,6 +125,24 @@ GSM8K-100: 97 % (bf16 97-98 %). The FP8 weights move greedy tokens more than bf1
 prompts (fp32 gap 1.14 at token 181, the token still in the fp32 top 5), so treat it as an opt-in accuracy trade.
 For throughput (32+ concurrent requests) use `--enable-expert-parallel` without FP8.
 
+### Expert-major FP8 decode MoE
+
+`MELLUM_MOE_EM=1` (with `--enable-expert-parallel`) replaces the bf16 torch decode MoE with an NKI kernel that loads
+each local expert's FP8 weights once per step for all decode rows (up to the 256-request decode bucket; the weights
+carry an extra FP8 copy, +2.8 GB per core). 2048 decode bucket, 8 prompts per prefill step, 128 / 1,024:
+
+| Concurrency | KV budget | bf16 torch MoE (default) | expert-major FP8 |
+|---:|---|---:|---:|
+| 8 | 0.25 | 588 tok/s, TPOT 13.5 ms | 644, 12.3 ms (+10 %) |
+| 32 | 0.25 | 2,045, 15.4 | 2,191, 14.4 (+7 %) |
+| 64 | 0.42 | 3,268, 19.2 | 3,649, 17.2 (+12 %) |
+| 128 | 0.42 / 0.32 | 2,951, 42.7 | 3,789, 33.1 (+28 %) |
+| 256 | 0.42 / 0.32 | 3,395, 74.1 | **4,294, 58.3 (+26 %)** |
+| 512 | 0.42 / 0.32 | **4,894, 102.0** | 4,804, 95.7 (-2 %) |
+
+With the kernel the KV budget must drop to 0.32 (0.42 runs out of HBM at load or under load at 512), so it does not
+raise the 512-request peak. Accuracy: fp32 gate PASS / PASS (max gap 0.28), GSM8K-100 97 %.
+
 ### Decode bucket ladder
 
 `"decode_context_length_buckets": [1024, 2048, 4096]` instead of `[2048]` (8 per step, EP=4, default KV):
