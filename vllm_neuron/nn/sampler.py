@@ -59,6 +59,7 @@ class Sampler(torch.nn.Module):
         sampling_params: torch.Tensor | None = None,
         logit_mask: torch.Tensor | None = None,
         tp_rank: torch.Tensor | None = None,
+        greedy_step: bool = False,
     ) -> torch.Tensor:
         """Sample from logits with per-request sampling parameters.
 
@@ -138,7 +139,7 @@ class Sampler(torch.nn.Module):
             return sample(
                 logits,
                 deterministic=self.deterministic,
-                all_greedy=self.all_greedy,
+                all_greedy=self.all_greedy or greedy_step,
                 tp_group=self.process_group,
                 max_top_k=self.max_top_k,
                 all2all_group=self.all2all_group,
@@ -157,7 +158,7 @@ class Sampler(torch.nn.Module):
             top_k=top_k,
             top_p=top_p,
             deterministic=self.deterministic,
-            all_greedy=self.all_greedy,
+            all_greedy=self.all_greedy or greedy_step,
             tp_group=self.process_group,
             max_top_k=self.max_top_k,
             all2all_group=self.all2all_group,

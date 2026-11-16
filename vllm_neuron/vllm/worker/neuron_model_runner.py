@@ -1795,6 +1795,31 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
         return logits.masked_fill(~bitmask, float("-inf"))
 
+    def _per_step_greedy_enabled(self) -> bool:
+        """Return whether decode picks a greedy (argmax) graph for all-greedy steps.
+
+        ``VLLM_NEURON_PER_STEP_GREEDY=1`` (opt-in): every decode bucket compiles a
+        second graph whose sampler is a distributed argmax. A decode step whose
+        requests are all greedy (temperature 0, as vLLM's
+        ``sampling_metadata.all_greedy`` reports) runs that graph; any other step
+        runs the full top-k / top-p sampler. Plain decode only (no spec decode, no
+        structured-output mask, no logprobs).
+
+        Example:
+            >>> runner._per_step_greedy_enabled()  # doctest: +SKIP
+            False
+        """
+        import os
+
+        return (
+            os.environ.get("VLLM_NEURON_PER_STEP_GREEDY") == "1"
+            and self.on_device_sampling
+            and not getattr(
+                self.neuron_config.on_device_sampling_config, "all_greedy", False
+            )
+            and self.speculative_config is None
+        )
+
     def _compile_model(self, model: torch.nn.Module) -> torch.nn.Module:
         """Wrap the model with torch.compile, with the arguments of load_model."""
         from vllm_neuron.envs import (
@@ -6738,6 +6763,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if not spec_decode_enabled:
             with self._plain_decode_forward() as plain_decode_forward:
                 model_output = plain_decode_forward(**kwargs)
+                if self._per_step_greedy_enabled():
+                    # The argmax-sampler graph of this bucket (all-greedy steps).
+                    greedy_output = plain_decode_forward(**kwargs, greedy_step=True)
+                    if self.use_async_scheduling:
+                        self._materialize_warmup_output(greedy_output)
         else:
             # TODO(compiler-args): this is the spec-verify (draft-length target)
             # graph. To tune its arguments, wrap this call with
@@ -9102,6 +9132,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             and next(iter(attn_metadata.values()))["max_query_len"]
             <= next(iter(attn_metadata.values()))["decode_token_threshold"]
         )
+        if (
+            is_decode_step
+            and spec_decode_metadata is None
+            and self._per_step_greedy_enabled()
+            and logit_mask is None
+            and getattr(self.input_batch.sampling_metadata, "all_greedy", False)
+            and not getattr(self.input_batch.sampling_metadata, "max_num_logprobs", None)
+        ):
+            model_kwargs["greedy_step"] = True
         if self._model_is_async_spec_decoded() and is_decode_step:
             num_reqs_padded = (
                 spec_decode_metadata.bonus_logits_indices.shape[0]

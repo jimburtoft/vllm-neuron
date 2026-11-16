@@ -1916,6 +1916,16 @@ class NeuronWorker(WorkerBase):
                     graph_type="decode",
                 )
             )
+            if self.model_runner._per_step_greedy_enabled():
+                # VLLM_NEURON_PER_STEP_GREEDY: the argmax-sampler graph of this
+                # bucket, used by decode steps whose requests are all greedy.
+                jobs.append(
+                    self._build_trace_job(
+                        dict(kwargs, greedy_step=True),
+                        native_compile_only=native_compile_only,
+                        graph_type="decode",
+                    )
+                )
             if spec_decode_enabled:
                 # Target model decode WITHOUT spec decode — separate
                 # cache key, different decode_token_threshold.

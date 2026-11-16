@@ -42,6 +42,7 @@ from vllm_neuron.utils.dtype_utils import (
     validate_fp8_segmented_supported,
 )
 from vllm_neuron.utils.weight_loader import (
+    SafetensorsWeightLoader,
     fused_qkv_weight_loader,
     set_weight_loader,
     sharding_weight_loader,
@@ -309,6 +310,20 @@ def _fuse_decode_norms() -> bool:
     import os
 
     return os.environ.get("VLLM_NEURON_FUSE_DECODE_NORMS") == "1"
+
+
+def _replicated_decode_embedding() -> bool:
+    """Return whether decode uses a replicated embedding table (no all-reduce).
+
+    ``VLLM_NEURON_REPLICATED_DECODE_EMBEDDING=1``. Off by default.
+
+    Example:
+        >>> _replicated_decode_embedding()  # doctest: +SKIP
+        False
+    """
+    import os
+
+    return os.environ.get("VLLM_NEURON_REPLICATED_DECODE_EMBEDDING") == "1"
 
 
 class LlamaAttention(nn.Module):
@@ -1584,6 +1599,26 @@ class LlamaModel(nn.Module):
         emb_loader = with_rank_override(emb_loader, rank=self.embedding_tp_rank)
         set_weight_loader(self.embed_tokens.weight, emb_loader)
 
+        # VLLM_NEURON_REPLICATED_DECODE_EMBEDDING=1: decode also keeps the full
+        # embedding table on every rank, so the decode embedding is a local
+        # gather with no all-reduce (one collective fewer per decode step; costs
+        # vocab x hidden x dtype bytes per rank). Prefill keeps the vocab-sharded
+        # table with its sequence-parallel reduce-scatter.
+        self.decode_embed_weight = None
+        if (
+            _replicated_decode_embedding()
+            and self.embedding_dp_size == 1
+            and self.embed_tokens.tp_size > 1
+        ):
+            self.decode_embed_weight = nn.Parameter(
+                torch.empty(
+                    (config.vocab_size, config.hidden_size), dtype=config.torch_dtype
+                ),
+                requires_grad=False,
+            )
+            # Identity loader: the whole checkpoint tensor on every rank.
+            set_weight_loader(self.decode_embed_weight, SafetensorsWeightLoader())
+
         # Eagle3 speculative decoding: layer indices whose hidden states
         # are collected for the draft model.  Empty until the drafter sets them.
         self.aux_hidden_state_layers = []
@@ -1618,9 +1653,12 @@ class LlamaModel(nn.Module):
         emb_rank = rank
         if rank is not None and self.embedding_dp_size > 1:
             emb_rank = self.embedding_tp_group.rank_in_group_tensor.to(rank.dtype)
-        hidden_states = self.embed_tokens(
-            input_ids, scatter_tokens=is_prefill, rank=emb_rank
-        )
+        if not is_prefill and self.decode_embed_weight is not None:
+            hidden_states = NF.embedding(input_ids, self.decode_embed_weight)
+        else:
+            hidden_states = self.embed_tokens(
+                input_ids, scatter_tokens=is_prefill, rank=emb_rank
+            )
         # Decode: embedding output at emb_dp gathered state
 
         # >>> PARALLELISM: Transition emb_dp → mlp_dp for decoder layers <<<
@@ -1784,6 +1822,7 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
         spec_decode_metadata=None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
+        greedy_step: bool = False,
         **kwargs,  # @async_speculative_decoding injects async-spec args
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         positions = positions.to(torch.int32)
@@ -1895,7 +1934,11 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
         if rank is not None and self.lm_head_dp_size > 1:
             lm_head_rank = self.lm_head_tp_group.rank_in_group_tensor.to(rank.dtype)
         sampled_tokens = self.sampler(
-            logits, sampling_params, logit_mask=logit_mask, tp_rank=lm_head_rank
+            logits,
+            sampling_params,
+            logit_mask=logit_mask,
+            tp_rank=lm_head_rank,
+            greedy_step=greedy_step,
         )
         if self.lm_head_dp_size > 1:
             # Slice sampled tokens after sampler; slicing logits earlier would
@@ -2098,6 +2141,9 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
         # <-- MODEL-SPECIFIC: Tied embeddings — load lm_head from embed_tokens checkpoint key
         if self.config.tie_word_embeddings:
             mappings["lm_head.weight"] = "model.embed_tokens.weight"
+        # Replicated decode embedding (VLLM_NEURON_REPLICATED_DECODE_EMBEDDING=1)
+        if getattr(self.model, "decode_embed_weight", None) is not None:
+            mappings["model.decode_embed_weight"] = "model.embed_tokens.weight"
 
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         rank_sharded = checkpoint.load_sharded_pipelined(
