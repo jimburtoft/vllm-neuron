@@ -1910,7 +1910,9 @@ class NeuronWorker(WorkerBase):
                 compiled_graph_input=True,
             )
             if self.model_runner._per_step_greedy_enabled():
-                kwargs = dict(kwargs, greedy_step=False)
+                kwargs = dict(
+                    self.model_runner._fresh_decode_kwargs(kwargs), greedy_step=False
+                )
             jobs.append(
                 self._build_trace_job(
                     kwargs,
@@ -1923,7 +1925,10 @@ class NeuronWorker(WorkerBase):
                 # bucket, used by decode steps whose requests are all greedy.
                 jobs.append(
                     self._build_trace_job(
-                        dict(kwargs, greedy_step=True),
+                        dict(
+                            self.model_runner._fresh_decode_kwargs(kwargs),
+                            greedy_step=True,
+                        ),
                         native_compile_only=native_compile_only,
                         graph_type="decode",
                     )

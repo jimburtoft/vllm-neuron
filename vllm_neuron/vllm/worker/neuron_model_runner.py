@@ -1820,6 +1820,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             and self.speculative_config is None
         )
 
+    @staticmethod
+    def _fresh_decode_kwargs(kwargs: dict) -> dict:
+        """Copy decode kwargs with a fresh attn_metadata (outer and per-layer dicts).
+
+        The tensors are shared; only the dict containers are copied, so keys the
+        model writes during one forward do not leak into the next call.
+
+        Example:
+            >>> k = {"attn_metadata": {"l0": {"a": 1}}}
+            >>> NeuronModelRunner._fresh_decode_kwargs(k)["attn_metadata"] is k["attn_metadata"]
+            False
+        """
+        out = dict(kwargs)
+        am = kwargs.get("attn_metadata")
+        if isinstance(am, dict):
+            out["attn_metadata"] = {
+                k: (dict(v) if isinstance(v, dict) else v) for k, v in am.items()
+            }
+        return out
+
     def _per_step_greedy_step(self) -> bool:
         """Return whether the current decode step can use the argmax graph.
 
@@ -6781,8 +6801,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 if self._per_step_greedy_enabled():
                     # Both graphs of this bucket: the full sampler and the
                     # argmax sampler (all-greedy steps). Same kwarg set.
-                    model_output = plain_decode_forward(**kwargs, greedy_step=False)
-                    greedy_output = plain_decode_forward(**kwargs, greedy_step=True)
+                    # Each call gets its own attn_metadata dict: the model caches
+                    # the decode mask in it, and a shared dict would compile the
+                    # second graph with the cache key present (serve-time miss).
+                    model_output = plain_decode_forward(
+                        **self._fresh_decode_kwargs(kwargs), greedy_step=False
+                    )
+                    greedy_output = plain_decode_forward(
+                        **self._fresh_decode_kwargs(kwargs), greedy_step=True
+                    )
                     if self.use_async_scheduling:
                         self._materialize_warmup_output(greedy_output)
                 else:
