@@ -367,7 +367,8 @@ class LlamaAttention(nn.Module):
                 mml = get_current_vllm_config().model_config.max_model_len
             except Exception:  # noqa: BLE001 - no vLLM context
                 mml = None
-            if mml is None or mml > orig:
+            # VLLM_NEURON_LLAMA4_SCALING_OFF=1: diagnostic only (wrong past original_max).
+            if (mml is None or mml > orig) and os.environ.get("VLLM_NEURON_LLAMA4_SCALING_OFF") != "1":
                 self.l4_beta = float(beta)
                 self.l4_orig = int(orig)
 
