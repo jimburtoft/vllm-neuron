@@ -63,7 +63,8 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
     Rp = ((R + 15) // 16) * 16
     NI = (IC + 127) // 128
     NI2 = (NI + 1) // 2
-    DRD = DR and int(dr) >= 2  # dr=2: double_row on the down projection too
+    DRD = DR and int(dr) == 2  # dr=2: double_row down, per-slot scale, SBUF accumulation
+    DR3 = DR and int(dr) == 3  # dr=3: two-pass: all h first, one per-row scale, double_row down in PSUM
 
     ident = _sb((128, 128), BF)
     io_p = _sb((128, 1))
@@ -72,6 +73,10 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
     nisa.iota(io_f, [[1, 128]], offset=0, channel_multiplier=0)
     nisa.tensor_scalar(dst=ident, data=io_f, op0=nl.equal, operand0=io_p)
 
+    identf_r = _sb((R, R))
+    nisa.tensor_copy(dst=identf_r, src=ident[0:R, 0:R])
+    ones1r = _sb((1, 128))
+    nisa.memset(ones1r, 1.0)
     # x -> K-major tiles xP[p, kt * R + r] = x[r, kt * 128 + p]
     xs = _sb((R, H), BF)
     nisa.dma_copy(dst=xs, src=x)
@@ -276,7 +281,111 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
 
     # software pipeline (pipe=1): the tensor engine runs in program order, so slot j's gate|up matmuls are
     # emitted before slot j-1's transposes / down matmuls, which wait on the vector engine's SiLU of slot j-1
-    if pipe:
+    if DR3:
+        # down weights for ALL slots stay resident (FP8: E * NI2*2*H bytes = 16 x 9.2 KB per partition = 147 KB? too big)
+        # -> keep a ring, but issue the first nbuf slots' down loads now so pass 2 starts without waiting
+        dbufs = []
+        for bi in range(nbuf):
+            t8 = _sb((128, NI2, 2, H), WDT)
+            nisa.memset(t8, 0.0, engine=nisa.gpsimd_engine)
+            dbufs.append(t8)
+
+        def _load_down(j):
+            if dedupe:
+                ivd = u.ap(pattern=[[E + 1, 1], [1, 1]], offset=j)
+                dkd = dict(scalar_offset=ivd, indirect_dim=0)
+                okd = dict(oob_mode=nisa.oob_mode.skip)
+                based = 0
+            else:
+                dkd, okd = {}, {}
+                based = j
+            db = dbufs[j % nbuf]
+            for ti, (o, n) in enumerate(I_TILES):
+                nisa.dma_copy(dst=db[0:n, ti // 2, ti % 2, :],
+                              src=Wd.ap(pattern=[[H, n], [1, H]], offset=based * I * H + (i0 + o) * H, **dkd), **okd)
+            return db
+
+        # pass 1: gate|up (double_row) + SiLU * up * routing weight * down scale for every slot -> hall [R, E*IC]
+        hall = _sb((R, E * IC), BF)
+        # x^T layout for h: per-slot transposes happen in pass 1 right after h is formed (overlaps pass-1 matmuls)
+        hT = _sb((128, E, NI, R), BF)
+        for j in range(E):
+            wg, wu, _ = bufs[j % nbuf]
+            if dedupe:
+                iv = u.ap(pattern=[[E + 1, 1], [1, 1]], offset=j)
+                dk = dict(scalar_offset=iv, indirect_dim=0)
+                ok = dict(oob_mode=nisa.oob_mode.skip)
+                base = 0
+            else:
+                dk, ok = {}, {}
+                base = j
+            nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * H * I2 + i0, **dk), **ok)
+            nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * H * I2 + I + i0, **dk), **ok)
+            gsc, dsc = sbufs[j % nbuf]
+            nisa.dma_copy(dst=gsc[:, 0:IC], src=gu_scale.ap(pattern=[[0, R], [1, IC]], offset=base * I2 + i0, **dk), **ok)
+            nisa.dma_copy(dst=gsc[:, IC:2 * IC], src=gu_scale.ap(pattern=[[0, R], [1, IC]], offset=base * I2 + I + i0, **dk), **ok)
+            nisa.dma_copy(dst=dsc, src=d_scale.ap(pattern=[[0, R], [1, 1]], offset=base, **dk), **ok)
+            gu = _sb((R, 2 * IC), BF)
+            for (which, co, cn) in GT:
+                wsrc = wg if which == 0 else wu
+                dco = which * IC + co
+                w3 = wsrc.reshape((128, KT2, 2, IC))
+                pgu = nl.ndarray((Rp, cn), dtype=F32, buffer=nl.psum)
+                for kt2 in range(KT2):
+                    nisa.nc_matmul(pgu, x8[:, kt2, :, :], w3[:, kt2, :, co:co + cn],
+                                   perf_mode=nisa.matmul_perf_mode.double_row)
+                gtmp = _sb((R, cn))
+                nisa.tensor_tensor(dst=gtmp, data1=pgu[0:R, :], data2=gsc[:, dco:dco + cn], op=nl.multiply)
+                nisa.tensor_scalar(dst=gu[:, dco:dco + cn], data=gtmp, op0=nl.multiply, operand0=xsc)
+            sg = _sb((R, IC), BF)
+            nisa.activation(dst=sg, data=gu[:, 0:IC], op=nl.silu)
+            hr = _sb((R, IC), BF)
+            nisa.tensor_tensor(dst=hr, data1=sg, data2=gu[:, IC:2 * IC], op=nl.multiply)
+            wcol = (wsel if dedupe else dense)[:, j:j + 1]
+            wds = _sb((R, 1))
+            nisa.tensor_tensor(dst=wds, data1=wcol, data2=dsc, op=nl.multiply)
+            nisa.tensor_scalar(dst=hall[:, j * IC:(j + 1) * IC], data=hr, op0=nl.multiply, operand0=wds)
+            for ti, (o, n) in enumerate(I_TILES):
+                ph = nl.ndarray((n, R), dtype=F32, buffer=nl.psum)
+                nisa.nc_matmul(ph, hall[:, j * IC + o:j * IC + o + n], ident[0:R, 0:R])
+                nisa.tensor_copy(dst=hT[0:n, j, ti, :], src=ph)
+        # one e4m3 scale per row over all slots: hsc[r] = amax_r / 240
+        ha = _sb((R, E * IC))
+        nisa.activation(dst=ha, op=nl.abs, data=hall)
+        hm = _sb((R, 1))
+        nisa.tensor_reduce(dst=hm, op=nl.maximum, data=ha, axis=1, keepdims=True)
+        nisa.tensor_scalar(dst=hm, data=hm, op0=nl.maximum, operand0=1e-20)
+        hsc = _sb((R, 1))
+        nisa.tensor_scalar(dst=hsc, data=hm, op0=nl.multiply, operand0=1.0 / 240.0)
+        hinv = _sb((R, 1))
+        nisa.reciprocal(dst=hinv, data=hsc)
+        # hinv as a row [128, R] (same value down each partition): ones[1,128]^T x hinv^T[1,R] via a K=1 matmul
+        hinvT = _sb((1, R))
+        pti = nl.ndarray((1, R), dtype=F32, buffer=nl.psum)
+        nisa.nc_matmul(pti, hinv, identf_r)
+        nisa.tensor_copy(dst=hinvT, src=pti)
+        pbc = nl.ndarray((128, R), dtype=F32, buffer=nl.psum)
+        nisa.nc_matmul(pbc, ones1r, hinvT)
+        hinvB = _sb((128, R))
+        nisa.tensor_copy(dst=hinvB, src=pbc)
+        h8 = _sb((128, E, NI2, 2, Rp), nl.float8_e4m3)
+        nisa.memset(h8, 0.0)
+        for j in range(E):
+            for ti, (o, n) in enumerate(I_TILES):
+                nisa.tensor_tensor(dst=h8[0:n, j, ti // 2, ti % 2, 0:R], data1=hT[0:n, j, ti, :], data2=hinvB[0:n, :],
+                                   op=nl.multiply)
+        # pass 2: down in double_row, accumulated over slots in PSUM (scale applied once at the end)
+        py3 = [nl.ndarray((Rp, n), dtype=F32, buffer=nl.psum) for (_, n) in HT]
+        for j in range(E):
+            db = _load_down(j)
+            for t, (ho, hn) in enumerate(HT):
+                for t2 in range(NI2):
+                    nisa.nc_matmul(py3[t], h8[:, j, t2, :, :], db[:, t2, :, ho:ho + hn],
+                                   perf_mode=nisa.matmul_perf_mode.double_row)
+        ys3 = _sb((R, H))
+        for t, (ho, hn) in enumerate(HT):
+            nisa.tensor_scalar(dst=ys3[:, ho:ho + hn], data=py3[t][0:R, :], op0=nl.multiply, operand0=hsc)
+    elif pipe:
         prev = None
         for j in range(E):
             cur = _stage_a(j)
@@ -291,6 +400,8 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
     y = nl.ndarray((R, H), dtype=F32, buffer=nl.shared_hbm)
     if DRD:
         ys = ysb
+    elif DR3:
+        ys = ys3
     else:
         ys = _sb((R, H))
         for t, (ho, hn) in enumerate(HT):

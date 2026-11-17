@@ -601,7 +601,7 @@ class MellumSparseMoeBlock(nn.Module):
         lnc = get_logical_nc_config()
         k = wrap_nki(mellum_moe_decode)
         k = k[lnc] if lnc > 1 else k
-        # MELLUM_MOE_EM_DR: FP8 double_row (1: gate/up, 2: gate/up + down). Standalone trn2: dr 1 -14 % at R 16
+        # MELLUM_MOE_EM_DR: FP8 double_row (1: gate/up, 2: + down per slot, 3: + down two-pass). dr 2 / 3 measured slower than dr 1. Standalone trn2: dr 1 -14 % at R 16
         # (250.7 -> 216.3 us), -3 % at R 64, -5 % at R 128; dr 2 no faster than dr 1. Per-token e4m3 activation
         # quantization: cos 0.99929 / 0.99899 vs 0.99999 for dr 0. Default 0 (accuracy gate not run).
         kw = dict(nbuf=int(os.environ.get("MELLUM_MOE_EM_NBUF", "2")), dedupe=1, dr=int(os.environ.get("MELLUM_MOE_EM_DR", "0")),
