@@ -71,6 +71,12 @@ logger = logging.getLogger(__name__)
 # a hybrid/SWA model with per-group block_size/window would need a per-group key).
 _DECODE_MASK_CACHE_KEY = "_cached_decode_mask"
 
+# nkilib mlp_tkg with column tiling fails kernel validation ("[NCC_INKI016]
+# Stack out of memory") above this intermediate size per rank, e.g. Mistral-7B
+# / Llama-3-8B at TP1 (14336). 7168 (TP2) compiles. Decode turns the column
+# tiling off past it; the non-tiled path compiles and is numerically identical.
+_MLP_TKG_COLUMN_TILING_MAX_I = 7168
+
 
 def _validate_dcp_prefill_kv_cache(
     k_cache: torch.Tensor,
@@ -1250,6 +1256,12 @@ class LlamaMLP(nn.Module):
             norm_type=NormType.RMS_NORM if ln_w is not None else NormType.NO_NORM,
             fused_add_tensor=fused_add_tensor,
             store_fused_add_result=fused_add_tensor is not None,
+            column_tiling=(
+                False
+                if not is_prefill
+                and self.intermediate_size_per_rank > _MLP_TKG_COLUMN_TILING_MAX_I
+                else None
+            ),
         )
         if fused_add_tensor is not None:
             output, fused_add_result = result
