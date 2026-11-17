@@ -142,6 +142,9 @@ _QKV_FUSED = 3
 # once per parameter at checkpoint load time and is transparent to
 # downstream code. The scale rescaling is folded into the scale-loader
 # transforms below.
+#
+# On Trn2, multiply input dequantization scales by 448/240.
+# This preserves the ModelOpt activation range after quantization.
 
 _FP8_E4M3_MAX = 240.0
 _FP8_E4M3FN_MAX = 448.0
@@ -203,28 +206,20 @@ def _read_scalar_from_slice(slice_obj) -> torch.Tensor:
     return flat
 
 
-def _broadcast_scalar_scale_loader(
-    is_weight_scale: bool,
-) -> SafetensorsWeightLoader:
+def _broadcast_scalar_scale_loader() -> SafetensorsWeightLoader:
     """Load a scalar fp32 checkpoint tensor and broadcast it to ``[128, 1]``.
 
     Expects exactly one checkpoint slice containing a scalar (``()``) or
     rank-1 length-1 (``(1,)``) tensor. Returns a contiguous ``[128, 1]``
     fp32 tensor with every entry equal to the scalar.
 
-    Args:
-        is_weight_scale: When ``True``, the returned scale is
-            pre-multiplied by :data:`_FP8_SCALE_COMPENSATION` to
-            absorb the ``240/448`` weight downscale applied by
-            :func:`_wrap_with_fp8_downscale`. When ``False`` (input
-            scale), no compensation is applied — see the module-level
-            comment above.
+    On Trn2, multiply the scale by :data:`_FP8_SCALE_COMPENSATION`.
+    Weight scales compensate for the ``240/448`` weight downscale.
+    Input scales preserve the ModelOpt activation range.
     """
 
     def transform(slices, rank):
-        mult = (
-            _FP8_SCALE_COMPENSATION if (is_weight_scale and _needs_downscale()) else 1.0
-        )
+        mult = _FP8_SCALE_COMPENSATION if _needs_downscale() else 1.0
         assert len(slices) == 1, (
             "_broadcast_scalar_scale_loader expects exactly one slice, "
             f"got {len(slices)}"
@@ -261,9 +256,8 @@ def _fused_qkv_input_scale_loader() -> SafetensorsWeightLoader:
     future checkpoint breaks this assumption the assertion catches it
     before the kernel silently miscomputes.
 
-    No ``_FP8_SCALE_COMPENSATION`` multiplication: the runtime activation
-    quantizers already produce Neuron-range values — see the
-    module-level comment.
+    On Trn2, multiply the input scale by ``_FP8_SCALE_COMPENSATION``.
+    This preserves the ModelOpt activation range.
     """
 
     def transform(slices, rank):
@@ -280,7 +274,8 @@ def _fused_qkv_input_scale_loader() -> SafetensorsWeightLoader:
                 "Fused QKV with per-projection input scales is not "
                 "supported by the STATIC kernel."
             )
-        return scalars[0].expand(_PMAX, 1).contiguous()
+        mult = _FP8_SCALE_COMPENSATION if _needs_downscale() else 1.0
+        return (scalars[0] * mult).expand(_PMAX, 1).contiguous()
 
     return SafetensorsWeightLoader(transform=transform)
 
@@ -516,16 +511,15 @@ class LlamaAttention(nn.Module):
         )
 
         # <-- STATIC-FP8: O weight + input scales (scalar → [128, 1]).
-        # weight scale compensates for the 240/448 weight downscale;
-        # input scale does not (activation quantizers are already
-        # Neuron-range-native — see the scale-loader module comment).
+        # Weight scales compensate for the 240/448 weight downscale.
+        # Input scales preserve the ModelOpt activation range on Trn2.
         set_weight_loader(
             self.o_weight_scale,
-            _broadcast_scalar_scale_loader(is_weight_scale=True),
+            _broadcast_scalar_scale_loader(),
         )
         set_weight_loader(
             self.o_input_scale,
-            _broadcast_scalar_scale_loader(is_weight_scale=False),
+            _broadcast_scalar_scale_loader(),
         )
 
     # ------------------------------------------------------------------
@@ -1238,27 +1232,27 @@ class LlamaMLP(nn.Module):
         set_weight_loader(self.down_proj_weight, down_loader)
 
         # <-- STATIC-FP8: weight and input scales (scalar → [128, 1]).
-        # Weight scales compensate for the 240/448 weight downscale;
-        # input scales do not.
+        # Weight scales compensate for the 240/448 weight downscale.
+        # Input scales preserve the ModelOpt activation range on Trn2.
         set_weight_loader(
             self.gate_weight_scale,
-            _broadcast_scalar_scale_loader(is_weight_scale=True),
+            _broadcast_scalar_scale_loader(),
         )
         set_weight_loader(
             self.up_weight_scale,
-            _broadcast_scalar_scale_loader(is_weight_scale=True),
+            _broadcast_scalar_scale_loader(),
         )
         set_weight_loader(
             self.down_weight_scale,
-            _broadcast_scalar_scale_loader(is_weight_scale=True),
+            _broadcast_scalar_scale_loader(),
         )
         set_weight_loader(
             self.gate_up_input_scale,
-            _broadcast_scalar_scale_loader(is_weight_scale=False),
+            _broadcast_scalar_scale_loader(),
         )
         set_weight_loader(
             self.down_input_scale,
-            _broadcast_scalar_scale_loader(is_weight_scale=False),
+            _broadcast_scalar_scale_loader(),
         )
 
     def forward(
