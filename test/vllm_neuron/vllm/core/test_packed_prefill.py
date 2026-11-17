@@ -47,7 +47,7 @@ class _Cfg:
         return None
 
 
-def _vllm_config(mns, ml, mnbt, buckets):
+def _vllm_config(mns, ml, mnbt, buckets, arch="GptOssForCausalLM"):
     import torch
 
     cfg = _Cfg()
@@ -56,7 +56,7 @@ def _vllm_config(mns, ml, mnbt, buckets):
     mc = MagicMock()
     for k, v in dict(max_model_len=ml, is_encoder_decoder=False, is_multimodal_model=False,
                      enable_return_routed_experts=False, uses_mrope=False, uses_xdrope=False,
-                     architectures=["MistralForCausalLM"], runner_type="generate",
+                     architectures=[arch], runner_type="generate",
                      enable_prompt_embeds=False, model="m").items():
         setattr(mc, k, v)
     cc = MagicMock()
@@ -69,7 +69,8 @@ def _vllm_config(mns, ml, mnbt, buckets):
         setattr(obs, k, v)
     vals = dict(
         scheduler_config=sc, model_config=mc, cache_config=cc, observability_config=obs,
-        additional_config={"neuron_config": {"num_batched_tokens_buckets": buckets}},
+        additional_config={"neuron_config": {"num_batched_tokens_buckets": buckets,
+                                             "quantization": "fp8"}},
         lora_config=None, kv_events_config=None, speculative_config=None, kv_transfer_config=None,
         ec_transfer_config=None, num_speculative_tokens=0, num_lookahead_tokens=0,
         ec_manager_config=Mock(get_encoder_cache_manager_obj=Mock(return_value=None)),
@@ -101,7 +102,7 @@ def _kv_cache_config(num_blocks):
 
 
 def _run(monkeypatch, lens, n_max, out_len=6, mns=16, buckets=(128, 256, 512, 1024, 2048, 4096),
-         limit=None, swa=False):
+         limit=None, swa=False, ml=4096, mnbt=None):
     from vllm.sampling_params import SamplingParams
     from vllm.v1.outputs import ModelRunnerOutput
     from vllm.v1.request import Request
@@ -118,8 +119,7 @@ def _run(monkeypatch, lens, n_max, out_len=6, mns=16, buckets=(128, 256, 512, 10
             monkeypatch.setenv(k, "1")
         else:
             monkeypatch.delenv(k, raising=False)
-    ml = 4096
-    cfg = _vllm_config(mns, ml, ml, list(buckets))
+    cfg = _vllm_config(mns, ml, mnbt or ml, list(buckets))
     sched = NeuronAsyncScheduler(
         vllm_config=cfg, kv_cache_config=_kv_cache_config(4000),
         structured_output_manager=Mock(should_advance=Mock(return_value=False)), block_size=BLOCK,
@@ -206,16 +206,49 @@ def test_packs_whole_prompts(monkeypatch, n_max, swa):
             assert len(pre) == 1
 
 
-def test_llama_family_opts_in(monkeypatch):
+def test_gpt_oss_quantization_gate(monkeypatch):
     cfg = _vllm_config(16, 2048, 2048, [128, 256, 512, 1024, 2048])
     monkeypatch.setenv(pp.ENV, "8")
-    for arch in ("LlamaForCausalLM", "MistralForCausalLM"):
-        cfg.model_config.architectures = [arch]
-        cfg.model_config.hf_config.quantization_config = None
+    for q in ("bf16", "fp8"):
+        cfg.additional_config["neuron_config"]["quantization"] = q
         assert pp.resolve_max_prefills(cfg) == (8, None)
-        cfg.model_config.hf_config.quantization_config = {"quant_method": "modelopt"}
-        n, reason = pp.resolve_max_prefills(cfg)
-        assert n == 1 and "bf16" in reason
+    cfg.additional_config["neuron_config"]["quantization"] = "mxfp4"
+    n, reason = pp.resolve_max_prefills(cfg)
+    assert n == 1 and "quantization" in reason
+    cfg.additional_config["neuron_config"]["quantization"] = "fp8"
+    cfg.additional_config["neuron_config"]["gk_decode"] = True
+    assert pp.resolve_max_prefills(cfg)[0] == 1
+
+
+def test_mixed_mode_packs_whole_prompts_and_chunks_long_ones(monkeypatch):
+    """max_num_batched_tokens 2048 < max_model_len 8192: long prompts are chunked alone."""
+    lens = [100, 13, 40, 300, 5, 5000, 64, 65, 129, 2047, 30, 200, 3000, 17, 128, 900]
+    sched, steps, finished = _run(monkeypatch, lens, n_max=8, ml=8192, mnbt=2048,
+                                  buckets=(128, 256, 512, 1024, 2048))
+    assert sched.max_prefills_per_batch == 8
+    assert finished == len(lens)
+    for pre, padded in steps:
+        if len(pre) > 1:
+            assert sum(n for _, n, _, _ in pre) <= 2048
+            for rid, n, c0, P in pre:
+                assert c0 == 0 and n == P, "packed prompt not whole"
+                assert padded[rid] == n
+        else:
+            (rid, n, c0, P), = pre
+            if c0 != 0 or n != P:  # a chunk keeps its bucket padding
+                assert padded[rid] == pp.bucket_for(n, [128, 256, 512, 1024, 2048])
+    assert max(len(p) for p, _ in steps) >= 2
+    chunked = [p for p, _ in steps if p[0][2] > 0]
+    assert chunked, "long prompts were not chunked"
+
+
+def test_mixed_mode_off_by_env(monkeypatch):
+    cfg = _vllm_config(16, 8192, 2048, [128, 256, 512, 1024, 2048])
+    monkeypatch.setenv(pp.ENV, "8")
+    assert pp.resolve_max_prefills(cfg) == (8, None)
+    monkeypatch.setenv(pp.MIXED_ENV, "0")
+    n, reason = pp.resolve_max_prefills(cfg)
+    assert n == 1 and "segmented" in reason
 
 
 def test_limit_env(monkeypatch):
@@ -234,7 +267,8 @@ def test_unsupported_model_stays_single(monkeypatch):
     monkeypatch.setenv(pp.ENV, "4")
     n, reason = pp.resolve_max_prefills(cfg)
     assert n == 1 and "supports_packed_prefill" in reason
-    cfg.model_config.architectures = ["MistralForCausalLM"]
+    cfg.model_config.architectures = ["GptOssForCausalLM"]
     cfg.scheduler_config.max_num_batched_tokens = 1024
+    monkeypatch.setenv(pp.MIXED_ENV, "0")
     n, reason = pp.resolve_max_prefills(cfg)
     assert n == 1 and "segmented" in reason

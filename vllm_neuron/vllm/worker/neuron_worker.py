@@ -2185,6 +2185,16 @@ class NeuronWorker(WorkerBase):
                 else:
                     kv_seg_size_for_bucket = kv_seg_size
                 targets[(bucket_size, kv_seg_size_for_bucket)] = None
+        # Packed prefill next to segmented prefill (mixed mode): each bucket up
+        # to the packed limit also compiles the packed full-prefill graph.
+        rows = getattr(self.model_runner, "packed_prefill_rows", 1)
+        limit = getattr(self.model_runner, "packed_prefill_limit", 0)
+        if not (isinstance(rows, int) and isinstance(limit, int)):
+            rows, limit = 1, 0
+        if rows > 1 and any(effective_kv_buckets):
+            for bucket_size in num_batched_tokens_buckets:
+                if bucket_size <= limit:
+                    targets[(bucket_size, 0)] = None
         return list(targets)
 
     def _extract_graphs(
@@ -2451,41 +2461,43 @@ class NeuronWorker(WorkerBase):
             num_batched_tokens_buckets,
         )
 
-        total_warmups = len(effective_kv_buckets) * len(num_batched_tokens_buckets)
+        # Warm up the same targets that were compiled (_prefill_compile_targets),
+        # so the packed graphs of mixed mode are warm too.
+        targets = self._prefill_compile_targets()
+        total_warmups = len(targets)
         warmup_count = 0
 
-        for kv_seg_size in effective_kv_buckets:
-            for bucket_size in num_batched_tokens_buckets:
-                warmup_count += 1
+        for bucket_size, kv_seg_size in targets:
+            warmup_count += 1
+            logger.info(
+                "\n[%s/%s] Warming up for prefill: bucket_size=%s, "
+                "kv_segment_size=%s",
+                warmup_count,
+                total_warmups,
+                bucket_size,
+                kv_seg_size,
+            )
+            try:
+                self.model_runner.warmup_prefill(bucket_size, kv_seg_size)
                 logger.info(
-                    "\n[%s/%s] Warming up for prefill: bucket_size=%s, "
-                    "kv_segment_size=%s",
-                    warmup_count,
-                    total_warmups,
+                    "  Successfully warmed up for prefill bucket %s "
+                    "with kv_segment_size %s",
                     bucket_size,
                     kv_seg_size,
                 )
-                try:
-                    self.model_runner.warmup_prefill(bucket_size, kv_seg_size)
-                    logger.info(
-                        "  Successfully warmed up for prefill bucket %s "
-                        "with kv_segment_size %s",
-                        bucket_size,
-                        kv_seg_size,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "  Failed to warmup for prefill bucket %s "
-                        "with kv_segment_size %s: %s",
-                        bucket_size,
-                        kv_seg_size,
-                        e,
-                        exc_info=True,
-                    )
-                    raise RuntimeError(
-                        f"Model warmup failed for prefill bucket {bucket_size} "
-                        f"with kv_segment_size {kv_seg_size}. Error: {e}"
-                    ) from e
+            except Exception as e:
+                logger.error(
+                    "  Failed to warmup for prefill bucket %s "
+                    "with kv_segment_size %s: %s",
+                    bucket_size,
+                    kv_seg_size,
+                    e,
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    f"Model warmup failed for prefill bucket {bucket_size} "
+                    f"with kv_segment_size {kv_seg_size}. Error: {e}"
+                ) from e
 
     def _decode_compile_targets(self) -> list[tuple[int, int]]:
         """Enumerate (batch_bucket, ctx_bucket) pairs to compile.

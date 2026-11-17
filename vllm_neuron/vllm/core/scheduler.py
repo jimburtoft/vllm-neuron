@@ -1068,9 +1068,14 @@ class NeuronScheduler(Scheduler):
                 # the bucket of the total (packed_prefill.pack_padding).
                 # A 1-token prompt keeps its bucket so the step still reads as
                 # prefill (the runner overwrites the counts either way).
+                # Only a whole, fresh prompt can be packed: a chunk of a long
+                # prompt (mixed mode) keeps its bucket padding.
                 scheduler_output.num_scheduled_tokens_padded[req_id] = (
                     num_tokens
-                    if num_tokens > 1 and padded_tokens <= self._packed_token_budget
+                    if num_tokens > 1
+                    and padded_tokens <= self._packed_token_budget
+                    and num_computed == 0
+                    and num_tokens == request.num_prompt_tokens
                     else padded_tokens
                 )
 

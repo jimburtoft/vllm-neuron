@@ -4296,6 +4296,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             max_num_draft_tokens,
             cached_seq_len,
             max_decode_ctx_len=max_decode_ctx_len,
+            packed_prefill=packed_step,
         )
         if packed_step:
             self._add_packed_prefill_bounds(
@@ -4703,7 +4704,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if any(self._is_decode_row(i) for i in range(num_reqs)):
             return False
         total = sum(scheduler_output.num_scheduled_tokens[r] for r in req_ids)
-        return total <= self.packed_prefill_limit
+        if total > self.packed_prefill_limit:
+            return False
+        # Mixed mode (segmented prefill on): only whole, fresh prompts take the
+        # packed full-prefill graph. A chunk of a long prompt keeps the one-row
+        # segmented graph, which reads its prior KV.
+        for i, r in enumerate(req_ids):
+            req = self.requests.get(r)
+            if req is None or int(self.input_batch.num_computed_tokens_cpu[i]) != 0:
+                return False
+            if scheduler_output.num_scheduled_tokens[r] != req.num_prompt_tokens:
+                return False
+        return True
 
     def _add_packed_prefill_bounds(
         self, attn_metadata: dict, actual_num_tokens: np.ndarray, total: int
@@ -5601,6 +5613,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         max_num_draft_tokens: int,
         cached_seq_len: int = 0,
         max_decode_ctx_len: int = 0,
+        packed_prefill: bool = False,
     ) -> AttentionMetadata | None:
         """
         Build attention metadata for KV cache and attention computation.
@@ -5682,8 +5695,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # _prefill_compile_targets, which skips the same pairs at compile
             # time -- otherwise we would dispatch a shape we never compiled.
             kv_segment_size = 0
+            # A packed prefill step (whole, fresh prompts) runs the full-prefill
+            # graph with segment bounds, also when segmented prefill is on.
             if (
-                self.neuron_config.kv_segment_size_buckets is not None
+                not packed_prefill
+                and self.neuron_config.kv_segment_size_buckets is not None
                 and segmented_prefill_supports_q_len(total_num_scheduled_tokens)
             ):
                 kv_segment_size = pick_kv_segment_size(

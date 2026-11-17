@@ -113,9 +113,11 @@ def unsupported_reason(vllm_config: "VllmConfig") -> str | None:
         return "the model does not declare supports_packed_prefill"
     archs = list(getattr(mc, "architectures", None) or [])
     if "GptOssForCausalLM" in archs:
-        # Only the bf16 GPT-OSS module honours the bounds (not mxfp4 / trn3 defaults).
-        if nc.get("quantization") != "bf16":
-            return "GPT-OSS packed prefill needs neuron_config quantization='bf16'"
+        # Only the model_bf16 GPT-OSS module honours the bounds. It serves both
+        # quantization 'bf16' and 'fp8' (FP8 expert weights); the mxfp4 modules
+        # (trn3 defaults, gk_decode) do not.
+        if nc.get("quantization") not in ("bf16", "fp8") or nc.get("gk_decode"):
+            return "GPT-OSS packed prefill needs neuron_config quantization 'bf16' or 'fp8'"
     if {"LlamaForCausalLM", "MistralForCausalLM"} & set(archs):
         # Only the bf16 llama3 module honours the bounds (not the static-FP8 one).
         hf = getattr(mc, "hf_config", None)
@@ -142,9 +144,37 @@ def unsupported_reason(vllm_config: "VllmConfig") -> str | None:
         return "structured outputs are enabled"
     if nc.get("max_jump_forward_tokens", 0):
         return "jump-forward decoding is enabled"
-    if nc.get("kv_segment_size_buckets") or sc.max_num_batched_tokens < mc.max_model_len:
+    if (
+        nc.get("kv_segment_size_buckets") or sc.max_num_batched_tokens < mc.max_model_len
+    ) and not mixed_mode_allowed(vllm_config):
         return "segmented (chunked) prefill is possible (max_num_batched_tokens < max_model_len)"
     return None
+
+
+MIXED_ENV = "VLLM_NEURON_PACKED_PREFILL_MIXED"
+
+
+def mixed_mode_allowed(vllm_config: "VllmConfig") -> bool:
+    """Packing next to segmented (chunked) prefill on the V1 runner.
+
+    A step of whole, fresh prompts that fit the packed limit runs the packed
+    full-prefill graph (``kv_segment_size`` 0). A later chunk of a long prompt
+    runs the one-row segmented graph, alone. On by default; set
+    ``VLLM_NEURON_PACKED_PREFILL_MIXED=0`` to require single-shot prefill.
+    """
+    if (os.getenv(MIXED_ENV) or "1").strip() == "0":
+        return False
+    try:
+        if vllm_config.use_v2_model_runner:
+            return False
+    except Exception:  # noqa: BLE001 - property may be unavailable on a partial config
+        pass
+    return True
+
+
+def is_mixed(vllm_config: "VllmConfig", segmented_on: bool) -> bool:
+    """True when packed prefill runs alongside segmented prefill."""
+    return segmented_on and mixed_mode_allowed(vllm_config)
 
 
 def resolve_max_prefills(vllm_config: "VllmConfig") -> tuple[int, str | None]:
