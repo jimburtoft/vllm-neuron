@@ -40,7 +40,7 @@ def _col_tiles(n, w=512):
 
 
 @nki.jit
-def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedupe=1, dr=0):
+def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedupe=1, dr=0, pipe=0):
     R, H = x.shape
     NC = nl.num_programs(0) if nl.program_ndim() > 0 else 1
     pid = nl.program_id(0) if nl.program_ndim() > 0 else 0
@@ -168,7 +168,8 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
                 nisa.memset(dsc0, 0.0)
             sbufs.append((gsc0, dsc0))
     py = [nl.ndarray((R, n), dtype=F32, buffer=nl.psum) for (_, n) in HT]
-    for j in range(E):
+    def _stage_a(j):
+        """weight / scale loads + gate|up matmuls + dequant for slot j -> (j, gu, dsc, wd buffers)"""
         wg, wu, wd = bufs[j % nbuf]
         if dedupe:
             iv = u.ap(pattern=[[E + 1, 1], [1, 1]], offset=j)
@@ -217,6 +218,11 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
                     nisa.tensor_tensor(dst=gu[:, dco:dco + cn], data1=pgu, data2=gsc[:, dco:dco + cn], op=nl.multiply)
                 else:
                     nisa.tensor_copy(dst=gu[:, dco:dco + cn], src=pgu)
+        return (j, gu, (dsc if FP8 else None), wd)
+
+    def _stage_b(st):
+        """SiLU * up, routing weight, transpose, down matmuls for a slot from _stage_a"""
+        j, gu, dsc, wd = st
         sg = _sb((R, IC), BF)
         nisa.activation(dst=sg, data=gu[:, 0:IC], op=nl.silu)
         hr = _sb((R, IC), BF)
@@ -267,6 +273,20 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
                 nisa.tensor_copy(dst=hs, src=ph)
                 for t, (ho, hn) in enumerate(HT):
                     nisa.nc_matmul(py[t], hs, wd[ti][:, ho:ho + hn])
+
+    # software pipeline (pipe=1): the tensor engine runs in program order, so slot j's gate|up matmuls are
+    # emitted before slot j-1's transposes / down matmuls, which wait on the vector engine's SiLU of slot j-1
+    if pipe:
+        prev = None
+        for j in range(E):
+            cur = _stage_a(j)
+            if prev is not None:
+                _stage_b(prev)
+            prev = cur
+        _stage_b(prev)
+    else:
+        for j in range(E):
+            _stage_b(_stage_a(j))
 
     y = nl.ndarray((R, H), dtype=F32, buffer=nl.shared_hbm)
     if DRD:
