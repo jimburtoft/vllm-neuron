@@ -299,6 +299,143 @@ def _torch_compatible_attention_block_tkg_kernel(
 
 
 @nki.jit
+def _torch_compatible_attention_block_tkg_kernel_qscale(
+    # -- input
+    X: Tensor,
+    X_hidden_dim_actual: int = None,
+    # -- rmsnorm X
+    rmsnorm_X_enabled: bool = False,
+    rmsnorm_X_eps: Optional[float] = None,
+    rmsnorm_X_gamma: Tensor = None,
+    # -- qkv projections
+    W_qkv: Tensor = None,
+    bias_qkv: Tensor = None,
+    quantization_type_qkv: QuantizationType = QuantizationType.NONE,
+    weight_dequant_scale_qkv: torch.Tensor = None,
+    input_dequant_scale_qkv: torch.Tensor = None,
+    # -- Q/K processing: pre-RoPE RMSNorm
+    rmsnorm_QK_pre_rope_enabled: bool = False,
+    rmsnorm_QK_pre_rope_eps: float = 1e-6,
+    rmsnorm_QK_pre_rope_W_Q: Tensor = None,
+    rmsnorm_QK_pre_rope_W_K: Tensor = None,
+    # -- Q/K processing: RoPE
+    cos: Optional[Tensor] = None,
+    sin: Optional[Tensor] = None,
+    rope_contiguous_layout: bool = True,
+    # -- Q/K processing: post-RoPE RMSNorm
+    rmsnorm_QK_post_rope_enabled: bool = False,
+    rmsnorm_QK_post_rope_eps: float = 1e-6,
+    rmsnorm_QK_post_rope_W_Q: Tensor = None,
+    rmsnorm_QK_post_rope_W_K: Tensor = None,
+    # -- attention
+    K_cache_transposed: bool = False,
+    active_blocks_table: Tensor = None,
+    K_cache: Tensor = None,
+    V_cache: Tensor = None,
+    attention_mask: Tensor = None,
+    sink: Tensor = None,
+    softmax_scale: float = None,
+    # -- in-kernel mask generation (when pos_ids is provided, the kernel
+    #    generates the prior causal/SWA mask on-chip from pos_ids and
+    #    attention_mask carries only the active-only portion)
+    pos_ids: Tensor = None,
+    swa_start_pos_ids: Tensor = None,
+    # -- KV cache update
+    update_cache: bool = False,
+    kv_cache_update_idx: Tensor = None,
+    k_scale: Tensor = None,
+    v_scale: Tensor = None,
+    # -- packed FP8 K cache layout
+    fp8_packed: bool = False,
+    # -- output projection
+    W_out: Tensor = None,
+    bias_out: Tensor = None,
+    quantization_type_out: QuantizationType = QuantizationType.NONE,
+    weight_dequant_scale_out: Tensor = None,
+    input_dequant_scale_out: Tensor = None,
+    transposed_out: bool = False,
+    # -- output control
+    out_in_sb: bool = False,
+    skip_attention: bool = False,
+    # -- STATIC_MX layout flag
+    is_h_transposed_by_4: bool = False,
+    # -- sbm
+    sbm_lower_bound: int = None,
+    sbm_upper_bound: int = None,
+    sbm_use_auto_alloc: bool = True,
+    sbm_default_stack_alloc: bool = True,
+    # -- per-token query scale [B, S_tkg] float32 (vendored kernel)
+    q_scale: Tensor = None,
+):
+    """
+    Torch-friendly @nki.jit wrapper that reconstructs NKI-specific objects
+    (SbufManager, QuantizationType) from plain scalar / tensor args and
+    delegates to the library attention_block_tkg kernel.
+    """
+
+    sbm = _maybe_build_sbm(
+        sbm_lower_bound, sbm_upper_bound, sbm_use_auto_alloc, sbm_default_stack_alloc
+    )
+
+    # Forward to the library kernel (no kv_heads argument — see the module header).
+    from vllm_neuron.functional.vendored_kernels.attention_block_tkg_qscale import (
+        attention_block_tkg as _nki_attention_block_tkg_qscale,
+    )
+
+    return _nki_attention_block_tkg_qscale(
+        X=X,
+        X_hidden_dim_actual=X_hidden_dim_actual,
+        rmsnorm_X_enabled=rmsnorm_X_enabled,
+        rmsnorm_X_eps=rmsnorm_X_eps,
+        rmsnorm_X_gamma=rmsnorm_X_gamma,
+        W_qkv=W_qkv,
+        bias_qkv=bias_qkv,
+        quantization_type_qkv=quantization_type_qkv,
+        weight_dequant_scale_qkv=weight_dequant_scale_qkv,
+        input_dequant_scale_qkv=input_dequant_scale_qkv,
+        rmsnorm_QK_pre_rope_enabled=rmsnorm_QK_pre_rope_enabled,
+        rmsnorm_QK_pre_rope_eps=rmsnorm_QK_pre_rope_eps,
+        rmsnorm_QK_pre_rope_W_Q=rmsnorm_QK_pre_rope_W_Q,
+        rmsnorm_QK_pre_rope_W_K=rmsnorm_QK_pre_rope_W_K,
+        cos=cos,
+        sin=sin,
+        rope_contiguous_layout=rope_contiguous_layout,
+        rmsnorm_QK_post_rope_enabled=rmsnorm_QK_post_rope_enabled,
+        rmsnorm_QK_post_rope_eps=rmsnorm_QK_post_rope_eps,
+        rmsnorm_QK_post_rope_W_Q=rmsnorm_QK_post_rope_W_Q,
+        rmsnorm_QK_post_rope_W_K=rmsnorm_QK_post_rope_W_K,
+        K_cache_transposed=K_cache_transposed,
+        active_blocks_table=active_blocks_table,
+        K_cache=K_cache,
+        V_cache=V_cache,
+        attention_mask=attention_mask,
+        sink=sink,
+        softmax_scale=softmax_scale,
+        update_cache=update_cache,
+        kv_cache_update_idx=kv_cache_update_idx,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        fp8_packed=fp8_packed,
+        W_out=W_out,
+        bias_out=bias_out,
+        quantization_type_out=quantization_type_out,
+        weight_dequant_scale_out=weight_dequant_scale_out,
+        input_dequant_scale_out=input_dequant_scale_out,
+        transposed_out=transposed_out,
+        out_in_sb=out_in_sb,
+        sbm=sbm,
+        skip_attention=skip_attention,
+        is_h_transposed_by_4=is_h_transposed_by_4,
+        KVDP=1,
+        KVDP_replica_group=None,
+        pos_ids=pos_ids,
+        swa_start_pos_ids=swa_start_pos_ids,
+        S_ctx=None,
+        q_scale=q_scale,
+    )
+
+
+@nki.jit
 def _torch_compatible_attention_block_tkg_kernel_dcp(
     # -- input
     X: Tensor,
@@ -1711,11 +1848,15 @@ def attention_decode(
         active_blocks_table=active_blocks_table,
         attention_dp=attention_dp,
     )
-    # The kernel scales Q by one scalar; a per-token q_scale runs the torch path.
+    # A per-token q_scale runs the vendored kernel (q_scale input) when the kernel is
+    # otherwise eligible; VLLM_NEURON_QSCALE_TORCH=1 forces the torch path.
     if q_scale is not None:
         if attention_dp > 1 or dcp_size > 1:
             raise NotImplementedError("q_scale is not supported with attention DP or DCP")
-        can_use_kernel = False
+        import os as _os
+
+        if _os.environ.get("VLLM_NEURON_QSCALE_TORCH") == "1" or V_cache.shape[-1] > _PMAX:
+            can_use_kernel = False
 
     # 2D-table GQA is already routed to the torch fallback by
     # _can_use_attention_block_kernel.
@@ -1797,9 +1938,15 @@ def attention_decode(
                 swa_start_pos_ids=swa_start_pos_ids,
             )
         else:
-            wrapped = wrap_nki(_torch_compatible_attention_block_tkg_kernel)
+            extra = {}
+            if q_scale is not None:
+                wrapped = wrap_nki(_torch_compatible_attention_block_tkg_kernel_qscale)
+                extra["q_scale"] = q_scale.to(torch.float32).reshape(X.shape[0], X.shape[1])
+            else:
+                wrapped = wrap_nki(_torch_compatible_attention_block_tkg_kernel)
             kernel_out = wrapped[lnc_degree](
                 X,
+                **extra,
                 X_hidden_dim_actual=X_hidden_dim_actual,
                 rmsnorm_X_enabled=rmsnorm_X_enabled,
                 rmsnorm_X_eps=rmsnorm_X_eps,

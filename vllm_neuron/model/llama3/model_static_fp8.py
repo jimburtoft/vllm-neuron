@@ -77,6 +77,7 @@ from .config import LlamaConfig
 from .model import (
     _DECODE_MASK_CACHE_KEY,
     _segmented_attention_cp_prefill,
+    llama4_query_scale,
     _validate_dcp_decode_sequence_length,
     _validate_dcp_prefill_kv_cache,
 )
@@ -354,6 +355,22 @@ class LlamaAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.scaling = config.head_dim**-0.5
 
+        # <-- MODEL-SPECIFIC: Llama 4 query scaling (same rule as the bf16 module).
+        self.l4_beta = None
+        self.l4_orig = None
+        beta = getattr(config, "llama_4_scaling_beta", None)
+        orig = getattr(config, "llama_4_scaling_original_max", None)
+        if beta and orig:
+            try:
+                from vllm.config import get_current_vllm_config
+
+                mml = get_current_vllm_config().model_config.max_model_len
+            except Exception:  # noqa: BLE001 - no vLLM context
+                mml = None
+            if mml is None or mml > orig:
+                self.l4_beta = float(beta)
+                self.l4_orig = int(orig)
+
         # >>> PARALLELISM: TP group setup <<<
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
@@ -613,6 +630,15 @@ class LlamaAttention(nn.Module):
     # Prefill
     # ------------------------------------------------------------------
 
+    def _apply_l4_scale(self, q: torch.Tensor, positions, tokens: int) -> torch.Tensor:
+        """Llama 4 query scaling after RoPE on prefill Q [Nh, T, Dh] (no-op when off)."""
+        if self.l4_beta is None:
+            return q
+        if self.dcp_size > 1:
+            raise NotImplementedError("Llama 4 query scaling with DCP")
+        s = llama4_query_scale(positions, self.l4_beta, self.l4_orig)
+        return q * s.to(q.dtype).view(1, tokens, 1)
+
     def forward_prefill(
         self,
         hidden_states: torch.Tensor,
@@ -719,6 +745,7 @@ class LlamaAttention(nn.Module):
                 .view(tokens, self.num_attention_heads_per_rank, self.head_dim)
                 .transpose(0, 1)
             )
+            q = self._apply_l4_scale(q, positions, tokens)
 
             # FP8 KV dequant for the segmented read: the in-kernel write stored
             # k*k_scale / v*v_scale, so fold the K-dequant into the softmax scale
@@ -764,6 +791,7 @@ class LlamaAttention(nn.Module):
             q = q.view(
                 tokens, self.num_attention_heads_per_rank, self.head_dim
             ).transpose(0, 1)
+            q = self._apply_l4_scale(q, positions, tokens)
             k = k.view(tokens, self.num_kv_heads_for_weight, self.head_dim).transpose(
                 0, 1
             )
@@ -1134,6 +1162,14 @@ class LlamaAttention(nn.Module):
             dcp_active_owner=dcp_active_mask,
             fp8_fused_mask_allowed=fuse_mask,
             return_updated_kv=_needs_k_back,
+            # <-- MODEL-SPECIFIC: Llama 4 query scaling (per-token kernel input).
+            q_scale=(
+                llama4_query_scale(positions, self.l4_beta, self.l4_orig).view(
+                    B_local, S_decode
+                )
+                if self.l4_beta is not None
+                else None
+            ),
         )
         if _needs_k_back:
             output, _k_updated, _v_updated = _decode_result

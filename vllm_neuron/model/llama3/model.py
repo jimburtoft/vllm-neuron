@@ -20,6 +20,7 @@ PARALLELISM SHARDING:
 
 import logging
 import math
+import os
 
 import torch
 from torch import nn
@@ -1114,7 +1115,8 @@ class LlamaAttention(nn.Module):
             nkh > 1
             and S_decode == 1
             and not dcp_decode_active
-            and self.l4_beta is None  # q_scale runs the torch path (2D table)
+            # q_scale (Llama 4 scaling) runs the kernel too, unless forced to torch.
+            and (self.l4_beta is None or os.environ.get("VLLM_NEURON_QSCALE_TORCH") != "1")
             and can_run_kernel(hidden_states)
         ):
             active_blocks_table = build_per_head_block_table(block_table, nkh).to(
@@ -1187,7 +1189,7 @@ class LlamaAttention(nn.Module):
             kv_needs_a2a=self.kv_needs_a2a,
             dcp_size=self.dcp_size if dcp_decode_active else 1,
             dcp_group=self.dcp_group if dcp_decode_active else None,
-            # <-- MODEL-SPECIFIC: Llama 4 query scaling (runs the torch path).
+            # <-- MODEL-SPECIFIC: Llama 4 query scaling (per-token kernel input).
             q_scale=(
                 llama4_query_scale(positions, self.l4_beta, self.l4_orig).view(
                     B_local, S_decode
