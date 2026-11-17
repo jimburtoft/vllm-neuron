@@ -401,6 +401,53 @@ class Fp8RowColumnParallelLinear(nn.Module):
         return out * self.weight_scale
 
 
+def _fp8_row_mlp() -> bool:
+    """Return whether the BF16 llama3 MLP self-quantizes to FP8 ROW at load.
+
+    ``VLLM_NEURON_FP8_ROW_MLP=1``. Off by default. Weights: e4m3 with one fp32
+    scale per output channel (absmax / 240) from the BF16 checkpoint.
+    Activations: weight-only on decode (TKG), dynamic per token on prefill (CTE).
+
+    Example:
+        >>> _fp8_row_mlp()  # doctest: +SKIP
+        False
+    """
+    import os
+
+    return os.environ.get("VLLM_NEURON_FP8_ROW_MLP") == "1"
+
+
+# nkilib's TKG/CTE split for the MLP (TKG_BS_SEQLEN_THRESHOLD). The ROW CTE
+# kernel needs a pre-quantized [T, H+4] input; TKG takes bf16 activations.
+_FP8_ROW_MLP_TKG_MAX_T = 96
+_FP8_ROW_PMAX = 128
+
+
+def _fp8_row_quantize_kn(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``w`` [K, N] -> (e4m3 [K, N], fp32 [128, N] per-output-channel dequant scale).
+
+    Example:
+        >>> q, s = _fp8_row_quantize_kn(torch.randn(8, 4))
+        >>> tuple(q.shape), tuple(s.shape)
+        ((8, 4), (128, 4))
+    """
+    wf = w.to(torch.float32)
+    scale = (wf.abs().amax(dim=0, keepdim=True) / _LM_HEAD_FP8_MAX).clamp(min=1e-12)
+    q = (wf / scale).clamp(-_LM_HEAD_FP8_MAX, _LM_HEAD_FP8_MAX).to(torch.float8_e4m3fn)
+    return q, scale.expand(_FP8_ROW_PMAX, scale.shape[1]).contiguous()
+
+
+def _fp8_row_wrap(loader: SafetensorsWeightLoader, want: str) -> SafetensorsWeightLoader:
+    """Quantize the [K, N] output of a BF16 loader: ``want`` "q" (weight) or "s" (scale)."""
+    base = loader.transform or (lambda slices, rank: slices[0][:])
+
+    def transform(slices, rank):
+        q, sc = _fp8_row_quantize_kn(base(slices, rank))
+        return q if want == "q" else sc
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
 def _replicated_decode_embedding() -> bool:
     """Return whether decode uses a replicated embedding table (no all-reduce).
 
@@ -1278,6 +1325,31 @@ class LlamaMLP(nn.Module):
             )
         )
 
+        # VLLM_NEURON_FP8_ROW_MLP=1: FP8 e4m3 weights + per-output-channel scales.
+        self.fp8_row = _fp8_row_mlp()
+        if self.fp8_row:
+            H, inter = config.hidden_size, self.intermediate_size_per_rank
+            f8 = torch.float8_e4m3fn
+            self.gate_proj_weight = nn.Parameter(
+                torch.empty(H, inter, dtype=f8), requires_grad=False
+            )
+            self.up_proj_weight = nn.Parameter(
+                torch.empty(H, inter, dtype=f8), requires_grad=False
+            )
+            self.down_proj_weight = nn.Parameter(
+                torch.empty(inter, H, dtype=f8), requires_grad=False
+            )
+            for name, n in (("gate_w_scale", inter), ("up_w_scale", inter), ("down_w_scale", H)):
+                setattr(
+                    self,
+                    name,
+                    nn.Parameter(
+                        torch.empty(_FP8_ROW_PMAX, n, dtype=torch.float32),
+                        requires_grad=False,
+                    ),
+                )
+            self.out_dtype_name = str(config.torch_dtype).removeprefix("torch.")
+
         self._setup_weight_loaders(config)
 
     def _setup_weight_loaders(self, config):
@@ -1298,6 +1370,14 @@ class LlamaMLP(nn.Module):
         gate_up_loader = with_rank_override(gate_up_loader, rank=self.mlp_tp_rank)
         down_loader = with_rank_override(down_loader, rank=self.mlp_tp_rank)
 
+        if self.fp8_row:
+            set_weight_loader(self.gate_proj_weight, _fp8_row_wrap(gate_up_loader, "q"))
+            set_weight_loader(self.up_proj_weight, _fp8_row_wrap(gate_up_loader, "q"))
+            set_weight_loader(self.down_proj_weight, _fp8_row_wrap(down_loader, "q"))
+            set_weight_loader(self.gate_w_scale, _fp8_row_wrap(gate_up_loader, "s"))
+            set_weight_loader(self.up_w_scale, _fp8_row_wrap(gate_up_loader, "s"))
+            set_weight_loader(self.down_w_scale, _fp8_row_wrap(down_loader, "s"))
+            return
         set_weight_loader(self.gate_proj_weight, gate_up_loader)
         set_weight_loader(self.up_proj_weight, gate_up_loader)
         set_weight_loader(self.down_proj_weight, down_loader)
@@ -1329,23 +1409,26 @@ class LlamaMLP(nn.Module):
         if is_prefill and self.mlp_tp_size > 1:
             hidden_states = self.mlp_tp_group.all_gather(hidden_states, dim=0)
 
-        result = NF.mlp(
-            hidden_states,
-            self.gate_proj_weight,
-            self.up_proj_weight,
-            self.down_proj_weight,
-            eps=eps,
-            ln_w=ln_w.view(1, -1) if ln_w is not None else None,
-            norm_type=NormType.RMS_NORM if ln_w is not None else NormType.NO_NORM,
-            fused_add_tensor=fused_add_tensor,
-            store_fused_add_result=fused_add_tensor is not None,
-            column_tiling=(
-                False
-                if not is_prefill
-                and self.intermediate_size_per_rank > _MLP_TKG_COLUMN_TILING_MAX_I
-                else None
-            ),
-        )
+        if self.fp8_row:
+            result = self._forward_fp8_row(hidden_states, ln_w, eps)
+        else:
+            result = NF.mlp(
+                hidden_states,
+                self.gate_proj_weight,
+                self.up_proj_weight,
+                self.down_proj_weight,
+                eps=eps,
+                ln_w=ln_w.view(1, -1) if ln_w is not None else None,
+                norm_type=NormType.RMS_NORM if ln_w is not None else NormType.NO_NORM,
+                fused_add_tensor=fused_add_tensor,
+                store_fused_add_result=fused_add_tensor is not None,
+                column_tiling=(
+                    False
+                    if not is_prefill
+                    and self.intermediate_size_per_rank > _MLP_TKG_COLUMN_TILING_MAX_I
+                    else None
+                ),
+            )
         if fused_add_tensor is not None:
             output, fused_add_result = result
         else:
@@ -1365,6 +1448,55 @@ class LlamaMLP(nn.Module):
         if fused_add_tensor is not None:
             return output, fused_add_result
         return output
+
+    def _forward_fp8_row(
+        self, x: torch.Tensor, ln_w: torch.Tensor | None, eps: float
+    ) -> torch.Tensor:
+        """FP8 ROW MLP (VLLM_NEURON_FP8_ROW_MLP=1); ``x`` is already normed unless ``ln_w``.
+
+        CPU / fallback: dequantized BF16 weights through the plain MLP.
+        """
+        from nkilib.core.utils.common_types import QuantizationType
+
+        if not can_run_kernel(x):
+            def dq(w, sc):
+                return (w.to(torch.float32) * sc[0:1]).to(x.dtype)
+
+            if ln_w is not None:
+                xf = x.to(torch.float32)
+                x = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(
+                    x.dtype
+                ) * ln_w.view(1, -1)
+            return NF.mlp(
+                x,
+                dq(self.gate_proj_weight, self.gate_w_scale),
+                dq(self.up_proj_weight, self.up_w_scale),
+                dq(self.down_proj_weight, self.down_w_scale),
+            )
+        norm_type = NormType.RMS_NORM if ln_w is not None else NormType.NO_NORM
+        if x.shape[0] > _FP8_ROW_MLP_TKG_MAX_T:
+            # CTE: fused RMSNorm + per-token dynamic quant -> [T, H+4]. The caller
+            # passes the raw residual with ln_w (rmsnorm_quant always normalizes).
+            if ln_w is None:
+                raise ValueError("FP8 ROW MLP prefill needs ln_w (raw residual input)")
+            x = NF.rmsnorm_quant(
+                x, ln_w.view(1, -1), None, eps=eps, quantization_type=QuantizationType.ROW
+            )
+            norm_type, ln_w = NormType.NO_NORM, None
+        return NF.mlp(
+            x,
+            self.gate_proj_weight,
+            self.up_proj_weight,
+            self.down_proj_weight,
+            eps=eps,
+            ln_w=ln_w.view(1, -1) if ln_w is not None else None,
+            norm_type=norm_type,
+            quantization_type=QuantizationType.ROW,
+            gate_w_scale=self.gate_w_scale,
+            up_w_scale=self.up_w_scale,
+            down_w_scale=self.down_w_scale,
+            output_dtype=self.out_dtype_name,
+        )
 
 
 # =============================================================================
@@ -1553,7 +1685,7 @@ class LlamaDecoderLayer(nn.Module):
                 ln_w=self.post_attention_layernorm.weight,
                 eps=self.rms_norm_eps,
             )
-        elif _fuse_decode_norms():
+        elif _fuse_decode_norms() or getattr(self.mlp, "fp8_row", False):
             # <-- MODEL-SPECIFIC: Pre-MLP RMSNorm fused into the MLP kernel
             hidden_states = self.mlp(
                 hidden_states,
@@ -1604,6 +1736,14 @@ class LlamaDecoderLayer(nn.Module):
         # prefill (they fuse it with the static activation quant via
         # ``NF.rmsnorm_quant``). The bf16 path keeps the explicit norm call.
         if self._mlp_scheme is QuantScheme.FP8_STATIC_PER_TENSOR:
+            hidden_states = self.mlp(
+                hidden_states,
+                is_prefill=True,
+                ln_w=self.post_attention_layernorm.weight,
+                eps=self.rms_norm_eps,
+            )
+        elif getattr(self.mlp, "fp8_row", False):
+            # FP8 ROW MLP: norm + per-token quant fused after the SP all-gather.
             hidden_states = self.mlp(
                 hidden_states,
                 is_prefill=True,
@@ -2223,6 +2363,13 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
             mappings[f"{prefix}.mlp.down_proj_weight"] = (
                 f"{prefix}.mlp.down_proj.weight"
             )
+            # FP8 ROW MLP (VLLM_NEURON_FP8_ROW_MLP=1): scales derive from the
+            # same BF16 tensors as the weights.
+            if getattr(self.model.layers[layer_id].mlp, "fp8_row", False):
+                for nm in ("gate", "up", "down"):
+                    mappings[f"{prefix}.mlp.{nm}_w_scale"] = (
+                        f"{prefix}.mlp.{nm}_proj.weight"
+                    )
 
             # <-- MX FP8 dual-buffer (trn3): CTE (MX swizzled) + TKG
             # (plain fp8 STATIC decode) MLP buffers.
