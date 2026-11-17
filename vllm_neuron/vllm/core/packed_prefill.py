@@ -103,6 +103,20 @@ def _model_supports(vllm_config: "VllmConfig") -> bool:
     )
 
 
+SPEC_ENV = "VLLM_NEURON_PACKED_PREFILL_SPEC"
+
+
+def _spec_supported(spec, archs: list[str]) -> bool:
+    """EAGLE3 with GPT-OSS: the draft layer shares the target's attention metadata
+    (llama3 full prefill honours the bounds), samples at each prompt's last real
+    token and writes its own KV at the prompts' slots. Other methods (MTP, DFlash,
+    P-EAGLE) are not adapted. ``VLLM_NEURON_PACKED_PREFILL_SPEC=0`` turns it off.
+    """
+    if (os.getenv(SPEC_ENV) or "1").strip() == "0":
+        return False
+    return getattr(spec, "method", None) == "eagle3" and "GptOssForCausalLM" in archs
+
+
 def unsupported_reason(vllm_config: "VllmConfig") -> str | None:
     """Why packed prefill cannot run with this configuration, or None if it can."""
     mc = vllm_config.model_config
@@ -124,8 +138,9 @@ def unsupported_reason(vllm_config: "VllmConfig") -> str | None:
         qc = getattr(hf, "quantization_config", None)
         if isinstance(qc, dict) and qc.get("quant_method"):
             return "llama3 packed prefill needs an unquantized (bf16) checkpoint"
-    if vllm_config.speculative_config is not None:
-        return "speculative decoding is configured"
+    spec = vllm_config.speculative_config
+    if spec is not None and not _spec_supported(spec, archs):
+        return "speculative decoding is configured (only EAGLE3 with GPT-OSS packs)"
     if vllm_config.kv_transfer_config is not None:
         return "a KV connector is configured"
     if getattr(pc, "data_parallel_size", 1) > 1:

@@ -102,7 +102,7 @@ def _kv_cache_config(num_blocks):
 
 
 def _run(monkeypatch, lens, n_max, out_len=6, mns=16, buckets=(128, 256, 512, 1024, 2048, 4096),
-         limit=None, swa=False, ml=4096, mnbt=None):
+         limit=None, swa=False, ml=4096, mnbt=None, spec_k=0):
     from vllm.sampling_params import SamplingParams
     from vllm.v1.outputs import ModelRunnerOutput
     from vllm.v1.request import Request
@@ -120,6 +120,13 @@ def _run(monkeypatch, lens, n_max, out_len=6, mns=16, buckets=(128, 256, 512, 10
         else:
             monkeypatch.delenv(k, raising=False)
     cfg = _vllm_config(mns, ml, mnbt or ml, list(buckets))
+    if spec_k:
+        spec = Mock(method="eagle3", num_speculative_tokens=spec_k,
+                    num_speculative_tokens_per_batch_size=None, max_num_new_slots_for_drafting=spec_k)
+        spec.use_eagle.return_value = True
+        spec.use_multi_module_mtp.return_value = False
+        object.__setattr__(cfg, "speculative_config", spec)
+        object.__setattr__(cfg, "num_speculative_tokens", spec_k)
     sched = NeuronAsyncScheduler(
         vllm_config=cfg, kv_cache_config=_kv_cache_config(4000),
         structured_output_manager=Mock(should_advance=Mock(return_value=False)), block_size=BLOCK,
@@ -156,6 +163,10 @@ def _run(monkeypatch, lens, n_max, out_len=6, mns=16, buckets=(128, 256, 512, 10
         ids = list(out.num_scheduled_tokens)
         mro = ModelRunnerOutput(req_ids=ids, req_id_to_index={r: j for j, r in enumerate(ids)},
                                 sampled_token_ids=[[11] if samples[r] else [] for r in ids])
+        if spec_k:
+            from vllm.v1.outputs import DraftTokenIds
+            live = [r for r in ids if samples[r]]
+            sched.update_draft_token_ids(DraftTokenIds(live, [[12] * spec_k for _ in live]))
         for v in sched.update_from_output(out, mro).values():
             finished += sum(1 for o in v.outputs if o.finish_reason is not None)
         assert steps < 50 * (len(lens) + out_len), "stalled"
@@ -272,3 +283,35 @@ def test_unsupported_model_stays_single(monkeypatch):
     monkeypatch.setenv(pp.MIXED_ENV, "0")
     n, reason = pp.resolve_max_prefills(cfg)
     assert n == 1 and "segmented" in reason
+
+
+def test_spec_gate_eagle3_gpt_oss_only(monkeypatch):
+    cfg = _vllm_config(16, 8192, 2048, [128, 256, 512, 1024, 2048])
+    monkeypatch.setenv(pp.ENV, "8")
+    object.__setattr__(cfg, "speculative_config", Mock(method="eagle3", num_speculative_tokens=1))
+    assert pp.resolve_max_prefills(cfg) == (8, None)
+    monkeypatch.setenv(pp.SPEC_ENV, "0")
+    n, reason = pp.resolve_max_prefills(cfg)
+    assert n == 1 and "speculative" in reason
+    monkeypatch.delenv(pp.SPEC_ENV)
+    for method in ("mtp", "dflash", "ngram"):
+        cfg.speculative_config.method = method
+        assert pp.resolve_max_prefills(cfg)[0] == 1
+    cfg.speculative_config.method = "eagle3"
+    cfg.model_config.architectures = ["LlamaForCausalLM"]
+    assert pp.resolve_max_prefills(cfg)[0] == 1
+
+
+def test_packs_with_eagle3_drafts(monkeypatch):
+    """EAGLE3 k=1: prompts still pack, chunks run alone, prefill and decode never mix."""
+    lens = [100, 13, 40, 300, 5, 3000, 64, 65, 129, 2047, 30, 200, 17, 128, 900]
+    sched, steps, finished = _run(monkeypatch, lens, n_max=8, ml=4096, mnbt=2048,
+                                  buckets=(128, 256, 512, 1024, 2048), spec_k=1)
+    assert sched.max_prefills_per_batch == 8
+    assert finished == len(lens)
+    assert max(len(p) for p, _ in steps) >= 2
+    for pre, padded in steps:
+        if len(pre) > 1:
+            assert sum(n for _, n, _, _ in pre) <= 2048
+            for rid, n, c0, P in pre:
+                assert c0 == 0 and n == P

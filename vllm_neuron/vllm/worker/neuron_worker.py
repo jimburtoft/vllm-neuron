@@ -2346,7 +2346,9 @@ class NeuronWorker(WorkerBase):
         args = []
         for bucket_size, kv_seg_size in sorted(prefill_buckets, reverse=True):
             inputs = runner._build_prefill_synthetic_inputs(bucket_size, kv_seg_size)
-            args.append((bucket_size, 1, inputs["attn_metadata"]))
+            # A packed prefill graph carries packed_prefill_rows request rows.
+            rows = runner._prefill_graph_rows(bucket_size, kv_seg_size)
+            args.append((bucket_size, rows, inputs["attn_metadata"]))
         # Each request carries the bonus token plus the speculative tokens.
         tokens_per_req = 1 + runner.speculative_config.num_speculative_tokens
         for batch_size, ctx_bucket in sorted(decode_targets, reverse=True):
@@ -2382,7 +2384,7 @@ class NeuronWorker(WorkerBase):
             )
             self.model_runner.drafter.graph_extract(
                 num_tokens=bucket_size,
-                num_reqs=1,
+                num_reqs=self.model_runner._prefill_graph_rows(bucket_size, kv_seg_size),
                 attn_metadata=kwargs["attn_metadata"],
             )
 

@@ -4688,6 +4688,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             logits_indices=logits_indices,
         )
 
+    def _prefill_graph_rows(self, bucket_size: int, kv_segment_size: int) -> int:
+        """Request rows of the prefill graph for a bucket (packed: packed_prefill_rows)."""
+        if (
+            getattr(self, "packed_prefill_rows", 1) > 1
+            and not kv_segment_size
+            and bucket_size <= self.packed_prefill_limit
+        ):
+            return self.packed_prefill_rows
+        return 1
+
     def _is_packed_prefill_step(self, scheduler_output: Any) -> bool:
         """True on a prefill step whose real tokens fit the packed bucket limit.
 
@@ -6190,7 +6200,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
             self.drafter.graph_extract(
                 num_tokens=bucket_size,
-                num_reqs=1,
+                # A packed prefill graph carries packed_prefill_rows request rows.
+                num_reqs=self._prefill_graph_rows(bucket_size, kv_segment_size),
                 attn_metadata=kwargs["attn_metadata"],
                 device=device,
             )
@@ -6295,7 +6306,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
             self.drafter.warmup(
                 num_tokens=bucket_size,
-                num_reqs=1,
+                # A packed prefill graph carries packed_prefill_rows request rows.
+                num_reqs=self._prefill_graph_rows(bucket_size, kv_segment_size),
                 attn_metadata=warmup_kwargs["attn_metadata"],
             )
 
