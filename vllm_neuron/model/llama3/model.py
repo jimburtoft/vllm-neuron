@@ -318,6 +318,89 @@ def _fuse_decode_norms() -> bool:
     return os.environ.get("VLLM_NEURON_FUSE_DECODE_NORMS") == "1"
 
 
+def _fp8_lm_head() -> bool:
+    """Return whether the LM head stores FP8 weights with per-row scales.
+
+    ``VLLM_NEURON_FP8_LM_HEAD=1``. Off by default. Untied heads only.
+
+    Example:
+        >>> _fp8_lm_head()  # doctest: +SKIP
+        False
+    """
+    import os
+
+    return os.environ.get("VLLM_NEURON_FP8_LM_HEAD") == "1"
+
+
+# Largest magnitude of Neuron's float8_e4m3 on trn2 (IEEE e4m3fn reaches 448).
+_LM_HEAD_FP8_MAX = 240.0
+
+
+class Fp8RowColumnParallelLinear(nn.Module):
+    """Column-parallel, bias-free linear with FP8 weights and one scale per row.
+
+    The checkpoint's bf16 rows are quantized at load: ``scale[r] = amax(row r) /
+    240``, ``w8[r] = w[r] / scale[r]``. The forward computes
+    ``(x @ w8.T) * scale`` in bf16, which is exact up to the FP8 rounding of the
+    weights because the scale is per output column. Halves the bytes streamed.
+
+    Example:
+        >>> lin = Fp8RowColumnParallelLinear(8, 16, tp_size=1, tp_rank=0)  # doctest: +SKIP
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        tp_size: int,
+        tp_rank: int,
+        compute_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        assert out_features % tp_size == 0
+        self.in_features = in_features
+        self.out_features = out_features
+        self.tp_size = tp_size
+        self.out_features_per_rank = out_features // tp_size
+        self.compute_dtype = compute_dtype
+        self.gather_output = False
+        self.weight = nn.Parameter(
+            torch.zeros(
+                (self.out_features_per_rank, in_features), dtype=torch.float8_e4m3fn
+            ),
+            requires_grad=False,
+        )
+        self.weight_scale = nn.Parameter(
+            torch.ones((1, self.out_features_per_rank), dtype=compute_dtype),
+            requires_grad=False,
+        )
+        n = self.out_features_per_rank
+
+        def _shard(slices, rank):
+            return slices[0][tp_rank * n : (tp_rank + 1) * n, :].to(torch.float32)
+
+        def _scale(w):
+            return w.abs().amax(dim=1).clamp(min=1e-12) / _LM_HEAD_FP8_MAX
+
+        def _load_w(slices, rank):
+            w = _shard(slices, rank)
+            q = (w / _scale(w)[:, None]).clamp(-_LM_HEAD_FP8_MAX, _LM_HEAD_FP8_MAX)
+            return q.to(torch.float8_e4m3fn)
+
+        def _load_s(slices, rank):
+            return _scale(_shard(slices, rank)).view(1, n).to(compute_dtype)
+
+        set_weight_loader(self.weight, SafetensorsWeightLoader(transform=_load_w))
+        set_weight_loader(
+            self.weight_scale, SafetensorsWeightLoader(transform=_load_s)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.nn.functional.linear(x, self.weight.to(self.compute_dtype))
+        return out * self.weight_scale
+
+
 def _replicated_decode_embedding() -> bool:
     """Return whether decode uses a replicated embedding table (no all-reduce).
 
@@ -1795,6 +1878,20 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
                 tp_group=lm_head_device_group,
             )
             # Weight will be tied after loading
+        elif (
+            _fp8_lm_head()
+            and self.on_device_sampling_config is not None
+            and self.lm_head_dp_size == 1
+        ):
+            # VLLM_NEURON_FP8_LM_HEAD=1: FP8 weights + per-row scales (sharded
+            # logits only, i.e. on-device sampling).
+            self.lm_head = Fp8RowColumnParallelLinear(
+                config.hidden_size,
+                config.vocab_size,
+                tp_size=lm_head_tp_group.world_size,
+                tp_rank=lm_head_tp_rank,
+                compute_dtype=config.torch_dtype,
+            )
         else:
             # >>> PARALLELISM: Column-parallel LM head <<<
             self.lm_head = neuron_nn.ColumnParallelLinear(
@@ -1806,14 +1903,15 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
                 tp_group=lm_head_device_group,
             )
 
-        lm_head_loader = sharding_weight_loader(
-            shard_dim=0,
-            shard_size=self.lm_head.out_features_per_rank,
-            num_shards=self.lm_head.tp_size,
-            is_storage_transposed=False,
-        )
-        lm_head_loader = with_rank_override(lm_head_loader, rank=lm_head_tp_rank)
-        set_weight_loader(self.lm_head.weight, lm_head_loader)
+        if not isinstance(self.lm_head, Fp8RowColumnParallelLinear):
+            lm_head_loader = sharding_weight_loader(
+                shard_dim=0,
+                shard_size=self.lm_head.out_features_per_rank,
+                num_shards=self.lm_head.tp_size,
+                is_storage_transposed=False,
+            )
+            lm_head_loader = with_rank_override(lm_head_loader, rank=lm_head_tp_rank)
+            set_weight_loader(self.lm_head.weight, lm_head_loader)
 
         if self.on_device_sampling_config is not None:
             self.sampler = Sampler(
@@ -2156,6 +2254,10 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
         # Replicated decode embedding (VLLM_NEURON_REPLICATED_DECODE_EMBEDDING=1)
         if getattr(self.model, "decode_embed_weight", None) is not None:
             mappings["model.decode_embed_weight"] = "model.embed_tokens.weight"
+        # FP8 LM head (VLLM_NEURON_FP8_LM_HEAD=1): the per-row scale is derived
+        # from the same bf16 checkpoint tensor as the weight.
+        if isinstance(self.lm_head, Fp8RowColumnParallelLinear):
+            mappings["lm_head.weight_scale"] = "lm_head.weight"
 
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         rank_sharded = checkpoint.load_sharded_pipelined(
