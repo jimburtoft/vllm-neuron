@@ -69,8 +69,11 @@ Recommended servers with it (one trn2.3xlarge, BF16, output tok/s at the through
 | ~1k contexts | as "Short prompts" plus `--kv-cache-dtype fp8_e4m3` and `"fp8_packed_kv": true` (`UNSAFE_FP8FNCAST=1`), BF16 weights | 4,074 | 4,097 | | |
 | ~1k contexts, FP8 weights | same with the FP8 checkpoint (`VLLM_NEURON_FP8_INPUT_SCALE_COMPENSATION=1`) | 4,304 | **4,415** | | |
 | Long prompts | TP=4; `--max-model-len 10240 --max-num-batched-tokens 8192 --max-num-seqs 128`, `num_batched_tokens_buckets` [256, 1024, 2048, 4096, 8192], `num_seqs_buckets` [1, 4, 8, 16, 32, 64, 96, 128], `decode_context_length_buckets` [2048, 4096, 8192], KV cap 0.5 | | 2,947 | 900 | 723 |
+| Long prompts, packed FP8 KV | as "Long prompts" plus `--kv-cache-dtype fp8_e4m3`, `"fp8_packed_kv": true`, `max_top_k` 32 | | 3,224 | 1,158 | 1,012 |
+| Long prompts, FP8 weights + packed FP8 KV | same with the FP8 checkpoint | | 3,865 | **1,420** | **1,206** |
 
-- GSM8K (1319): 89.2 % (short), 89.4 % (packed FP8 KV), 89.2 % (FP8 weights + packed FP8 KV), 89.6 % (long); 89.4 % before these changes. Unpacked FP8 KV
+- GSM8K (1319): 89.2 % (short), 89.4 % (packed FP8 KV), 89.2 % (FP8 weights + packed FP8 KV), 89.6 % (long),
+  89.3 % / 89.0 % (long with packed FP8 KV, BF16 / FP8 weights); 89.4 % before these changes. Unpacked FP8 KV
   (without `fp8_packed_kv`) is slower: 3,661 tok/s at 1024 / 1024, because 1-byte K takes a PE-transpose path in the decode kernel.
 - Keep a decode bucket at about 2 x the typical context: with [1024, 4096] instead of [2048, 4096, 8192]
   the long server drops to 2,015 tok/s at 1024 / 1024.
@@ -201,6 +204,13 @@ on the same pixels): argmax 98.0 % with 1 non-tie mismatch, against 97.5 % / 1 f
 logprob error 0.091 / 0.210 (median / p95) against 0.092 / 0.241 for HF bf16.
 
 ## FP8
+
+Accuracy: FP8 **weights** raise the per-token logprob error against HF fp32 about 5x over BF16 (median 0.36 vs 0.075),
+whatever the scheme. An HF fake-quant study (per-tensor or per-channel weights, static or dynamic activations, MLP-only)
+found none within the BF16 noise floor, although GSM8K stays within 0.5 points. FP8 **KV** (packed, scale 1.0) keeps BF16
+accuracy: K/V stay below 18 in every layer, far inside the FP8 range. For accuracy-sensitive use: BF16 weights + packed
+FP8 KV. On trn2 the plugin re-scales FP8 weights by 0.5 (exact) instead of 240/448 to fit the 240-range FP8 format.
+
 
 The `mistralai/Ministral-3-8B-Instruct-2512` checkpoint is static per-tensor FP8 (`quant_method: fp8`,
 `weight_scale_inv` / `activation_scale`). It runs on the llama3 static-FP8 path after renaming the scales to
