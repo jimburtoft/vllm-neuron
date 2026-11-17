@@ -97,6 +97,9 @@ class SchedulerState(Enum):
         return self.name
 
 
+from vllm_neuron.vllm.core import packed_prefill  # noqa: E402
+
+
 class NeuronScheduler(Scheduler):
     """
     Scheduler for Neuron platform with prefill/decode separation.
@@ -1173,7 +1176,7 @@ class NeuronScheduler(Scheduler):
         return (
             request.num_computed_tokens == 0
             and request.num_tokens == request.num_prompt_tokens
-            and not request.mm_features
+            and (not request.mm_features or packed_prefill.pack_multimodal())
             and not request.use_structured_output
             and getattr(request, "prompt_embeds", None) is None
             and getattr(request, "lora_request", None) is None

@@ -52,6 +52,22 @@ BOUND_MAX_KEY = "packed_bound_max"
 REAL_TOKENS_KEY = "packed_real_tokens"
 
 
+MM_ENV = "VLLM_NEURON_PACK_MULTIMODAL"
+
+
+def pack_multimodal() -> bool:
+    """VLLM_NEURON_PACK_MULTIMODAL=1: requests with images may share a packed
+    prefill step (their encoder inputs run together before the step). Needs a
+    model whose encoder-cache budget is sized per step (see
+    ``mm_rows_per_step``)."""
+    return (os.getenv(MM_ENV) or "").strip() == "1"
+
+
+def mm_rows_per_step() -> int:
+    """Requests whose multimodal items one prefill step may hold (1 = no packing)."""
+    return requested_max_prefills() if pack_multimodal() else 1
+
+
 def requested_max_prefills() -> int:
     """``VLLM_NEURON_MAX_PREFILLS_PER_BATCH`` as an int >= 1 (unset, empty or bad: 1)."""
     raw = (os.getenv(ENV) or "").strip()

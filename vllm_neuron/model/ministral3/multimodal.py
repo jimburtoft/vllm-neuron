@@ -146,10 +146,15 @@ class Ministral3ForConditionalGeneration(
 
     @classmethod
     def get_max_encoder_embed_budget(cls, hf_config, encoder_neuron_config) -> int | None:
+        """Merged (embed) tokens one step may encode. embed_multimodal runs one graph per
+        image (or per packed group), so with multimodal packed prefill the step budget is
+        the largest bucket times the prompts per step."""
+        from vllm_neuron.vllm.core.packed_prefill import mm_rows_per_step
+
         buckets = encoder_neuron_config.num_encoder_input_buckets
         if not buckets:
             return None
-        return max(buckets) // cls.get_vision_token_merge_factor(hf_config)
+        return max(buckets) // cls.get_vision_token_merge_factor(hf_config) * mm_rows_per_step()
 
     @classmethod
     def get_encoder_cache_block_size(cls, hf_config, encoder_attention_block_size) -> int:
@@ -176,7 +181,10 @@ class Ministral3ForConditionalGeneration(
             limit = max(1, int(mm.get_limit_per_prompt("image")))
         except Exception:  # noqa: BLE001 - no vLLM context
             pass
-        return max(by_bucket, limit * per_image)
+        from vllm_neuron.vllm.core.packed_prefill import mm_rows_per_step
+
+        # One prefill step gathers the items of every packed request.
+        return max(by_bucket, limit * per_image) * mm_rows_per_step()
 
     # -- warmup -----------------------------------------------------------
     def get_encoder(self):

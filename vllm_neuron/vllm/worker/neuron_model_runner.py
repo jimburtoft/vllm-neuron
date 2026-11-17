@@ -3481,9 +3481,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
               encoder_positions[i, j] = batch position for token j in block i.
               Sentinel value = num_tokens for don't-care positions.
         """
-        # A packed prefill step (several text prompts) has no multimodal items; the
-        # loop below then fills nothing. Multimodal requests are never packed.
-        assert (
+        # A packed prefill step holds several prompts. Without
+        # VLLM_NEURON_PACK_MULTIMODAL they are text-only; with it, image requests
+        # can share the step, and the gather window is sized for all of them
+        # (get_max_encoder_blocks_per_request times the rows per step).
+        from vllm_neuron.vllm.core import packed_prefill as _pp
+
+        n_mm = sum(1 for r in req_ids if self.requests[r].mm_features)
+        if n_mm > 1 and not getattr(self, "_logged_mm_pack", False):
+            self._logged_mm_pack = True
+            logger.info("Packed multimodal prefill: %d image requests in one step", n_mm)
+        assert _pp.pack_multimodal() or (
             sum(1 for r in req_ids if self.requests[r].mm_features) <= 1
             and (len(req_ids) == 1 or not any(self.requests[r].mm_features for r in req_ids))
         ), (
