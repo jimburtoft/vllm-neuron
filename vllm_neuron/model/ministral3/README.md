@@ -100,7 +100,7 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
   HuggingFace tokenizer. The tekken tokenizer gives the same chat-templated token ids as
   transformers' `apply_chat_template`.
 - `--language-model-only` builds the text decoder only (no vision weights). For images see "Images".
-- Up to `--max-model-len 16384` decode uses the fused attention kernel. Above it see "Long context".
+- Decode uses the fused attention kernel at every `--max-model-len`; see "Long context" for > 16384.
 - `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (default 0.30) caps the KV cache.
 - `VLLM_NEURON_SWA_REAL_ADMISSION=1` admits requests by their real KV peak instead of `max_model_len`;
   with `num_seqs_buckets` up to 128 (`--max-num-seqs 128`) the long server reaches 2,849 tok/s at
@@ -147,12 +147,21 @@ Single request (long server): 1024 / 1024 at 102 tok/s, TTFT 63 ms, TPOT 9.8 ms.
 
 Past `original_max_position_embeddings` (16384) Ministral 3 scales the queries by
 `1 + 0.1 * log(1 + floor(pos / 16384))` after RoPE. The llama3 attention applies it when
-`max_model_len` exceeds 16384: prefill scales the query rows, and decode passes a per-token query
-scale to `NF.attention_decode`. The fused decode kernel only takes a scalar softmax scale, so decode
-attention then runs the PyTorch path: at `--max-model-len 32768` the single-request decode TPOT is
-22.3 ms (9.8 ms on the fused kernel at <= 16384). Needle retrieval at 20k and 24k tokens: 2/2; the
-teacher-forced logprob error vs HF fp32 is 0.086 / 0.190 (median / p95), against 0.089 / 0.168 for HF
-bf16 and 0.33 / 0.53 for HF fp32 without the query scaling.
+`max_model_len` exceeds 16384. Prefill scales the query rows. Decode passes the per-token scale to
+the fused decode kernel as a `q_scale` input. That input comes from a vendored `attention_block_tkg`
+(`functional/vendored_kernels/attention_block_tkg_qscale.py`, from
+`jimburtoft/nki-library@ministral3/tkg-q-scale-2.33`) until it ships in nkilib. The static-FP8
+attention applies the same scaling.
+
+At `--max-model-len 32768`, TP4, BF16:
+- Single-request decode TPOT is 12.4 ms (22.5 ms on the PyTorch path); batch 8 is 55.7 ms (202 ms).
+- Needle retrieval at 20k and 24k tokens: 2/2.
+- Teacher-forced logprob error vs HF fp32 is 0.066 / 0.166 (median / p95), against 0.089 / 0.168 for
+  HF bf16 and 0.33 / 0.53 for HF fp32 without the query scaling.
+
+FP8 weights with packed FP8 KV at 32768: TPOT 9.0 ms (batch 1) and 18.2 ms (batch 8); needle 2/2.
+FP8 weights with a BF16 KV cache lose needle retrieval past about 15k tokens, so use packed FP8 KV
+with FP8 weights. `VLLM_NEURON_QSCALE_TORCH=1` puts decode back on the PyTorch path.
 
 ## Images
 
@@ -239,6 +248,6 @@ are calibrated for `float8_e4m3fn` (448). Set `VLLM_NEURON_FP8_INPUT_SCALE_COMPE
 | Packed prefill | ✅ | short server |
 | Vision tower (Pixtral) + projector | ✅ | one image per encoder block; see Images |
 | FP8 checkpoint | ✅ (after scale renaming) | see FP8 |
-| Llama 4 query scaling (positions >= 16384) | ✅ | decode attention uses the PyTorch path when `max_model_len > 16384` |
+| Llama 4 query scaling (positions >= 16384) | ✅ | fused decode kernel with a per-token query scale (vendored kernel) |
 | FP8 KV cache | ✅ | with the FP8 checkpoint (scales 1.0) |
 | Eagle3 | not tested | |
