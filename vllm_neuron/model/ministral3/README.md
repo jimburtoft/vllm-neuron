@@ -187,8 +187,14 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
   pruning; vendored here from `jimburtoft/nki-library@attention-cte-seqpack-tile-prune`, based on nki-library
   2.33, until it ships in a release). Two 448x448 images: encoder
   15.9 ms instead of 2 x 10 ms; two 640x896 images: 46 ms instead of 2 x 24 ms (53-60 ms packed
-  without the pruning). The scheduler encodes one request per step, so this helps multi-image
-  prompts only.
+  without the pruning). On its own this helps multi-image prompts only.
+- **Image requests in packed prefill** (opt-in, `VLLM_NEURON_PACK_MULTIMODAL=1` with
+  `VLLM_NEURON_MAX_PREFILLS_PER_BATCH=N`): up to N image prompts share one prefill step, and their
+  images are encoded in the same step. The encoder budget and the per-step cache-block window scale
+  by N. This needs `max_num_batched_tokens >= max_model_len` and prefill buckets no larger than
+  `VLLM_NEURON_PACKED_PREFILL_MAX_TOKENS` (default 2048); otherwise packing stays off.
+  640x896 images, TP4, mml 4096, max_num_seqs 128, N=4: plateau 1,136 tok/s against 1,100 without
+  packing; single-request TTFT unchanged.
 - The upstream vLLM `Mistral3ForConditionalGeneration` does not import with the transformers in
   this environment, so the processor is vendored (`processing.py`) and the platform registers a
   stand-in class (`validation.py`) for config validation.
