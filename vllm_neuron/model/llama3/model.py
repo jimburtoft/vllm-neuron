@@ -1475,14 +1475,23 @@ class LlamaMLP(nn.Module):
             )
         norm_type = NormType.RMS_NORM if ln_w is not None else NormType.NO_NORM
         if x.shape[0] > _FP8_ROW_MLP_TKG_MAX_T:
-            # CTE: fused RMSNorm + per-token dynamic quant -> [T, H+4]. The caller
-            # passes the raw residual with ln_w (rmsnorm_quant always normalizes).
-            if ln_w is None:
-                raise ValueError("FP8 ROW MLP prefill needs ln_w (raw residual input)")
-            x = NF.rmsnorm_quant(
-                x, ln_w.view(1, -1), None, eps=eps, quantization_type=QuantizationType.ROW
+            # Prefill (CTE): the nkilib ROW CTE kernel fails validation at
+            # Mistral-7B TP4 (NCC_INKI016 stack out of memory), so prefill runs
+            # W8A16 too: dequantize the weights in the graph and use the BF16
+            # kernel. Decode (TKG ROW) is weight-only, so the model is W8A16 end
+            # to end.
+            def dq(w, sc):
+                return (w.to(torch.float32) * sc[0:1]).to(x.dtype)
+
+            return NF.mlp(
+                x,
+                dq(self.gate_proj_weight, self.gate_w_scale),
+                dq(self.up_proj_weight, self.up_w_scale),
+                dq(self.down_proj_weight, self.down_w_scale),
+                eps=eps,
+                ln_w=ln_w.view(1, -1) if ln_w is not None else None,
+                norm_type=norm_type,
             )
-            norm_type, ln_w = NormType.NO_NORM, None
         return NF.mlp(
             x,
             self.gate_proj_weight,
