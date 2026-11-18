@@ -258,6 +258,7 @@ def mlp(
     up_clamp_lower_limit: float | None = None,
     gate_up_w_layout=None,
     column_tiling: bool | None = None,
+    force_decode_mode: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """MLP API that automatically selects between nkilib NKI kernel and PyTorch fallback.
 
@@ -344,6 +345,10 @@ def mlp(
         and _can_fuse_decode_norm(hidden, quantization_type)
         else ComputationMode.AUTO
     )
+    # The caller knows this is a decode step (e.g. FP8 ROW weight-only decode at
+    # batch > 96, which has no usable CTE kernel): run TKG at any T when it can.
+    if force_decode_mode and can_run_kernel(hidden) and _tkg_runs_shape(T, H):
+        computation_mode = ComputationMode.DECODE
 
     if _can_use_kernel(
         hidden, gate_w, gate_b, up_b, down_b, quantization_type, computation_mode

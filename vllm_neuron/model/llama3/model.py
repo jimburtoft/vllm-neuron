@@ -1410,7 +1410,7 @@ class LlamaMLP(nn.Module):
             hidden_states = self.mlp_tp_group.all_gather(hidden_states, dim=0)
 
         if self.fp8_row:
-            result = self._forward_fp8_row(hidden_states, ln_w, eps)
+            result = self._forward_fp8_row(hidden_states, ln_w, eps, is_prefill)
         else:
             result = NF.mlp(
                 hidden_states,
@@ -1450,7 +1450,11 @@ class LlamaMLP(nn.Module):
         return output
 
     def _forward_fp8_row(
-        self, x: torch.Tensor, ln_w: torch.Tensor | None, eps: float
+        self,
+        x: torch.Tensor,
+        ln_w: torch.Tensor | None,
+        eps: float,
+        is_prefill: bool = True,
     ) -> torch.Tensor:
         """FP8 ROW MLP (VLLM_NEURON_FP8_ROW_MLP=1); ``x`` is already normed unless ``ln_w``.
 
@@ -1474,7 +1478,7 @@ class LlamaMLP(nn.Module):
                 dq(self.down_proj_weight, self.down_w_scale),
             )
         norm_type = NormType.RMS_NORM if ln_w is not None else NormType.NO_NORM
-        if x.shape[0] > _FP8_ROW_MLP_TKG_MAX_T:
+        if is_prefill and x.shape[0] > _FP8_ROW_MLP_TKG_MAX_T:
             # Prefill (CTE): the nkilib ROW CTE kernel fails validation at
             # Mistral-7B TP4 (NCC_INKI016 stack out of memory), so prefill runs
             # W8A16 too: dequantize the weights in the graph and use the BF16
@@ -1510,6 +1514,9 @@ class LlamaMLP(nn.Module):
                 if self.intermediate_size_per_rank > _MLP_TKG_COLUMN_TILING_MAX_I
                 else None
             ),
+            # Decode at any batch: weight-only TKG ROW (nkilib's AUTO switches to
+            # CTE above 96 tokens, which this path cannot use).
+            force_decode_mode=not is_prefill,
         )
 
 
