@@ -145,6 +145,35 @@ variable (`GPTOSS_KV_WRITE=kernel`, `GPTOSS_PREFILL_IMPL=shard_on_block`,
 native route `-O2` decode is already as fast, so the hook has no measurable effect there.
 An explicit `--optimization-level` turns the per-graph hook off.
 
+### Packed prefill for short prompts (opt-in, Trn2)
+
+`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=16` lets one prefill step carry several whole, fresh prompts (up to the
+largest prefill bucket in total). Attention stays per prompt (per-token segment bounds), and padding tokens get no
+MoE routing. It works with `quantization` `"fp8"` and `"bf16"`, and next to segmented prefill: with
+`max_num_batched_tokens` < `max_model_len` (the configuration above), whole short prompts pack and chunks of long
+prompts run alone. Prefix caching, LoRA, structured outputs, prompt embeddings and data parallelism turn it off
+with a log line. Each prefill bucket compiles a second (packed) graph, which adds 5-10 minutes to the first start.
+
+Served on trn2.3xlarge (the FP8 configuration above, `max_num_seqs` 64, random prompts, 128 output tokens), output
+tokens/s at 64 concurrent requests, without / with packing:
+
+| Input tokens | 64 | 128 | 256 | 512 | 1024 | 2048 | > 2048 |
+|---|---|---|---|---|---|---|---|
+| Without | 1,298 | 1,264 | 1,211 | 1,078 | 897 | 658 | |
+| With packing | 2,160 (+66 %) | 2,064 (+63 %) | 1,844 (+52 %) | 1,498 (+39 %) | 1,078 (+20 %) | 692 (+5 %) | no change |
+
+Time to first token at 64 concurrent requests and 64 input tokens drops from 1.5 s to 0.29 s. The gain grows with
+concurrency (+25 % at 16 concurrent requests for 64-token prompts, +0-6 % at one request) and ends at the packed
+token budget: a prompt longer than the largest bucket never packs. `max_num_batched_tokens=4096` with buckets up
+to 4096 and `VLLM_NEURON_PACKED_PREFILL_MAX_TOKENS=4096` keeps +15 % at 2048 tokens and +8 % at 3072 tokens.
+GSM8K-CoT (250 questions): 0.896 with packing, 0.876 without. Packing changes which prompts share a prefill
+step, so greedy output can differ from the unpacked run in the last bits (near ties); answers do not leak between
+prompts.
+
+Knobs: `VLLM_NEURON_PACKED_PREFILL_MAX_TOKENS` (real-token budget, default the largest bucket),
+`VLLM_NEURON_PACKED_PREFILL_MIXED=0` (pack only when prefill is single shot), `VLLM_NEURON_PACKED_PREFILL_SPEC=0`
+(no packing with EAGLE3).
+
 ### EAGLE3 speculative decoding (gpt-oss-20b, Trn2)
 
 The public EAGLE3 draft [`RedHatAI/gpt-oss-20b-speculator.eagle3`](https://huggingface.co/RedHatAI/gpt-oss-20b-speculator.eagle3)
@@ -166,6 +195,12 @@ On trn2.3xlarge (chat prompts, 256 output tokens): output tokens/s 187 / 402 / 9
 requests, against 167 / 410 / 707 without speculation (+12 % / -2 % / +28 %). The draft acceptance rate was
 71-73 %. GSM8K-CoT (1,319 questions) was 0.876 with EAGLE3 and 0.873 without. `num_speculative_tokens: 2` was
 slower than `1` at every concurrency. The first compile takes about 48 minutes instead of 19.
+
+EAGLE3 also works with packed prefill (`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8` on the command above); the draft
+model attends and writes its KV cache per prompt. Same instance, chat prompts, 256 output tokens, median of 6-10
+runs, output tokens/s without / with packing: 186 / 175 (-6 %) at 1 concurrent request, 407 / 414 (+2 %) at 4,
+914 / 1,010 (+10 %) at 16. The acceptance rate is the same (0.68-0.69). Use it when there are usually several
+requests in flight; at one request the decode steps after a packed prefill are slightly slower.
 
 ## Known issues
 
