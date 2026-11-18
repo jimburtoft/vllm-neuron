@@ -25,7 +25,9 @@ import nki.collectives as ncc
 import nki.isa as nisa
 import nki.language as nl
 from nkilib.core.mlp.mlp import mlp as _mlp
+from nkilib.core.utils.allocator import BufferManager, create_auto_alloc_manager
 from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
+from nkilib.core.utils.logging import get_logger
 from nkilib.core.utils.common_types import ActFnType, ComputationMode, DtypeMode, NormType, QuantizationType
 from nkilib.experimental.transformer.attention_block_tkg import attention_block_tkg as _attn
 
@@ -61,6 +63,12 @@ def layers_body(X, cos, sin, attention_mask, active_blocks_table, kv_cache_updat
     B, _, H = X.shape
     h = X
     for l in range(len(wqkv)):
+        # Each nkilib call names its buffers from the SBM prefix; distinct prefixes per layer
+        # avoid duplicate op names when several layers are traced into one kernel.
+        sbm_a = create_auto_alloc_manager(logger=get_logger("layers_tkg"))
+        sbm_a.set_name_prefix(f"L{l}_attn_")
+        sbm_m = BufferManager(0, 200 * 1024, get_logger("layers_tkg"))
+        sbm_m.set_name_prefix(f"L{l}_mlp_")
         a = _attn(
             X=h, X_hidden_dim_actual=H,
             rmsnorm_X_enabled=True, rmsnorm_X_eps=eps, rmsnorm_X_gamma=ln1[l],
@@ -76,7 +84,7 @@ def layers_body(X, cos, sin, attention_mask, active_blocks_table, kv_cache_updat
             update_cache=True, kv_cache_update_idx=kv_cache_update_idx,
             W_out=wo[l], bias_out=None, quantization_type_out=QuantizationType.NONE,
             weight_dequant_scale_out=None, input_dequant_scale_out=None,
-            transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale,
+            transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale, sbm=sbm_a,
         )[0]
         h = _all_reduce_add(a, h, ranks, B, H, f"a{l}")
         m = _mlp(
@@ -86,7 +94,7 @@ def layers_body(X, cos, sin, attention_mask, active_blocks_table, kv_cache_updat
             quantization_type=QuantizationType.NONE, eps=eps, store_output_in_sbuf=False,
             use_tkg_gate_up_proj_column_tiling=True, use_tkg_down_proj_column_tiling=True,
             use_tkg_down_proj_optimized_layout=False, mode=ComputationMode.DECODE, force_cte_mode=False,
-            dtype_mode=DtypeMode.AUTO,
+            dtype_mode=DtypeMode.AUTO, sbm=sbm_m,
         )
         m = m[0] if isinstance(m, (tuple, list)) else m
         h = _all_reduce_add(m, h, ranks, B, H, f"m{l}")
