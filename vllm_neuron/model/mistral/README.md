@@ -78,7 +78,8 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
 - FP8 decode without a special checkpoint: `VLLM_NEURON_FP8_ROW_MLP=1` quantizes the MLP weights (about 80 % of
   the weight bytes) to FP8 at load, with one scale per output channel, from the BF16 checkpoint. Attention stays
   BF16, and decode multiplies BF16 activations by the FP8 weights. Decode is 15 % faster at batch 1 (8.26 -> 7.06 ms)
-  and 7-9 % faster at batch 8-64. GSM8K is 59.1 %, inside the BF16 range. Prefix caching and segmented prefill
+  and 7-9 % faster at batch 8-64. GSM8K is 59.1 %, inside the BF16 range; token-level agreement with an fp32
+  reference is 98.6 % (BF16: 99.2 %). Prefix caching and segmented prefill
   still work. Prefill keeps BF16 speed.
 - Per-tensor FP8 checkpoints (ModelOpt, or `RedHatAI/Mistral-7B-Instruct-v0.3-FP8` relabelled to ModelOpt) also
   load, with or without an FP8 KV cache. Decode is 18 % faster at batch 1, but GSM8K drops to about 56.5 %: the
