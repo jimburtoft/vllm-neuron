@@ -4095,24 +4095,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Packed prefill: the scheduler pads each prompt to its own bucket. Lay
         # the prompts out back to back instead and pad only the last row, to the
         # bucket of the total (packed_prefill.py). Idempotent on the re-prep.
-        if (
-            not packed_step
-            and getattr(self, "packed_prefill_rows", 1) > 1
-            and not self._is_decode()
-        ):
-            # The scheduler leaves packable prompts unpadded (the runner packs
-            # them). A step that is not packed (a lone prompt) pads to its bucket.
-            from vllm_neuron.vllm.core import packed_prefill as _packed_prefill
-
-            for i, req_id in enumerate(req_ids):
-                n = scheduler_output.num_scheduled_tokens[req_id]
-                if tokens[i] == n and n > 1 + self._num_spec_tokens_for_padding():
-                    b = _packed_prefill.bucket_for(
-                        n, self.neuron_config.num_batched_tokens_buckets
-                    )
-                    if b is not None and b > n:
-                        tokens[i] = b
-                        scheduler_output.num_scheduled_tokens_padded[req_id] = b
         if packed_step:
             from vllm_neuron.vllm.core import packed_prefill as _packed_prefill
 
@@ -4715,11 +4697,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             logits_indices=logits_indices,
         )
 
-    def _num_spec_tokens_for_padding(self) -> int:
-        """Decode-shaped rows (1 + k tokens) are never prefill-padded."""
-        spec = getattr(self, "speculative_config", None)
-        return int(getattr(spec, "num_speculative_tokens", 0) or 0) if spec else 0
-
     def _prefill_graph_rows(self, bucket_size: int, kv_segment_size: int) -> int:
         """Request rows of the prefill graph for a bucket (packed: packed_prefill_rows)."""
         if (
@@ -4747,19 +4724,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return False
         total = sum(scheduler_output.num_scheduled_tokens[r] for r in req_ids)
         if total > self.packed_prefill_limit:
-            return False
-        # A lone prompt runs the one-row graph (the unpacked path): with
-        # speculative decoding, the 8-row packed step costs the following
-        # decode steps (measured c=1 -17 %). VLLM_NEURON_PACKED_PREFILL_SINGLE=1
-        # keeps one prompt on the packed graph.
-        # Only in mixed mode, where the one-row segmented graph of every bucket
-        # is compiled (single-shot servers compile only the packed graph).
-        if (
-            num_reqs == 1
-            and self._num_spec_tokens_for_padding() > 0
-            and self.neuron_config.kv_segment_size_buckets is not None
-            and os.getenv("VLLM_NEURON_PACKED_PREFILL_SINGLE", "0") != "1"
-        ):
             return False
         # Mixed mode (segmented prefill on): only whole, fresh prompts take the
         # packed full-prefill graph. A chunk of a long prompt keeps the one-row
@@ -8303,14 +8267,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         future = self.async_execution_buffer["futures_sampled_token_ids"]
         draft_future = self.async_execution_buffer.get("futures_draft_token_ids")
-        if os.getenv("VLLM_NEURON_ASYNC_STATS") and (
-            self._async_steps + self._sync_fallback_steps
-        ) % 500 == 0:
-            logger.info(
-                "async stats: async=%d sync_fallback=%d",
-                self._async_steps,
-                self._sync_fallback_steps,
-            )
 
         assembled = self._try_assemble_spec_input_ids(input_ids, draft_future)
         if assembled is not None:
