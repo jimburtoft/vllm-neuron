@@ -79,7 +79,10 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
   the weight bytes) to FP8 at load, with one scale per output channel, from the BF16 checkpoint. Attention stays
   BF16, and decode multiplies BF16 activations by the FP8 weights. Decode is 15 % faster at batch 1 (8.26 -> 7.06 ms)
   and 7-9 % faster at batch 8-64. GSM8K is 59.1 %, inside the BF16 range; token-level agreement with an fp32
-  reference is 98.6 % (BF16: 99.2 %). Prefix caching and segmented prefill
+  reference is 98.6 % (BF16: 99.2 %). Prefill is slower than BF16, because the FP8 prefill kernel does not run at
+  this shape and prefill converts the MLP weights back to BF16 on every step. Use it for decode-heavy traffic: on
+  stock Llama-3.1-8B-Instruct (same MLP shape) 1k/1k peak throughput rises 6 % (3,122 -> 3,299 tok/s) and 128/128
+  drops 10 % (2,222 -> 2,000). GSM8K on Llama-3.1-8B: 85.5 % (BF16 85.4 %). Prefix caching and segmented prefill
   still work. Prefill keeps BF16 speed.
 - Per-tensor FP8 checkpoints (ModelOpt, or `RedHatAI/Mistral-7B-Instruct-v0.3-FP8` relabelled to ModelOpt) also
   load, with or without an FP8 KV cache. Decode is 18 % faster at batch 1, but GSM8K drops to about 56.5 %: the
