@@ -1146,6 +1146,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     **segmented_off_evidence,
                 )
             )
+        # Chunked prefill (max_num_batched_tokens < max_model_len) with segmented
+        # prefill off: a long prompt is split across steps, and each later chunk's
+        # full-prefill flash attention reads only its own K/V, so the earlier
+        # chunks are silently ignored (task 034: unpacked FP8 KV at mml 16384 /
+        # mnbt 8192 lost the needle at 15k tokens). Refuse to start instead.
+        if (
+            segmented_off
+            and self.max_num_batched_tokens < self.max_model_len
+            and getattr(vllm_config.scheduler_config, "enable_chunked_prefill", True)
+        ):
+            raise ValueError(
+                _segmented_prefill_required_msg(
+                    feature=(
+                        "Chunked prefill (max_num_batched_tokens="
+                        f"{self.max_num_batched_tokens} < max_model_len="
+                        f"{self.max_model_len})"
+                    ),
+                    disable_hint=(
+                        "set max_num_batched_tokens >= max_model_len so prefill "
+                        "is single-shot"
+                    ),
+                    **segmented_off_evidence,
+                )
+            )
         if segmented_off and self._dcp_size > 1:
             raise ValueError(
                 _segmented_prefill_required_msg(
