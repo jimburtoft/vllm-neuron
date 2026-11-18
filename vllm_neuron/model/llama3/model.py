@@ -1505,6 +1505,11 @@ class LlamaMLP(nn.Module):
             up_w_scale=self.up_w_scale,
             down_w_scale=self.down_w_scale,
             output_dtype=self.out_dtype_name,
+            column_tiling=(
+                False
+                if self.intermediate_size_per_rank > _MLP_TKG_COLUMN_TILING_MAX_I
+                else None
+            ),
         )
 
 
