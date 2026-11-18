@@ -4298,9 +4298,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             max_decode_ctx_len=max_decode_ctx_len,
             packed_prefill=packed_step,
         )
+        self._packed_req_indices_per_token = None
         if packed_step:
             self._add_packed_prefill_bounds(
                 attn_metadata, actual_num_tokens, total_num_scheduled_tokens_padded
+            )
+            # Request row of every token (padding belongs to the last row), for
+            # the EAGLE3 draft's slot_mapping recompute on this step.
+            self._packed_req_indices_per_token = torch.from_numpy(
+                np.repeat(
+                    np.arange(len(num_scheduled_tokens_padded), dtype=np.int64),
+                    num_scheduled_tokens_padded,
+                )
             )
 
         # Spec decoding
@@ -10821,6 +10830,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 async_spec_kwargs["cur_num_draft_tokens"] = cur_num_draft_tokens
             elif "prev_num_draft_tokens" not in async_spec_kwargs:
                 async_spec_kwargs["prev_num_draft_tokens"] = cur_num_draft_tokens
+
+        # Packed prefill: the rows are uneven, so give the draft the real
+        # per-token request index (see EagleProposer.propose).
+        packed_rows = getattr(self, "_packed_req_indices_per_token", None)
+        if (
+            spec_decode_metadata is None
+            and packed_rows is not None
+            and packed_rows.shape[0] == input_ids.shape[0]
+            and "req_indices_per_token" not in async_spec_kwargs
+        ):
+            async_spec_kwargs["req_indices_per_token"] = packed_rows
 
         if self._draft_tensor_capture is not None:
             self._draft_tensor_capture.setup_tensor_capture()

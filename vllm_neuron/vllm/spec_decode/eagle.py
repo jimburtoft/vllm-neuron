@@ -562,7 +562,14 @@ class EagleProposer:
             )
             prev_sampled_token_ids = correction_kwargs["prev_sampled_token_ids"]
             prev_num_draft_tokens = correction_kwargs["prev_num_draft_tokens"]
-            req_indices_per_token = correction_kwargs["req_indices_per_token"]
+            # The no-op correction still recomputes the draft slot_mapping from
+            # req_indices_per_token. A packed prefill step has uneven rows, so the
+            # runner passes the real per-token request index; the even split
+            # would write the draft KV of most prompts into other rows' blocks.
+            if req_indices_per_token is None:
+                req_indices_per_token = correction_kwargs["req_indices_per_token"]
+            else:
+                req_indices_per_token = req_indices_per_token.to(target_device)
         else:
             prev_sampled_token_ids = prev_sampled_token_ids.to(target_device)
             assert prev_num_draft_tokens is not None
