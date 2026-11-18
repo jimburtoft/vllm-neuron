@@ -47,6 +47,42 @@ _MAX_T_FOR_I_SHARDING = 256
 # when present (H % 128 == 4).
 _MX_PACKED_SCALE_BYTES = 4
 
+
+def _patch_nkilib_cte_row_scale_footprint() -> None:
+    """Count the ROW gate/up weight-scale SBUF buffers in nkilib's CTE tile-size model.
+
+    ``mlp_cte_basic`` picks its BxS tile from ``calc_peak_footprint``, then allocates
+    the ROW gate and up weight scales ([128, I] fp32 each) on the heap. The model
+    leaves those out, so for large I and T >= 2048 it picks a tile that overflows
+    SBUF ("[NCC_INKI016] Stack out of memory"; Mistral-7B / Llama-3-8B at TP4:
+    I=3584, 3.4 KB/partition short at T=2048). Adding them makes it pick the next
+    smaller tile. No-op for every other quantization type. Idempotent.
+
+    Example:
+        >>> _patch_nkilib_cte_row_scale_footprint()  # doctest: +SKIP
+    """
+    import nki.language as nl
+    from nkilib.core.mlp.mlp_cte.basic import mlp_cte_basic_tile_info as _ti
+
+    if getattr(_ti.calc_peak_footprint, "_row_scales_counted", False):
+        return
+    orig = _ti.calc_peak_footprint
+
+    def calc_peak_footprint(mlp_params, constants, *args, **kwargs):
+        peak = orig(mlp_params, constants, *args, **kwargs)
+        if mlp_params.quant_params.is_logical_quant_row():
+            n_scales = 1 if mlp_params.skip_gate_proj else 2
+            peak += n_scales * _ti.footprint_B(
+                (nl.tile_size.pmax, mlp_params.intermediate_size), nl.float32
+            )
+        return peak
+
+    calc_peak_footprint._row_scales_counted = True
+    _ti.calc_peak_footprint = calc_peak_footprint
+
+
+_patch_nkilib_cte_row_scale_footprint()
+
 # MX weight-packing tile geometry (shared MX kernel layout, NOT model-specific).
 # The H_X4_* / MX_CONTIGUOUS swizzles tile the contraction dim into 512-element
 # tiles of 128 partitions x 4 x4-packed fp8 bytes. The per-model MX weight loaders

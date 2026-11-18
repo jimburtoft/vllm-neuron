@@ -417,6 +417,20 @@ def _fp8_row_mlp() -> bool:
     return os.environ.get("VLLM_NEURON_FP8_ROW_MLP") == "1"
 
 
+def _fp8_row_cte() -> bool:
+    """Whether FP8 ROW MLP prefill uses the nkilib ROW CTE kernel (W8A8, per-token).
+
+    ``VLLM_NEURON_FP8_ROW_CTE`` (default on). ``0`` dequantizes to BF16 instead.
+
+    Example:
+        >>> _fp8_row_cte()  # doctest: +SKIP
+        True
+    """
+    import os
+
+    return os.environ.get("VLLM_NEURON_FP8_ROW_CTE", "1") != "0"
+
+
 # nkilib's TKG/CTE split for the MLP (TKG_BS_SEQLEN_THRESHOLD). The ROW CTE
 # kernel needs a pre-quantized [T, H+4] input; TKG takes bf16 activations.
 _FP8_ROW_MLP_TKG_MAX_T = 96
@@ -1478,12 +1492,30 @@ class LlamaMLP(nn.Module):
                 dq(self.down_proj_weight, self.down_w_scale),
             )
         norm_type = NormType.RMS_NORM if ln_w is not None else NormType.NO_NORM
+        if is_prefill and x.shape[0] > _FP8_ROW_MLP_TKG_MAX_T and _fp8_row_cte():
+            # Prefill (CTE) on the nkilib ROW kernel: fused RMSNorm + per-token
+            # dynamic quant -> [T, H+4] fp8, then the FP8 MLP. Needs the CTE
+            # footprint fix in functional/mlp.py for T >= 2048.
+            if ln_w is None:
+                raise ValueError("FP8 ROW MLP prefill needs ln_w (raw residual input)")
+            xq = NF.rmsnorm_quant(
+                x, ln_w.view(1, -1), None, eps=eps, quantization_type=QuantizationType.ROW
+            )
+            return NF.mlp(
+                xq,
+                self.gate_proj_weight,
+                self.up_proj_weight,
+                self.down_proj_weight,
+                norm_type=NormType.NO_NORM,
+                quantization_type=QuantizationType.ROW,
+                gate_w_scale=self.gate_w_scale,
+                up_w_scale=self.up_w_scale,
+                down_w_scale=self.down_w_scale,
+                output_dtype=self.out_dtype_name,
+            )
         if is_prefill and x.shape[0] > _FP8_ROW_MLP_TKG_MAX_T:
-            # Prefill (CTE): the nkilib ROW CTE kernel fails validation at
-            # Mistral-7B TP4 (NCC_INKI016 stack out of memory), so prefill runs
-            # W8A16 too: dequantize the weights in the graph and use the BF16
-            # kernel. Decode (TKG ROW) is weight-only, so the model is W8A16 end
-            # to end.
+            # Prefill without the ROW CTE kernel (VLLM_NEURON_FP8_ROW_CTE=0):
+            # dequantize the weights in the graph and use the BF16 kernel.
             def dq(w, sc):
                 return (w.to(torch.float32) * sc[0:1]).to(x.dtype)
 
