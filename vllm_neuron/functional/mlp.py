@@ -446,7 +446,12 @@ def mlp(
             return result[0].squeeze(0)
         return result.squeeze(0)
     else:
-        return _torch_mlp_impl(
+        if quantization_type == QuantizationType.ROW:
+            # Ineligible / CPU fallback: dequantize (per-output-channel scales).
+            hidden, gate_w, up_w, down_w = _row_dequant_for_torch(
+                hidden, gate_w, up_w, down_w, gate_w_scale, up_w_scale, down_w_scale
+            )
+        out = _torch_mlp_impl(
             hidden=hidden,
             ln_w=ln_w,
             gate_w=gate_w,
@@ -463,6 +468,33 @@ def mlp(
             fused_add_tensor=fused_add_tensor,
             store_fused_add_result=store_fused_add_result,
         )
+        if quantization_type == QuantizationType.ROW and not isinstance(out, tuple):
+            out = out.to(
+                getattr(torch, output_dtype)
+                if isinstance(output_dtype, str)
+                else (output_dtype or torch.bfloat16)
+            )
+        return out
+
+
+def _row_dequant_for_torch(hidden, gate_w, up_w, down_w, gate_s, up_s, down_s):
+    """ROW: fp8 [K, N] weights with [128, N] scales; hidden bf16 [T, H] or packed fp8 [T, H+4].
+
+    Example:
+        >>> # see tests: returns fp32 (x, gate, up, down) for the torch MLP
+    """
+    H = down_w.shape[-1]
+    if hidden.shape[-1] == H + _MX_PACKED_SCALE_BYTES:
+        u = hidden.view(torch.uint8)
+        x = u[:, :H].view(hidden.dtype).to(torch.float32)
+        x = x * u[:, H:].contiguous().view(torch.float32)
+    else:
+        x = hidden.to(torch.float32)
+
+    def dq(w, s):
+        return w.to(torch.float32) * s[0:1].to(torch.float32)
+
+    return x, dq(gate_w, gate_s), dq(up_w, up_s), dq(down_w, down_s)
 
 
 def _check_static_input_is_quantized(
@@ -634,6 +666,11 @@ def _can_use_kernel(
         H_eff = H - _MX_PACKED_SCALE_BYTES if H % 128 == _MX_PACKED_SCALE_BYTES else H
         return H_eff % 128 == 0
 
+    # ROW with a pre-quantized activation: rmsnorm_quant(ROW) packs the per-row fp32
+    # dequant scale into a trailing 4 bytes ([T, H+4]); the kernel reads H from down_w.
+    if quantization_type == QuantizationType.ROW and H % 128 == _MX_PACKED_SCALE_BYTES:
+        H -= _MX_PACKED_SCALE_BYTES
+
     if H % 128 != 0:
         return False
 
@@ -657,6 +694,11 @@ def _can_use_kernel(
         and T <= _MAX_T_FOR_I_SHARDING
         and not has_bias
     )
+    # nkilib's CTE sharding re-enables I-sharding whenever intermediate > 4096,
+    # whatever H/T are. Quantized weights have no scaled torch fallback, so follow
+    # nkilib's rule for them instead of rejecting a shape the kernel runs.
+    if quantization_type != QuantizationType.NONE and I > 4096 and not has_bias:
+        can_shard_on_i = True
     effective_i = I // lnc_degree if can_shard_on_i else I
     return math.ceil(effective_i / _SRC_PROJ_INT_DIM_TILE_SIZE) <= _NUM_HW_PSUM_BANKS
 
