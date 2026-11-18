@@ -338,6 +338,11 @@ class MellumSparseMoeBlock(nn.Module):
         # Measured (trn2, KV cap 0.42, mns 512): through the 256 bucket the chunked kernel wins (c256 +14 %); at the
         # 512 bucket the 4 kernel copies' scratch plus KV 0.42 ran out of HBM (nrt_tensor_allocate status=4) -> 256.
         self.em_max_t = int(os.environ.get("MELLUM_MOE_EM_MAX_T", "256"))
+        # MELLUM_MOE_FP8_ONLY=1 (with MELLUM_MOE_EM=1, EP only): keep a single FP8 copy of the experts (padded Hp layout
+        # with per-column gate|up and per-H-column down scales). Prefill uses it through nkilib bwmm_shard_on_I(_hybrid)
+        # FP8 (stock: upcasts tiles to bf16; CR 10 overlay: no upcast); decode uses the expert-major kernel on the same
+        # buffers. The bf16 experts are freed (-1 copy, ~3 GB/core).
+        self.fp8_only = self.em_enabled and self.em_fp8 and os.environ.get("MELLUM_MOE_FP8_ONLY", "0") == "1"
         # >>> PARALLELISM: router replicated on every rank <<<
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, dtype=self.dtype))
         self.gate_up_proj_weight = nn.Parameter(
@@ -404,6 +409,8 @@ class MellumSparseMoeBlock(nn.Module):
         if mode == "auto":
             if self.swm_enabled and T <= self.swm_max_t:
                 return "routed_fp8"
+            if self.fp8_only:
+                return "expert_major"  # the bf16 experts are gone: every decode batch uses the FP8 kernel
             if self.em_enabled and T <= self.em_max_t and T * self.top_k > self.num_local_experts:
                 return "expert_major"
             if self.fp8_decode and T * self.top_k > self.num_local_experts:
@@ -622,6 +629,28 @@ class MellumSparseMoeBlock(nn.Module):
         per gate/up output column, per-expert scalar for down) or bf16. Host-side, once at load."""
         dev = device if device is not None else self.gate_up_proj_weight.device
         H, I = self.hidden_size, self.i_real
+        if self.fp8_only:
+            # single FP8 copy in the prefill kernel's padded layout: gate|up [E, Hp, 2I] (gate cols 0..I-1, up I..2I-1)
+            # scale [E, 1, 2I] per output column; down [E, I, Hp], scale [E, 1, Hp] per output column. The decode
+            # kernel reads the same buffers (first H rows/cols) with gate|up scale [E, 2I] and a per-expert down
+            # scalar -> keep the down scale per expert (constant over H) so both kernels agree.
+            gu = self.gate_up_proj_weight.detach().cpu().float()  # [E, Hp, 2 I_tp], gate | up halves
+            dn = self.down_proj_weight.detach().cpu().float()  # [E, I_tp, Hp]
+            E = gu.shape[0]
+            gs = (gu.abs().amax(1) / 240.0).clamp(min=1e-12)  # [E, 2I]
+            ds = (dn.abs().reshape(E, -1).amax(1, keepdim=True) / 240.0).clamp(min=1e-12)  # [E, 1]
+            gq = (gu / gs[:, None, :]).clamp(-240, 240).to(torch.float8_e4m3fn)
+            dq = (dn / ds[:, :, None]).clamp(-240, 240).to(torch.float8_e4m3fn)
+            self.em_gu = nn.Parameter(gq.contiguous().to(dev), requires_grad=False)  # [E, Hp, 2I]
+            self.em_dn = nn.Parameter(dq.contiguous().to(dev), requires_grad=False)  # [E, I, Hp]
+            self.em_gu_scale = nn.Parameter(gs.contiguous().to(dev), requires_grad=False)  # [E, 2I]
+            self.em_d_scale = nn.Parameter(ds.contiguous().to(dev), requires_grad=False)  # [E, 1]
+            self.pf_gu_scale = nn.Parameter(gs.reshape(E, 1, -1).contiguous().to(dev), requires_grad=False)
+            self.pf_d_scale = nn.Parameter(ds.expand(E, self.hp).reshape(E, 1, -1).contiguous().to(dev), requires_grad=False)
+            # drop the bf16 experts
+            self.gate_up_proj_weight = nn.Parameter(torch.empty(0, dtype=self.dtype, device=dev), requires_grad=False)
+            self.down_proj_weight = nn.Parameter(torch.empty(0, dtype=self.dtype, device=dev), requires_grad=False)
+            return
         gu = self.gate_up_proj_weight.detach().cpu()[:, :H, :]
         gu = torch.cat([gu[:, :, :I], gu[:, :, self.i_tp:self.i_tp + I]], dim=2).float()  # [E, H, 2I]
         dn = self.down_proj_weight.detach().cpu()[:, :I, :H].float()  # [E, I, H]
@@ -805,6 +834,9 @@ class MellumSparseMoeBlock(nn.Module):
         impl_name = os.environ.get("MELLUM_MOE_PREFILL_IMPL", "auto")
         if impl_name == "auto":
             impl_name = "hybrid" if self.tp_degree == 1 else "block"
+        if self.fp8_only and impl_name == "block":
+            # bwmm_shard_on_block ignores FP8 dequant scales; FP8 prefill must use shard_on_I(_hybrid)
+            impl_name = "hybrid" if self.tp_degree == 1 else "shard_on_i"
         impl = {
             "block": MoECTEImplementation.shard_on_block,
             "shard_on_i": MoECTEImplementation.shard_on_i,
@@ -825,8 +857,10 @@ class MellumSparseMoeBlock(nn.Module):
             conditions=conditions,
             hidden_states=self._pad_h(x).float() if cte_io_fp32 else self._pad_h(x),
             expert_affinities_masked=aff_masked,
-            gate_up_proj_weight=self.gate_up_proj_weight.reshape(self.num_local_experts, self.hp, 2, self.i_tp),
-            down_proj_weight=self.down_proj_weight,
+            gate_up_proj_weight=(self.em_gu if self.fp8_only else self.gate_up_proj_weight).reshape(
+                self.num_local_experts, self.hp, 2, self.i_tp),
+            down_proj_weight=self.em_dn if self.fp8_only else self.down_proj_weight,
+            **({"gate_up_proj_scale": self.pf_gu_scale, "down_proj_scale": self.pf_d_scale} if self.fp8_only else {}),
             activation_function=ActFnType.SiLU,
             block_size=self.block_size,
             token_position_to_id=tok_pos_to_id.to(dtype=torch.int32),

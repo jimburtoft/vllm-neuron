@@ -48,6 +48,10 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
     I2 = Wgu.shape[2]
     I = I2 // 2
     KT = H // 128
+    # storage row widths may exceed the compute H (weights zero-padded to Hp for the prefill kernel):
+    # only the first H rows of Wgu / columns of Wd are read.
+    HSG = Wgu.shape[1]
+    HSD = Wd.shape[2]
     WDT = Wgu.dtype
     FP8 = gu_scale is not None
     IC = I // NC  # this core's I rows per expert
@@ -184,15 +188,15 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
         else:
             dk, ok = {}, {}
             base = j
-        nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * H * I2 + i0, **dk), **ok)
-        nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * H * I2 + I + i0, **dk), **ok)
+        nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * HSG * I2 + i0, **dk), **ok)
+        nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * HSG * I2 + I + i0, **dk), **ok)
         if DRD:
             for ti, (o, n) in enumerate(I_TILES):
                 nisa.dma_copy(dst=wd8[j % nbuf][0:n, ti // 2, ti % 2, :],
-                              src=Wd.ap(pattern=[[H, n], [1, H]], offset=base * I * H + (i0 + o) * H, **dk), **ok)
+                              src=Wd.ap(pattern=[[HSD, n], [1, H]], offset=base * I * HSD + (i0 + o) * HSD, **dk), **ok)
         else:
             for ti, (o, n) in enumerate(I_TILES):
-                nisa.dma_copy(dst=wd[ti], src=Wd.ap(pattern=[[H, n], [1, H]], offset=base * I * H + (i0 + o) * H, **dk), **ok)
+                nisa.dma_copy(dst=wd[ti], src=Wd.ap(pattern=[[HSD, n], [1, H]], offset=base * I * HSD + (i0 + o) * HSD, **dk), **ok)
         if FP8:
             # scale buffers zeroed once (ring), not per slot: a skipped slot's routing weight is 0 anyway, and the
             # buffers only need finite contents
@@ -302,7 +306,7 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
             db = dbufs[j % nbuf]
             for ti, (o, n) in enumerate(I_TILES):
                 nisa.dma_copy(dst=db[0:n, ti // 2, ti % 2, :],
-                              src=Wd.ap(pattern=[[H, n], [1, H]], offset=based * I * H + (i0 + o) * H, **dkd), **okd)
+                              src=Wd.ap(pattern=[[HSD, n], [1, H]], offset=based * I * HSD + (i0 + o) * HSD, **dkd), **okd)
             return db
 
         # pass 1: gate|up (double_row) + SiLU * up * routing weight * down scale for every slot -> hall [R, E*IC]
@@ -319,8 +323,8 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
             else:
                 dk, ok = {}, {}
                 base = j
-            nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * H * I2 + i0, **dk), **ok)
-            nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * H * I2 + I + i0, **dk), **ok)
+            nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * HSG * I2 + i0, **dk), **ok)
+            nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * HSG * I2 + I + i0, **dk), **ok)
             gsc, dsc = sbufs[j % nbuf]
             nisa.dma_copy(dst=gsc[:, 0:IC], src=gu_scale.ap(pattern=[[0, R], [1, IC]], offset=base * I2 + i0, **dk), **ok)
             nisa.dma_copy(dst=gsc[:, IC:2 * IC], src=gu_scale.ap(pattern=[[0, R], [1, IC]], offset=base * I2 + I + i0, **dk), **ok)
