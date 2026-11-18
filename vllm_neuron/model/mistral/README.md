@@ -75,6 +75,22 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
   12.68 -> 12.24 ms at batch 32), and sampled requests are unchanged. It doubles the decode compile time.
 - `VLLM_NEURON_REPLICATED_DECODE_EMBEDDING=1` keeps the full embedding table on each rank for decode (+256 MiB per
   rank in bf16) and skips the embedding all-reduce: -2.5 % at batch 32, no gain at batch 1-8.
+- FP8 decode without a special checkpoint: `VLLM_NEURON_FP8_ROW_MLP=1` quantizes the MLP weights (about 80 % of
+  the weight bytes) to FP8 at load, with one scale per output channel, from the BF16 checkpoint. Attention stays
+  BF16, and decode multiplies BF16 activations by the FP8 weights. Decode is 15 % faster at batch 1 (8.26 -> 7.06 ms)
+  and 7-9 % faster at batch 8-64. GSM8K is 59.1 %, inside the BF16 range. Prefix caching and segmented prefill
+  still work. Prefill keeps BF16 speed.
+- Per-tensor FP8 checkpoints (ModelOpt, or `RedHatAI/Mistral-7B-Instruct-v0.3-FP8` relabelled to ModelOpt) also
+  load, with or without an FP8 KV cache. Decode is 18 % faster at batch 1, but GSM8K drops to about 56.5 %: the
+  per-tensor weight scales and the static per-tensor activation quantization each cost about 2 points.
+- `VLLM_NEURON_FP8_LM_HEAD=1` stores the LM head in FP8 with one scale per vocabulary row: -0.6 / -5.5 / -8.2 %
+  decode time at batch 1 / 8 / 32, but GSM8K drops by 1-2 points (59.0 %). Off by default.
+- EAGLE3 speculative decoding (`--speculative-config '{"method": "eagle3", "model": <draft>,
+  "num_speculative_tokens": 3}'`) with a Mistral-7B-v0.3 EAGLE3 draft cuts decode time 1.75x at concurrency 1
+  (4.5 ms per token), 1.39x at 4 and 1.15x at 8. From concurrency 16 up, the plain recipe above is faster (1,405
+  vs 1,286 tok/s at 16, 2,371 vs 1,614 at 32), so use EAGLE3 for latency-bound serving only. Under speculative
+  decoding, packed prefill is turned off by the scheduler, and fused decode norms make it 2-4 % slower, so leave
+  both off with EAGLE3.
 - `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (default 0.30) caps the KV cache. 0.6 is the largest value that
   still leaves HBM for the 8192-token prefill graph; 0.7 fails at load with `Allocation Failure`.
 - `decode_context_length_buckets` selects Model Runner V1 on this release. On the 10k server they double
@@ -141,4 +157,9 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
 ## Not supported
 
 - Sliding-window checkpoints (Mistral-7B-v0.1).
-- TP=1 for 7B: the decode MLP kernel fails with `NCC_INKI016 Stack out of memory` at intermediate size 14336.
+- TP=1 / TP=2 data-parallel layouts are slower per device than TP=4: decode is weight-read bound, so each engine
+  streams the whole model for its own small batch. Per-engine decode at batch 8: TP1 29.6 ms, TP2 16.6 ms, TP4
+  10.2 ms. At concurrency 32, TP1 x 4 engines gives 1,080 tok/s against 2,432 for TP4. TP1 compiles on this branch
+  (the decode MLP turns column tiling off above 7168 intermediate per rank), but the 10k-context server takes more
+  than an hour to compile. TP2 x 2 does not fit the 10k server's prefill and decode graphs at any KV cap that
+  leaves room for the KV cache.
