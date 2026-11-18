@@ -160,8 +160,12 @@ At `--max-model-len 32768`, TP4, BF16:
   HF bf16 and 0.33 / 0.53 for HF fp32 without the query scaling.
 
 FP8 weights with packed FP8 KV at 32768: TPOT 9.0 ms (batch 1) and 18.2 ms (batch 8); needle 2/2.
-FP8 weights with a BF16 KV cache lose needle retrieval past about 15k tokens, so use packed FP8 KV
-with FP8 weights. `VLLM_NEURON_QSCALE_TORCH=1` puts decode back on the PyTorch path.
+`VLLM_NEURON_QSCALE_TORCH=1` puts decode back on the PyTorch path.
+
+An unpacked FP8 KV cache (`--kv-cache-dtype fp8_e4m3` without `"fp8_packed_kv": true`, which the
+ModelOpt FP8 checkpoint selects by default) cannot use segmented prefill. Set
+`--max-num-batched-tokens` to at least `--max-model-len` so prefill is single-shot; the server
+refuses a smaller value, because a chunked prompt would otherwise ignore its earlier chunks.
 
 ## Images
 
