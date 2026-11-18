@@ -1812,7 +1812,17 @@ class LlamaModel(nn.Module):
         )
 
         aux_hidden_states = []
-        for idx, decoder_layer in enumerate(self.layers):
+        mk_n = self._decode_layers_mk(is_prefill, hidden_states, positions, attn_metadata)
+        idx = 0
+        while idx < len(self.layers):
+            if mk_n and idx + mk_n <= len(self.layers):
+                # Task 035: mk_n decoder layers in one NKI call (VLLM_NEURON_DECODE_LAYERS_MK).
+                hidden_states = self._decode_layers_call(
+                    idx, mk_n, hidden_states, positions, position_embeddings, attn_metadata
+                )
+                idx += mk_n
+                continue
+            decoder_layer = self.layers[idx]
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states)
             hidden_states = decoder_layer(
@@ -1821,6 +1831,7 @@ class LlamaModel(nn.Module):
                 position_embeddings=position_embeddings,
                 attn_metadata=attn_metadata,
             )
+            idx += 1
 
         hidden_states = self.norm(hidden_states)
 
@@ -1833,6 +1844,85 @@ class LlamaModel(nn.Module):
             ]
 
         return hidden_states, aux_hidden_states
+
+    # -- Task 035: several decoder layers per NKI call on decode ---------------
+    def _decode_layers_mk(self, is_prefill, hidden_states, positions, attn_metadata) -> int:
+        """Layers per kernel call (0 = per-layer path). Opt-in VLLM_NEURON_DECODE_LAYERS_MK=<n>; BF16 weights and
+        KV, S=1, no attention / MLP DP, no DCP, no Llama 4 query scaling, no Eagle3 aux layers, kernel available."""
+        n = int(os.environ.get("VLLM_NEURON_DECODE_LAYERS_MK", "0") or 0)
+        if n <= 0 or is_prefill or self.aux_hidden_state_layers:
+            return 0
+        from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+        L0 = self.layers[0]
+        a0 = L0.self_attn
+        md = attn_metadata["layers.0.self_attn"]
+        B = md["block_table_tensor"].shape[0]
+        if (
+            not can_run_kernel(hidden_states)
+            or L0._mlp_scheme is not QuantScheme.NONE
+            or a0.k_cache.dtype != a0.dtype
+            or getattr(a0, "fp8_packed", False)
+            or a0.attention_dp_size != 1
+            or a0.dcp_size != 1
+            or a0.kv_needs_a2a
+            or a0.l4_beta is not None
+            or L0.attn_dp != 1
+            or L0.mlp_dp != 1
+            or a0.num_key_value_heads_per_rank < 2
+            or hidden_states.shape[0] != B
+        ):
+            return 0
+        return n
+
+    def _decode_layers_call(self, start, n, hidden_states, positions, position_embeddings, attn_metadata):
+        from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+        from vllm_neuron.model.llama3.layers_tkg import layers_tkg_entry
+        from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+        layers = self.layers[start : start + n]
+        a0 = layers[0].self_attn
+        md = attn_metadata[f"layers.{start}.self_attn"]
+        block_table = md["block_table_tensor"]
+        block_size = md["block_size"]
+        S_ctx = md["max_blocks_per_seq"] * block_size
+        B = block_table.shape[0]
+        H = hidden_states.shape[-1]
+        nkh = a0.num_key_value_heads_per_rank
+        dt = a0.dtype
+        cos, sin = position_embeddings
+        half_d = a0.head_dim // 2
+        cos_k = cos[:, :half_d].view(B, 1, half_d).permute(2, 0, 1).contiguous().to(dt)
+        sin_k = sin[:, :half_d].view(B, 1, half_d).permute(2, 0, 1).contiguous().to(dt)
+        mask = attn_metadata.get(_DECODE_MASK_CACHE_KEY)
+        if mask is None:
+            mask = NF.gen_attention_decode_mask(
+                pos_ids=positions.view(1, B).to(torch.float32), bs=B, q_head=a0.num_q_heads_after_a2a,
+                s_active=1, s_prior=S_ctx, start_pos=None, block_len=block_size,
+            )
+            attn_metadata[_DECODE_MASK_CACHE_KEY] = mask
+        from vllm_neuron.functional.attention.attention_decode_mask import maybe_transpose_mask_for_qk_swap
+
+        mask_k = maybe_transpose_mask_for_qk_swap(mask, d_head=a0.head_dim)
+        abt = build_per_head_block_table(block_table, nkh).to(torch.int32)
+        upd = _per_head_cache_slots(md["slot_mapping"], block_size, nkh, B, 1)
+        kw = {}
+        for i, L in enumerate(layers):
+            a, m = L.self_attn, L.mlp
+            kw.update({
+                f"ln1_{i}": L.input_layernorm.weight.view(1, -1), f"wqkv_{i}": a.qkv_proj_weight,
+                f"wo_{i}": a.o_proj_weight, f"ln2_{i}": L.post_attention_layernorm.weight.view(1, -1),
+                f"wg_{i}": m.gate_proj_weight, f"wu_{i}": m.up_proj_weight, f"wd_{i}": m.down_proj_weight,
+                f"kc_{i}": a.k_cache, f"vc_{i}": a.v_cache,
+            })
+        ranks = tuple(a0.attn_tp_group.ranks) if a0.attn_tp_group.world_size > 1 else None
+        outs = wrap_nki(layers_tkg_entry(n))[get_logical_nc_config()](
+            X=hidden_states.to(dt).view(B, 1, H), cos=cos_k, sin=sin_k, attention_mask=mask_k,
+            active_blocks_table=abt, kv_cache_update_idx=upd, softmax_scale=a0.scaling,
+            eps=layers[0].rms_norm_eps, ranks=ranks, **kw,
+        )
+        return outs[0].view(B, H)
 
 
 # =============================================================================
