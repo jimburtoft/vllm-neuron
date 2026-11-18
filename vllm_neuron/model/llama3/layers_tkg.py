@@ -32,6 +32,33 @@ from nkilib.core.utils.common_types import ActFnType, ComputationMode, DtypeMode
 from nkilib.experimental.transformer.attention_block_tkg import attention_block_tkg as _attn
 
 
+def _allow_repeated_op_names():
+    """nkilib kernels give some DMAs fixed debug names (e.g. attention_tkg's block-table loads), so tracing the same
+    kernel twice in one NKI function raises "duplicate op name". The names are MLIR NameLoc labels only; make repeats
+    unique with a suffix instead. Only changes behaviour where the tracer would otherwise raise."""
+    try:
+        from nki._backends.mlir_tracer.context import MLIRTracerContext
+    except Exception:  # noqa: BLE001 - other NKI builds: leave as is
+        return
+    if getattr(MLIRTracerContext.setup_loc, "_layers_tkg_patched", False):
+        return
+    orig = MLIRTracerContext.setup_loc
+
+    def setup_loc(self, name=None):
+        if name and name in self._op_names:
+            k = 1
+            while f"{name}__r{k}" in self._op_names:
+                k += 1
+            name = f"{name}__r{k}"
+        return orig(self, name)
+
+    setup_loc._layers_tkg_patched = True
+    MLIRTracerContext.setup_loc = setup_loc
+
+
+_allow_repeated_op_names()
+
+
 def _all_reduce_add(partial, residual, ranks, B, H, tag):
     """residual + sum over TP ranks of ``partial`` ([B, 1, H] or [B, H] @ HBM) -> new [B, 1, H] @ shared HBM."""
     _, NC, pid = get_verified_program_sharding_info("layers_tkg", (0, 1), 2)
