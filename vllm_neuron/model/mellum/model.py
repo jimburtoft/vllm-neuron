@@ -637,7 +637,19 @@ class MellumSparseMoeBlock(nn.Module):
             gu = self.gate_up_proj_weight.detach().cpu().float()  # [E, Hp, 2 I_tp], gate | up halves
             dn = self.down_proj_weight.detach().cpu().float()  # [E, I_tp, Hp]
             E = gu.shape[0]
-            gs = (gu.abs().amax(1) / 240.0).clamp(min=1e-12)  # [E, 2I]
+            # Pad I so each of the 2 physical cores gets a multiple of 128 (bwmm_shard_on_I's per-tile FP8 scale DMA
+            # inside the hybrid dynamic loop fails to compile otherwise: NCC_IGCA108). Exact: zero gate/up columns
+            # and zero down rows contribute 0 (scales for the pad set to 1).
+            ip = ((self.i_tp + 255) // 256) * 256
+            if ip > self.i_tp:
+                pd = ip - self.i_tp
+                g_, u_ = gu[:, :, : self.i_tp], gu[:, :, self.i_tp :]
+                z = torch.zeros(E, gu.shape[1], pd)
+                gu = torch.cat([g_, z, u_, z], dim=2)
+                dn = torch.cat([dn, torch.zeros(E, pd, dn.shape[2])], dim=1)
+            self.em_ip = ip
+            gs = gu.abs().amax(1) / 240.0  # [E, 2I]
+            gs = torch.where(gs > 0, gs, torch.ones_like(gs))
             ds = (dn.abs().reshape(E, -1).amax(1, keepdim=True) / 240.0).clamp(min=1e-12)  # [E, 1]
             gq = (gu / gs[:, None, :]).clamp(-240, 240).to(torch.float8_e4m3fn)
             dq = (dn / ds[:, :, None]).clamp(-240, 240).to(torch.float8_e4m3fn)
@@ -858,7 +870,7 @@ class MellumSparseMoeBlock(nn.Module):
             hidden_states=self._pad_h(x).float() if cte_io_fp32 else self._pad_h(x),
             expert_affinities_masked=aff_masked,
             gate_up_proj_weight=(self.em_gu if self.fp8_only else self.gate_up_proj_weight).reshape(
-                self.num_local_experts, self.hp, 2, self.i_tp),
+                self.num_local_experts, self.hp, 2, self.em_ip if self.fp8_only else self.i_tp),
             down_proj_weight=self.em_dn if self.fp8_only else self.down_proj_weight,
             **({"gate_up_proj_scale": self.pf_gu_scale, "down_proj_scale": self.pf_d_scale} if self.fp8_only else {}),
             activation_function=ActFnType.SiLU,
