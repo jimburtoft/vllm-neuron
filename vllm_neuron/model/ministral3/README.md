@@ -143,6 +143,37 @@ Single request (long server): 1024 / 1024 at 102 tok/s, TTFT 63 ms, TPOT 9.8 ms.
   TP=2 x DP=2 uses `--max-num-seqs 64` per engine and `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.4` (0.6 runs out of
   device memory under load).
 
+## Speculative decoding (EAGLE-3)
+
+The public EAGLE-3 draft head
+[`flaitenberger/economize-eagle3-Ministral-3-8B-Instruct-2512`](https://huggingface.co/flaitenberger/economize-eagle3-Ministral-3-8B-Instruct-2512)
+(Apache-2.0) is published in the economize format. Convert it to the vLLM EAGLE-3 layout first. The
+plugin's draft loader reads the token embedding from the draft folder, so pass the target checkpoint
+too:
+
+```bash
+hf download flaitenberger/economize-eagle3-Ministral-3-8B-Instruct-2512 --local-dir economize-draft
+python vllm_neuron/model/ministral3/convert_economize_eagle3.py economize-draft \
+  Ministral-3-8B-Instruct-2512-BF16/config.json m3-eagle3 Ministral-3-8B-Instruct-2512-BF16
+vllm serve Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 --max-model-len 2048 \
+  --max-num-batched-tokens 2048 --max-num-seqs 32 --language-model-only --tokenizer-mode mistral \
+  --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [2048], "decode_context_length_buckets": [1024], "on_device_sampling_config": {"all_greedy": "true"}}}' \
+  --speculative-config '{"method": "eagle3", "model": "m3-eagle3", "num_speculative_tokens": 3}'
+```
+
+TP=4, 256 output tokens, greedy, output tok/s relative to the same server without speculation:
+
+| prompts | concurrency 1 | 4 | 8 |
+|---|---|---|---|
+| GSM8K | 1.89x (2.67 tokens per step) | 1.48x | 1.31x |
+| code | 1.71x (2.33) | 1.32x | 1.14x |
+| chat (UltraChat) | 1.40x (1.88) | 1.09x | 0.94x |
+
+At concurrency 16 and 32 (chat) it is 0.79x and 0.70x, so use it for latency-bound serving at low
+concurrency. GSM8K-256 accuracy is unchanged (90.6 %). `num_speculative_tokens` 4 compiles only
+with `--max-num-seqs` 16 or less (the draft sampler's 32,768-entry vocabulary limit) and is not
+faster than 3.
+
 ## Long context (> 16384)
 
 Past `original_max_position_embeddings` (16384) Ministral 3 scales the queries by
@@ -252,6 +283,7 @@ are calibrated for `float8_e4m3fn` (448). Set `VLLM_NEURON_FP8_INPUT_SCALE_COMPE
 | Packed prefill | ✅ | short server |
 | Vision tower (Pixtral) + projector | ✅ | one image per encoder block; see Images |
 | FP8 checkpoint | ✅ (after scale renaming) | see FP8 |
+| EAGLE-3 speculative decoding | ✅ | public economize draft head after conversion (see above) |
 | Llama 4 query scaling (positions >= 16384) | ✅ | fused decode kernel with a per-token query scale (vendored kernel) |
 | FP8 KV cache | ✅ | with the FP8 checkpoint (scales 1.0) |
 | Eagle3 | not tested | |
