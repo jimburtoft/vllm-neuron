@@ -122,6 +122,7 @@ DECODE_RSAG_TOKEN_THRESHOLD = 128
 #     removes the function-return / semaphore wrapper around every collective.
 #     "base" keeps the level the runner passes in. Prefill is unaffected.
 _GPTOSS_KV_SCATTER = os.environ.get("GPTOSS_KV_WRITE", "scatter") != "kernel"
+_GPTOSS_PACKED_K_RESWIZZLE = os.environ.get("GPTOSS_PACKED_K_WRITE", "pairs") == "reswizzle"
 
 _GPTOSS_PREFILL_IMPL = (
     MoECTEImplementation.shard_on_block
@@ -665,7 +666,9 @@ class GptOssAttention(nn.Module):
                 attn_metadata,
             )
 
-    def _write_paged_kv_cache(self, k, v, slot_mapping, block_size, full_prefill=True):
+    def _write_paged_kv_cache(
+        self, k, v, slot_mapping, block_size, full_prefill=True, packed_step=False
+    ):
         """Scatter post-RoPE K/V into the paged cache at slot_mapping positions.
 
         Used on the prefill paths where the cache write is NOT folded into the
@@ -702,7 +705,13 @@ class GptOssAttention(nn.Module):
             block_size,
             full_prefill=full_prefill,
             fp8_packed=self.fp8_packed,
-            packed_k_fallback="reswizzle",
+            # Segmented chunks start at a block boundary, so new K rows are
+            # pair-aligned and the pair scatter writes only the new slots. A
+            # packed-prefill step can hold odd-length prompts: un-swizzle,
+            # scatter, re-swizzle (GPTOSS_PACKED_K_WRITE=reswizzle forces it).
+            packed_k_fallback=(
+                "reswizzle" if packed_step or _GPTOSS_PACKED_K_RESWIZZLE else "pairs"
+            ),
         )
 
     # ── Prefill path ─────────────────────────────────────────────────────
@@ -834,7 +843,9 @@ class GptOssAttention(nn.Module):
                     tokens, self.num_key_value_heads_per_rank, self.head_dim
                 ).transpose(0, 1)
                 self._write_paged_kv_cache(
-                    k, v, slot_mapping, block_size, full_prefill=False
+                    k, v, slot_mapping, block_size, full_prefill=False,
+                    packed_step=attn_metadata[layer_name].get("packed_bound_min")
+                    is not None,
                 )
 
             # FP8 KV dequant for the segmented (chunked) prefill path: the cache
@@ -897,7 +908,8 @@ class GptOssAttention(nn.Module):
             # per-token write; one prompt from position 0 writes whole blocks.
             packed_step = attn_metadata[layer_name].get("packed_bound_min") is not None
             self._write_paged_kv_cache(
-                k, v, slot_mapping, block_size, full_prefill=not packed_step
+                k, v, slot_mapping, block_size, full_prefill=not packed_step,
+                packed_step=packed_step,
             )
 
             # Full prefill: standard flash attention
