@@ -39,7 +39,12 @@ from vllm_neuron.functional.attention.attention_decode import (
     packed_fp8_viable_for_bucket as _packed_fp8_viable_for_bucket,
 )
 
-from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, write_prefill_kv
+from vllm_neuron.model.kv_cache import (
+    KVSpec,
+    LayerSpec,
+    scatter_packed_k_pairs_nogather,
+    write_prefill_kv,
+)
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.dtype_utils import (
     FP8_CLAMP_MAX,
@@ -126,6 +131,7 @@ DECODE_RSAG_TOKEN_THRESHOLD = 128
 #     "base" keeps the level the runner passes in. Prefill is unaffected.
 _GPTOSS_KV_SCATTER = os.environ.get("GPTOSS_KV_WRITE", "scatter") != "kernel"
 _GPTOSS_FP8_PACKED_GQA = os.environ.get("GPTOSS_FP8_PACKED_GQA", "1") != "0"
+_GPTOSS_SEG_PACKED_K_PAIRS = os.environ.get("GPTOSS_SEG_PACKED_K_WRITE", "pairs") != "reswizzle"
 
 _GPTOSS_PREFILL_IMPL = (
     MoECTEImplementation.shard_on_block
@@ -669,7 +675,9 @@ class GptOssAttention(nn.Module):
                 attn_metadata,
             )
 
-    def _write_paged_kv_cache(self, k, v, slot_mapping, block_size, full_prefill=True):
+    def _write_paged_kv_cache(
+        self, k, v, slot_mapping, block_size, full_prefill=True, segmented_chunk=False
+    ):
         """Scatter post-RoPE K/V into the paged cache at slot_mapping positions.
 
         Used on the prefill paths where the cache write is NOT folded into the
@@ -697,6 +705,27 @@ class GptOssAttention(nn.Module):
             k_flat = k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
             v_flat = v.reshape(-1, self.head_dim).to(self.k_cache.dtype)
 
+        if segmented_chunk and self.fp8_packed and _GPTOSS_SEG_PACKED_K_PAIRS:
+            # A segmented chunk starts at a block boundary and pads only after
+            # its real tokens: write new K pairs only, with no read of the cache
+            # (GPTOSS_SEG_PACKED_K_WRITE=reswizzle restores the whole-cache
+            # un-swizzle / scatter / re-swizzle).
+            from vllm_neuron.model.kv_cache import paged_slot_indices
+
+            blocks, positions = paged_slot_indices(
+                slot_mapping, block_size, self.v_cache.shape[0]
+            )
+            nkh = self.num_key_value_heads_per_rank
+            index = (
+                blocks.repeat(nkh),
+                torch.arange(nkh, dtype=blocks.dtype, device=blocks.device).repeat_interleave(
+                    slot_mapping.shape[0]
+                ),
+                positions.repeat(nkh),
+            )
+            self.v_cache.index_put_(index, v_flat)
+            scatter_packed_k_pairs_nogather(self.k_cache, k_flat, slot_mapping, block_size)
+            return
         write_prefill_kv(
             self.k_cache,
             self.v_cache,
@@ -838,7 +867,13 @@ class GptOssAttention(nn.Module):
                     tokens, self.num_key_value_heads_per_rank, self.head_dim
                 ).transpose(0, 1)
                 self._write_paged_kv_cache(
-                    k, v, slot_mapping, block_size, full_prefill=False
+                    k,
+                    v,
+                    slot_mapping,
+                    block_size,
+                    full_prefill=False,
+                    segmented_chunk=attn_metadata[layer_name].get("packed_bound_min")
+                    is None,
                 )
 
             # FP8 KV dequant for the segmented (chunked) prefill path: the cache
