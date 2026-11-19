@@ -1939,7 +1939,12 @@ def attention_decode(
             )
         else:
             extra = {}
-            if q_scale is not None:
+            import os as _os
+
+            if q_scale is None and _os.environ.get("VLLM_NEURON_DECODE_VENDORED_ATTN") == "1":
+                # Opt-in: the vendored attention_block_tkg (task 037 V-extraction fix) without q_scale.
+                wrapped = wrap_nki(_torch_compatible_attention_block_tkg_kernel_qscale)
+            elif q_scale is not None:
                 wrapped = wrap_nki(_torch_compatible_attention_block_tkg_kernel_qscale)
                 extra["q_scale"] = q_scale.to(torch.float32).reshape(X.shape[0], X.shape[1])
             else:

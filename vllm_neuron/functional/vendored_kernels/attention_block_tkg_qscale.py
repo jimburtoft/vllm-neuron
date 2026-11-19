@@ -2025,15 +2025,22 @@ def _QKV_processing(
             nisa.tensor_copy(v_all_sb, qkv_sb[:, nl.ds(d_head * (q_heads + kv_heads), kv_heads * d_head)])
             if kv_quant:
                 v_all_sb = _quantize_to_fp8(v_all_sb, v_scale, sbm, kv_quant_dtype)
-            V_hbm_flat = V_hbm.reshape((B * kv_heads * S_tkg, d_head))
-            for batch_idx in range(tile_B):
-                src_start = batch_idx * S_tkg
-                flat_dst = (tile_b_start + batch_idx) * kv_heads * S_tkg
-                for kv_head_idx in range(kv_heads):
-                    nisa.dma_copy(
-                        V_hbm_flat[nl.ds(flat_dst + kv_head_idx * S_tkg, S_tkg), :],
-                        v_all_sb[nl.ds(src_start, S_tkg), nl.ds(kv_head_idx * d_head, d_head)],
-                    )
+            if S_tkg == 1:
+                # S_tkg == 1: V_hbm [B, kv_heads, 1, d_head] rows are contiguous [kv_heads * d_head] per batch,
+                # the same layout as v_all_sb [tile_B, kv_heads * d_head], so one DMA replaces
+                # tile_B * kv_heads tiny (d_head-element) copies.
+                V_hbm_rows = V_hbm.reshape((B, kv_heads * d_head))
+                nisa.dma_copy(V_hbm_rows[nl.ds(tile_b_start, tile_B), :], v_all_sb)
+            else:
+                V_hbm_flat = V_hbm.reshape((B * kv_heads * S_tkg, d_head))
+                for batch_idx in range(tile_B):
+                    src_start = batch_idx * S_tkg
+                    flat_dst = (tile_b_start + batch_idx) * kv_heads * S_tkg
+                    for kv_head_idx in range(kv_heads):
+                        nisa.dma_copy(
+                            V_hbm_flat[nl.ds(flat_dst + kv_head_idx * S_tkg, S_tkg), :],
+                            v_all_sb[nl.ds(src_start, S_tkg), nl.ds(kv_head_idx * d_head, d_head)],
+                        )
 
     # Quantize K to FP8 for attention when kv_quant=True
     if kv_quant:
