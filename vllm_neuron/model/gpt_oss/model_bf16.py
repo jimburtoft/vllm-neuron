@@ -94,6 +94,9 @@ DECODE_RSAG_TOKEN_THRESHOLD = 128
 # GPTOSS_DECODE_ATTN     "kernel" (default) | "torch"
 #     GQA decode attention via the NKI attention_block_tkg kernel, or the
 #     PyTorch fallback.
+# GPTOSS_FP8_PACKED_GQA  "1" (default) | "0"
+#     With a packed FP8 KV cache, also use the GQA decode kernel (per-head
+#     block table). "0" sends packed FP8 decode to the PyTorch fallback.
 # GPTOSS_GQA_LAYERS      "all" (default) | "full"
 #     Layers that use the GQA decode kernel. "full" keeps sliding-window layers
 #     on the PyTorch fallback.
@@ -122,6 +125,7 @@ DECODE_RSAG_TOKEN_THRESHOLD = 128
 #     removes the function-return / semaphore wrapper around every collective.
 #     "base" keeps the level the runner passes in. Prefill is unaffected.
 _GPTOSS_KV_SCATTER = os.environ.get("GPTOSS_KV_WRITE", "scatter") != "kernel"
+_GPTOSS_FP8_PACKED_GQA = os.environ.get("GPTOSS_FP8_PACKED_GQA", "1") != "0"
 
 _GPTOSS_PREFILL_IMPL = (
     MoECTEImplementation.shard_on_block
@@ -1072,7 +1076,14 @@ class GptOssAttention(nn.Module):
         # softmax). Same approach as qwen3_vl/model_bf16.py.
         # Pool addressing: block b, head h -> pool block b*nkh + h; token slot s -> pool slot
         # (s // bs * nkh + h) * bs + s % bs. -1 (inactive) is preserved.
-        _gqa_kernel = _GPTOSS_GQA_DECODE_KERNEL and nkh > 1 and not self.fp8_packed
+        # Packed FP8 KV too (GPTOSS_FP8_PACKED_GQA=0 restores the old gate): without
+        # the per-head table a packed cache takes the PyTorch decode fallback on
+        # every layer (107 ms/step at batch 1 vs ~5 ms with the kernel).
+        _gqa_kernel = (
+            _GPTOSS_GQA_DECODE_KERNEL
+            and nkh > 1
+            and (not self.fp8_packed or _GPTOSS_FP8_PACKED_GQA)
+        )
         # GPTOSS_GQA_LAYERS=full: kernel only on full-attention layers (no SWA).
         if _gqa_kernel and _GPTOSS_GQA_LAYERS == "full" and self.sliding_window is not None:
             _gqa_kernel = False
@@ -1097,6 +1108,16 @@ class GptOssAttention(nn.Module):
             s_active=S_decode,
             s_prior=S_ctx,
         )
+        # GQA kernel: it folds the KV heads into the batch, so the resized
+        # block_len must also hold at the folded batch (ministral3 a909905).
+        if use_packed_kernel and _gqa_kernel:
+            use_packed_kernel = _packed_fp8_viable_for_bucket(
+                block_len=block_size,
+                bs=B_local * nkh,
+                q_head=self.num_q_heads_after_a2a // nkh,
+                s_active=S_decode,
+                s_prior=S_ctx,
+            )
         k_cache_arg = (
             self.k_cache
             if (use_packed_kernel or not self.fp8_packed)
@@ -2363,7 +2384,11 @@ class GptOssModel(nn.Module):
         if not is_prefill:
             _a0 = self.layers[0].self_attn
             _nkh = _a0.num_key_value_heads_per_rank
-            _gqa = _GPTOSS_GQA_DECODE_KERNEL and _nkh > 1 and not _a0.fp8_packed
+            _gqa = (
+                _GPTOSS_GQA_DECODE_KERNEL
+                and _nkh > 1
+                and (not _a0.fp8_packed or _GPTOSS_FP8_PACKED_GQA)
+            )
             swa_mask, full_mask = _precompute_decode_attn_masks(
                 sliding_window=self.config.sliding_window,
                 attn_metadata=attn_metadata,
