@@ -39,7 +39,7 @@ from vllm_neuron.functional.attention.attention_decode import (
     packed_fp8_viable_for_bucket as _packed_fp8_viable_for_bucket,
 )
 
-from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, write_prefill_kv
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.dtype_utils import (
     FP8_CLAMP_MAX,
@@ -665,14 +665,18 @@ class GptOssAttention(nn.Module):
                 attn_metadata,
             )
 
-    def _write_paged_kv_cache(self, k, v, slot_mapping, block_size):
+    def _write_paged_kv_cache(self, k, v, slot_mapping, block_size, full_prefill=True):
         """Scatter post-RoPE K/V into the paged cache at slot_mapping positions.
 
         Used on the prefill paths where the cache write is NOT folded into the
         qkv kernel (full prefill needs raw K/V for flash attention; packed-FP8
         segmented prefill cannot use the in-kernel write). FP8 caches store
         ``fp8(clamp(tensor * scale))``; bf16 caches store directly. V is never
-        packed; packed K is un-swizzled, scattered, then re-swizzled in place.
+        packed.
+
+        A full prefill writes whole cache blocks (``write_prefill_kv``,
+        ``VLLM_NEURON_PREFILL_KV_BLOCK_WRITE``); otherwise one row per (token,
+        head), with a packed K cache un-swizzled, scattered, and re-swizzled.
         """
         if self.k_cache.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
             k_flat = (
@@ -689,27 +693,17 @@ class GptOssAttention(nn.Module):
             k_flat = k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
             v_flat = v.reshape(-1, self.head_dim).to(self.k_cache.dtype)
 
-        nkh = self.num_key_value_heads_per_rank
-        block_indices = (slot_mapping // block_size).repeat(nkh)
-        position_indices = (slot_mapping % block_size).repeat(nkh)
-        head_indices = torch.arange(
-            nkh, dtype=torch.long, device=k.device
-        ).repeat_interleave(slot_mapping.shape[0])
-        index = (block_indices, head_indices, position_indices)
-
-        # V is never packed → scatters directly.
-        self.v_cache.index_put_(index, v_flat)
-        if self.fp8_packed:
-            # Packed K cache [blocks, Nkh, block_size // 2, Dh, 2]: the swizzle
-            # interleaves adjacent token positions into the trailing size-2 dim,
-            # so a per-token scatter isn't expressible directly. Un-swizzle to
-            # the standard layout, scatter, then re-swizzle back in place
-            # (matching the decode kernel's write).
-            k_unpacked = _unswizzle_packed_k(self.k_cache)
-            k_unpacked.index_put_(index, k_flat)
-            self.k_cache.copy_(_swizzle_packed_k(k_unpacked))
-        else:
-            self.k_cache.index_put_(index, k_flat)
+        write_prefill_kv(
+            self.k_cache,
+            self.v_cache,
+            k_flat,
+            v_flat,
+            slot_mapping,
+            block_size,
+            full_prefill=full_prefill,
+            fp8_packed=self.fp8_packed,
+            packed_k_fallback="reswizzle",
+        )
 
     # ── Prefill path ─────────────────────────────────────────────────────
 
@@ -839,7 +833,9 @@ class GptOssAttention(nn.Module):
                 v = v.view(
                     tokens, self.num_key_value_heads_per_rank, self.head_dim
                 ).transpose(0, 1)
-                self._write_paged_kv_cache(k, v, slot_mapping, block_size)
+                self._write_paged_kv_cache(
+                    k, v, slot_mapping, block_size, full_prefill=False
+                )
 
             # FP8 KV dequant for the segmented (chunked) prefill path: the cache
             # stores k*k_scale / v*v_scale (see _write_paged_kv_cache), so the
@@ -896,7 +892,13 @@ class GptOssAttention(nn.Module):
             ).transpose(0, 1)
 
             # KV cache update via index_put_ (flash_attention needs raw K/V).
-            self._write_paged_kv_cache(k, v, slot_mapping, block_size)
+            # A packed prefill step holds several prompts, whose blocks do not
+            # start at block_size multiples of the step, so it keeps the
+            # per-token write; one prompt from position 0 writes whole blocks.
+            packed_step = attn_metadata[layer_name].get("packed_bound_min") is not None
+            self._write_paged_kv_cache(
+                k, v, slot_mapping, block_size, full_prefill=not packed_step
+            )
 
             # Full prefill: standard flash attention
             k = k.repeat_interleave(self.num_key_value_groups, dim=0)

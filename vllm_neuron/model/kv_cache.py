@@ -183,3 +183,260 @@ def build_per_head_slot_mapping(
     global_slot = global_block * block_size + position.unsqueeze(1)
     # [B*S, kv_heads] -> [B, kv_heads, S_tkg]
     return global_slot.view(batch_size, -1, kv_heads).transpose(1, 2).contiguous()
+
+# ---------------------------------------------------------------------------
+# Full-prefill KV write in whole cache blocks (port of private-vllm-neuron
+# PR #5335, ba997f7576 + d15674ce35).
+# ---------------------------------------------------------------------------
+from torch._subclasses.fake_tensor import FakeTensor
+
+from vllm_neuron import envs as _envs
+
+_PREFILL_KV_BLOCK_WRITE = _envs.VLLM_NEURON_PREFILL_KV_BLOCK_WRITE
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _eager_values_visible(t: torch.Tensor) -> bool:
+    """Return True when ``t`` holds real values that a Python check can read.
+
+    Dynamo folds a tensor-valued Python assertion before the graph reaches a
+    backend, and a FakeTensor holds no values. Only a real eager tensor can
+    enforce a value contract.
+    """
+    return not torch.compiler.is_dynamo_compiling() and not isinstance(t, FakeTensor)
+
+
+def prefill_kv_block_write_ok(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    num_tokens: int,
+    block_size: int,
+    num_kv_heads: int,
+    *,
+    full_prefill: bool,
+    dcp_size: int = 1,
+    fp8_packed: bool = False,
+) -> bool:
+    """Return True when ``write_prefill_kv`` can write whole cache blocks.
+
+    Every input is a trace-time constant (Python ints, flags, and tensor
+    shapes), so the result selects one write path for the whole graph. No
+    branch depends on tensor values.
+
+    The block write needs all of these conditions:
+
+    * ``VLLM_NEURON_PREFILL_KV_BLOCK_WRITE`` allows it. ``"packed"`` (the
+      default) allows it for a packed FP8 K cache only, ``"all"`` for every
+      cache, and ``"off"`` for none. For a packed K cache, the per-token path
+      unswizzles and reswizzles the whole cache, and the block write does not.
+      For a bf16 or a non-packed FP8 cache, the per-token scatter is about as
+      fast on trn2, so the default keeps it.
+    * The step is a full prefill (no ``kv_segment_size``), so the tokens of the
+      step start at in-block position 0 and fill each block in order.
+    * ``dcp_size == 1``. A DCP rank owns only some tokens of each block.
+    * ``num_tokens`` is a whole number of blocks.
+    * The block dim of the cache is ``block_size`` and the head dim of the
+      cache is ``num_kv_heads``. A packed FP8 K cache holds ``block_size // 2``
+      token pairs in each block.
+
+    Example:
+        >>> import torch
+        >>> k = torch.zeros(4, 2, 8, 8, 2, dtype=torch.float8_e4m3fn)
+        >>> v = torch.zeros(4, 2, 16, 8, dtype=torch.float8_e4m3fn)
+        >>> ok = prefill_kv_block_write_ok
+        >>> ok(k, v, 32, 16, 2, full_prefill=True, fp8_packed=True)
+        True
+        >>> ok(k, v, 24, 16, 2, full_prefill=True, fp8_packed=True)
+        False
+    """
+    if _PREFILL_KV_BLOCK_WRITE == "off" or not full_prefill or dcp_size > 1:
+        return False
+    if _PREFILL_KV_BLOCK_WRITE == "packed" and not fp8_packed:
+        return False
+    if block_size <= 0 or num_tokens <= 0 or num_tokens % block_size != 0:
+        return False
+    if v_cache.dim() != 4 or tuple(v_cache.shape[1:3]) != (num_kv_heads, block_size):
+        return False
+    if fp8_packed:
+        return (
+            k_cache.dim() == 5
+            and k_cache.shape[-1] == 2
+            and block_size % 2 == 0
+            and tuple(k_cache.shape[1:3]) == (num_kv_heads, block_size // 2)
+        )
+    return k_cache.dim() == 4 and tuple(k_cache.shape[1:3]) == (
+        num_kv_heads,
+        block_size,
+    )
+
+
+def _check_block_aligned(
+    block_indices: torch.Tensor,
+    position_indices: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Check in eager mode that each ``block_size`` chunk fills one cache block.
+
+    Chunk ``c`` holds tokens ``[c * bs, (c + 1) * bs)``. A valid token (a block
+    other than the null block) must sit in the block of the first token of its
+    chunk, at in-block position ``token - c * bs``. A chunk whose first token is
+    padding must hold padding only.
+    """
+    blocks = block_indices.view(-1, block_size)
+    positions = position_indices.view(-1, block_size)
+    valid = blocks != _NULL_BLOCK_ID
+    offset = torch.arange(block_size, device=blocks.device).view(1, -1)
+    aligned = (blocks == blocks[:, :1]) & (positions == offset)
+    assert bool(torch.all(~valid | aligned)), (
+        "write_prefill_kv: the slots of a full prefill are not block-aligned. "
+        "Each chunk of block_size tokens must start at in-block position 0 of "
+        "one block, or hold padding only. Pass full_prefill=False to use the "
+        "per-token write."
+    )
+
+
+def write_prefill_kv(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+    *,
+    full_prefill: bool,
+    dcp_size: int = 1,
+    fp8_packed: bool = False,
+    packed_k_fallback: str = "pairs",
+) -> None:
+    """Write the K/V of a prefill step into the paged KV cache, in place.
+
+    The caller quantizes or casts K/V first. This function only moves bytes, so
+    the cache contents of each real token are identical on both paths.
+
+    **Block path.** When ``prefill_kv_block_write_ok`` is True, each chunk of
+    ``block_size`` tokens is one cache block, and the function writes one
+    ``index_put_`` row for each (block, head). By default only a packed FP8 K
+    cache takes this path (see ``prefill_kv_block_write_ok``). The block of
+    chunk ``c`` is the block of its first token. The runner points a pad slot
+    at the null block (block 0), and ``paged_slot_indices`` also redirects
+    ``-1``, so a chunk of pad tokens writes the null block. The pad tail of the
+    last real chunk goes to positions past the prompt in the last block of that
+    request. No reader uses these positions before decode writes them: the
+    attention mask stops at the sequence length, a sliding window ends at the
+    sequence length too, and the prefix cache shares full blocks only. A
+    reused block already holds stale bytes at those positions on the per-token
+    path. A packed FP8 K block gets both lanes of each token pair from the new
+    tokens, so the write does not read the cache.
+
+    **Per-token path.** Otherwise, write one row for each (token, head) with
+    ``index_put_`` for K and V. A packed FP8 K cache uses
+    ``scatter_packed_k`` (``packed_k_fallback="pairs"``), or a whole-cache
+    unswizzle, scatter, and reswizzle (``packed_k_fallback="reswizzle"``).
+    ``scatter_packed_k`` needs an even token count.
+
+    In eager mode the block path checks that the slots are block-aligned.
+
+    Args:
+        k_cache: ``[nb, nkh, bs, d]``, or packed FP8 ``[nb, nkh, bs // 2, d, 2]``.
+        v_cache: ``[nb, nkh, bs, d]``.
+        k_new: ``[nkh, T, d]`` or ``[nkh * T, d]`` (head-major), in the cache
+            dtype (FP8 caches: already scaled, clamped, and cast).
+        v_new: Same layout as ``k_new``.
+        slot_mapping: ``[T]`` flat slots. Pad slots are 0 (null block) or -1.
+        block_size: Tokens in one cache block of this layer.
+        full_prefill: True when the step has no ``kv_segment_size``.
+        dcp_size: Decode-context-parallel size. A value above 1 selects the
+            per-token path.
+        fp8_packed: True when ``k_cache`` uses the packed FP8 layout.
+        packed_k_fallback: ``"pairs"`` or ``"reswizzle"``. The packed K write
+            of the per-token path.
+
+    Example:
+        >>> import torch
+        >>> k_cache = torch.zeros(3, 1, 2, 1)
+        >>> v_cache = torch.zeros(3, 1, 2, 1)
+        >>> k = torch.tensor([[[1.0], [2.0], [3.0], [4.0]]])  # [nkh=1, T=4, d=1]
+        >>> slots = torch.tensor([4, 5, 2, 3])  # block 2, then block 1
+        >>> write_prefill_kv(k_cache, v_cache, k, k, slots, 2, full_prefill=True)
+        >>> k_cache[:, 0, :, 0]
+        tensor([[0., 0.],
+                [3., 4.],
+                [1., 2.]])
+    """
+    num_tokens = slot_mapping.shape[0]
+    d_head = k_new.shape[-1]
+    nkh = k_new.numel() // (num_tokens * d_head)
+    block_indices, position_indices = paged_slot_indices(
+        slot_mapping, block_size, k_cache.shape[0]
+    )
+
+    if prefill_kv_block_write_ok(
+        k_cache,
+        v_cache,
+        num_tokens,
+        block_size,
+        nkh,
+        full_prefill=full_prefill,
+        dcp_size=dcp_size,
+        fp8_packed=fp8_packed,
+    ):
+        if _eager_values_visible(slot_mapping):
+            _check_block_aligned(block_indices, position_indices, block_size)
+        num_blocks = num_tokens // block_size
+        # One row for each (head, block), in head-major order. Row h * nblk + c
+        # is block c of head h. It is a contiguous [bs, d] slice of the
+        # head-major K/V, so the payload needs no transpose.
+        blk = block_indices.view(num_blocks, block_size)[:, 0]
+        index = (
+            blk.repeat(nkh),
+            torch.arange(nkh, dtype=blk.dtype, device=blk.device).repeat_interleave(
+                num_blocks
+            ),
+        )
+        rows = (nkh * num_blocks, block_size, d_head)
+        v_cache.index_put_(index, v_new.reshape(rows).to(v_cache.dtype))
+        if fp8_packed:
+            # Lane p % 2 of packed row p // 2 holds in-block position p. Swap
+            # the lane and the head dims in bf16: the fp8 -> bf16 -> fp8 round
+            # trip is exact, so the stored bytes do not change.
+            k_rows = k_new.reshape(nkh * num_blocks, block_size // 2, 2, d_head)
+            if k_rows.dtype in _FP8_DTYPES:
+                k_rows = k_rows.to(torch.bfloat16)
+            k_rows = k_rows.transpose(-1, -2).contiguous()
+        else:
+            k_rows = k_new.reshape(rows)
+        k_cache.index_put_(index, k_rows.to(k_cache.dtype))
+        return
+
+    head_indices = torch.arange(
+        nkh, dtype=torch.long, device=k_new.device
+    ).repeat_interleave(num_tokens)
+    index = (block_indices.repeat(nkh), head_indices, position_indices.repeat(nkh))
+    k_flat = k_new.reshape(-1, d_head).to(k_cache.dtype)
+    v_flat = v_new.reshape(-1, d_head).to(v_cache.dtype)
+    v_cache.index_put_(index, v_flat)
+    if not fp8_packed:
+        k_cache.index_put_(index, k_flat)
+        return
+
+    # Import here: attention_decode imports the NKI kernels, and kv_cache is
+    # imported by the model runner before they are needed.
+    from vllm_neuron.functional.attention.attention_decode import (
+        _swizzle_packed_k,
+        _unswizzle_packed_k,
+        scatter_packed_k,
+    )
+
+    if packed_k_fallback == "reswizzle":
+        k_unpacked = _unswizzle_packed_k(k_cache)
+        k_unpacked.index_put_(index, k_flat)
+        k_cache.copy_(_swizzle_packed_k(k_unpacked))
+    elif packed_k_fallback == "pairs":
+        scatter_packed_k(k_cache, k_flat, *index)
+    else:
+        raise ValueError(
+            f"packed_k_fallback {packed_k_fallback!r} is not known. "
+            "Use 'pairs' or 'reswizzle'."
+        )
+
+

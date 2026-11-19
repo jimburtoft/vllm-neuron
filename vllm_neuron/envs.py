@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     # Core System Variables
     VLLM_NEURON_CPU_MODE: bool = False
+    # Write the KV cache of a full prefill in whole cache blocks: "packed" (the
+    # default) for a packed FP8 K cache only, "all" for every cache, "off" for
+    # none (kill switch). See vllm_neuron.model.kv_cache.write_prefill_kv.
+    VLLM_NEURON_PREFILL_KV_BLOCK_WRITE: str = "packed"
     VLLM_NEURON_CPU_COMPILE: bool = False
     VLLM_NEURON_LOG_LEVEL: str = "INFO"
     VLLM_NEURON_DEBUG_MODE: bool = False
@@ -252,6 +256,29 @@ def optional_perf_float(name: str) -> float:
         return 0.0
 
 
+def _prefill_kv_block_write_mode(value: str | None) -> str:
+    """Parse VLLM_NEURON_PREFILL_KV_BLOCK_WRITE into "packed", "all", or "off".
+
+    Examples:
+        >>> _prefill_kv_block_write_mode(None)
+        'packed'
+        >>> _prefill_kv_block_write_mode("1")
+        'all'
+        >>> _prefill_kv_block_write_mode("0")
+        'off'
+    """
+    if value is None or value.strip() == "":
+        return "packed"
+    v = value.strip().lower()
+    v = {"1": "all", "true": "all", "0": "off", "false": "off"}.get(v, v)
+    if v not in ("packed", "all", "off"):
+        raise ValueError(
+            f"VLLM_NEURON_PREFILL_KV_BLOCK_WRITE={value!r} is not valid. "
+            "Use 'packed', 'all', or 'off'."
+        )
+    return v
+
+
 def maybe_convert_float(value: str | None) -> float | None:
     """Safely convert string to float."""
     if value is None:
@@ -260,6 +287,11 @@ def maybe_convert_float(value: str | None) -> float | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Full-prefill KV write in whole cache blocks; read once by
+    # vllm_neuron.model.kv_cache at import.
+    "VLLM_NEURON_PREFILL_KV_BLOCK_WRITE": lambda: _prefill_kv_block_write_mode(
+        os.getenv("VLLM_NEURON_PREFILL_KV_BLOCK_WRITE")
+    ),
     # ================== Core System Variables ==================
     # Enable CPU fallback mode instead of using Neuron accelerators
     "VLLM_NEURON_CPU_MODE": lambda: (
