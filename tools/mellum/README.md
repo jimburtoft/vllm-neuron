@@ -143,6 +143,36 @@ carry an extra FP8 copy, +2.8 GB per core). 2048 decode bucket, 8 prompts per pr
 With the kernel the KV budget must drop to 0.32 (0.42 runs out of HBM at load or under load at 512), so it does not
 raise the 512-request peak. Accuracy: fp32 gate PASS / PASS (max gap 0.28), GSM8K-100 97 %.
 
+### Single FP8 expert copy (highest throughput at 512 requests)
+
+Keep only an FP8 copy of the experts and run prefill on it too. This needs the patched NKI Library kernel on our
+fork (a coalesced FP8 scale load for a partial last I tile; the stock 2.33 kernel fails to compile at this shape with
+`NCC_IGCA108`, and otherwise converts FP8 tiles back to bf16):
+
+```bash
+pip install --no-deps --force-reinstall "git+https://github.com/jimburtoft/nki-library.git@mellum-trn2-2.33"
+export MELLUM_MOE_EM=1 MELLUM_MOE_FP8_ONLY=1 MELLUM_MOE_FP8_PAD_I=0
+export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.42 VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8
+vllm serve JetBrains/Mellum2.1-12B-A2.5B-Thinking --tensor-parallel-size 4 --enable-expert-parallel \
+  --max-model-len 8192 --max-num-seqs 512 --max-num-batched-tokens 8192 --no-enable-prefix-caching \
+  --additional-config '{"neuron_config": {"decode_context_length_buckets": [2048]}}'
+```
+
+Expert weights drop from 6.2 to 3.8 GiB per core. Measured from these public installs (trn2.3xlarge, TP=4, EP=4):
+
+| Workload | Output tok/s | TTFT p50 | TPOT p50 |
+|---|---:|---:|---:|
+| one request, 1,024 / 4,096-token prompt | | 91 / 234 ms | |
+| 128 / 1,024, 64 concurrent | 3,744 | 400 ms | 16.7 ms |
+| 128 / 1,024, 256 concurrent | 3,863 | 1,478 ms | 64.9 ms |
+| 128 / 1,024, 512 concurrent | **4,981** | 2,933 ms | 99.9 ms |
+| 1,024 / 1,024, 512 concurrent | 4,176 | 13,366 ms | 109.5 ms |
+| 4,096 / 1,024, 64 concurrent | 1,571 | 6,716 ms | 34.2 ms |
+
+Accuracy: fp32 gate PASS / PASS except one short-prompt near-tie (0.386, target in the fp32 top 5); GSM8K-100 96 %.
+The prefill kernel's hidden-state I/O is fp32 in this mode (`MELLUM_MOE_CTE_IO=auto`); with bf16 I/O one long prompt
+diverged (fp32 gap 1.74) in 2 of 3 compiles. More than 512 sequences (`--max-num-seqs 1024`) is slower (3,517 tok/s).
+
 ### Decode bucket ladder
 
 `"decode_context_length_buckets": [1024, 2048, 4096]` instead of `[2048]` (8 per step, EP=4, default KV):

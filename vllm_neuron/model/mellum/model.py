@@ -836,7 +836,9 @@ class MellumSparseMoeBlock(nn.Module):
         # near-tie on trn2 (fp32 gap 1.74 under segmented prefill); fp32 I/O removed it. "auto" (default): fp32 when
         # the experts are I-sharded, bf16 with whole experts per rank (EP4, validated in bf16). "fp32" / "bf16" force.
         io = os.environ.get("MELLUM_MOE_CTE_IO", "auto")
-        cte_io_fp32 = io == "fp32" or (io == "auto" and self.tp_degree > 1)
+        # FP8-only: fp32 I/O also with EP (bf16 I/O flipped a long-prompt near-tie, fp32 gate gap 1.74, 2 of 3 compiles;
+        # fp32 I/O: PASS, gap 0.12; -1 % throughput, +5-12 % TTFT).
+        cte_io_fp32 = io == "fp32" or (io == "auto" and (self.tp_degree > 1 or self.fp8_only))
         # MELLUM_MOE_PREFILL_IMPL: "auto" (default): "hybrid" with whole experts per rank (EP), "block" when the
         # experts are I-sharded (TP without EP). "block": bwmm shard_on_block; it computes every allocated block
         # (worst case: all top-k experts of a token on one rank), so at EP4 about 70 % of its blocks are empty, and
