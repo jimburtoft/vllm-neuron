@@ -640,7 +640,7 @@ class MellumSparseMoeBlock(nn.Module):
             # Pad I so each of the 2 physical cores gets a multiple of 128 (bwmm_shard_on_I's per-tile FP8 scale DMA
             # inside the hybrid dynamic loop fails to compile otherwise: NCC_IGCA108). Exact: zero gate/up columns
             # and zero down rows contribute 0 (scales for the pad set to 1).
-            ip = ((self.i_tp + 255) // 256) * 256
+            ip = ((self.i_tp + 255) // 256) * 256 if os.environ.get("MELLUM_MOE_FP8_PAD_I", "1") == "1" else self.i_tp
             if ip > self.i_tp:
                 pd = ip - self.i_tp
                 g_, u_ = gu[:, :, : self.i_tp], gu[:, :, self.i_tp :]
