@@ -440,3 +440,67 @@ def write_prefill_kv(
         )
 
 
+
+
+def scatter_packed_k_pairs_nogather(
+    k_cache: torch.Tensor,
+    k_new: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Write new K token pairs into a packed FP8 K cache without reading it.
+
+    For a prefill chunk that starts at an even position and has its pad slots
+    (0 or -1) only after its real tokens -- a segmented-prefill chunk, or a
+    single prompt from position 0. Then each token pair (2k, 2k+1) is either
+    two real tokens, a real token followed by a pad, or two pads. A real + pad
+    pair writes the pad into the position after the prompt's last token, in the
+    request's own block; no reader uses that position before decode writes it
+    (the same argument as the block path of ``write_prefill_kv``). Two pads go
+    to the null block.
+
+    ``scatter_packed_k`` instead gathers the stored pair to merge one lane; that
+    gather went out of bounds on trn2 with two KV heads per rank (gpt-oss-trn2
+    Task 086, ministral3-8b Task 030).
+
+    Args:
+        k_cache: packed FP8 K cache ``[nb, nkh, bs // 2, d, 2]``.
+        k_new: ``[nkh, T, d]`` or ``[nkh * T, d]`` (head-major), cache dtype.
+        slot_mapping: ``[T]`` flat slots, pads 0 or -1 after the real tokens.
+        block_size: tokens in one cache block.
+
+    Example:
+        >>> import torch
+        >>> kc = torch.zeros(3, 1, 2, 1, 2)
+        >>> k = torch.tensor([[[1.0], [2.0], [3.0], [0.0]]])  # 3 real + 1 pad
+        >>> scatter_packed_k_pairs_nogather(kc, k, torch.tensor([8, 9, 10, 0]), 4)
+        >>> kc[2, 0, :, 0].tolist()
+        [[1.0, 2.0], [3.0, 0.0]]
+    """
+    num_tokens = slot_mapping.shape[0]
+    d_head = k_new.shape[-1]
+    nkh = k_new.numel() // (num_tokens * d_head)
+    if _eager_values_visible(slot_mapping):
+        assert num_tokens % 2 == 0, "scatter_packed_k_pairs_nogather needs an even token count"
+    blocks, positions = paged_slot_indices(slot_mapping, block_size, k_cache.shape[0])
+    lane0_blocks = blocks.view(-1, 2)[:, 0]
+    lane1_blocks = blocks.view(-1, 2)[:, 1]
+    lane0_outer = positions.view(-1, 2)[:, 0] // 2
+    lane1_outer = positions.view(-1, 2)[:, 1] // 2
+    # Lane 0 is real unless the whole pair is padding; a pad-then-real pair
+    # cannot occur for this layout. Pick lane 1's coordinate only for that
+    # impossible case to keep the write in range.
+    use_lane0 = lane0_blocks > 0
+    pair_blocks = torch.where(use_lane0, lane0_blocks, lane1_blocks)
+    pair_outer = torch.where(use_lane0, lane0_outer, lane1_outer)
+    num_pairs = num_tokens // 2
+    index = (
+        pair_blocks.repeat(nkh),
+        torch.arange(nkh, dtype=pair_blocks.dtype, device=pair_blocks.device).repeat_interleave(num_pairs),
+        pair_outer.repeat(nkh),
+    )
+    k_rows = k_new.reshape(nkh * num_pairs, 2, d_head)
+    if k_rows.dtype in _FP8_DTYPES:
+        k_rows = k_rows.to(torch.bfloat16)
+    k_rows = k_rows.transpose(-1, -2).contiguous()  # [pairs, d, 2]
+    k_cache.index_put_(index, k_rows.to(k_cache.dtype))
