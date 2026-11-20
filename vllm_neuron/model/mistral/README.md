@@ -86,6 +86,9 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
   - 8k-token prompts: time to first token 16-19 % lower;
   - GSM8K 85.7 % (BF16 85.4 %); on Mistral-7B 59.1 % (BF16 59.2-60.9 %). Token-level agreement with an fp32
     reference is about 0.5 points lower than BF16.
+  - long prompts: 4k/512 979 -> 1,046 tok/s (+7 %), 8k/1k 780 -> 840 (+8 %).
+  Keep `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` at 0.6 and `max_num_seqs` at 128 with FP8 as well: a higher cap or
+  `max_num_seqs` 256 gave no more throughput and failed HBM allocations at run time after warmup had passed.
   Prefix caching and segmented prefill keep working. `VLLM_NEURON_FP8_ROW_CTE=0` falls back to dequantizing the
   weights for prefill (slower prefill, same decode).
 - Per-tensor FP8 checkpoints (ModelOpt, or `RedHatAI/Mistral-7B-Instruct-v0.3-FP8` relabelled to ModelOpt) also
