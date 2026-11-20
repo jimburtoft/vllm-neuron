@@ -202,6 +202,31 @@ runs, output tokens/s without / with packing: 186 / 175 (-6 %) at 1 concurrent r
 914 / 1,010 (+10 %) at 16. The acceptance rate is the same (0.68-0.69). Use it when there are usually several
 requests in flight; at one request the decode steps after a packed prefill are slightly slower.
 
+### Packed FP8 KV cache for long requests (opt-in, Trn2)
+
+Add `--kv-cache-dtype fp8` and `"fp8_packed_kv": true` (in `neuron_config`) to the FP8 command above. The KV cache
+holds twice as many tokens (1,511,925 vs 755,920 on trn2.3xlarge at `max_model_len` 8192). Decode reads the packed
+cache in the GQA attention kernel, and prefill writes only the new token pairs. Decode step time (5.4 / 8.8 / 18.4 ms
+at batch 1 / 4 / 16) and time to first token (60 / 141 / 275 ms at 128 / 2,000 / 3,900 tokens) match the BF16 KV
+cache within 3 %.
+
+Served on trn2.3xlarge, random prompts, output tokens/s, BF16 KV / packed FP8 KV:
+
+| Prompt / output tokens, concurrency | BF16 KV | FP8 KV |
+|---|---:|---:|
+| 512 / 128, 64 | 1,096 | 1,109 (+1 %) |
+| 4,000 / 128, 64 | 383 | 393 (+3 %) |
+| 6,000 / 1,024, 64 (`--max-num-seqs 128`) | 979 | 1,129 (+15 %) |
+| 6,000 / 1,024, 128 (`--max-num-seqs 128`) | 843 | 1,202 (+43 %) |
+
+The gain comes when the BF16 cache cannot hold every running request. GSM8K-CoT (250 questions): 0.892. Greedy
+output differs from the BF16 KV cache after a few dozen tokens, as expected for an 8-bit cache. Packed prefill
+(`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=16`) also works: +51 % at 64-token prompts and 64 concurrent requests.
+**Do not combine it with EAGLE3 yet:** EAGLE3 + FP8 KV is correct (same acceptance, GSM8K 0.872) but 35-50 % slower
+than EAGLE3 + BF16 KV (101 vs 186 tokens/s at one request); the cause is not yet known.
+Knobs: `GPTOSS_FP8_PACKED_GQA=0` (PyTorch decode, about 20x slower), `GPTOSS_SEG_PACKED_K_WRITE=reswizzle` (the old
+whole-cache prefill write, 4-5x slower), `VLLM_NEURON_PREFILL_KV_BLOCK_WRITE=packed|all|off` (single-step prefill).
+
 ## Known issues
 
 - **Intermittent HTTP 500 errors with an FP8 KV cache on Trn3.** A race
@@ -215,6 +240,9 @@ requests in flight; at one request the decode steps after a packed prefill are s
   `VLLM_NEURON_ATTN_MASK_TORCH=1` in the server environment. For a
   disaggregated deployment, set it on the decode server. This flag builds the
   decode attention mask in PyTorch, in place of an NKI kernel.
+- **`HarmonyError` stream errors with packed prefill + EAGLE3 + FP8 KV on Trn2.** 4 of about 640 chat requests ended
+  with `openai_harmony.HarmonyError: Unexpected token 200002` in the API server. Not seen with FP8 KV + EAGLE3
+  without packing. This combination is not recommended yet (see "Packed FP8 KV cache").
 
 ## Accuracy Evaluation
 
