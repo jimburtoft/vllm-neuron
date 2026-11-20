@@ -616,6 +616,8 @@ class MellumSparseMoeBlock(nn.Module):
         if self.em_fp8:
             kw.update(gu_scale=self.em_gu_scale, d_scale=self.em_d_scale)
         xb = x.to(torch.bfloat16).contiguous()
+        if T > 128 and os.environ.get("MELLUM_MOE_EM_GATHER", "1") == "1":
+            return self._decode_expert_major_gathered(xb, aff, k_lnc=lnc).to(self.dtype)
         outs = []
         for c0 in range(0, T, 128):
             c1 = min(T, c0 + 128)
@@ -623,6 +625,47 @@ class MellumSparseMoeBlock(nn.Module):
             outs.append(o if isinstance(o, torch.Tensor) else o[0])
         out = outs[0] if len(outs) == 1 else torch.cat(outs, 0)
         return out.to(self.dtype)
+
+    def _decode_expert_major_gathered(self, xb, aff, k_lnc):
+        """T > 128: gather each local expert's routed rows into C slots (C = capacity, a multiple of 16 <= 128),
+        one kernel pass per expert, scatter-add the slot outputs back. Rows routed to an expert beyond C are
+        dropped (C defaults to 2 x the mean load, ~8 sigma above it for Binomial(T, 1/8))."""
+        from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+        from .moe_decode_kernel import mellum_moe_decode_gathered
+
+        T, H = xb.shape
+        E = self.num_local_experts
+        mean = T * self.top_k / self.num_experts
+        C = int(os.environ.get("MELLUM_MOE_EM_CAP", "0")) or min(128, max(16, int(-(-2 * mean // 16)) * 16))
+        routed = aff > 0  # [T, E]
+        # position of each routed (row, expert) among that expert's rows: cumsum over T
+        pos = torch.cumsum(routed.to(torch.int32), dim=0) - 1  # [T, E]
+        keep = routed & (pos < C)
+        # slot -> row map, built with a scatter on a flattened [E * C (+1 dump)] index
+        dump = E * C
+        flat = torch.where(keep, torch.arange(E, device=xb.device).unsqueeze(0) * C + pos, torch.full_like(pos, dump))
+        rows = torch.arange(T, device=xb.device, dtype=torch.int32).unsqueeze(1).expand(T, E)
+        slot_row = torch.full((dump + 1,), T, device=xb.device, dtype=torch.int32)
+        slot_row = slot_row.scatter(0, flat.reshape(-1).to(torch.int64), rows.reshape(-1))[:dump]  # T = empty slot
+        xpad = torch.cat([xb, torch.zeros(1, H, dtype=xb.dtype, device=xb.device)], 0)
+        xg = xpad.index_select(0, slot_row.to(torch.int64)).reshape(E, C, H)
+        affpad = torch.cat([aff, torch.zeros(1, E, dtype=aff.dtype, device=aff.device)], 0)
+        e_of_slot = torch.arange(E, device=xb.device).repeat_interleave(C)
+        wslot = affpad[slot_row.to(torch.int64), e_of_slot].reshape(E, C)
+        if self.em_fp8:
+            wslot = wslot * self.em_d_scale  # [E, 1] down scale folded in
+        k = wrap_nki(mellum_moe_decode_gathered)
+        k = k[k_lnc] if k_lnc > 1 else k
+        kw = dict(nbuf=int(os.environ.get("MELLUM_MOE_EM_NBUF", "2")))
+        if self.em_fp8:
+            kw.update(gu_scale=self.em_gu_scale)
+        o = k(xg.transpose(1, 2).contiguous(), wslot.float().contiguous(), self.em_gu, self.em_dn, **kw)
+        o = o if isinstance(o, torch.Tensor) else o[0]
+        o = o.sum(0).reshape(E * C, H)  # [E*C, H] fp32
+        y = torch.zeros(T + 1, H, dtype=torch.float32, device=xb.device)
+        y = y.index_add(0, slot_row.to(torch.int64), o)[:T]
+        return y
 
     def build_expert_major_weights(self, device=None):
         """Real-H (2304) expert weights for the expert-major kernel: gate|up [E, H, 2I], down [E, I, H]; FP8 (amax/240

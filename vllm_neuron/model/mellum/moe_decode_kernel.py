@@ -421,3 +421,89 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
     else:
         nisa.dma_copy(dst=y, src=ys)
     return y
+
+
+@nki.jit
+def mellum_moe_decode_gathered(xgT, wslot, Wgu, Wd, gu_scale=None, nbuf=2):
+    """Expert-major decode MoE on per-expert gathered tokens (one pass per expert at any batch size).
+
+    xgT   bf16 [E, H, C]  for each local expert, the hidden states of its routed tokens (slot-major, transposed;
+                          unused slots are zero rows)
+    wslot fp32 [E, C]     routing weight of each slot (x the expert's down scale for FP8; 0 for unused slots)
+    Wgu / Wd / gu_scale   as in mellum_moe_decode (storage may be H-padded)
+    returns fp32 [NC, E, C, H]: per physical core the partial (its I slice) output of every slot.
+    """
+    E, H, C = xgT.shape
+    NC = nl.num_programs(0) if nl.program_ndim() > 0 else 1
+    pid = nl.program_id(0) if nl.program_ndim() > 0 else 0
+    I2 = Wgu.shape[2]
+    I = I2 // 2
+    KT = H // 128
+    HSG = Wgu.shape[1]
+    HSD = Wd.shape[2]
+    WDT = Wgu.dtype
+    FP8 = gu_scale is not None
+    IC = I // NC
+    i0 = pid * IC
+    I_TILES = [(o, min(128, IC - o)) for o in range(0, IC, 128)]
+    HT = _col_tiles(H)
+    GT = [(0, o, n) for (o, n) in _col_tiles(IC)] + [(1, o, n) for (o, n) in _col_tiles(IC)]
+
+    ident = _sb((128, 128), BF)
+    io_p = _sb((128, 1))
+    nisa.iota(io_p, [[0, 1]], offset=0, channel_multiplier=1)
+    io_f = _sb((128, 128))
+    nisa.iota(io_f, [[1, 128]], offset=0, channel_multiplier=0)
+    nisa.tensor_scalar(dst=ident, data=io_f, op0=nl.equal, operand0=io_p)
+
+    y = nl.ndarray((NC, E, C, H), dtype=F32, buffer=nl.shared_hbm)
+    bufs = []
+    for bi in range(nbuf):
+        xP = _sb((128, KT * C), BF)
+        wg = _sb((128, KT * IC), WDT)
+        wu = _sb((128, KT * IC), WDT)
+        wd = [_sb((n, H), WDT) for (_, n) in I_TILES]
+        gsc = _sb((C, 2 * IC)) if FP8 else None
+        wc = _sb((C, 1))
+        bufs.append((xP, wg, wu, wd, gsc, wc))
+    for j in range(E):
+        xP, wg, wu, wd, gsc, wc = bufs[j % nbuf]
+        nisa.dma_copy(dst=xP, src=xgT.ap(pattern=[[C, 128], [128 * C, KT], [1, C]], offset=j * H * C))
+        nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=j * HSG * I2 + i0))
+        nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=j * HSG * I2 + I + i0))
+        for ti, (o, n) in enumerate(I_TILES):
+            nisa.dma_copy(dst=wd[ti], src=Wd.ap(pattern=[[HSD, n], [1, H]], offset=j * I * HSD + (i0 + o) * HSD))
+        nisa.dma_copy(dst=wc, src=wslot.ap(pattern=[[1, C], [1, 1]], offset=j * C))
+        if FP8:
+            nisa.dma_copy(dst=gsc[:, 0:IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=j * I2 + i0))
+            nisa.dma_copy(dst=gsc[:, IC:2 * IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=j * I2 + I + i0))
+        gu = _sb((C, 2 * IC), BF)
+        for (which, co, cn) in GT:
+            wsrc = wg if which == 0 else wu
+            dco = which * IC + co
+            pgu = nl.ndarray((C, cn), dtype=F32, buffer=nl.psum)
+            for kt in range(KT):
+                nisa.nc_matmul(pgu, xP[:, kt * C:(kt + 1) * C], wsrc[:, kt * IC + co: kt * IC + co + cn])
+            if FP8:
+                nisa.tensor_tensor(dst=gu[:, dco:dco + cn], data1=pgu, data2=gsc[:, dco:dco + cn], op=nl.multiply)
+            else:
+                nisa.tensor_copy(dst=gu[:, dco:dco + cn], src=pgu)
+        sg = _sb((C, IC), BF)
+        nisa.activation(dst=sg, data=gu[:, 0:IC], op=nl.silu)
+        hr = _sb((C, IC), BF)
+        nisa.tensor_tensor(dst=hr, data1=sg, data2=gu[:, IC:2 * IC], op=nl.multiply)
+        hw = _sb((C, IC), BF)
+        nisa.tensor_scalar(dst=hw, data=hr, op0=nl.multiply, operand0=wc)
+        py = [nl.ndarray((C, n), dtype=F32, buffer=nl.psum) for (_, n) in HT]
+        for ti, (o, n) in enumerate(I_TILES):
+            ph = nl.ndarray((n, C), dtype=F32, buffer=nl.psum)
+            nisa.nc_matmul(ph, hw[:, o:o + n], ident[0:C, 0:C])
+            hs = _sb((n, C), BF)
+            nisa.tensor_copy(dst=hs, src=ph)
+            for t, (ho, hn) in enumerate(HT):
+                nisa.nc_matmul(py[t], hs, wd[ti][:, ho:ho + hn])
+        ys = _sb((C, H))
+        for t, (ho, hn) in enumerate(HT):
+            nisa.tensor_copy(dst=ys[:, ho:ho + hn], src=py[t])
+        nisa.dma_copy(dst=y.ap(pattern=[[H, C], [1, H]], offset=(pid * E + j) * C * H), src=ys)
+    return y
