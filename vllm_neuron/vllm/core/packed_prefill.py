@@ -116,7 +116,7 @@ def unsupported_reason(vllm_config: "VllmConfig") -> str | None:
         # Only the bf16 GPT-OSS module honours the bounds (not mxfp4 / trn3 defaults).
         if nc.get("quantization") != "bf16":
             return "GPT-OSS packed prefill needs neuron_config quantization='bf16'"
-    if {"LlamaForCausalLM", "MistralForCausalLM"} & set(archs):
+    if {"LlamaForCausalLM", "MistralForCausalLM", "Phi3ForCausalLM"} & set(archs):
         # Only the bf16 llama3 module honours the bounds (not the static-FP8 one).
         hf = getattr(mc, "hf_config", None)
         qc = getattr(hf, "quantization_config", None)
