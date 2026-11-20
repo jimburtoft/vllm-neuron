@@ -222,9 +222,12 @@ Served on trn2.3xlarge, random prompts, output tokens/s, BF16 KV / packed FP8 KV
 The gain comes when the BF16 cache cannot hold every running request. GSM8K-CoT (250 questions): 0.892. Greedy
 output differs from the BF16 KV cache after a few dozen tokens, as expected for an 8-bit cache. Packed prefill
 (`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=16`) also works: +51 % at 64-token prompts and 64 concurrent requests.
-**Do not combine it with EAGLE3 yet:** EAGLE3 + FP8 KV is correct (same acceptance, GSM8K 0.872) but 35-50 % slower
-than EAGLE3 + BF16 KV (101 vs 186 tokens/s at one request); the cause is not yet known.
-Knobs: `GPTOSS_FP8_PACKED_GQA=0` (PyTorch decode, about 20x slower), `GPTOSS_SEG_PACKED_K_WRITE=reswizzle` (the old
+**EAGLE3 works with it at BF16 speed** (EAGLE3 command above plus the two FP8 settings; chat prompts, 256 output tokens,
+tokens/s BF16 KV / FP8 KV: 185-190 / 178-186 at 1 request, 411-413 / 411-414 at 4, 927-933 / 956-963 at 16; same
+acceptance, GSM8K 0.876). **Packed prefill + EAGLE3 + FP8 KV is not recommended**: time to first token is about 245 ms
+instead of 65 ms (packed steps rewrite the whole packed K cache) and about 1 in 200 chat requests ends with a
+`HarmonyError` stream error.
+Knobs: `VLLM_NEURON_LLAMA3_GQA_MULTI_TOKEN=0` (EAGLE3 draft decode back on the PyTorch path), `GPTOSS_FP8_PACKED_GQA=0` (PyTorch decode, about 20x slower), `GPTOSS_SEG_PACKED_K_WRITE=reswizzle` (the old
 whole-cache prefill write, 4-5x slower), `VLLM_NEURON_PREFILL_KV_BLOCK_WRITE=packed|all|off` (single-step prefill).
 
 ## Known issues
@@ -242,7 +245,8 @@ whole-cache prefill write, 4-5x slower), `VLLM_NEURON_PREFILL_KV_BLOCK_WRITE=pac
   decode attention mask in PyTorch, in place of an NKI kernel.
 - **`HarmonyError` stream errors with packed prefill + EAGLE3 + FP8 KV on Trn2.** 4 of about 640 chat requests ended
   with `openai_harmony.HarmonyError: Unexpected token 200002` in the API server. Not seen with FP8 KV + EAGLE3
-  without packing. This combination is not recommended yet (see "Packed FP8 KV cache").
+  without packing (rechecked after the EAGLE3 draft fix: 3 of about 640). This combination is not recommended
+  (see "Packed FP8 KV cache").
 
 ## Accuracy Evaluation
 
