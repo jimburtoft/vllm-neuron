@@ -21,6 +21,8 @@ PARALLELISM SHARDING:
 import logging
 import math
 
+import os
+
 import torch
 from torch import nn
 from nkilib.core.utils.common_types import NormType
@@ -31,8 +33,11 @@ import vllm_neuron.functional as NF
 from vllm_neuron.functional.attention.attention_decode import (
     _swizzle_packed_k,
     _unswizzle_packed_k,
+    packed_fp8_viable_for_bucket,
 )
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.model.qwen3_vl.utils.decode_kv import build_per_head_block_table
+from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm_neuron.parallel.neuron_parallel_state import shard_select
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.dtype_utils import (
@@ -920,6 +925,42 @@ class LlamaAttention(nn.Module):
             attn_metadata[_DECODE_MASK_CACHE_KEY] = attention_mask
 
         active_blocks_table = block_table
+        kv_cache_update_idx = slot_mapping.view(B_local, S_decode).to(torch.uint32)
+        # GQA with more than one KV head per rank (8 KV heads at TP <= 4): the
+        # fused decode kernel needs a per-head 3D block table and per-head cache
+        # slots; a 2D table sends attention to the torch fallback (see
+        # _can_use_attention_block_kernel). With a packed FP8 K cache, read it
+        # packed where the bucket keeps block_len >= 2 after the kernel's resize
+        # (at the unfolded and the head-folded batch), else un-swizzle for the
+        # unpacked kernel and re-swizzle the returned K. Port of ministral3-trn2
+        # 32a81b8 / fd71a73 / 1d676cd (single-token decode only; speculative
+        # verify and the CPU torch fallback keep the 2D table).
+        use_packed_kernel = self.fp8_packed
+        needs_k_back = False
+        if (
+            nkh > 1
+            and S_decode == 1
+            and not dcp_decode_active
+            and self.attention_dp_size == 1
+            and can_run_kernel(hidden_states)
+            and os.environ.get("VLLM_NEURON_LLAMA3_GQA_DECODE", "1") != "0"
+        ):
+            if self.fp8_packed:
+                block_len = self.v_cache.shape[-2]
+                use_packed_kernel = packed_fp8_viable_for_bucket(
+                    block_len=block_len, bs=B_local, q_head=mask_q_heads,
+                    s_active=S_decode, s_prior=S_ctx,
+                ) and packed_fp8_viable_for_bucket(
+                    block_len=block_len, bs=B_local * nkh, q_head=mask_q_heads // nkh,
+                    s_active=S_decode, s_prior=S_ctx,
+                )
+                needs_k_back = not use_packed_kernel
+            active_blocks_table = build_per_head_block_table(block_table, nkh).to(
+                torch.int32
+            )
+            kv_cache_update_idx = _per_head_cache_slots(
+                slot_mapping, block_size, nkh, B_local, S_decode
+            )
 
         # Packed FP8 is selected by server config (neuron_config.fp8_packed_kv):
         # when enabled, the runner allocates the swizzled K layout and
@@ -948,15 +989,16 @@ class LlamaAttention(nn.Module):
             rope_contiguous_layout=True,
             K_cache_transposed=False,
             active_blocks_table=active_blocks_table,
-            K_cache=self.k_cache,
+            K_cache=_unswizzle_packed_k(self.k_cache) if needs_k_back else self.k_cache,
             V_cache=self.v_cache,
             attention_mask=attention_mask,
             # Kernel currently requires fusing the K scale dequantization into softmax scale for KV quantization
             softmax_scale=self.scaling / self.k_scale_float,
             sink=None,
             update_cache=True,
-            kv_cache_update_idx=slot_mapping.view(B_local, S_decode).to(torch.uint32),
-            fp8_packed=self.fp8_packed,
+            kv_cache_update_idx=kv_cache_update_idx,
+            fp8_packed=use_packed_kernel,
+            return_updated_kv=needs_k_back,
             # Kernel currently requires fusing the V scale dequantization into W_out for KV quantization
             W_out=self.o_proj_weight / self.v_scale_float,
             bias_out=None,
@@ -983,10 +1025,40 @@ class LlamaAttention(nn.Module):
             dcp_group=self.dcp_group if dcp_decode_active else None,
         )
 
+        if needs_k_back:
+            output, k_updated, _ = output
+            self.k_cache.copy_(_swizzle_packed_k(k_updated))
+
         # >>> PARALLELISM: Sum O-proj partials across TP * attn_dp supergroup <<<
         self.attn_tp_group.all_reduce(output)
 
         return output
+
+
+def _per_head_cache_slots(
+    slot_mapping: torch.Tensor,
+    block_size: int,
+    kv_heads: int,
+    batch: int,
+    tokens: int = 1,
+) -> torch.Tensor:
+    """Return the per-head ``kv_cache_update_idx`` ``[B, kv_heads, S]`` (uint32).
+
+    Same values as ``build_per_head_slot_mapping``, built head-major with a
+    broadcast: a transpose into a uint32 cast does not compile (NCC_IDDT901).
+
+    Example:
+        >>> import torch
+        >>> _per_head_cache_slots(torch.tensor([2 * 4 + 3]), 4, 2, 1).tolist()
+        [[[19], [23]]]
+    """
+    base_block = torch.div(slot_mapping, block_size, rounding_mode="floor")
+    position = slot_mapping - base_block * block_size
+    kv_h = torch.arange(kv_heads, dtype=slot_mapping.dtype, device=slot_mapping.device)
+    base_block = base_block.view(batch, 1, tokens)
+    position = position.view(batch, 1, tokens)
+    slots = (base_block * kv_heads + kv_h.view(1, kv_heads, 1)) * block_size + position
+    return slots.to(torch.uint32)
 
 
 # =============================================================================
