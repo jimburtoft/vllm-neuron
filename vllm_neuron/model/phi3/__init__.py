@@ -15,10 +15,12 @@ handled here without touching the Llama 3 kernels:
    wrapper permutes the Q and K rows of every head (the same permutation on
    both, so q.k is unchanged) so that HF's rotary pairs land on Llama's pairs,
    and the pass-through dims land on pairs whose frequency is 0 (cos 1, sin 0).
-3. LongRoPE (``rope_scaling.type: longrope``). The short factors divide the
+3. LongRoPE (``rope_scaling.type: longrope``). The rescale factors divide the
    inverse frequencies and the attention factor scales cos/sin of the rotary
-   dims. Only positions < ``original_max_position_embeddings`` are supported;
-   ``max_model_len`` above that is rejected (long factors not implemented).
+   dims. As in upstream vLLM (``Phi3LongRoPEScaledRotaryEmbedding``), the
+   factor set is chosen once from ``max_model_len``: short factors when
+   ``max_model_len <= original_max_position_embeddings``, long factors for
+   every position otherwise (so the KV cache never mixes the two).
 4. KV heads that do not divide TP (Phi-4: 10 KV heads at TP4). KV heads are
    replicated at load (10 -> 20) so every rank holds whole KV heads; each
    replica serves the same Q heads as the original.
@@ -202,22 +204,28 @@ class _Phi3Checkpoint(SafetensorsCheckpoint):
 class Phi3RotaryEmbedding(torch.nn.Module):
     """cos/sin in the Llama 3 rotate-half layout for Phi-3 partial/LongRoPE."""
 
-    def __init__(self, head_dim: int, info: dict):
+    def __init__(self, head_dim: int, info: dict, use_long: bool = False):
         super().__init__()
+        self.use_long = use_long
         self.head_dim = head_dim
         half = head_dim // 2
         rotary_dim = int(head_dim * info["partial_rotary_factor"])
         assert rotary_dim % 2 == 0 and rotary_dim <= head_dim
         rh = rotary_dim // 2
-        # Pure Python: the model is constructed under a meta-device context.
-        inv = [
-            1.0 / (info["rope_theta"] ** (i / rotary_dim)) for i in range(0, rotary_dim, 2)
-        ]
+        # Pure Python (the model is constructed under a meta-device context), rounded
+        # to fp32 at each step like HF / vLLM so long positions match their tables.
+        import struct
+
+        def f32(x):
+            return struct.unpack("f", struct.pack("f", x))[0]
+
+        pw = [f32(f32(info["rope_theta"]) ** f32(i / rotary_dim)) for i in range(0, rotary_dim, 2)]
+        inv = [f32(1.0 / p) for p in pw]
         self.attention_scaling = 1.0
         if info["rope_type"] == "longrope":
-            short = [float(x) for x in info["short_factor"]]
-            assert len(short) == rh, (len(short), rh)
-            inv = [a / b for a, b in zip(inv, short)]
+            fac = [float(x) for x in info["long_factor" if use_long else "short_factor"]]
+            assert len(fac) == rh, (len(fac), rh)
+            inv = [f32(1.0 / f32(f32(b) * p)) for b, p in zip(fac, pw)]  # HF: 1 / (factor * base**x)
             af = info.get("attention_factor")
             orig = info["original_max_position_embeddings"]
             if af is None:
@@ -300,7 +308,16 @@ class _Phi3Model(llama_model.LlamaForCausalLM):
         }
         model = cls(config)
         model.phi3_layout = layout
-        model.model.rotary_emb = Phi3RotaryEmbedding(head_dim, info)
+        use_long = False
+        if info["rope_type"] == "longrope":
+            try:
+                from vllm.config import get_current_vllm_config
+
+                mml = get_current_vllm_config().model_config.max_model_len
+            except Exception:  # no vLLM config (unit tests)
+                mml = 0
+            use_long = mml > info["original_max_position_embeddings"]
+        model.model.rotary_emb = Phi3RotaryEmbedding(head_dim, info, use_long)
         import os
 
         if os.environ.get("PHI3_DEBUG_ROPE") == "1":
@@ -319,8 +336,9 @@ class _Phi3Model(llama_model.LlamaForCausalLM):
 
         logging.getLogger(__name__).info(
             "Phi3 on llama3: heads %d/%d (kv x%d -> %d), head_dim %d, rotary_dim %d, "
-            "rope %s theta %.0f attn_scale %.6f, tie %s, tp %d, dtype %s",
+            "rope %s%s theta %.0f attn_scale %.6f, tie %s, tp %d, dtype %s",
             n_h, n_kv, rep, n_kv * rep, head_dim, rotary_dim, info["rope_type"],
+            " (long factors)" if use_long else "",
             info["rope_theta"], model.model.rotary_emb.attention_scaling,
             config.tie_word_embeddings, tp, config.torch_dtype,
         )
@@ -372,21 +390,6 @@ class Phi3ForCausalLM(_LlamaFactory):
                 f"Phi3ForCausalLM with sliding_window={sw} < max_position_embeddings "
                 f"is not supported (the Llama 3 path is full attention only)."
             )
-        info = _rope_info(hf_config)
-        if info["rope_type"] == "longrope":
-            from vllm.config import get_current_vllm_config
-
-            try:
-                mml = get_current_vllm_config().model_config.max_model_len
-            except Exception:  # no vLLM config (unit tests)
-                mml = 0
-            orig = info["original_max_position_embeddings"]
-            if mml > orig:
-                raise NotImplementedError(
-                    f"Phi3 LongRoPE: max_model_len {mml} > original_max_position_embeddings "
-                    f"{orig}; the long-factor path is not implemented. Use "
-                    f"--max-model-len {orig}."
-                )
         if _cfg(hf_config, "attention_bias", False) or _cfg(hf_config, "mlp_bias", False):
             raise NotImplementedError("Phi3: biases are not supported")
         super()._validate_config(hf_config, neuron_config)
