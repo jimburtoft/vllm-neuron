@@ -933,13 +933,15 @@ class LlamaAttention(nn.Module):
         # packed where the bucket keeps block_len >= 2 after the kernel's resize
         # (at the unfolded and the head-folded batch), else un-swizzle for the
         # unpacked kernel and re-swizzle the returned K. Port of ministral3-trn2
-        # 32a81b8 / fd71a73 / 1d676cd (single-token decode only; speculative
-        # verify and the CPU torch fallback keep the 2D table).
+        # 32a81b8 / fd71a73 / 1d676cd; the CPU torch fallback keeps the 2D table).
         use_packed_kernel = self.fp8_packed
         needs_k_back = False
+        # Multi-token decode too: the EAGLE3 draft decodes 1 + k tokens per
+        # request, so with S_decode == 1 only it never reached the kernel and a
+        # packed FP8 cache was un-swizzled whole on every draft step.
         if (
             nkh > 1
-            and S_decode == 1
+            and (S_decode == 1 or _LLAMA3_GQA_MULTI_TOKEN)
             and not dcp_decode_active
             and self.attention_dp_size == 1
             and can_run_kernel(hidden_states)
@@ -1033,6 +1035,9 @@ class LlamaAttention(nn.Module):
         self.attn_tp_group.all_reduce(output)
 
         return output
+
+
+_LLAMA3_GQA_MULTI_TOKEN = os.environ.get("VLLM_NEURON_LLAMA3_GQA_MULTI_TOKEN", "1") != "0"
 
 
 def _per_head_cache_slots(
