@@ -143,6 +143,22 @@ carry an extra FP8 copy, +2.8 GB per core). 2048 decode bucket, 8 prompts per pr
 With the kernel the KV budget must drop to 0.32 (0.42 runs out of HBM at load or under load at 512), so it does not
 raise the 512-request peak. Accuracy: fp32 gate PASS / PASS (max gap 0.28), GSM8K-100 97 %.
 
+### Presets
+
+`tools/mellum/preset.sh` sets the environment and `vllm serve` arguments for four workloads:
+
+```bash
+source tools/mellum/preset.sh throughput   # latency | mixed | throughput | long
+vllm serve JetBrains/Mellum2.1-12B-A2.5B-Thinking $MELLUM_SERVE_ARGS --additional-config "$MELLUM_ADDITIONAL_CONFIG"
+```
+
+| Preset | Use for | Measured (128 in / 1,024 out) |
+|---|---|---|
+| `latency` | 1-16 concurrent requests | 177 tok/s at 1 (5.6 ms per token), 934 at 16 |
+| `mixed` | 16-256 concurrent | 3,665 at 64, 4,294 at 256 |
+| `throughput` | 256-512 concurrent (needs `jimburtoft/nki-library@mellum-trn2-2.33`) | 3,799 at 64, 5,175 at 512 |
+| `long` | prompts up to ~48k tokens | 30k-token prompt: TTFT 1.95 s, 10.3 ms per token |
+
 ### Single FP8 expert copy (highest throughput at 512 requests)
 
 Keep only an FP8 copy of the experts and run prefill on it too. This needs the patched NKI Library kernel on our
@@ -165,7 +181,9 @@ Expert weights drop from 6.2 to 3.8 GiB per core. Measured from these public ins
 | one request, 1,024 / 4,096-token prompt | | 91 / 234 ms | |
 | 128 / 1,024, 64 concurrent | 3,744 | 400 ms | 16.7 ms |
 | 128 / 1,024, 256 concurrent | 3,863 | 1,478 ms | 64.9 ms |
-| 128 / 1,024, 512 concurrent | **4,981** | 2,933 ms | 99.9 ms |
+| 128 / 1,024, 512 concurrent | 4,981 | 2,933 ms | 99.9 ms |
+| 128 / 1,024, 512 concurrent, decode buckets `[1024, 2048, 4096]` | **5,175** | 2,895 ms | 96.2 ms |
+| 2,048 / 1,024, 64 concurrent, buckets `[1024, 2048, 4096]` | 1,962 | 3,398 ms | 29.3 ms |
 | 1,024 / 1,024, 512 concurrent | 4,176 | 13,366 ms | 109.5 ms |
 | 4,096 / 1,024, 64 concurrent | 1,571 | 6,716 ms | 34.2 ms |
 
