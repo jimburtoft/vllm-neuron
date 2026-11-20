@@ -20,10 +20,11 @@ PARALLELISM SHARDING:
 
 import logging
 import math
+import os
 
 import torch
 from torch import nn
-from nkilib.core.utils.common_types import NormType
+from nkilib.core.utils.common_types import NormType, QuantizationType
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.models.interfaces import SupportsEagle3
 
@@ -417,6 +418,22 @@ def _fp8_row_mlp() -> bool:
     return os.environ.get("VLLM_NEURON_FP8_ROW_MLP") == "1"
 
 
+def _fp8_row_attn() -> bool:
+    """Return whether the BF16 llama3 attention stores FP8 ROW q/k/v/o weights.
+
+    ``VLLM_NEURON_FP8_ROW_ATTN=1`` quantizes the fused QKV and the o_proj weights
+    at load (per output channel, as the MLP). Decode: the attention megakernel
+    with ROW QKV / O weights (BF16 activations). Prefill: ``NF.qkv_proj`` ROW and
+    ``NF.o_proj`` ROW (per-token FP8 activations). Off by default. Not with an
+    FP8 KV cache, DCP or attention DP.
+
+    Example:
+        >>> _fp8_row_attn()  # doctest: +SKIP
+        False
+    """
+    return os.environ.get("VLLM_NEURON_FP8_ROW_ATTN") == "1"
+
+
 def _fp8_row_cte() -> bool:
     """Whether FP8 ROW MLP prefill uses the nkilib ROW CTE kernel (W8A8, per-token).
 
@@ -460,6 +477,11 @@ def _fp8_row_wrap(loader: SafetensorsWeightLoader, want: str) -> SafetensorsWeig
         return q if want == "q" else sc
 
     return SafetensorsWeightLoader(transform=transform)
+
+
+def _fp8_row_dequant(w: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """``w * scale[0]`` in ``dtype`` (CPU fallback of the FP8 ROW weights)."""
+    return (w.to(torch.float32) * scale[0:1].to(torch.float32)).to(dtype)
 
 
 def _replicated_decode_embedding() -> bool:
@@ -614,6 +636,30 @@ class LlamaAttention(nn.Module):
         self.kv_size = kv_size
         self.qkv_split_indices = [q_size, q_size + kv_size]
 
+        # <-- QUANTIZATION: VLLM_NEURON_FP8_ROW_ATTN=1 stores FP8 q/k/v/o weights
+        # with per-output-channel scales, quantized from the BF16 checkpoint.
+        self.fp8_row = _fp8_row_attn() and self.dtype == torch.bfloat16
+        if self.fp8_row:
+            if self.attention_dp_size > 1 or self.dcp_size > 1:
+                raise ValueError(
+                    "VLLM_NEURON_FP8_ROW_ATTN does not support attention DP or DCP"
+                )
+            f8 = torch.float8_e4m3fn
+            self.qkv_proj_weight = nn.Parameter(
+                torch.empty(self.hidden_size, qkv_size, dtype=f8), requires_grad=False
+            )
+            self.o_proj_weight = nn.Parameter(
+                torch.empty(o_proj_in_features, self.hidden_size, dtype=f8),
+                requires_grad=False,
+            )
+            self.qkv_proj_scale = nn.Parameter(
+                torch.empty(128, qkv_size, dtype=torch.float32), requires_grad=False
+            )
+            self.o_proj_scale = nn.Parameter(
+                torch.empty(128, self.hidden_size, dtype=torch.float32),
+                requires_grad=False,
+            )
+
         # KV caches bound externally via bind_kv_cache()
         self.k_cache = None
         self.v_cache = None
@@ -657,32 +703,56 @@ class LlamaAttention(nn.Module):
 
         # QKV: Q and KV need different shard ranks with attention DP
         # (Q uses effective_rank, KV uses tp_rank). The loader handles this internally.
-        set_weight_loader(
-            self.qkv_proj_weight,
-            fused_qkv_weight_loader(
-                q_size=self.q_size,
-                kv_size=self.kv_size,
-                shard_dim=1,
-                num_shards=self.world_size,
+        qkv_loader = fused_qkv_weight_loader(
+            q_size=self.q_size,
+            kv_size=self.kv_size,
+            shard_dim=1,
+            num_shards=self.world_size,
+            is_storage_transposed=True,
+            num_kv_replicas=self.num_kv_replicas,
+            attention_dp_rank=self.attention_dp_rank,
+            attention_dp_size=ddp,
+            kv_sharded_across_attention_dp=self.kv_needs_a2a,
+        )
+        o_loader = with_rank_override(
+            sharding_weight_loader(
+                shard_dim=0,
+                shard_size=o_shard_size,
+                num_shards=self.world_size * ddp,
                 is_storage_transposed=True,
-                num_kv_replicas=self.num_kv_replicas,
-                attention_dp_rank=self.attention_dp_rank,
-                attention_dp_size=ddp,
-                kv_sharded_across_attention_dp=self.kv_needs_a2a,
             ),
+            rank=effective_q_rank,
         )
-        set_weight_loader(
-            self.o_proj_weight,
-            with_rank_override(
-                sharding_weight_loader(
-                    shard_dim=0,
-                    shard_size=o_shard_size,
-                    num_shards=self.world_size * ddp,
-                    is_storage_transposed=True,
-                ),
-                rank=effective_q_rank,
-            ),
-        )
+        if self.fp8_row:
+            set_weight_loader(self.qkv_proj_weight, _fp8_row_wrap(qkv_loader, "q"))
+            set_weight_loader(self.qkv_proj_scale, _fp8_row_wrap(qkv_loader, "s"))
+            set_weight_loader(self.o_proj_weight, _fp8_row_wrap(o_loader, "q"))
+            set_weight_loader(self.o_proj_scale, _fp8_row_wrap(o_loader, "s"))
+            return
+        set_weight_loader(self.qkv_proj_weight, qkv_loader)
+        set_weight_loader(self.o_proj_weight, o_loader)
+
+    def _fp8_row_on_kernel(self, x: torch.Tensor) -> bool:
+        """FP8 ROW attention on the NKI kernels (False on CPU: dequantized BF16)."""
+        return self.fp8_row and can_run_kernel(x)
+
+    def _qkv_weight_for(self, x: torch.Tensor) -> torch.Tensor:
+        """The QKV weight to pass with ``x``: FP8 on the kernel, else dequantized."""
+        if self.fp8_row and not can_run_kernel(x):
+            return _fp8_row_dequant(self.qkv_proj_weight, self.qkv_proj_scale, x.dtype)
+        return self.qkv_proj_weight
+
+    def _o_weight_for(self, x: torch.Tensor) -> torch.Tensor:
+        """The o_proj weight to pass with ``x``: FP8 on the kernel, else dequantized."""
+        if self.fp8_row and not can_run_kernel(x):
+            return _fp8_row_dequant(self.o_proj_weight, self.o_proj_scale, x.dtype)
+        return self.o_proj_weight
+
+    def _fp8_row_qkv_kwargs(self, x: torch.Tensor) -> dict:
+        """Quantization kwargs for ``NF.qkv_proj`` (empty unless FP8 ROW on the kernel)."""
+        if not self._fp8_row_on_kernel(x):
+            return {}
+        return {"quantization_type": QuantizationType.ROW, "qkv_w_scale": self.qkv_proj_scale}
 
     # ── Forward dispatch ─────────────────────────────────────────────────
 
@@ -860,8 +930,9 @@ class LlamaAttention(nn.Module):
 
             q_hbm, _, _ = NF.qkv_proj(
                 hidden=hidden_states.unsqueeze(0),
-                qkv_weights=self.qkv_proj_weight,
+                qkv_weights=self._qkv_weight_for(hidden_states),
                 bias=None,
+                **self._fp8_row_qkv_kwargs(hidden_states),
                 d_head=self.head_dim,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
@@ -888,8 +959,9 @@ class LlamaAttention(nn.Module):
         else:
             qkv = NF.qkv_proj(
                 hidden=hidden_states.unsqueeze(0),
-                qkv_weights=self.qkv_proj_weight,
+                qkv_weights=self._qkv_weight_for(hidden_states),
                 bias=None,
+                **self._fp8_row_qkv_kwargs(hidden_states),
                 d_head=self.head_dim,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
@@ -1015,7 +1087,17 @@ class LlamaAttention(nn.Module):
 
         # ── Step 5: Output Projection ────────────────────────────────────
         attn_output = attn_output.unsqueeze(0)  # [1, Nh, Dh, T]
-        attn_output = NF.o_proj(attn_output, self.o_proj_weight, None)  # [1, T, H]
+        if self._fp8_row_on_kernel(attn_output):
+            # ROW o_proj reads [B, S, N, D] and quantizes per token.
+            attn_output = NF.o_proj(
+                attn_output.permute(0, 3, 1, 2).contiguous(),
+                self.o_proj_weight,
+                None,
+                quantization_type=QuantizationType.ROW,
+                weight_scales=self.o_proj_scale,
+            )
+        else:
+            attn_output = NF.o_proj(attn_output, self._o_weight_for(attn_output), None)
         attn_output = attn_output.squeeze(0)  # [T, H]
 
         # >>> PARALLELISM: Reduce-scatter to return to SP layout <<<
@@ -1183,8 +1265,16 @@ class LlamaAttention(nn.Module):
             rmsnorm_X_enabled=ln_w is not None,
             rmsnorm_X_eps=eps if ln_w is not None else None,
             rmsnorm_X_gamma=ln_w.view(1, -1) if ln_w is not None else None,
-            W_qkv=self.qkv_proj_weight,
+            W_qkv=self._qkv_weight_for(hidden_states),
             bias_qkv=None,
+            quantization_type_qkv=(
+                QuantizationType.ROW
+                if self._fp8_row_on_kernel(hidden_states)
+                else QuantizationType.NONE
+            ),
+            weight_dequant_scale_qkv=(
+                self.qkv_proj_scale if self._fp8_row_on_kernel(hidden_states) else None
+            ),
             rmsnorm_QK_pre_rope_enabled=False,
             rmsnorm_QK_post_rope_enabled=False,
             cos=cos_kernel,
@@ -1202,8 +1292,20 @@ class LlamaAttention(nn.Module):
             kv_cache_update_idx=kv_cache_update_idx,
             fp8_packed=self.fp8_packed,
             # Kernel currently requires fusing the V scale dequantization into W_out for KV quantization
-            W_out=self.o_proj_weight / self.v_scale_float,
+            W_out=self.o_proj_weight
+            if self._fp8_row_on_kernel(hidden_states)
+            else self._o_weight_for(hidden_states) / self.v_scale_float,
             bias_out=None,
+            quantization_type_out=(
+                QuantizationType.ROW
+                if self._fp8_row_on_kernel(hidden_states)
+                else QuantizationType.NONE
+            ),
+            weight_dequant_scale_out=(
+                self.o_proj_scale / self.v_scale_float
+                if self._fp8_row_on_kernel(hidden_states)
+                else None
+            ),
             transposed_out=False,
             out_in_sb=False,
             k_scale=self.k_scale
@@ -2386,6 +2488,14 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
             mappings[f"{prefix}.self_attn.o_proj_weight"] = (
                 f"{prefix}.self_attn.o_proj.weight"
             )
+            if getattr(self.model.layers[layer_id].self_attn, "fp8_row", False):
+                # FP8 ROW attention scales derive from the same BF16 tensors.
+                mappings[f"{prefix}.self_attn.qkv_proj_scale"] = list(
+                    mappings[f"{prefix}.self_attn.qkv_proj_weight"]
+                )
+                mappings[f"{prefix}.self_attn.o_proj_scale"] = (
+                    f"{prefix}.self_attn.o_proj.weight"
+                )
 
             # <-- MX FP8 dual-buffer (trn3): CTE (MX prefill) + TKG
             # (STATIC decode) attention buffers. The pipelined loader
