@@ -12,7 +12,7 @@
 #             jimburtoft/nki-library@mellum-trn2-2.33): 5,175 tok/s at 512 (128/1k), 3,799 at c64. KV 0.42.
 # long        prompts up to ~48k tokens. Segmented prefill (4,096-token chunks), ring off, bf16 experts.
 #
-# All presets use 8 prompts per prefill step (packed prefill; whole-prompt prefill only) except "long". Decode context
+# mixed and throughput use 8 prompts per prefill step (packed prefill; whole-prompt prefill only). Decode context
 # buckets: [1024, 2048, 4096] for throughput (measured with FP8-only), [2048] for latency / mixed (measured there).
 # Accuracy notes: FP8 presets score GSM8K-100 96-97 % (bf16 97-98 %); see tools/mellum/README.md.
 
@@ -25,7 +25,7 @@ unset MELLUM_MOE_EM MELLUM_MOE_FP8_ONLY MELLUM_MOE_FP8_PAD_I MELLUM_MOE_FP8_ROUT
 _buckets='[1024, 2048, 4096]'
 case "$_p" in
   latency)
-    export MELLUM_MOE_FP8_ROUTED=1 VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.2 VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8
+    export MELLUM_MOE_FP8_ROUTED=1 VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.2  # measured without packed prefill
     MELLUM_SERVE_ARGS="--tensor-parallel-size 4 --max-model-len 8192 --max-num-seqs 64 --max-num-batched-tokens 8192 --no-enable-prefix-caching"
     _buckets='[2048]'
     ;;
