@@ -638,7 +638,11 @@ class LlamaAttention(nn.Module):
 
         # <-- QUANTIZATION: VLLM_NEURON_FP8_ROW_ATTN=1 stores FP8 q/k/v/o weights
         # with per-output-channel scales, quantized from the BF16 checkpoint.
-        self.fp8_row = _fp8_row_attn() and self.dtype == torch.bfloat16
+        self.fp8_row = (
+            _fp8_row_attn()
+            and self.dtype == torch.bfloat16
+            and not config.use_draft_mlp_groups
+        )
         if self.fp8_row:
             if self.attention_dp_size > 1 or self.dcp_size > 1:
                 raise ValueError(
@@ -1442,7 +1446,7 @@ class LlamaMLP(nn.Module):
         )
 
         # VLLM_NEURON_FP8_ROW_MLP=1: FP8 e4m3 weights + per-output-channel scales.
-        self.fp8_row = _fp8_row_mlp()
+        self.fp8_row = _fp8_row_mlp() and not config.use_draft_mlp_groups
         if self.fp8_row:
             H, inter = config.hidden_size, self.intermediate_size_per_rank
             f8 = torch.float8_e4m3fn
