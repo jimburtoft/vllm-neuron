@@ -156,7 +156,7 @@ vllm serve JetBrains/Mellum2.1-12B-A2.5B-Thinking $MELLUM_SERVE_ARGS --additiona
 |---|---|---|
 | `latency` | 1-16 concurrent requests | 177 tok/s at 1 (5.6 ms per token), 934 at 16 |
 | `mixed` | 16-256 concurrent | 3,665 at 64, 4,294 at 256 |
-| `throughput` | 256-512 concurrent (needs `jimburtoft/nki-library@mellum-trn2-2.33`) | 3,799 at 64, 5,175 at 512 |
+| `throughput` | 256-512 concurrent (needs `jimburtoft/nki-library@mellum-trn2-2.33`) | 3,799 at 64, 4,185 at 256, 5,739 at 512 |
 | `long` | prompts up to ~48k tokens | 30k-token prompt: TTFT 1.95 s, 10.3 ms per token |
 
 ### Single FP8 expert copy (highest throughput at 512 requests)
@@ -182,7 +182,8 @@ Expert weights drop from 6.2 to 3.8 GiB per core. Measured from these public ins
 | 128 / 1,024, 64 concurrent | 3,744 | 400 ms | 16.7 ms |
 | 128 / 1,024, 256 concurrent | 3,863 | 1,478 ms | 64.9 ms |
 | 128 / 1,024, 512 concurrent | 4,981 | 2,933 ms | 99.9 ms |
-| 128 / 1,024, 512 concurrent, decode buckets `[1024, 2048, 4096]` | **5,175** | 2,895 ms | 96.2 ms |
+| 128 / 1,024, 512 concurrent, decode buckets `[1024, 2048, 4096]` | 5,175 | 2,895 ms | 96.2 ms |
+| same, gathered decode MoE for batches above 128 (default, see below) | **5,739** | 2,949 ms | 86.4 ms |
 | 2,048 / 1,024, 64 concurrent, buckets `[1024, 2048, 4096]` | 1,962 | 3,398 ms | 29.3 ms |
 | 1,024 / 1,024, 512 concurrent | 4,176 | 13,366 ms | 109.5 ms |
 | 4,096 / 1,024, 64 concurrent | 1,571 | 6,716 ms | 34.2 ms |
@@ -190,6 +191,22 @@ Expert weights drop from 6.2 to 3.8 GiB per core. Measured from these public ins
 Accuracy: fp32 gate PASS / PASS except one short-prompt near-tie (0.386, target in the fp32 top 5); GSM8K-100 96 %.
 The prefill kernel's hidden-state I/O is fp32 in this mode (`MELLUM_MOE_CTE_IO=auto`); with bf16 I/O one long prompt
 diverged (fp32 gap 1.74) in 2 of 3 compiles. More than 512 sequences (`--max-num-seqs 1024`) is slower (3,517 tok/s).
+
+### Gathered decode MoE for batches above 128
+
+Above 128 decode rows the expert-major kernel used to run once per 128-row chunk and re-read every local expert's
+weights each time. By default (`MELLUM_MOE_EM_GATHER=1`) it now sorts the routed (row, expert) pairs into groups of
+128 rows per expert and runs only the groups in use (a runtime loop). The kernel gathers each group's rows and adds
+the results back into the output by DMA. Throughput preset, decode buckets `[1024, 2048, 4096]`:
+
+| Workload | Chunked | Gathered |
+|---|---:|---:|
+| 128 / 1,024, 256 concurrent | 3,924 tok/s | 4,185 tok/s |
+| 128 / 1,024, 512 concurrent | 5,175 tok/s | 5,739 tok/s (TPOT 86 ms) |
+| 1,024 / 1,024, 512 concurrent | 4,172 tok/s | 4,510 tok/s |
+
+Accuracy: full GSM8K (1,319 questions, 256 concurrent) 95.5 % gathered vs 95.2 % chunked. `MELLUM_MOE_EM_GATHER=0`
+restores the chunked path.
 
 ### Decode bucket ladder
 

@@ -9,7 +9,7 @@
 # mixed       16-256 concurrent requests. EP + expert-major FP8 decode kernel with a bf16 copy for prefill
 #             (128/1k: 1,228 at c16, 3,665 at c64, 4,294 at c256). KV budget 0.32, up to 256 sequences.
 # throughput  256-512 concurrent requests. EP + one FP8 expert copy for prefill and decode (needs
-#             jimburtoft/nki-library@mellum-trn2-2.33): 5,175 tok/s at 512 (128/1k), 3,799 at c64. KV 0.42.
+#             jimburtoft/nki-library@mellum-trn2-2.33): 5,739 tok/s at 512 (128/1k), 3,799 at c64. KV 0.42.
 # long        prompts up to ~48k tokens. Segmented prefill (4,096-token chunks), ring off, bf16 experts.
 #
 # mixed and throughput use 8 prompts per prefill step (packed prefill; whole-prompt prefill only). Decode context

@@ -616,7 +616,7 @@ class MellumSparseMoeBlock(nn.Module):
         if self.em_fp8:
             kw.update(gu_scale=self.em_gu_scale, d_scale=self.em_d_scale)
         xb = x.to(torch.bfloat16).contiguous()
-        if T > 128 and os.environ.get("MELLUM_MOE_EM_GATHER", "0") == "1":
+        if T > 128 and os.environ.get("MELLUM_MOE_EM_GATHER", "1") == "1":
             return self._decode_expert_major_gathered(xb, aff, k_lnc=lnc).to(self.dtype)
         outs = []
         for c0 in range(0, T, 128):
@@ -632,8 +632,11 @@ class MellumSparseMoeBlock(nn.Module):
         an expert with more than Cg rows uses several groups (its weights are re-read once per extra group).
 
         Sizing: P = T * min(top_k, E_local) pair slots (upper bound on routed local pairs); groups are aligned to
-        expert boundaries, so G = ceil(P / Cg) + E_local groups always suffice. Unused groups have weight 0.
-        Scatter-free: argsort / gather to build the groups, one-hot matmul to combine.
+        expert boundaries, so G = ceil(P / Cg) + E_local (+1) groups always suffice. Unused groups have weight 0.
+        Groups are built in torch (argsort / gather, no scatter). Default (MELLUM_MOE_EM_DYN=1, MELLUM_MOE_EM_XIN=1):
+        the kernel runs S0 groups unrolled plus a runtime loop up to the used group count, gathers each group's rows
+        itself and scatter-adds the results into [T, H] by DMA. A torch index_select gather and a one-hot combine
+        cost more than the expert work at T 256-512. Real routing on GSM8K uses ~15-19 groups of 128 per rank.
         """
         from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
