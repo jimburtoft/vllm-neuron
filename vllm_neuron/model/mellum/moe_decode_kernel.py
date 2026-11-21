@@ -519,3 +519,394 @@ def mellum_moe_decode_gathered(xgT, wslot, Wgu, Wd, gu_scale=None, nbuf=2, eidx=
             nisa.tensor_copy(dst=ys[:, ho:ho + hn], src=py[t])
         nisa.dma_copy(dst=y.ap(pattern=[[H, C], [1, H]], offset=(pid * E + j) * C * H), src=ys)
     return y
+
+
+@nki.jit
+def mellum_moe_decode_gathered_dyn(xgT, wslot, Wgu, Wd, eidx, ngrp, gu_scale=None, S0=16):
+    """Gathered expert-major decode MoE, runtime group count.
+
+    xgT   bf16 [G, H, C]  slot-major transposed hidden states of each group (groups packed: used ones first)
+    wslot fp32 [G, C]     routing weight per slot (x down scale for FP8; 0 for padding slots)
+    eidx  int32 [1, G]    expert of each group (valid id for every group, also unused ones)
+    ngrp  int32 [1, 1]    number of groups to run (>= S0; groups S0.. run in a runtime loop, 2 per iteration, so
+                          G must be >= ngrp + 1)
+    returns fp32 [NC, G, C, H]; groups >= the processed count are NOT written (mask them on the caller side).
+    """
+    G, H, C = xgT.shape
+    NC = nl.num_programs(0) if nl.program_ndim() > 0 else 1
+    pid = nl.program_id(0) if nl.program_ndim() > 0 else 0
+    I2 = Wgu.shape[2]
+    I = I2 // 2
+    KT = H // 128
+    HSG = Wgu.shape[1]
+    HSD = Wd.shape[2]
+    WDT = Wgu.dtype
+    FP8 = gu_scale is not None
+    IC = I // NC
+    i0 = pid * IC
+    I_TILES = [(o, min(128, IC - o)) for o in range(0, IC, 128)]
+    HT = _col_tiles(H)
+    GT = [(0, o, n) for (o, n) in _col_tiles(IC)] + [(1, o, n) for (o, n) in _col_tiles(IC)]
+
+    ident = _sb((128, 128), BF)
+    io_p = _sb((128, 1))
+    nisa.iota(io_p, [[0, 1]], offset=0, channel_multiplier=1)
+    io_f = _sb((128, 128))
+    nisa.iota(io_f, [[1, 128]], offset=0, channel_multiplier=0)
+    nisa.tensor_scalar(dst=ident, data=io_f, op0=nl.equal, operand0=io_p)
+
+    y = nl.ndarray((NC, G, C, H), dtype=F32, buffer=nl.shared_hbm)
+    bufs = []
+    for bi in range(2):
+        xP = _sb((128, KT * C), BF)
+        wg = _sb((128, KT * IC), WDT)
+        wu = _sb((128, KT * IC), WDT)
+        wd = [_sb((n, H), WDT) for (_, n) in I_TILES]
+        gsc = _sb((C, 2 * IC)) if FP8 else None
+        wc = _sb((C, 1))
+        bufs.append((xP, wg, wu, wd, gsc, wc))
+    ev = nl.ndarray((1, G), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=ev, src=eidx)
+    gv = nl.ndarray((1, G), dtype=nl.int32, buffer=nl.sbuf)  # group index table for the dynamic part
+    gvf = _sb((1, G))
+    nisa.iota(gvf, [[1, G]], offset=0, channel_multiplier=0)
+    nisa.tensor_copy(dst=gv, src=gvf)
+
+    def group(jx, ex, buf, ystat=None):
+        """jx: group index (int or [1,1] int32 tile); ex: expert id [1,1] tile view."""
+        xP, wg, wu, wd, gsc, wc = buf
+        dk = dict(scalar_offset=ex, indirect_dim=0)
+        if isinstance(jx, int):
+            nisa.dma_copy(dst=xP, src=xgT.ap(pattern=[[C, 128], [128 * C, KT], [1, C]], offset=jx * H * C))
+            nisa.dma_copy(dst=wc, src=wslot.ap(pattern=[[1, C], [1, 1]], offset=jx * C))
+        else:
+            gk = dict(scalar_offset=jx, indirect_dim=0)
+            nisa.dma_copy(dst=xP, src=xgT.ap(pattern=[[C, 128], [128 * C, KT], [1, C]], offset=0, **gk))
+            nisa.dma_copy(dst=wc, src=wslot.ap(pattern=[[1, C], [1, 1]], offset=0, **gk))
+        nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=i0, **dk))
+        nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=I + i0, **dk))
+        for ti, (o, n) in enumerate(I_TILES):
+            nisa.dma_copy(dst=wd[ti], src=Wd.ap(pattern=[[HSD, n], [1, H]], offset=(i0 + o) * HSD, **dk))
+        if FP8:
+            nisa.dma_copy(dst=gsc[:, 0:IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=i0, **dk))
+            nisa.dma_copy(dst=gsc[:, IC:2 * IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=I + i0, **dk))
+        gu = _sb((C, 2 * IC), BF)
+        for (which, co, cn) in GT:
+            wsrc = wg if which == 0 else wu
+            dco = which * IC + co
+            pgu = nl.ndarray((C, cn), dtype=F32, buffer=nl.psum)
+            for kt in range(KT):
+                nisa.nc_matmul(pgu, xP[:, kt * C:(kt + 1) * C], wsrc[:, kt * IC + co: kt * IC + co + cn])
+            if FP8:
+                nisa.tensor_tensor(dst=gu[:, dco:dco + cn], data1=pgu, data2=gsc[:, dco:dco + cn], op=nl.multiply)
+            else:
+                nisa.tensor_copy(dst=gu[:, dco:dco + cn], src=pgu)
+        sg = _sb((C, IC), BF)
+        nisa.activation(dst=sg, data=gu[:, 0:IC], op=nl.silu)
+        hr = _sb((C, IC), BF)
+        nisa.tensor_tensor(dst=hr, data1=sg, data2=gu[:, IC:2 * IC], op=nl.multiply)
+        hw = _sb((C, IC), BF)
+        nisa.tensor_scalar(dst=hw, data=hr, op0=nl.multiply, operand0=wc)
+        py = [nl.ndarray((C, n), dtype=F32, buffer=nl.psum) for (_, n) in HT]
+        for ti, (o, n) in enumerate(I_TILES):
+            ph = nl.ndarray((n, C), dtype=F32, buffer=nl.psum)
+            nisa.nc_matmul(ph, hw[:, o:o + n], ident[0:C, 0:C])
+            hs = _sb((n, C), BF)
+            nisa.tensor_copy(dst=hs, src=ph)
+            for t, (ho, hn) in enumerate(HT):
+                nisa.nc_matmul(py[t], hs, wd[ti][:, ho:ho + hn])
+        ys = _sb((C, H))
+        for t, (ho, hn) in enumerate(HT):
+            nisa.tensor_copy(dst=ys[:, ho:ho + hn], src=py[t])
+        if isinstance(jx, int):
+            nisa.dma_copy(dst=y.ap(pattern=[[H, C], [1, H]], offset=(pid * G + jx) * C * H), src=ys)
+        else:
+            nisa.dma_copy(dst=y.ap(pattern=[[H, C], [1, H]], offset=pid * G * C * H, scalar_offset=jx, indirect_dim=1),
+                          src=ys)
+
+    for j in range(S0):
+        group(j, ev.ap(pattern=[[G, 1], [1, 1]], offset=j), bufs[j % 2])
+
+    nsb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=nsb, src=ngrp)
+    nreg = nisa.scalar_load(nsb)
+
+    def body(iv):
+        jk = nl.ndarray((1, 2), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=jk, src=gv.ap(pattern=[[G, 1], [1, 2]], offset=0, scalar_offset=iv, indirect_dim=1))
+        ek = nl.ndarray((1, 2), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ek, src=ev.ap(pattern=[[G, 1], [1, 2]], offset=0, scalar_offset=iv, indirect_dim=1))
+        for k in range(2):
+            group(jk.ap(pattern=[[2, 1], [1, 1]], offset=k), ek.ap(pattern=[[2, 1], [1, 1]], offset=k), bufs[k])
+
+    nl.fori_loop(S0, nreg, body, step=2)
+    return y
+
+
+@nki.jit
+def mellum_moe_decode_gathered_dyn_sc(xgT, wslot, Wgu, Wd, eidx, ngrp, srow, T, gu_scale=None, S0=16):
+    """Gathered expert-major decode MoE, runtime group count.
+
+    xgT   bf16 [G, H, C]  slot-major transposed hidden states of each group (groups packed: used ones first)
+    wslot fp32 [G, C]     routing weight per slot (x down scale for FP8; 0 for padding slots)
+    eidx  int32 [1, G]    expert of each group (valid id for every group, also unused ones)
+    ngrp  int32 [1, 1]    number of groups to run (>= S0; groups S0.. run in a runtime loop, 2 per iteration, so
+                          G must be >= ngrp + 1)
+    srow  int32 [G, C]    token row of each slot (padding slots: T -> out of bounds, skipped)
+    returns fp32 [NC * T, H]: per physical core the partial (its I slice) MoE output, combined in-kernel by a
+    DMA scatter-add (rows are unique within a group).
+    """
+    G, H, C = xgT.shape
+    NC = nl.num_programs(0) if nl.program_ndim() > 0 else 1
+    pid = nl.program_id(0) if nl.program_ndim() > 0 else 0
+    I2 = Wgu.shape[2]
+    I = I2 // 2
+    KT = H // 128
+    HSG = Wgu.shape[1]
+    HSD = Wd.shape[2]
+    WDT = Wgu.dtype
+    FP8 = gu_scale is not None
+    IC = I // NC
+    i0 = pid * IC
+    I_TILES = [(o, min(128, IC - o)) for o in range(0, IC, 128)]
+    HT = _col_tiles(H)
+    GT = [(0, o, n) for (o, n) in _col_tiles(IC)] + [(1, o, n) for (o, n) in _col_tiles(IC)]
+
+    ident = _sb((128, 128), BF)
+    io_p = _sb((128, 1))
+    nisa.iota(io_p, [[0, 1]], offset=0, channel_multiplier=1)
+    io_f = _sb((128, 128))
+    nisa.iota(io_f, [[1, 128]], offset=0, channel_multiplier=0)
+    nisa.tensor_scalar(dst=ident, data=io_f, op0=nl.equal, operand0=io_p)
+
+    y = nl.ndarray((NC * T, H), dtype=F32, buffer=nl.shared_hbm)  # [NC, T, H] flattened: dim 0 stride H for the scatter
+    z = _sb((128, H))
+    nisa.memset(z, 0.0)
+    for r0 in range(0, T, 128):
+        rn = min(128, T - r0)
+        nisa.dma_copy(dst=y.ap(pattern=[[H, rn], [1, H]], offset=(pid * T + r0) * H), src=z[0:rn, :])
+    bufs = []
+    for bi in range(2):
+        xP = _sb((128, KT * C), BF)
+        wg = _sb((128, KT * IC), WDT)
+        wu = _sb((128, KT * IC), WDT)
+        wd = [_sb((n, H), WDT) for (_, n) in I_TILES]
+        gsc = _sb((C, 2 * IC)) if FP8 else None
+        wc = _sb((C, 1))
+        bufs.append((xP, wg, wu, wd, gsc, wc))
+    ev = nl.ndarray((1, G), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=ev, src=eidx)
+    gv = nl.ndarray((1, G), dtype=nl.int32, buffer=nl.sbuf)  # group index table for the dynamic part
+    gvf = _sb((1, G))
+    nisa.iota(gvf, [[1, G]], offset=0, channel_multiplier=0)
+    nisa.tensor_copy(dst=gv, src=gvf)
+
+    def group(jx, ex, buf, ystat=None):
+        """jx: group index (int or [1,1] int32 tile); ex: expert id [1,1] tile view."""
+        xP, wg, wu, wd, gsc, wc = buf
+        dk = dict(scalar_offset=ex, indirect_dim=0)
+        if isinstance(jx, int):
+            nisa.dma_copy(dst=xP, src=xgT.ap(pattern=[[C, 128], [128 * C, KT], [1, C]], offset=jx * H * C))
+            nisa.dma_copy(dst=wc, src=wslot.ap(pattern=[[1, C], [1, 1]], offset=jx * C))
+        else:
+            gk = dict(scalar_offset=jx, indirect_dim=0)
+            nisa.dma_copy(dst=xP, src=xgT.ap(pattern=[[C, 128], [128 * C, KT], [1, C]], offset=0, **gk))
+            nisa.dma_copy(dst=wc, src=wslot.ap(pattern=[[1, C], [1, 1]], offset=0, **gk))
+        nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=i0, **dk))
+        nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=I + i0, **dk))
+        for ti, (o, n) in enumerate(I_TILES):
+            nisa.dma_copy(dst=wd[ti], src=Wd.ap(pattern=[[HSD, n], [1, H]], offset=(i0 + o) * HSD, **dk))
+        if FP8:
+            nisa.dma_copy(dst=gsc[:, 0:IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=i0, **dk))
+            nisa.dma_copy(dst=gsc[:, IC:2 * IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=I + i0, **dk))
+        gu = _sb((C, 2 * IC), BF)
+        for (which, co, cn) in GT:
+            wsrc = wg if which == 0 else wu
+            dco = which * IC + co
+            pgu = nl.ndarray((C, cn), dtype=F32, buffer=nl.psum)
+            for kt in range(KT):
+                nisa.nc_matmul(pgu, xP[:, kt * C:(kt + 1) * C], wsrc[:, kt * IC + co: kt * IC + co + cn])
+            if FP8:
+                nisa.tensor_tensor(dst=gu[:, dco:dco + cn], data1=pgu, data2=gsc[:, dco:dco + cn], op=nl.multiply)
+            else:
+                nisa.tensor_copy(dst=gu[:, dco:dco + cn], src=pgu)
+        sg = _sb((C, IC), BF)
+        nisa.activation(dst=sg, data=gu[:, 0:IC], op=nl.silu)
+        hr = _sb((C, IC), BF)
+        nisa.tensor_tensor(dst=hr, data1=sg, data2=gu[:, IC:2 * IC], op=nl.multiply)
+        hw = _sb((C, IC), BF)
+        nisa.tensor_scalar(dst=hw, data=hr, op0=nl.multiply, operand0=wc)
+        py = [nl.ndarray((C, n), dtype=F32, buffer=nl.psum) for (_, n) in HT]
+        for ti, (o, n) in enumerate(I_TILES):
+            ph = nl.ndarray((n, C), dtype=F32, buffer=nl.psum)
+            nisa.nc_matmul(ph, hw[:, o:o + n], ident[0:C, 0:C])
+            hs = _sb((n, C), BF)
+            nisa.tensor_copy(dst=hs, src=ph)
+            for t, (ho, hn) in enumerate(HT):
+                nisa.nc_matmul(py[t], hs, wd[ti][:, ho:ho + hn])
+        ys = _sb((C, H))
+        for t, (ho, hn) in enumerate(HT):
+            nisa.tensor_copy(dst=ys[:, ho:ho + hn], src=py[t])
+        rows = nl.ndarray((C, 1), dtype=nl.int32, buffer=nl.sbuf)
+        if isinstance(jx, int):
+            nisa.dma_copy(dst=rows, src=srow.ap(pattern=[[1, C], [1, 1]], offset=jx * C))
+        else:
+            nisa.dma_copy(dst=rows, src=srow.ap(pattern=[[1, C], [1, 1]], offset=0, scalar_offset=jx, indirect_dim=0))
+        yv = y.ap(pattern=[[H, C], [1, H]], offset=pid * T * H, vector_offset=rows, indirect_dim=0)
+        nisa.dma_compute(dst=yv, srcs=[yv, ys], reduce_op=nl.add, oob_mode=nisa.oob_mode.skip)
+
+    for j in range(S0):
+        group(j, ev.ap(pattern=[[G, 1], [1, 1]], offset=j), bufs[j % 2])
+
+    nsb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=nsb, src=ngrp)
+    nreg = nisa.scalar_load(nsb)
+
+    def body(iv):
+        jk = nl.ndarray((1, 2), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=jk, src=gv.ap(pattern=[[G, 1], [1, 2]], offset=0, scalar_offset=iv, indirect_dim=1))
+        ek = nl.ndarray((1, 2), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ek, src=ev.ap(pattern=[[G, 1], [1, 2]], offset=0, scalar_offset=iv, indirect_dim=1))
+        for k in range(2):
+            group(jk.ap(pattern=[[2, 1], [1, 1]], offset=k), ek.ap(pattern=[[2, 1], [1, 1]], offset=k), bufs[k])
+
+    nl.fori_loop(S0, nreg, body, step=2)
+    return y
+
+
+@nki.jit
+def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow, gu_scale=None, S0=16):
+    """Gathered expert-major decode MoE, runtime group count.
+
+    x     bf16 [T, H]     hidden states (gathered in-kernel: indirect row DMA + PE transpose)
+    srow_g int32 [G, C]   gather row per slot (padding slots: any valid row, e.g. 0; their weight is 0)
+    wslot fp32 [G, C]     routing weight per slot (x down scale for FP8; 0 for padding slots)
+    eidx  int32 [1, G]    expert of each group (valid id for every group, also unused ones)
+    ngrp  int32 [1, 1]    number of groups to run (>= S0; groups S0.. run in a runtime loop, 2 per iteration, so
+                          G must be >= ngrp + 1)
+    srow  int32 [G, C]    token row of each slot (padding slots: T -> out of bounds, skipped)
+    returns fp32 [NC * T, H]: per physical core the partial (its I slice) MoE output, combined in-kernel by a
+    DMA scatter-add (rows are unique within a group).
+    """
+    T, H = x.shape
+    G, C = wslot.shape
+    NC = nl.num_programs(0) if nl.program_ndim() > 0 else 1
+    pid = nl.program_id(0) if nl.program_ndim() > 0 else 0
+    I2 = Wgu.shape[2]
+    I = I2 // 2
+    KT = H // 128
+    HSG = Wgu.shape[1]
+    HSD = Wd.shape[2]
+    WDT = Wgu.dtype
+    FP8 = gu_scale is not None
+    IC = I // NC
+    i0 = pid * IC
+    I_TILES = [(o, min(128, IC - o)) for o in range(0, IC, 128)]
+    HT = _col_tiles(H)
+    GT = [(0, o, n) for (o, n) in _col_tiles(IC)] + [(1, o, n) for (o, n) in _col_tiles(IC)]
+
+    ident = _sb((128, 128), BF)
+    io_p = _sb((128, 1))
+    nisa.iota(io_p, [[0, 1]], offset=0, channel_multiplier=1)
+    io_f = _sb((128, 128))
+    nisa.iota(io_f, [[1, 128]], offset=0, channel_multiplier=0)
+    nisa.tensor_scalar(dst=ident, data=io_f, op0=nl.equal, operand0=io_p)
+
+    y = nl.ndarray((NC * T, H), dtype=F32, buffer=nl.shared_hbm)  # [NC, T, H] flattened: dim 0 stride H for the scatter
+    z = _sb((128, H))
+    nisa.memset(z, 0.0)
+    for r0 in range(0, T, 128):
+        rn = min(128, T - r0)
+        nisa.dma_copy(dst=y.ap(pattern=[[H, rn], [1, H]], offset=(pid * T + r0) * H), src=z[0:rn, :])
+    bufs = []
+    for bi in range(2):
+        xP = _sb((128, KT * C), BF)
+        wg = _sb((128, KT * IC), WDT)
+        wu = _sb((128, KT * IC), WDT)
+        wd = [_sb((n, H), WDT) for (_, n) in I_TILES]
+        gsc = _sb((C, 2 * IC)) if FP8 else None
+        wc = _sb((C, 1))
+        bufs.append((xP, wg, wu, wd, gsc, wc))
+    ev = nl.ndarray((1, G), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=ev, src=eidx)
+    gv = nl.ndarray((1, G), dtype=nl.int32, buffer=nl.sbuf)  # group index table for the dynamic part
+    gvf = _sb((1, G))
+    nisa.iota(gvf, [[1, G]], offset=0, channel_multiplier=0)
+    nisa.tensor_copy(dst=gv, src=gvf)
+
+    def group(jx, ex, buf, ystat=None):
+        """jx: group index (int or [1,1] int32 tile); ex: expert id [1,1] tile view."""
+        xP, wg, wu, wd, gsc, wc = buf
+        dk = dict(scalar_offset=ex, indirect_dim=0)
+        rg = nl.ndarray((C, 1), dtype=nl.int32, buffer=nl.sbuf)
+        rows = nl.ndarray((C, 1), dtype=nl.int32, buffer=nl.sbuf)
+        if isinstance(jx, int):
+            nisa.dma_copy(dst=wc, src=wslot.ap(pattern=[[1, C], [1, 1]], offset=jx * C))
+            nisa.dma_copy(dst=rg, src=srow_g.ap(pattern=[[1, C], [1, 1]], offset=jx * C))
+            nisa.dma_copy(dst=rows, src=srow.ap(pattern=[[1, C], [1, 1]], offset=jx * C))
+        else:
+            gk = dict(scalar_offset=jx, indirect_dim=0)
+            nisa.dma_copy(dst=wc, src=wslot.ap(pattern=[[1, C], [1, 1]], offset=0, **gk))
+            nisa.dma_copy(dst=rg, src=srow_g.ap(pattern=[[1, C], [1, 1]], offset=0, **gk))
+            nisa.dma_copy(dst=rows, src=srow.ap(pattern=[[1, C], [1, 1]], offset=0, **gk))
+        xr = _sb((C, H), BF)
+        nisa.dma_copy(dst=xr, src=x.ap(pattern=[[H, C], [1, H]], offset=0, vector_offset=rg, indirect_dim=0))
+        for kt in range(KT):
+            pt = nl.ndarray((128, C), dtype=F32, buffer=nl.psum)
+            nisa.nc_matmul(pt, xr[:, kt * 128:(kt + 1) * 128], ident[0:C, 0:C])
+            nisa.tensor_copy(dst=xP[:, kt * C:(kt + 1) * C], src=pt)
+        nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=i0, **dk))
+        nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=I + i0, **dk))
+        for ti, (o, n) in enumerate(I_TILES):
+            nisa.dma_copy(dst=wd[ti], src=Wd.ap(pattern=[[HSD, n], [1, H]], offset=(i0 + o) * HSD, **dk))
+        if FP8:
+            nisa.dma_copy(dst=gsc[:, 0:IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=i0, **dk))
+            nisa.dma_copy(dst=gsc[:, IC:2 * IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=I + i0, **dk))
+        gu = _sb((C, 2 * IC), BF)
+        for (which, co, cn) in GT:
+            wsrc = wg if which == 0 else wu
+            dco = which * IC + co
+            pgu = nl.ndarray((C, cn), dtype=F32, buffer=nl.psum)
+            for kt in range(KT):
+                nisa.nc_matmul(pgu, xP[:, kt * C:(kt + 1) * C], wsrc[:, kt * IC + co: kt * IC + co + cn])
+            if FP8:
+                nisa.tensor_tensor(dst=gu[:, dco:dco + cn], data1=pgu, data2=gsc[:, dco:dco + cn], op=nl.multiply)
+            else:
+                nisa.tensor_copy(dst=gu[:, dco:dco + cn], src=pgu)
+        sg = _sb((C, IC), BF)
+        nisa.activation(dst=sg, data=gu[:, 0:IC], op=nl.silu)
+        hr = _sb((C, IC), BF)
+        nisa.tensor_tensor(dst=hr, data1=sg, data2=gu[:, IC:2 * IC], op=nl.multiply)
+        hw = _sb((C, IC), BF)
+        nisa.tensor_scalar(dst=hw, data=hr, op0=nl.multiply, operand0=wc)
+        py = [nl.ndarray((C, n), dtype=F32, buffer=nl.psum) for (_, n) in HT]
+        for ti, (o, n) in enumerate(I_TILES):
+            ph = nl.ndarray((n, C), dtype=F32, buffer=nl.psum)
+            nisa.nc_matmul(ph, hw[:, o:o + n], ident[0:C, 0:C])
+            hs = _sb((n, C), BF)
+            nisa.tensor_copy(dst=hs, src=ph)
+            for t, (ho, hn) in enumerate(HT):
+                nisa.nc_matmul(py[t], hs, wd[ti][:, ho:ho + hn])
+        ys = _sb((C, H))
+        for t, (ho, hn) in enumerate(HT):
+            nisa.tensor_copy(dst=ys[:, ho:ho + hn], src=py[t])
+        yv = y.ap(pattern=[[H, C], [1, H]], offset=pid * T * H, vector_offset=rows, indirect_dim=0)
+        nisa.dma_compute(dst=yv, srcs=[yv, ys], reduce_op=nl.add, oob_mode=nisa.oob_mode.skip)
+
+    for j in range(S0):
+        group(j, ev.ap(pattern=[[G, 1], [1, 1]], offset=j), bufs[j % 2])
+
+    nsb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=nsb, src=ngrp)
+    nreg = nisa.scalar_load(nsb)
+
+    def body(iv):
+        jk = nl.ndarray((1, 2), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=jk, src=gv.ap(pattern=[[G, 1], [1, 2]], offset=0, scalar_offset=iv, indirect_dim=1))
+        ek = nl.ndarray((1, 2), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ek, src=ev.ap(pattern=[[G, 1], [1, 2]], offset=0, scalar_offset=iv, indirect_dim=1))
+        for k in range(2):
+            group(jk.ap(pattern=[[2, 1], [1, 1]], offset=k), ek.ap(pattern=[[2, 1], [1, 1]], offset=k), bufs[k])
+
+    nl.fori_loop(S0, nreg, body, step=2)
+    return y

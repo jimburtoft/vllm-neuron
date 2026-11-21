@@ -637,13 +637,15 @@ class MellumSparseMoeBlock(nn.Module):
         """
         from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-        from .moe_decode_kernel import mellum_moe_decode_gathered
+        from .moe_decode_kernel import mellum_moe_decode_gathered, mellum_moe_decode_gathered_dyn
 
         T, H = xb.shape
         E = self.num_local_experts
-        Cg = int(os.environ.get("MELLUM_MOE_EM_GROUP", "64"))
+        Cg = int(os.environ.get("MELLUM_MOE_EM_GROUP", "128"))
+        dyn = os.environ.get("MELLUM_MOE_EM_DYN", "1") == "1"
+        S0 = int(os.environ.get("MELLUM_MOE_EM_S0", "16"))
         K = min(self.top_k, E)
-        G = -(-T * K // Cg) + E
+        G = -(-T * K // Cg) + E + (1 if dyn else 0)
         routed = aff > 0  # [T, E]
         cnt = routed.sum(0).to(torch.int32)  # [E] rows per expert
         gpe = (cnt + Cg - 1) // Cg  # groups per expert
@@ -660,19 +662,50 @@ class MellumSparseMoeBlock(nn.Module):
         in_e = (sidx < cnt[g_exp].unsqueeze(1)) & (g_ids < gpe.sum()).unsqueeze(1)
         sidx_c = sidx.clamp(max=T - 1).to(torch.int64)
         slot_row = torch.gather(rows_by_e[g_exp.to(torch.int64)], 1, sidx_c)  # [G, Cg]
-        xg = xb.index_select(0, slot_row.reshape(-1)).reshape(G, Cg, H)
+        xin = dyn and os.environ.get("MELLUM_MOE_EM_XIN", "1") == "1"
+        xg = None if xin else xb.index_select(0, slot_row.reshape(-1)).reshape(G, Cg, H)
         w = aff[slot_row, g_exp.to(torch.int64).unsqueeze(1).expand(G, Cg)]  # [G, Cg]
         wslot = torch.where(in_e, w, torch.zeros_like(w))
         if self.em_fp8:
             wslot = wslot * self.em_d_scale[g_exp.to(torch.int64)]  # [G, 1]
-        k = wrap_nki(mellum_moe_decode_gathered)
-        k = k[k_lnc] if k_lnc > 1 else k
-        kw = dict(nbuf=int(os.environ.get("MELLUM_MOE_EM_NBUF", "2")), eidx=g_exp.to(torch.int32).reshape(1, G).contiguous())
-        if self.em_fp8:
-            kw.update(gu_scale=self.em_gu_scale)
-        o = k(xg.transpose(1, 2).contiguous(), wslot.float().contiguous(), self.em_gu, self.em_dn, **kw)
+        eidx = g_exp.to(torch.int32).reshape(1, G).contiguous()
+        if xin:
+            # in-kernel row gather + DMA scatter-add combine (torch index_select / one-hot combine cost more than
+            # the expert work); only the used groups run
+            from .moe_decode_kernel import mellum_moe_decode_gathered_dyn_x
+
+            used = gpe.sum().to(torch.int32).clamp(min=S0)
+            nrun = (S0 + (used - S0 + 1) // 2 * 2).reshape(1, 1).to(torch.int32)
+            srow = torch.where(in_e, slot_row, torch.full_like(slot_row, T)).to(torch.int32).contiguous()
+            k = wrap_nki(mellum_moe_decode_gathered_dyn_x)
+            k = k[k_lnc] if k_lnc > 1 else k
+            kw = dict(S0=S0)
+            if self.em_fp8:
+                kw.update(gu_scale=self.em_gu_scale)
+            o = k(xb, wslot.float().contiguous(), self.em_gu, self.em_dn, eidx, nrun, slot_row.to(torch.int32).contiguous(), srow, **kw)
+            o = o if isinstance(o, torch.Tensor) else o[0]
+            return o.reshape(-1, T, H).sum(0).to(torch.bfloat16)
+        if dyn:
+            # run only the used groups: S0 unrolled + a runtime loop (step 2) up to the used count
+            used = gpe.sum().to(torch.int32).clamp(min=S0)
+            nrun = (S0 + (used - S0 + 1) // 2 * 2).reshape(1, 1).to(torch.int32)
+            k = wrap_nki(mellum_moe_decode_gathered_dyn)
+            k = k[k_lnc] if k_lnc > 1 else k
+            kw = dict(S0=S0)
+            if self.em_fp8:
+                kw.update(gu_scale=self.em_gu_scale)
+            o = k(xg.transpose(1, 2).contiguous(), wslot.float().contiguous(), self.em_gu, self.em_dn, eidx, nrun, **kw)
+        else:
+            k = wrap_nki(mellum_moe_decode_gathered)
+            k = k[k_lnc] if k_lnc > 1 else k
+            kw = dict(nbuf=int(os.environ.get("MELLUM_MOE_EM_NBUF", "2")), eidx=eidx)
+            if self.em_fp8:
+                kw.update(gu_scale=self.em_gu_scale)
+            o = k(xg.transpose(1, 2).contiguous(), wslot.float().contiguous(), self.em_gu, self.em_dn, **kw)
         o = o if isinstance(o, torch.Tensor) else o[0]
         o = o.sum(0).reshape(G * Cg, H)
+        # groups the dynamic kernel skipped are never written (uninitialized HBM): zero them before the combine
+        o = torch.where(in_e.reshape(-1, 1), o, torch.zeros_like(o))
         sel = ((slot_row.reshape(1, -1) == torch.arange(T, device=xb.device).unsqueeze(1)) & in_e.reshape(1, -1)).to(torch.bfloat16)
         return sel @ o.to(torch.bfloat16)
 
