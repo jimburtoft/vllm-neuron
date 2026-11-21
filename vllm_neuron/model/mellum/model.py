@@ -616,7 +616,7 @@ class MellumSparseMoeBlock(nn.Module):
         if self.em_fp8:
             kw.update(gu_scale=self.em_gu_scale, d_scale=self.em_d_scale)
         xb = x.to(torch.bfloat16).contiguous()
-        if T > 128 and os.environ.get("MELLUM_MOE_EM_GATHER", "1") == "1":
+        if T > 128 and os.environ.get("MELLUM_MOE_EM_GATHER", "0") == "1":
             return self._decode_expert_major_gathered(xb, aff, k_lnc=lnc).to(self.dtype)
         outs = []
         for c0 in range(0, T, 128):
@@ -627,12 +627,13 @@ class MellumSparseMoeBlock(nn.Module):
         return out.to(self.dtype)
 
     def _decode_expert_major_gathered(self, xb, aff, k_lnc):
-        """T > 128: gather each local expert's routed rows into C slots, one kernel pass per expert, combine.
+        """T > 128: the routed (row, local expert) pairs, sorted by expert, are cut into G groups of Cg slots; each
+        group runs one kernel pass against its expert's weights (indirect DMA by group expert id). No capacity limit:
+        an expert with more than Cg rows uses several groups (its weights are re-read once per extra group).
 
-        Scatter-free (scatter / index_add compiled to ~9k GpSimd EMBEDDING_UPDATE ops and 4x the step time):
-        slot -> row via a stable argsort of the routed mask per expert (rows of expert e, in order, come first),
-        and the combine is a dense matmul of the slot outputs with a one-hot [T, E*C] selection matrix.
-        Rows routed to an expert beyond C are dropped (C defaults to 2 x the mean load).
+        Sizing: P = T * min(top_k, E_local) pair slots (upper bound on routed local pairs); groups are aligned to
+        expert boundaries, so G = ceil(P / Cg) + E_local groups always suffice. Unused groups have weight 0.
+        Scatter-free: argsort / gather to build the groups, one-hot matmul to combine.
         """
         from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
@@ -640,29 +641,39 @@ class MellumSparseMoeBlock(nn.Module):
 
         T, H = xb.shape
         E = self.num_local_experts
-        mean = T * self.top_k / self.num_experts
-        C = int(os.environ.get("MELLUM_MOE_EM_CAP", "0")) or min(128, max(16, int(-(-2 * mean // 16)) * 16))
+        Cg = int(os.environ.get("MELLUM_MOE_EM_GROUP", "64"))
+        K = min(self.top_k, E)
+        G = -(-T * K // Cg) + E
         routed = aff > 0  # [T, E]
-        # per expert: routed row indices first (ascending), then the others -> first C are its slots
-        key = (~routed).to(torch.int32) * T + torch.arange(T, device=xb.device, dtype=torch.int32).unsqueeze(1)
-        order = torch.argsort(key, dim=0)[:C]  # [C, E] row index per slot
-        valid = torch.gather(routed, 0, order)  # [C, E]
-        slot_row = order.t().contiguous()  # [E, C]
-        xg = xb.index_select(0, slot_row.reshape(-1)).reshape(E, C, H)
-        w = torch.gather(aff, 0, order).t()  # [E, C] routing weight per slot
-        wslot = torch.where(valid.t(), w, torch.zeros_like(w))
+        cnt = routed.sum(0).to(torch.int32)  # [E] rows per expert
+        gpe = (cnt + Cg - 1) // Cg  # groups per expert
+        gstart = torch.cumsum(gpe, 0) - gpe  # first group of each expert
+        # pair order: by expert, then row (expert-major flatten of the routed mask)
+        rm = routed.t().contiguous()  # [E, T]
+        key = (~rm).to(torch.int32) * T + torch.arange(T, device=xb.device, dtype=torch.int32).unsqueeze(0)  # [E, T]
+        rows_by_e = torch.argsort(key, dim=1)  # [E, T]: expert e's routed rows first
+        # slot s of group g of expert e: row rows_by_e[e, (g - gstart[e]) * Cg + s] if that index < cnt[e]
+        g_ids = torch.arange(G, device=xb.device, dtype=torch.int32)
+        g_exp = (torch.searchsorted(torch.cumsum(gpe, 0), g_ids, right=True)).clamp(max=E - 1)  # [G] expert of group
+        local_g = g_ids - gstart[g_exp]  # [G] group index within its expert
+        sidx = local_g.unsqueeze(1) * Cg + torch.arange(Cg, device=xb.device, dtype=torch.int32).unsqueeze(0)  # [G, Cg]
+        in_e = (sidx < cnt[g_exp].unsqueeze(1)) & (g_ids < gpe.sum()).unsqueeze(1)
+        sidx_c = sidx.clamp(max=T - 1).to(torch.int64)
+        slot_row = torch.gather(rows_by_e[g_exp.to(torch.int64)], 1, sidx_c)  # [G, Cg]
+        xg = xb.index_select(0, slot_row.reshape(-1)).reshape(G, Cg, H)
+        w = aff[slot_row, g_exp.to(torch.int64).unsqueeze(1).expand(G, Cg)]  # [G, Cg]
+        wslot = torch.where(in_e, w, torch.zeros_like(w))
         if self.em_fp8:
-            wslot = wslot * self.em_d_scale
+            wslot = wslot * self.em_d_scale[g_exp.to(torch.int64)]  # [G, 1]
         k = wrap_nki(mellum_moe_decode_gathered)
         k = k[k_lnc] if k_lnc > 1 else k
-        kw = dict(nbuf=int(os.environ.get("MELLUM_MOE_EM_NBUF", "2")))
+        kw = dict(nbuf=int(os.environ.get("MELLUM_MOE_EM_NBUF", "2")), eidx=g_exp.to(torch.int32).reshape(1, G).contiguous())
         if self.em_fp8:
             kw.update(gu_scale=self.em_gu_scale)
         o = k(xg.transpose(1, 2).contiguous(), wslot.float().contiguous(), self.em_gu, self.em_dn, **kw)
         o = o if isinstance(o, torch.Tensor) else o[0]
-        o = o.sum(0).reshape(E * C, H)  # [E*C, H] fp32 (unused slots are 0: weight 0)
-        # combine: y[t] = sum over slots s with slot_row[s] == t of o[s]  (one-hot matmul, no scatter)
-        sel = (slot_row.reshape(1, -1) == torch.arange(T, device=xb.device).unsqueeze(1)).to(torch.bfloat16)  # [T, E*C]
+        o = o.sum(0).reshape(G * Cg, H)
+        sel = ((slot_row.reshape(1, -1) == torch.arange(T, device=xb.device).unsqueeze(1)) & in_e.reshape(1, -1)).to(torch.bfloat16)
         return sel @ o.to(torch.bfloat16)
 
     def build_expert_major_weights(self, device=None):

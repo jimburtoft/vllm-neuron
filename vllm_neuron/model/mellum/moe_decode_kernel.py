@@ -424,12 +424,14 @@ def mellum_moe_decode(x, aff, Wgu, Wd, gu_scale=None, d_scale=None, nbuf=4, dedu
 
 
 @nki.jit
-def mellum_moe_decode_gathered(xgT, wslot, Wgu, Wd, gu_scale=None, nbuf=2):
+def mellum_moe_decode_gathered(xgT, wslot, Wgu, Wd, gu_scale=None, nbuf=2, eidx=None):
     """Expert-major decode MoE on per-expert gathered tokens (one pass per expert at any batch size).
 
     xgT   bf16 [E, H, C]  for each local expert, the hidden states of its routed tokens (slot-major, transposed;
                           unused slots are zero rows)
     wslot fp32 [E, C]     routing weight of each slot (x the expert's down scale for FP8; 0 for unused slots)
+    eidx  int32 [1, E]    optional: weight expert of each slot group (lets an overloaded expert use several groups;
+                          default group j = expert j). xgT / wslot have one group per entry.
     Wgu / Wd / gu_scale   as in mellum_moe_decode (storage may be H-padded)
     returns fp32 [NC, E, C, H]: per physical core the partial (its I slice) output of every slot.
     """
@@ -466,17 +468,27 @@ def mellum_moe_decode_gathered(xgT, wslot, Wgu, Wd, gu_scale=None, nbuf=2):
         gsc = _sb((C, 2 * IC)) if FP8 else None
         wc = _sb((C, 1))
         bufs.append((xP, wg, wu, wd, gsc, wc))
+    if eidx is not None:
+        ev = nl.ndarray((1, E), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=ev, src=eidx)
     for j in range(E):
         xP, wg, wu, wd, gsc, wc = bufs[j % nbuf]
+        if eidx is not None:
+            iv = ev.ap(pattern=[[E, 1], [1, 1]], offset=j)
+            dk = dict(scalar_offset=iv, indirect_dim=0)
+            base = 0
+        else:
+            dk = {}
+            base = j
         nisa.dma_copy(dst=xP, src=xgT.ap(pattern=[[C, 128], [128 * C, KT], [1, C]], offset=j * H * C))
-        nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=j * HSG * I2 + i0))
-        nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=j * HSG * I2 + I + i0))
+        nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * HSG * I2 + i0, **dk))
+        nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=base * HSG * I2 + I + i0, **dk))
         for ti, (o, n) in enumerate(I_TILES):
-            nisa.dma_copy(dst=wd[ti], src=Wd.ap(pattern=[[HSD, n], [1, H]], offset=j * I * HSD + (i0 + o) * HSD))
+            nisa.dma_copy(dst=wd[ti], src=Wd.ap(pattern=[[HSD, n], [1, H]], offset=base * I * HSD + (i0 + o) * HSD, **dk))
         nisa.dma_copy(dst=wc, src=wslot.ap(pattern=[[1, C], [1, 1]], offset=j * C))
         if FP8:
-            nisa.dma_copy(dst=gsc[:, 0:IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=j * I2 + i0))
-            nisa.dma_copy(dst=gsc[:, IC:2 * IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=j * I2 + I + i0))
+            nisa.dma_copy(dst=gsc[:, 0:IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=base * I2 + i0, **dk))
+            nisa.dma_copy(dst=gsc[:, IC:2 * IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=base * I2 + I + i0, **dk))
         gu = _sb((C, 2 * IC), BF)
         for (which, co, cn) in GT:
             wsrc = wg if which == 0 else wu
