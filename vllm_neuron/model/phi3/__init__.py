@@ -250,10 +250,6 @@ class Phi3RotaryEmbedding(torch.nn.Module):
         freqs = position_ids[:, None].float() * inv[None, :]
         emb = torch.cat((freqs, freqs), dim=-1)
         cos, sin = (emb.cos() * s).to(dtype=dtype), (emb.sin() * s).to(dtype=dtype)
-        import os
-        if os.environ.get("PHI3_DEBUG_ROPE") == "1":
-            print("PHI3ROPE", tuple(position_ids.shape), position_ids.dtype, tuple(cos.shape),
-                  bool(torch.isnan(cos).any()), position_ids.flatten()[:4].tolist(), flush=True)
         return cos, sin
 
 
@@ -318,20 +314,6 @@ class _Phi3Model(llama_model.LlamaForCausalLM):
                 mml = 0
             use_long = mml > info["original_max_position_embeddings"]
         model.model.rotary_emb = Phi3RotaryEmbedding(head_dim, info, use_long)
-        import os
-
-        if os.environ.get("PHI3_DEBUG_ROPE") == "1":
-            def _hook(name):
-                def h(mod, args, kwargs, out):
-                    o = out[0] if isinstance(out, tuple) else out
-                    am = kwargs.get("attn_metadata", "absent")
-                    kc = getattr(mod, "k_cache", None)
-                    print("PHI3NAN", name, tuple(o.shape), "out_nan", bool(torch.isnan(o).any()),
-                          "absmax", float(o.float().abs().max()), "am_none", am is None,
-                          "kcache_nan", None if kc is None else bool(torch.isnan(kc).any()), flush=True)
-                return h
-            for i, layer in enumerate(model.model.layers):
-                layer.self_attn.register_forward_hook(_hook(f"L{i}.attn"), with_kwargs=True)
         import logging
 
         logging.getLogger(__name__).info(
@@ -354,18 +336,9 @@ class _Phi3Model(llama_model.LlamaForCausalLM):
             llama_model.SafetensorsCheckpoint = orig
 
     def load_weights(self, checkpoint_path, device, cache_dir):
-        r = self._with_phi3_checkpoint(
+        return self._with_phi3_checkpoint(
             super().load_weights, checkpoint_path, device, cache_dir
         )
-        import os
-
-        if os.environ.get("PHI3_DEBUG_ROPE") == "1":
-            for n, p in self.named_parameters():
-                if "layers.0." in n or "layers" not in n:
-                    t = p.detach().float().cpu()
-                    print("PHI3W", n, tuple(t.shape), "absmax", float(t.abs().max()),
-                          "nan", bool(torch.isnan(t).any()), flush=True)
-        return r
 
     def load_weights_lite(self, checkpoint_path, device, cache_dir):
         return self._with_phi3_checkpoint(
