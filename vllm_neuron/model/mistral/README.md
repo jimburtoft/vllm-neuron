@@ -94,12 +94,16 @@ vllm serve mistralai/Mistral-7B-Instruct-v0.3 --tensor-parallel-size 4 \
 - Per-tensor FP8 checkpoints (ModelOpt, or `RedHatAI/Mistral-7B-Instruct-v0.3-FP8` relabelled to ModelOpt) also
   load, with or without an FP8 KV cache. Decode is 18 % faster at batch 1, but GSM8K drops to about 56.5 %: the
   per-tensor weight scales and the static per-tensor activation quantization each cost about 2 points.
+- `VLLM_NEURON_FP8_ROW_ATTN=1` also puts the q/k/v/o projections in FP8. Not recommended: decode at batch 1-8 is
+  2-3 % faster, but serving loses 3-5 % (1k/1k 3,497 -> 3,338 tok/s) and GSM8K drops 1.1 points.
 - `VLLM_NEURON_FP8_LM_HEAD=1` stores the LM head in FP8 with one scale per vocabulary row: -0.6 / -5.5 / -8.2 %
   decode time at batch 1 / 8 / 32, but GSM8K drops by 1-2 points (59.0 %). Off by default.
 - EAGLE3 speculative decoding (`--speculative-config '{"method": "eagle3", "model": <draft>,
   "num_speculative_tokens": 3}'`) with a Mistral-7B-v0.3 EAGLE3 draft cuts decode time 1.75x at concurrency 1
   (4.5 ms per token), 1.39x at 4 and 1.15x at 8. From concurrency 16 up, the plain recipe above is faster (1,405
-  vs 1,286 tok/s at 16, 2,371 vs 1,614 at 32), so use EAGLE3 for latency-bound serving only. Under speculative
+  vs 1,286 tok/s at 16, 2,371 vs 1,614 at 32), so use EAGLE3 for latency-bound serving only. With
+  `VLLM_NEURON_FP8_ROW_MLP=1` on the target (the draft stays BF16), EAGLE3 is 4-16 % faster again: 3.87 ms per
+  token at concurrency 1 (254 tok/s, about 2x plain BF16 decode); the crossover stays between 8 and 16. Under speculative
   decoding, packed prefill is turned off by the scheduler, and fused decode norms make it 2-4 % slower, so leave
   both off with EAGLE3.
 - `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` (default 0.30) caps the KV cache. 0.6 is the largest value that
