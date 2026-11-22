@@ -340,7 +340,8 @@ class MellumSparseMoeBlock(nn.Module):
         self.em_max_t = int(os.environ.get("MELLUM_MOE_EM_MAX_T", "256"))
         # MELLUM_MOE_FP8_ONLY=1 (with MELLUM_MOE_EM=1, EP only): keep a single FP8 copy of the experts (padded Hp layout
         # with per-column gate|up and per-H-column down scales). Prefill uses it through nkilib bwmm_shard_on_I(_hybrid)
-        # FP8 (stock: upcasts tiles to bf16; CR 10 overlay: no upcast); decode uses the expert-major kernel on the same
+        # FP8 (stock 2.33: fails at I/core 448; branch jimburtoft/nki-library@mellum-trn2-2.33: direct FP8 matmuls);
+        # decode uses the expert-major kernel on the same
         # buffers. The bf16 experts are freed (-1 copy, ~3 GB/core).
         self.fp8_only = self.em_enabled and self.em_fp8 and os.environ.get("MELLUM_MOE_FP8_ONLY", "0") == "1"
         # >>> PARALLELISM: router replicated on every rank <<<
@@ -644,7 +645,7 @@ class MellumSparseMoeBlock(nn.Module):
 
         T, H = xb.shape
         E = self.num_local_experts
-        # Group size: 64 rows up to T 256, 128 above (real-routing model-path timing, task 041: T256 Cg64 933 vs Cg128
+        # Group size: 64 rows up to T 256, 128 above (model-path timing with real routing: T256 Cg64 933 vs Cg128
         # 1,090 us per layer; T512 Cg128 1,431 vs Cg64 1,560 us).
         _cg = os.environ.get("MELLUM_MOE_EM_GROUP", "auto")
         Cg = (64 if T <= 256 else 128) if _cg == "auto" else int(_cg)
