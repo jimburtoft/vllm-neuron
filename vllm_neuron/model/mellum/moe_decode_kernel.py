@@ -775,7 +775,7 @@ def mellum_moe_decode_gathered_dyn_sc(xgT, wslot, Wgu, Wd, eidx, ngrp, srow, T, 
 
 
 @nki.jit
-def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow, gu_scale=None, S0=16, xt=0):
+def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow, gu_scale=None, S0=16, xt=0, oh=0):
     """Gathered expert-major decode MoE, runtime group count.
 
     x     bf16 [T, H]     hidden states (gathered in-kernel: indirect row DMA + PE transpose)
@@ -813,11 +813,19 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
     nisa.tensor_scalar(dst=ident, data=io_f, op0=nl.equal, operand0=io_p)
 
     y = nl.ndarray((NC * T, H), dtype=F32, buffer=nl.shared_hbm)  # [NC, T, H] flattened: dim 0 stride H for the scatter
-    z = _sb((128, H))
-    nisa.memset(z, 0.0)
-    for r0 in range(0, T, 128):
-        rn = min(128, T - r0)
-        nisa.dma_copy(dst=y.ap(pattern=[[H, rn], [1, H]], offset=(pid * T + r0) * H), src=z[0:rn, :])
+    RT = [(r0, min(128, T - r0)) for r0 in range(0, T, 128)]
+    if oh:
+        # on-chip combine: acc[rt][p, :] = sum over slots c with row(c) == r0 + p of ys[c, :] (one-hot matmul per group)
+        acc = [_sb((128, H)) for _ in RT]
+        for a_ in acc:
+            nisa.memset(a_, 0.0)
+        iot = _sb((128, T))  # iot[c, t] = t
+        nisa.iota(iot, [[1, T]], offset=0, channel_multiplier=0)
+    else:
+        z = _sb((128, H))
+        nisa.memset(z, 0.0)
+        for r0, rn in RT:
+            nisa.dma_copy(dst=y.ap(pattern=[[H, rn], [1, H]], offset=(pid * T + r0) * H), src=z[0:rn, :])
     bufs = []
     for bi in range(2):
         xP = _sb((128, KT * C), BF)
@@ -899,8 +907,21 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
         ys = _sb((C, H))
         for t, (ho, hn) in enumerate(HT):
             nisa.tensor_copy(dst=ys[:, ho:ho + hn], src=py[t])
-        yv = y.ap(pattern=[[H, C], [1, H]], offset=pid * T * H, vector_offset=rows, indirect_dim=0)
-        nisa.dma_compute(dst=yv, srcs=[yv, ys], reduce_op=nl.add, oob_mode=nisa.oob_mode.skip)
+        if oh:
+            rf = _sb((C, 1))
+            nisa.tensor_copy(dst=rf, src=rows)
+            sel = _sb((C, T), BF)  # sel[c, t] = (row(c) == t); padding rows (T) match nothing
+            nisa.tensor_scalar(dst=sel, data=iot[0:C, :], op0=nl.equal, operand0=rf)
+            ysb = _sb((C, H), BF)
+            nisa.tensor_copy(dst=ysb, src=ys)
+            for ri, (r0, rn) in enumerate(RT):
+                for t, (ho, hn) in enumerate(HT):
+                    pc = nl.ndarray((rn, hn), dtype=F32, buffer=nl.psum)
+                    nisa.nc_matmul(pc, sel[:, r0:r0 + rn], ysb[:, ho:ho + hn])
+                    nisa.tensor_tensor(dst=acc[ri][0:rn, ho:ho + hn], data1=acc[ri][0:rn, ho:ho + hn], data2=pc, op=nl.add)
+        else:
+            yv = y.ap(pattern=[[H, C], [1, H]], offset=pid * T * H, vector_offset=rows, indirect_dim=0)
+            nisa.dma_compute(dst=yv, srcs=[yv, ys], reduce_op=nl.add, oob_mode=nisa.oob_mode.skip)
 
     for j in range(S0):
         group(j, ev.ap(pattern=[[G, 1], [1, 1]], offset=j), bufs[j % 2])
@@ -918,4 +939,7 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
             group(jk.ap(pattern=[[2, 1], [1, 1]], offset=k), ek.ap(pattern=[[2, 1], [1, 1]], offset=k), bufs[k])
 
     nl.fori_loop(S0, nreg, body, step=2)
+    if oh:
+        for ri, (r0, rn) in enumerate(RT):
+            nisa.dma_copy(dst=y.ap(pattern=[[H, rn], [1, H]], offset=(pid * T + r0) * H), src=acc[ri][0:rn, :])
     return y
