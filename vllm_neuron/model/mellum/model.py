@@ -644,7 +644,10 @@ class MellumSparseMoeBlock(nn.Module):
 
         T, H = xb.shape
         E = self.num_local_experts
-        Cg = int(os.environ.get("MELLUM_MOE_EM_GROUP", "128"))
+        # Group size: 64 rows up to T 256, 128 above (real-routing model-path timing, task 041: T256 Cg64 933 vs Cg128
+        # 1,090 us per layer; T512 Cg128 1,431 vs Cg64 1,560 us).
+        _cg = os.environ.get("MELLUM_MOE_EM_GROUP", "auto")
+        Cg = (64 if T <= 256 else 128) if _cg == "auto" else int(_cg)
         dyn = os.environ.get("MELLUM_MOE_EM_DYN", "1") == "1"
         S0 = int(os.environ.get("MELLUM_MOE_EM_S0", "16"))
         K = min(self.top_k, E)
@@ -682,7 +685,7 @@ class MellumSparseMoeBlock(nn.Module):
             srow = torch.where(in_e, slot_row, torch.full_like(slot_row, T)).to(torch.int32).contiguous()
             k = wrap_nki(mellum_moe_decode_gathered_dyn_x)
             k = k[k_lnc] if k_lnc > 1 else k
-            kw = dict(S0=S0)
+            kw = dict(S0=S0, xt=int(os.environ.get("MELLUM_MOE_EM_XT", "0")))
             if self.em_fp8:
                 kw.update(gu_scale=self.em_gu_scale)
             o = k(xb, wslot.float().contiguous(), self.em_gu, self.em_dn, eidx, nrun, slot_row.to(torch.int32).contiguous(), srow, **kw)

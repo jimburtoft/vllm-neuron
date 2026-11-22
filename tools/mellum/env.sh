@@ -6,3 +6,9 @@ export VLLM_NEURON_SWA_RING=${VLLM_NEURON_SWA_RING:-1}
 export VLLM_NEURON_SWA_REAL_ADMISSION=${VLLM_NEURON_SWA_REAL_ADMISSION:-1}
 export VLLM_NEURON_SWA_EARLY_FREE=${VLLM_NEURON_SWA_EARLY_FREE:-1}
 export VLLM_NEURON_SWA_CTX_BUCKETS=${VLLM_NEURON_SWA_CTX_BUCKETS:-1}
+# Content-fingerprint the standalone NKI Library in the NKI trace cache. The cache only version-pins packages outside
+# the kernel's own package, and installing nki-library (or a new commit of it) keeps every pinned version unchanged,
+# so without this a trace of the stock kernels keeps being served.
+_nkilib_src="$(python -c 'import importlib.util as u, os; s = u.find_spec("nkilib_src"); print(os.path.dirname(s.origin) if s and s.origin else "")' 2>/dev/null)"
+[ -n "$_nkilib_src" ] && export NKI_TRACE_CACHE_ROOTS="${NKI_TRACE_CACHE_ROOTS:+$NKI_TRACE_CACHE_ROOTS:}$_nkilib_src"
+unset _nkilib_src

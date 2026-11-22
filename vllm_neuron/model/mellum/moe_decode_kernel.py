@@ -775,7 +775,7 @@ def mellum_moe_decode_gathered_dyn_sc(xgT, wslot, Wgu, Wd, eidx, ngrp, srow, T, 
 
 
 @nki.jit
-def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow, gu_scale=None, S0=16):
+def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow, gu_scale=None, S0=16, xt=0):
     """Gathered expert-major decode MoE, runtime group count.
 
     x     bf16 [T, H]     hidden states (gathered in-kernel: indirect row DMA + PE transpose)
@@ -849,12 +849,21 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
             nisa.dma_copy(dst=wc, src=wslot.ap(pattern=[[1, C], [1, 1]], offset=0, **gk))
             nisa.dma_copy(dst=rg, src=srow_g.ap(pattern=[[1, C], [1, 1]], offset=0, **gk))
             nisa.dma_copy(dst=rows, src=srow.ap(pattern=[[1, C], [1, 1]], offset=0, **gk))
-        xr = _sb((C, H), BF)
-        nisa.dma_copy(dst=xr, src=x.ap(pattern=[[H, C], [1, H]], offset=0, vector_offset=rg, indirect_dim=0))
-        for kt in range(KT):
-            pt = nl.ndarray((128, C), dtype=F32, buffer=nl.psum)
-            nisa.nc_matmul(pt, xr[:, kt * 128:(kt + 1) * 128], ident[0:C, 0:C])
-            nisa.tensor_copy(dst=xP[:, kt * C:(kt + 1) * C], src=pt)
+        if xt:
+            # indirect gather-transpose by DMA (software DGE): xP[:, kt*C + c] = x[rg[c], kt*128 + p]
+            rgu = nl.ndarray((C, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=rgu, src=rg)
+            for kt in range(KT):
+                nisa.dma_transpose(dst=xP[:, kt * C:(kt + 1) * C],
+                                   src=x.ap(pattern=[[H, C], [1, 128]], offset=kt * 128, vector_offset=rgu, indirect_dim=0),
+                                   axes=(1, 0))
+        else:
+            xr = _sb((C, H), BF)
+            nisa.dma_copy(dst=xr, src=x.ap(pattern=[[H, C], [1, H]], offset=0, vector_offset=rg, indirect_dim=0))
+            for kt in range(KT):
+                pt = nl.ndarray((128, C), dtype=F32, buffer=nl.psum)
+                nisa.nc_matmul(pt, xr[:, kt * 128:(kt + 1) * 128], ident[0:C, 0:C])
+                nisa.tensor_copy(dst=xP[:, kt * C:(kt + 1) * C], src=pt)
         nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=i0, **dk))
         nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=I + i0, **dk))
         for ti, (o, n) in enumerate(I_TILES):
