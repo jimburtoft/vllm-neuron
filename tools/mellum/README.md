@@ -174,6 +174,10 @@ vllm serve JetBrains/Mellum2.1-12B-A2.5B-Thinking --tensor-parallel-size 4 --ena
   --additional-config '{"neuron_config": {"decode_context_length_buckets": [2048]}}'
 ```
 
+Install the NKI Library branch **before the first serve** on a machine. Otherwise the NKI trace cache keeps the stock
+kernel's trace and the compile still fails with `NCC_IGCA108` after the install. If that happens, clear
+`/var/tmp/nki-trace-cache-uid*`, `/var/tmp/nki-intermediate-cache` and the vLLM compile cache, then restart.
+
 Expert weights drop from 6.2 to 3.8 GiB per core. Measured from these public installs (trn2.3xlarge, TP=4, EP=4):
 
 | Workload | Output tok/s | TTFT p50 | TPOT p50 |
