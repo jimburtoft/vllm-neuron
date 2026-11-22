@@ -156,7 +156,7 @@ vllm serve JetBrains/Mellum2.1-12B-A2.5B-Thinking $MELLUM_SERVE_ARGS --additiona
 |---|---|---|
 | `latency` | 1-16 concurrent requests | 177 tok/s at 1 (5.6 ms per token), 934 at 16 |
 | `mixed` | 16-256 concurrent | 3,665 at 64, 4,294 at 256 |
-| `throughput` | 256-512 concurrent (needs `jimburtoft/nki-library@mellum-trn2-2.33`) | 3,799 at 64, 4,185 at 256, 5,739 at 512 |
+| `throughput` | 256-512 concurrent (needs `jimburtoft/nki-library@mellum-trn2-2.33`) | 3,799 at 64, 4,671 at 256, 5,748 at 512 |
 | `long` | prompts up to ~48k tokens | 30k-token prompt: TTFT 1.95 s, 10.3 ms per token |
 
 ### Single FP8 expert copy (highest throughput at 512 requests)
@@ -205,11 +205,13 @@ the results back into the output by DMA. Throughput preset, decode buckets `[102
 
 | Workload | Chunked | Gathered |
 |---|---:|---:|
-| 128 / 1,024, 256 concurrent | 3,924 tok/s | 4,185 tok/s |
+| 128 / 1,024, 256 concurrent | 3,924 tok/s | 4,671 tok/s (groups of 64 rows up to 256 rows) |
 | 128 / 1,024, 512 concurrent | 5,175 tok/s | 5,739 tok/s (TPOT 86 ms) |
 | 1,024 / 1,024, 512 concurrent | 4,172 tok/s | 4,510 tok/s |
 
-Accuracy: full GSM8K (1,319 questions, 256 concurrent) 95.5 % gathered vs 95.2 % chunked. `MELLUM_MOE_EM_GATHER=0`
+Accuracy: full GSM8K (1,319 questions, 256 concurrent) 95.3-95.5 % gathered vs 95.2 % chunked. More than 512
+concurrent requests does not help: at 640 / 768 / 1,024 throughput drops to 5,623 / 5,247 / 5,323 tok/s (the KV
+budget admits at most 638 live requests and the time per step grows faster than the batch). `MELLUM_MOE_EM_GATHER=0`
 restores the chunked path.
 
 ### Decode bucket ladder
