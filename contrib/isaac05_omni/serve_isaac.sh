@@ -5,7 +5,7 @@
 ISAAC05_OMNI_DIR=${ISAAC05_OMNI_DIR:-$(cd "$(dirname "$0")" && pwd)}
 source /opt/aws_neuronx_venv_pytorch_inference_vllm_omni_0_29_0_0_2_0/bin/activate
 export PATH=/opt/aws_neuronx_venv_pytorch_inference_vllm_omni_0_29_0_0_2_0/bin:$PATH
-export PYTHONPATH=${VLLM_NEURON_DIR:-$HOME/vllm-neuron}:${ISAAC05_OVERLAY:-$HOME/isaac05_overlay} NEURON_LOGICAL_NC_CONFIG=2 NEURON_SKIP_EFA_AFFINITY=1
+export PYTHONPATH=${VLLM_NEURON_DIR:-$ISAAC05_OMNI_DIR/../..}:${ISAAC05_OVERLAY:-$HOME/isaac05_overlay} NEURON_LOGICAL_NC_CONFIG=2 NEURON_SKIP_EFA_AFFINITY=1
 export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$HOME/.cache/isaac05_omni} QWEN35_DECODE_MK=0 ${XENV}
 PROFARGS=()
 if [ "${PROF:-0}" = 1 ]; then

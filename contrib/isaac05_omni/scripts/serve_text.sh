@@ -3,7 +3,7 @@
 # usage: MODEL=<vllm view dir from make_vllm_dir.py> [PROFILE=t2k|t8k|img] serve_text.sh
 # Profiles are the tuned configurations measured in contrib/isaac05_omni/README.md.
 source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/activate
-export PYTHONPATH=${VLLM_NEURON_DIR:-$HOME/vllm-neuron} NEURON_LOGICAL_NC_CONFIG=2 NEURON_SKIP_EFA_AFFINITY=1
+export PYTHONPATH=${VLLM_NEURON_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)} NEURON_LOGICAL_NC_CONFIG=2 NEURON_SKIP_EFA_AFFINITY=1
 export QWEN35_DECODE_MK=1 QWEN35_NULL_ROUTING=1 VLLM_NEURON_KV_ADMIT=tokens VLLM_NEURON_MIN_KV_BUDGET_GIB=0.5
 PROFILE=${PROFILE:-t2k}
 NC='"num_batched_tokens_buckets": [128, 256, 512, 1024, 2048], "on_device_sampling_config": {"all_greedy": true}'

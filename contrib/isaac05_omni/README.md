@@ -43,21 +43,28 @@ One layer at T = 512 takes 0.90 ms per rank, against 4.05 ms for the block kerne
 ## Setup
 
 ```bash
-# on a trn2.3xlarge with the SDK 2.33 DLAMI
+# on a trn2.3xlarge with the SDK 2.33 DLAMI (300 GB+ disk)
 git clone -b isaac05-action https://github.com/jimburtoft/vllm-neuron.git ~/vllm-neuron
-# 1) BF16 checkpoint (the published checkpoint is FP32; the model runs in BF16)
-huggingface-cli download PerceptronAI/Isaac-0.5 --local-dir ~/models/Isaac-0.5-fp32
-python ~/vllm-neuron/contrib/isaac05_omni/scripts/convert_bf16.py ~/models/Isaac-0.5-fp32 ~/models/Isaac-0.5-bf16
-# 2) vLLM view of the checkpoint for text / VL serving (architectures: Qwen3_5MoeForCausalLM or ...ForConditionalGeneration)
-python ~/vllm-neuron/contrib/isaac05_omni/scripts/make_vllm_dir.py ~/models/Isaac-0.5-bf16 ~/models/Isaac-0.5-vllm
-# 3) action path extras into an overlay dir (the SDK venvs stay untouched)
+C=~/vllm-neuron/contrib/isaac05_omni
 source /opt/aws_neuronx_venv_pytorch_inference_vllm_omni_0_29_0_0_2_0/bin/activate
+# 1) BF16 checkpoint (the published checkpoint is FP32; the model runs in BF16)
+hf download PerceptronAI/Isaac-0.5 --revision 6e397429f0ab91528ebac915004eba5e763fcdd4 --local-dir ~/models/Isaac-0.5-fp32
+python $C/scripts/convert_bf16.py ~/models/Isaac-0.5-fp32 ~/models/Isaac-0.5-bf16
+# 2) vLLM views of the checkpoint for text / vision-language serving (symlinks + rewritten config)
+python $C/scripts/make_vllm_dir.py ~/models/Isaac-0.5-bf16 ~/models/Isaac-0.5-vllm text
+python $C/scripts/make_vllm_dir.py ~/models/Isaac-0.5-bf16 ~/models/Isaac-0.5-vllm-vl vl
+# 3) action-path extras into an overlay dir (the SDK venvs stay untouched)
 git clone https://github.com/perceptron-ai-inc/lerobot.git ~/lerobot && git -C ~/lerobot checkout e12389c1f8f591ad05dced4e284d4e92e48c5df4
 git clone https://github.com/perceptron-ai-inc/mharmony.git ~/mharmony && git -C ~/mharmony checkout 9a57efbf8ada2d73641fc40081f4e4fa6ff2ab92
-# mharmony is a Rust extension: install rustup, then build it with maturin into the overlay
-pip install --no-deps --target ~/isaac05_overlay ~/mharmony draccus gymnasium mergedeep termcolor toml typing-inspect
+curl -sSf https://sh.rustup.rs | sh -s -- -y && source ~/.cargo/env          # mharmony is a Rust extension
+python3 -m venv ~/maturin && ~/maturin/bin/pip install maturin
+(cd ~/mharmony && ~/maturin/bin/maturin build --release -o /tmp/mhwheel)
+mkdir -p ~/isaac05_overlay
+pip install --no-deps --target ~/isaac05_overlay /tmp/mhwheel/*.whl draccus gymnasium Farama-Notifications \
+    mergedeep termcolor toml typing-inspect
 ln -s ~/lerobot/src/lerobot ~/isaac05_overlay/lerobot
-pip install --no-deps --target ~/isaac05_overlay ~/vllm-neuron/contrib/isaac05_omni
+pip install --no-deps --target ~/isaac05_overlay $C
+python -c "from huggingface_hub import hf_hub_download as d; [d('Qwen/Qwen3.5-0.8B', f) for f in ['vocab.json','merges.txt','tokenizer.json','tokenizer_config.json','config.json','chat_template.jinja']]"
 ```
 Add a 64 GB swap file before the first compile. The compiler can need more host memory than the instance has.
 
@@ -65,7 +72,9 @@ Add a 64 GB swap file before the first compile. The compiler can need more host 
 
 Text / VL (vLLM-Neuron, OpenAI API):
 ```bash
-MODEL=~/models/Isaac-0.5-vllm PROFILE=t2k bash ~/vllm-neuron/contrib/isaac05_omni/scripts/serve_text.sh   # t2k | t8k | img
+MODEL=~/models/Isaac-0.5-vllm PROFILE=t2k bash ~/vllm-neuron/contrib/isaac05_omni/scripts/serve_text.sh      # text, 2K
+MODEL=~/models/Isaac-0.5-vllm PROFILE=t8k bash ~/vllm-neuron/contrib/isaac05_omni/scripts/serve_text.sh      # text, 8K
+MODEL=~/models/Isaac-0.5-vllm-vl PROFILE=img bash ~/vllm-neuron/contrib/isaac05_omni/scripts/serve_text.sh   # images
 ```
 
 Robot actions (vLLM-Omni, OpenPI websocket):
