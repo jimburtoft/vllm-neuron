@@ -634,6 +634,9 @@ class MellumSparseMoeBlock(nn.Module):
 
         Sizing: P = T * min(top_k, E_local) pair slots (upper bound on routed local pairs); groups are aligned to
         expert boundaries, so G = ceil(P / Cg) + E_local (+1) groups always suffice. Unused groups have weight 0.
+        Above 256 rows (MELLUM_MOE_EM_XS / _YBF = auto): x stays resident in SBUF and each group selects its rows with a
+        one-hot matmul (no per-group HBM gather + transpose), and the scatter-add accumulator is bf16 (half the
+        read-modify-write bytes; a row gets <= top_k partials). c512 +3 %, GSM8K unchanged.
         Groups are built in torch (argsort / gather, no scatter). Default (MELLUM_MOE_EM_DYN=1, MELLUM_MOE_EM_XIN=1):
         the kernel runs S0 groups unrolled plus a runtime loop up to the used group count, gathers each group's rows
         itself and scatter-adds the results into [T, H] by DMA. A torch index_select gather and a one-hot combine
@@ -686,11 +689,24 @@ class MellumSparseMoeBlock(nn.Module):
             srow = torch.where(in_e, slot_row, torch.full_like(slot_row, T)).to(torch.int32).contiguous()
             k = wrap_nki(mellum_moe_decode_gathered_dyn_x)
             k = k[k_lnc] if k_lnc > 1 else k
-            kw = dict(S0=S0, xt=int(os.environ.get("MELLUM_MOE_EM_XT", "0")), oh=int(os.environ.get("MELLUM_MOE_EM_OH", "0")))
+            kw = dict(S0=S0, xt=int(os.environ.get("MELLUM_MOE_EM_XT", "0")), oh=int(os.environ.get("MELLUM_MOE_EM_OH", "0")), wq=int(os.environ.get("MELLUM_MOE_EM_WQ", "0")), xs=int(os.environ.get("MELLUM_MOE_EM_XS", "auto").replace("auto", "1" if T > 256 else "0")), abl=int(os.environ.get("MELLUM_MOE_EM_ABL", "0")), sc=int(os.environ.get("MELLUM_MOE_EM_SC", "0")), ybf=int(os.environ.get("MELLUM_MOE_EM_YBF", "auto").replace("auto", "1" if T > 256 else "0")))
             if self.em_fp8:
                 kw.update(gu_scale=self.em_gu_scale)
             o = k(xb, wslot.float().contiguous(), self.em_gu, self.em_dn, eidx, nrun, slot_row.to(torch.int32).contiguous(), srow, **kw)
             o = o if isinstance(o, torch.Tensor) else o[0]
+            if kw["sc"]:
+                # per-slot outputs [NC, G*Cg, H]; row t's slots: inverse table built without scatter. Slot s of row t
+                # (k-th routed local expert of t, in expert order) is at flat position pos[t, k]; pad -> a zero row.
+                o = o.reshape(-1, G * Cg, H).sum(0)  # [G*Cg, H] (skipped groups uninitialized -> never indexed)
+                o = torch.cat([o, torch.zeros(1, H, dtype=o.dtype, device=o.device)], 0)
+                # rank of t among expert e's routed rows = cumsum of routed[:, e] up to t (exclusive)
+                rk = torch.cumsum(routed.to(torch.int32), 0) - routed.to(torch.int32)  # [T, E]
+                flat = (gstart.unsqueeze(0) + rk // Cg) * Cg + rk % Cg  # [T, E] slot position if routed
+                flat = torch.where(routed, flat, torch.full_like(flat, G * Cg))
+                # keep the K smallest (all routed ones; pad entries sort last)
+                kk = min(self.top_k, E)
+                inv = torch.topk(flat, kk, dim=1, largest=False).values  # [T, K]
+                return o.index_select(0, inv.reshape(-1).to(torch.int64)).reshape(T, kk, H).float().sum(1).to(torch.bfloat16)
             return o.reshape(-1, T, H).sum(0).to(torch.bfloat16)
         if dyn:
             # run only the used groups: S0 unrolled + a runtime loop (step 2) up to the used count

@@ -775,7 +775,7 @@ def mellum_moe_decode_gathered_dyn_sc(xgT, wslot, Wgu, Wd, eidx, ngrp, srow, T, 
 
 
 @nki.jit
-def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow, gu_scale=None, S0=16, xt=0, oh=0):
+def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow, gu_scale=None, S0=16, xt=0, oh=0, wq=0, xs=0, abl=0, sc=0, ybf=0):
     """Gathered expert-major decode MoE, runtime group count.
 
     x     bf16 [T, H]     hidden states (gathered in-kernel: indirect row DMA + PE transpose)
@@ -812,8 +812,12 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
     nisa.iota(io_f, [[1, 128]], offset=0, channel_multiplier=0)
     nisa.tensor_scalar(dst=ident, data=io_f, op0=nl.equal, operand0=io_p)
 
-    y = nl.ndarray((NC * T, H), dtype=F32, buffer=nl.shared_hbm)  # [NC, T, H] flattened: dim 0 stride H for the scatter
     RT = [(r0, min(128, T - r0)) for r0 in range(0, T, 128)]
+    if sc:
+        y = nl.ndarray((NC * G, C * H), dtype=BF, buffer=nl.shared_hbm)  # per-slot outputs (bf16), combined by the caller
+    else:
+        # ybf: bf16 scatter-add accumulator (half the RMW bytes; each row gets <= K group partials)
+        y = nl.ndarray((NC * T, H), dtype=(BF if ybf else F32), buffer=nl.shared_hbm)  # [NC, T, H] flattened
     if oh:
         # on-chip combine: acc[rt][p, :] = sum over slots c with row(c) == r0 + p of ys[c, :] (one-hot matmul per group)
         acc = [_sb((128, H)) for _ in RT]
@@ -821,8 +825,10 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
             nisa.memset(a_, 0.0)
         iot = _sb((128, T))  # iot[c, t] = t
         nisa.iota(iot, [[1, T]], offset=0, channel_multiplier=0)
+    elif sc:
+        pass
     else:
-        z = _sb((128, H))
+        z = _sb((128, H), BF if ybf else F32)
         nisa.memset(z, 0.0)
         for r0, rn in RT:
             nisa.dma_copy(dst=y.ap(pattern=[[H, rn], [1, H]], offset=(pid * T + r0) * H), src=z[0:rn, :])
@@ -835,6 +841,17 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
         gsc = _sb((C, 2 * IC)) if FP8 else None
         wc = _sb((C, 1))
         bufs.append((xP, wg, wu, wd, gsc, wc))
+    if xs:
+        # xs: x rows resident in SBUF once per call (row tiles of 128); each group builds its transposed activations
+        # with one-hot matmuls xP[:, kt*C + c] = sum_t x[t, kt*128 + p] * (t == rg[c]) -- no per-group HBM gather and
+        # no per-group PE transpose of a gathered tile (1 matmul per row tile per K tile instead of gather + transpose)
+        xrow = []
+        for r0, rn in RT:
+            xr_ = _sb((128, H), BF)
+            nisa.dma_copy(dst=xr_[0:rn, :], src=x[r0:r0 + rn, :])
+            xrow.append(xr_)
+        iotx = _sb((128, T))
+        nisa.iota(iotx, [[1, T]], offset=0, channel_multiplier=0)
     ev = nl.ndarray((1, G), dtype=nl.int32, buffer=nl.sbuf)
     nisa.dma_copy(dst=ev, src=eidx)
     gv = nl.ndarray((1, G), dtype=nl.int32, buffer=nl.sbuf)  # group index table for the dynamic part
@@ -857,7 +874,24 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
             nisa.dma_copy(dst=wc, src=wslot.ap(pattern=[[1, C], [1, 1]], offset=0, **gk))
             nisa.dma_copy(dst=rg, src=srow_g.ap(pattern=[[1, C], [1, 1]], offset=0, **gk))
             nisa.dma_copy(dst=rows, src=srow.ap(pattern=[[1, C], [1, 1]], offset=0, **gk))
-        if xt:
+        if xs:
+            rgf = _sb((C, 1))
+            nisa.tensor_copy(dst=rgf, src=rg)
+            selT = _sb((C, T), BF)  # selT[c, t] = (rg[c] == t)
+            nisa.tensor_scalar(dst=selT, data=iotx[0:C, :], op0=nl.equal, operand0=rgf)
+            sels = []
+            for ri, (r0, rn) in enumerate(RT):
+                ps = nl.ndarray((128, C), dtype=F32, buffer=nl.psum)
+                nisa.nc_matmul(ps[0:rn, :], selT[:, r0:r0 + rn], ident[0:C, 0:C])
+                st = _sb((128, C), BF)
+                nisa.tensor_copy(dst=st[0:rn, :], src=ps[0:rn, :])
+                sels.append(st)
+            for kt in range(KT):
+                px = nl.ndarray((128, C), dtype=F32, buffer=nl.psum)
+                for ri, (r0, rn) in enumerate(RT):
+                    nisa.nc_matmul(px, xrow[ri][0:rn, kt * 128:(kt + 1) * 128], sels[ri][0:rn, :])
+                nisa.tensor_copy(dst=xP[:, kt * C:(kt + 1) * C], src=px)
+        elif xt:
             # indirect gather-transpose by DMA (software DGE): xP[:, kt*C + c] = x[rg[c], kt*128 + p]
             rgu = nl.ndarray((C, 1), dtype=nl.uint32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=rgu, src=rg)
@@ -865,6 +899,8 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
                 nisa.dma_transpose(dst=xP[:, kt * C:(kt + 1) * C],
                                    src=x.ap(pattern=[[H, C], [1, 128]], offset=kt * 128, vector_offset=rgu, indirect_dim=0),
                                    axes=(1, 0))
+        elif abl & 4:
+            pass
         else:
             xr = _sb((C, H), BF)
             nisa.dma_copy(dst=xr, src=x.ap(pattern=[[H, C], [1, H]], offset=0, vector_offset=rg, indirect_dim=0))
@@ -872,13 +908,21 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
                 pt = nl.ndarray((128, C), dtype=F32, buffer=nl.psum)
                 nisa.nc_matmul(pt, xr[:, kt * 128:(kt + 1) * 128], ident[0:C, 0:C])
                 nisa.tensor_copy(dst=xP[:, kt * C:(kt + 1) * C], src=pt)
-        nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=i0, **dk))
-        nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=I + i0, **dk))
-        for ti, (o, n) in enumerate(I_TILES):
-            nisa.dma_copy(dst=wd[ti], src=Wd.ap(pattern=[[HSD, n], [1, H]], offset=(i0 + o) * HSD, **dk))
+        # wq: expert weight loads by hardware DGE on the Sync / Scalar queues (wq=1: Sync; wq=2: gate/up Sync, down Scalar),
+        # instead of GpSimd software descriptors (GpSimd is the busiest engine in this kernel)
+        if wq:
+            q1 = dict(dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+            q2 = dict(dge_mode=nisa.dge_mode.hwdge, engine=(nisa.engine.scalar if wq == 2 else nisa.engine.sync))
+        else:
+            q1 = q2 = {}
+        if not (abl & 1):
+            nisa.dma_copy(dst=wg, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=i0, **dk), **q1)
+            nisa.dma_copy(dst=wu, src=Wgu.ap(pattern=[[I2, 128], [128 * I2, KT], [1, IC]], offset=I + i0, **dk), **q1)
+            for ti, (o, n) in enumerate(I_TILES):
+                nisa.dma_copy(dst=wd[ti], src=Wd.ap(pattern=[[HSD, n], [1, H]], offset=(i0 + o) * HSD, **dk), **q2)
         if FP8:
-            nisa.dma_copy(dst=gsc[:, 0:IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=i0, **dk))
-            nisa.dma_copy(dst=gsc[:, IC:2 * IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=I + i0, **dk))
+            nisa.dma_copy(dst=gsc[:, 0:IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=i0, **dk), **q1)
+            nisa.dma_copy(dst=gsc[:, IC:2 * IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=I + i0, **dk), **q1)
         gu = _sb((C, 2 * IC), BF)
         for (which, co, cn) in GT:
             wsrc = wg if which == 0 else wu
@@ -903,7 +947,8 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
             hs = _sb((n, C), BF)
             nisa.tensor_copy(dst=hs, src=ph)
             for t, (ho, hn) in enumerate(HT):
-                nisa.nc_matmul(py[t], hs, wd[ti][:, ho:ho + hn])
+                if not (abl & 8) or ti == 0:
+                    nisa.nc_matmul(py[t], hs, wd[ti][:, ho:ho + hn])
         ys = _sb((C, H))
         for t, (ho, hn) in enumerate(HT):
             nisa.tensor_copy(dst=ys[:, ho:ho + hn], src=py[t])
@@ -919,7 +964,21 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
                     pc = nl.ndarray((rn, hn), dtype=F32, buffer=nl.psum)
                     nisa.nc_matmul(pc, sel[:, r0:r0 + rn], ysb[:, ho:ho + hn])
                     nisa.tensor_tensor(dst=acc[ri][0:rn, ho:ho + hn], data1=acc[ri][0:rn, ho:ho + hn], data2=pc, op=nl.add)
+        elif sc:
+            ysb = _sb((C, H), BF)
+            nisa.tensor_copy(dst=ysb, src=ys)
+            if isinstance(jx, int):
+                nisa.dma_copy(dst=y.ap(pattern=[[H, C], [1, H]], offset=(pid * G + jx) * C * H), src=ysb)
+            else:
+                nisa.dma_copy(dst=y.ap(pattern=[[H, C], [1, H]], offset=pid * G * C * H, scalar_offset=jx, indirect_dim=0),
+                              src=ysb)
+        elif abl & 2:
+            nisa.dma_copy(dst=y.ap(pattern=[[H, C], [1, H]], offset=pid * T * H), src=ys)
         else:
+            if ybf:
+                ysb = _sb((C, H), BF)
+                nisa.tensor_copy(dst=ysb, src=ys)
+                ys = ysb
             yv = y.ap(pattern=[[H, C], [1, H]], offset=pid * T * H, vector_offset=rows, indirect_dim=0)
             nisa.dma_compute(dst=yv, srcs=[yv, ys], reduce_op=nl.add, oob_mode=nisa.oob_mode.skip)
 
