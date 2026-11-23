@@ -196,11 +196,12 @@ requests, against 167 / 410 / 707 without speculation (+12 % / -2 % / +28 %). Th
 71-73 %. GSM8K-CoT (1,319 questions) was 0.876 with EAGLE3 and 0.873 without. `num_speculative_tokens: 2` was
 slower than `1` at every concurrency. The first compile takes about 48 minutes instead of 19.
 
-**Not recommended (engine hang, see Known issues):** EAGLE3 with packed prefill (`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8` on the command above); the draft
+EAGLE3 also works with packed prefill (`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=8` on the command above; needs the 2026-11-23 hang fix, see Known issues); the draft
 model attends and writes its KV cache per prompt. Same instance, chat prompts, 256 output tokens, median of 6-10
 runs, output tokens/s without / with packing: 186 / 175 (-6 %) at 1 concurrent request, 407 / 414 (+2 %) at 4,
-914 / 1,010 (+10 %) at 16. The acceptance rate is the same (0.68-0.69). Use it when there are usually several
-requests in flight; at one request the decode steps after a packed prefill are slightly slower.
+914 / 1,010 (+10 %) at 16 (with the hang fix, 2026-11-23: 169-186 / 413-418 / 1,013-1,041; GSM8K 0.880). The
+acceptance rate is the same (0.68-0.69). Use it when there are usually several requests in flight; at one request the
+decode steps after a packed prefill are slightly slower.
 
 ### Packed FP8 KV cache for long requests (opt-in, Trn2)
 
@@ -225,8 +226,8 @@ output differs from the BF16 KV cache after a few dozen tokens, as expected for 
 **EAGLE3 works with it at BF16 speed** (EAGLE3 command above plus the two FP8 settings; chat prompts, 256 output tokens,
 tokens/s BF16 KV / FP8 KV: 185-190 / 178-186 at 1 request, 411-413 / 411-414 at 4, 927-933 / 956-963 at 16; same
 acceptance, GSM8K 0.876). **Packed prefill + EAGLE3 + FP8 KV is not recommended**: time to first token is about 245 ms
-instead of 65 ms (packed steps rewrite the whole packed K cache), and one engine hang (`RPC call to sample_tokens timed
-out`) was seen in about 1,500 requests, also with BF16 KV (Known issues).
+instead of 65 ms (packed steps rewrite the whole packed K cache), so output is 152-156 / 321-325 / 686-705 tokens/s at
+1 / 4 / 16 requests vs 178-186 / 411-414 / 956-963 without packing.
 Knobs: `VLLM_NEURON_LLAMA3_GQA_MULTI_TOKEN=0` (EAGLE3 draft decode back on the PyTorch path), `GPTOSS_FP8_PACKED_GQA=0` (PyTorch decode, about 20x slower), `GPTOSS_SEG_PACKED_K_WRITE=reswizzle` (the old
 whole-cache prefill write, 4-5x slower), `VLLM_NEURON_PREFILL_KV_BLOCK_WRITE=packed|all|off` (single-step prefill).
 
@@ -249,11 +250,10 @@ whole-cache prefill write, 4-5x slower), `VLLM_NEURON_PREFILL_KV_BLOCK_WRITE=pac
   the chat parser rejects a token after the end of the final message. This is vLLM / Harmony behaviour on any backend,
   not a Neuron fault, and a normal request cannot reach it. For fixed-length benchmarks use `/v1/completions` (with the
   chat template applied) or `vllm bench serve` with random prompts.
-- **Engine hang with packed prefill + EAGLE3 on Trn2.** The engine can stop with `RPC call to sample_tokens timed out`
-  on a packed prefill step of several fresh prompts; rank 0's device result for that step never completes. In tests it
-  hit 3 of 6 fresh server starts whose first batch was 64 concurrent prompts, with BF16 and FP8 KV. Not seen without
-  packing (0 of 4) or with `--no-async-scheduling` (0 of 4). **Do not combine `VLLM_NEURON_MAX_PREFILLS_PER_BATCH`
-  with EAGLE3** until this is fixed; packed prefill without EAGLE3 and EAGLE3 without packing are not affected.
+- **Engine hang with packed prefill + EAGLE3 (fixed 2026-11-23).** Before commit `d573abe` the engine could stop with
+  `RPC call to sample_tokens timed out` on the first packed prefill step after start (4 of 12 fresh starts). The runner
+  now waits for a packed prefill step's target and draft outputs before the next verify step is dispatched: 0 hangs in
+  24 fresh starts, no throughput change. Reinstall the branch if you installed it before 2026-11-23.
 
 ## Accuracy Evaluation
 
