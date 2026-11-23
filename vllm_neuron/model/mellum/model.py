@@ -708,7 +708,7 @@ class MellumSparseMoeBlock(nn.Module):
             srow = torch.where(in_e, slot_row, torch.full_like(slot_row, T)).to(torch.int32).contiguous()
             k = wrap_nki(mellum_moe_decode_gathered_dyn_x)
             k = k[k_lnc] if k_lnc > 1 else k
-            kw = dict(S0=S0, xt=int(os.environ.get("MELLUM_MOE_EM_XT", "0")), oh=int(os.environ.get("MELLUM_MOE_EM_OH", "0")), wq=int(os.environ.get("MELLUM_MOE_EM_WQ", "0")), xs=int(os.environ.get("MELLUM_MOE_EM_XS", "auto").replace("auto", "1" if T > 256 else "0")), abl=int(os.environ.get("MELLUM_MOE_EM_ABL", "0")), sc=int(os.environ.get("MELLUM_MOE_EM_SC", "0")), ybf=int(os.environ.get("MELLUM_MOE_EM_YBF", "auto").replace("auto", "1" if T > 256 else "0")), ls=LS)
+            kw = dict(S0=S0, xt=int(os.environ.get("MELLUM_MOE_EM_XT", "0")), oh=int(os.environ.get("MELLUM_MOE_EM_OH", "0")), wq=int(os.environ.get("MELLUM_MOE_EM_WQ", "0")), xs=int(os.environ.get("MELLUM_MOE_EM_XS", "auto").replace("auto", "1" if T > 256 else "0")), abl=int(os.environ.get("MELLUM_MOE_EM_ABL", "0")), sc=int(os.environ.get("MELLUM_MOE_EM_SC", "0")), ybf=int(os.environ.get("MELLUM_MOE_EM_YBF", "auto").replace("auto", "1" if T > 256 else "0")), ls=LS, dr=int(os.environ.get("MELLUM_MOE_EM_GDR", "0")))
             if self.em_fp8:
                 kw.update(gu_scale=self.em_gu_scale)
             o = k(xb, wslot.float().contiguous(), self.em_gu, self.em_dn, eidx, nrun, slot_row.to(torch.int32).contiguous(), srow, **kw)

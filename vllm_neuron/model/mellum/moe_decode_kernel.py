@@ -775,7 +775,7 @@ def mellum_moe_decode_gathered_dyn_sc(xgT, wslot, Wgu, Wd, eidx, ngrp, srow, T, 
 
 
 @nki.jit
-def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow, gu_scale=None, S0=16, xt=0, oh=0, wq=0, xs=0, abl=0, sc=0, ybf=0, ls=2):
+def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow, gu_scale=None, S0=16, xt=0, oh=0, wq=0, xs=0, abl=0, sc=0, ybf=0, ls=2, dr=0):
     """Gathered expert-major decode MoE, runtime group count.
 
     x     bf16 [T, H]     hidden states (gathered in-kernel: indirect row DMA + PE transpose)
@@ -795,6 +795,7 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
     I2 = Wgu.shape[2]
     I = I2 // 2
     KT = H // 128
+    KT2 = KT // 2
     HSG = Wgu.shape[1]
     HSD = Wd.shape[2]
     WDT = Wgu.dtype
@@ -924,9 +925,52 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
             nisa.dma_copy(dst=gsc[:, 0:IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=i0, **dk), **q1)
             nisa.dma_copy(dst=gsc[:, IC:2 * IC], src=gu_scale.ap(pattern=[[0, C], [1, IC]], offset=I + i0, **dk), **q1)
         gu = _sb((C, 2 * IC), BF)
+        if dr:
+            # FP8 double_row gate/up: activations quantized to e4m3 with one scale per slot (token) over H.
+            # amax per slot: xP is [128 (k within tile), KT*C]; reduce |xP| over partitions and K tiles via PE (ones^T)
+            # is not a max -> use the row-major gathered copy: the PE transpose of xP back is costly, so compute amax
+            # from xP with a partition-reduce (max) per K tile, then max over tiles.
+            xab = _sb((128, KT * C))
+            nisa.activation(dst=xab, op=nl.abs, data=xP)
+            pm = _sb((1, KT * C))
+            nisa.tensor_partition_reduce(dst=pm, op=nl.maximum, data=xab)
+            am = _sb((1, C))
+            nisa.tensor_copy(dst=am, src=pm[:, 0:C])
+            for kt in range(1, KT):
+                nisa.tensor_tensor(dst=am, data1=am, data2=pm[:, kt * C:(kt + 1) * C], op=nl.maximum)
+            nisa.tensor_scalar(dst=am, data=am, op0=nl.maximum, operand0=1e-6)
+            xinv1 = _sb((1, C))
+            nisa.reciprocal(dst=xinv1, data=am)
+            nisa.tensor_scalar(dst=xinv1, data=xinv1, op0=nl.multiply, operand0=240.0)
+            # broadcast xinv over partitions (ones[1,128]^T x xinv[1, C]) -> [128, C]
+            ones1 = _sb((1, 128))
+            nisa.memset(ones1, 1.0)
+            pb = nl.ndarray((128, C), dtype=F32, buffer=nl.psum)
+            nisa.nc_matmul(pb, ones1, xinv1)
+            xib = _sb((128, C))
+            nisa.tensor_copy(dst=xib, src=pb)
+            x8 = _sb((128, KT2, 2, C), nl.float8_e4m3)
+            for kt in range(KT):
+                nisa.tensor_tensor(dst=x8[:, kt // 2, kt % 2, :], data1=xP[:, kt * C:(kt + 1) * C], data2=xib, op=nl.multiply)
+            # per-slot dequant scale am/240 as a per-partition column [C, 1]: transpose am via PE
+            ams = _sb((1, C))
+            nisa.tensor_scalar(dst=ams, data=am, op0=nl.multiply, operand0=1.0 / 240.0)
+            pc_ = nl.ndarray((C, 1), dtype=F32, buffer=nl.psum)
+            nisa.nc_matmul(pc_, ams, ones1[:, 0:1])
+            xsc = _sb((C, 1))
+            nisa.tensor_copy(dst=xsc, src=pc_)
         for (which, co, cn) in GT:
             wsrc = wg if which == 0 else wu
             dco = which * IC + co
+            if dr:
+                w3 = wsrc.reshape((128, KT2, 2, IC))
+                pgu = nl.ndarray((C, cn), dtype=F32, buffer=nl.psum)
+                for kt2 in range(KT2):
+                    nisa.nc_matmul(pgu, x8[:, kt2, :, :], w3[:, kt2, :, co:co + cn], perf_mode=nisa.matmul_perf_mode.double_row)
+                gtmp = _sb((C, cn))
+                nisa.tensor_tensor(dst=gtmp, data1=pgu, data2=gsc[:, dco:dco + cn], op=nl.multiply)
+                nisa.tensor_scalar(dst=gu[:, dco:dco + cn], data=gtmp, op0=nl.multiply, operand0=xsc)
+                continue
             pgu = nl.ndarray((C, cn), dtype=F32, buffer=nl.psum)
             for kt in range(KT):
                 nisa.nc_matmul(pgu, xP[:, kt * C:(kt + 1) * C], wsrc[:, kt * IC + co: kt * IC + co + cn])
