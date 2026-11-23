@@ -680,9 +680,19 @@ class MellumSparseMoeBlock(nn.Module):
         gpe = (cnt + Cg - 1) // Cg  # groups per expert
         gstart = torch.cumsum(gpe, 0) - gpe  # first group of each expert
         # pair order: by expert, then row (expert-major flatten of the routed mask)
-        rm = routed.t().contiguous()  # [E, T]
-        key = (~rm).to(torch.int32) * T + torch.arange(T, device=xb.device, dtype=torch.int32).unsqueeze(0)  # [E, T]
-        rows_by_e = torch.argsort(key, dim=1)  # [E, T]: expert e's routed rows first
+        if os.environ.get("MELLUM_MOE_EM_NZ", "auto").replace("auto", "1" if T > 256 else "0") == "1":
+            # NKI GpSimd nonzero_with_count per expert (torch argsort of the [E, T] mask lowers to a slow sort)
+            from libtorch_neuronx_lite.nki.nki_hop import wrap_nki as _wn
+
+            from .moe_decode_kernel import mellum_moe_route_rows
+
+            rr = _wn(mellum_moe_route_rows)(aff.contiguous())
+            rr = rr if isinstance(rr, torch.Tensor) else rr[0]
+            rows_by_e = rr[:, :T].to(torch.int64).clamp(max=T - 1)  # [E, T]: expert e's routed rows first
+        else:
+            rm = routed.t().contiguous()  # [E, T]
+            key = (~rm).to(torch.int32) * T + torch.arange(T, device=xb.device, dtype=torch.int32).unsqueeze(0)  # [E, T]
+            rows_by_e = torch.argsort(key, dim=1)  # [E, T]: expert e's routed rows first
         # slot s of group g of expert e: row rows_by_e[e, (g - gstart[e]) * Cg + s] if that index < cnt[e]
         g_ids = torch.arange(G, device=xb.device, dtype=torch.int32)
         g_exp = (torch.searchsorted(torch.cumsum(gpe, 0), g_ids, right=True)).clamp(max=E - 1)  # [G] expert of group
@@ -690,13 +700,35 @@ class MellumSparseMoeBlock(nn.Module):
         sidx = local_g.unsqueeze(1) * Cg + torch.arange(Cg, device=xb.device, dtype=torch.int32).unsqueeze(0)  # [G, Cg]
         in_e = (sidx < cnt[g_exp].unsqueeze(1)) & (g_ids < gpe.sum()).unsqueeze(1)
         sidx_c = sidx.clamp(max=T - 1).to(torch.int64)
-        slot_row = torch.gather(rows_by_e[g_exp.to(torch.int64)], 1, sidx_c)  # [G, Cg]
+        meta_k = (os.environ.get("MELLUM_MOE_EM_META", "0") == "1" and dyn and os.environ.get("MELLUM_MOE_EM_XIN", "1") == "1"
+                  and (G * Cg) % 128 == 0 and os.environ.get("MELLUM_MOE_EM_NZ", "auto").replace("auto", "1" if T > 256 else "0") == "1")
+        if meta_k:
+            # one NKI kernel for the per-slot row / scatter row / routing weight (replaces the torch gathers)
+            from .moe_decode_kernel import mellum_moe_slot_meta
+
+            se = g_exp.to(torch.int32).unsqueeze(1).expand(G, Cg).reshape(-1, 1).contiguous()
+            si = torch.where(in_e, sidx, torch.full_like(sidx, T)).to(torch.int32).reshape(-1, 1).contiguous()
+            mo = wrap_nki(mellum_moe_slot_meta)(aff.contiguous(), rr.contiguous(), se, si,
+                                               self.em_d_scale.float().contiguous() if self.em_fp8 else None)
+            wslot_m, srow_g_m, srow_m = mo
+            slot_row = srow_g_m.reshape(G, Cg)
+            w = None
+        elif os.environ.get("MELLUM_MOE_EM_FLAT", "auto").replace("auto", "1" if T > 256 else "0") == "1":
+            # flat 1-D gathers (2-D gather / advanced indexing lower to slow multi-index DMAs)
+            ge = g_exp.to(torch.int64).unsqueeze(1)  # [G, 1]
+            slot_row = rows_by_e.reshape(-1).index_select(0, (ge * T + sidx_c).reshape(-1)).reshape(G, Cg)
+            w = aff.reshape(-1).index_select(0, (slot_row * E + ge).reshape(-1)).reshape(G, Cg)
+        else:
+            slot_row = torch.gather(rows_by_e[g_exp.to(torch.int64)], 1, sidx_c)  # [G, Cg]
+            w = aff[slot_row, g_exp.to(torch.int64).unsqueeze(1).expand(G, Cg)]  # [G, Cg]
         xin = dyn and os.environ.get("MELLUM_MOE_EM_XIN", "1") == "1"
         xg = None if xin else xb.index_select(0, slot_row.reshape(-1)).reshape(G, Cg, H)
-        w = aff[slot_row, g_exp.to(torch.int64).unsqueeze(1).expand(G, Cg)]  # [G, Cg]
-        wslot = torch.where(in_e, w, torch.zeros_like(w))
-        if self.em_fp8:
-            wslot = wslot * self.em_d_scale[g_exp.to(torch.int64)]  # [G, 1]
+        if meta_k:
+            wslot = wslot_m.reshape(G, Cg)
+        else:
+            wslot = torch.where(in_e, w, torch.zeros_like(w))
+            if self.em_fp8:
+                wslot = wslot * self.em_d_scale[g_exp.to(torch.int64)]  # [G, 1]
         eidx = g_exp.to(torch.int32).reshape(1, G).contiguous()
         if xin:
             # in-kernel row gather + DMA scatter-add combine (torch index_select / one-hot combine cost more than
@@ -705,10 +737,10 @@ class MellumSparseMoeBlock(nn.Module):
 
             used = gpe.sum().to(torch.int32).clamp(min=S0)
             nrun = (S0 + (used - S0 + LS - 1) // LS * LS).reshape(1, 1).to(torch.int32)
-            srow = torch.where(in_e, slot_row, torch.full_like(slot_row, T)).to(torch.int32).contiguous()
+            srow = (srow_m.reshape(G, Cg) if meta_k else torch.where(in_e, slot_row, torch.full_like(slot_row, T))).to(torch.int32).contiguous()
             k = wrap_nki(mellum_moe_decode_gathered_dyn_x)
             k = k[k_lnc] if k_lnc > 1 else k
-            kw = dict(S0=S0, xt=int(os.environ.get("MELLUM_MOE_EM_XT", "0")), oh=int(os.environ.get("MELLUM_MOE_EM_OH", "0")), wq=int(os.environ.get("MELLUM_MOE_EM_WQ", "0")), xs=int(os.environ.get("MELLUM_MOE_EM_XS", "auto").replace("auto", "1" if T > 256 else "0")), abl=int(os.environ.get("MELLUM_MOE_EM_ABL", "0")), sc=int(os.environ.get("MELLUM_MOE_EM_SC", "0")), ybf=int(os.environ.get("MELLUM_MOE_EM_YBF", "auto").replace("auto", "1" if T > 256 else "0")), ls=LS, dr=int(os.environ.get("MELLUM_MOE_EM_GDR", "0")))
+            kw = dict(S0=S0, xt=int(os.environ.get("MELLUM_MOE_EM_XT", "0")), oh=int(os.environ.get("MELLUM_MOE_EM_OH", "0")), wq=int(os.environ.get("MELLUM_MOE_EM_WQ", "0")), xs=int(os.environ.get("MELLUM_MOE_EM_XS", "auto").replace("auto", "1" if T > 256 else "0")), abl=int(os.environ.get("MELLUM_MOE_EM_ABL", "0")), sc=int(os.environ.get("MELLUM_MOE_EM_SC", "0")), ybf=int(os.environ.get("MELLUM_MOE_EM_YBF", "auto").replace("auto", "1" if T > 256 else "0")), ls=LS, dr=int(os.environ.get("MELLUM_MOE_EM_GDR", "0")), xs2=int(os.environ.get("MELLUM_MOE_EM_XS2", "0")))
             if self.em_fp8:
                 kw.update(gu_scale=self.em_gu_scale)
             o = k(xb, wslot.float().contiguous(), self.em_gu, self.em_dn, eidx, nrun, slot_row.to(torch.int32).contiguous(), srow, **kw)
