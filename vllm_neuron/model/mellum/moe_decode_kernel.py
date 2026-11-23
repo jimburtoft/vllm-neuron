@@ -775,15 +775,15 @@ def mellum_moe_decode_gathered_dyn_sc(xgT, wslot, Wgu, Wd, eidx, ngrp, srow, T, 
 
 
 @nki.jit
-def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow, gu_scale=None, S0=16, xt=0, oh=0, wq=0, xs=0, abl=0, sc=0, ybf=0):
+def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow, gu_scale=None, S0=16, xt=0, oh=0, wq=0, xs=0, abl=0, sc=0, ybf=0, ls=2):
     """Gathered expert-major decode MoE, runtime group count.
 
     x     bf16 [T, H]     hidden states (gathered in-kernel: indirect row DMA + PE transpose)
     srow_g int32 [G, C]   gather row per slot (padding slots: any valid row, e.g. 0; their weight is 0)
     wslot fp32 [G, C]     routing weight per slot (x down scale for FP8; 0 for padding slots)
     eidx  int32 [1, G]    expert of each group (valid id for every group, also unused ones)
-    ngrp  int32 [1, 1]    number of groups to run (>= S0; groups S0.. run in a runtime loop, 2 per iteration, so
-                          G must be >= ngrp + 1)
+    ngrp  int32 [1, 1]    number of groups to run (>= S0, S0 + a multiple of ls; groups S0.. run in a runtime loop,
+                          ls per iteration; G must be >= ngrp)
     srow  int32 [G, C]    token row of each slot (padding slots: T -> out of bounds, skipped)
     returns fp32 [NC * T, H]: per physical core the partial (its I slice) MoE output, combined in-kernel by a
     DMA scatter-add (rows are unique within a group).
@@ -833,7 +833,7 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
         for r0, rn in RT:
             nisa.dma_copy(dst=y.ap(pattern=[[H, rn], [1, H]], offset=(pid * T + r0) * H), src=z[0:rn, :])
     bufs = []
-    for bi in range(2):
+    for bi in range(max(2, ls)):
         xP = _sb((128, KT * C), BF)
         wg = _sb((128, KT * IC), WDT)
         wu = _sb((128, KT * IC), WDT)
@@ -989,15 +989,17 @@ def mellum_moe_decode_gathered_dyn_x(x, wslot, Wgu, Wd, eidx, ngrp, srow_g, srow
     nisa.dma_copy(dst=nsb, src=ngrp)
     nreg = nisa.scalar_load(nsb)
 
+    # ls groups per runtime-loop iteration (the loop body is a scheduling barrier: more groups per iteration lets the
+    # compiler overlap one group's loads / vector work with the next group's matmuls)
     def body(iv):
-        jk = nl.ndarray((1, 2), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=jk, src=gv.ap(pattern=[[G, 1], [1, 2]], offset=0, scalar_offset=iv, indirect_dim=1))
-        ek = nl.ndarray((1, 2), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=ek, src=ev.ap(pattern=[[G, 1], [1, 2]], offset=0, scalar_offset=iv, indirect_dim=1))
-        for k in range(2):
-            group(jk.ap(pattern=[[2, 1], [1, 1]], offset=k), ek.ap(pattern=[[2, 1], [1, 1]], offset=k), bufs[k])
+        jk = nl.ndarray((1, ls), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=jk, src=gv.ap(pattern=[[G, 1], [1, ls]], offset=0, scalar_offset=iv, indirect_dim=1))
+        ek = nl.ndarray((1, ls), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ek, src=ev.ap(pattern=[[G, 1], [1, ls]], offset=0, scalar_offset=iv, indirect_dim=1))
+        for k in range(ls):
+            group(jk.ap(pattern=[[ls, 1], [1, 1]], offset=k), ek.ap(pattern=[[ls, 1], [1, 1]], offset=k), bufs[k % len(bufs)])
 
-    nl.fori_loop(S0, nreg, body, step=2)
+    nl.fori_loop(S0, nreg, body, step=ls)
     if oh:
         for ri, (r0, rn) in enumerate(RT):
             nisa.dma_copy(dst=y.ap(pattern=[[H, rn], [1, H]], offset=(pid * T + r0) * H), src=acc[ri][0:rn, :])
