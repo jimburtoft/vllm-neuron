@@ -10875,6 +10875,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # bonus column off (which produces a non-contiguous view that
         # ``.contiguous()`` cannot resolve on Neuron device).
         self._futures_drafts_only = drafts_only
+        # Packed prefill + EAGLE3 under async scheduling: wait for this step's
+        # target and draft NEFFs before the next (verify) step is dispatched on
+        # top of them. Without it the engine can hang on the first packed step
+        # (rank 0's sampled-token readback never completes; gpt-oss-trn2 tasks
+        # 094/095: 4 of 12 fresh starts hung, 0 of 18 when these NEFFs were
+        # waited for). Costs one wait per packed prefill step, not per decode
+        # step. VLLM_NEURON_PACKED_SPEC_SYNC=0 turns it off.
+        if (
+            getattr(self, "_packed_req_indices_per_token", None) is not None
+            and os.environ.get("VLLM_NEURON_PACKED_SPEC_SYNC", "1") != "0"
+        ):
+            drafts_only.reshape(-1)[:1].cpu()
         return draft_token_ids
 
     # ------------------------------------------------------------------------
