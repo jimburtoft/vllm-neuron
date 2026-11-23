@@ -43,7 +43,7 @@ One layer at T = 512 takes 0.90 ms per rank, against 4.05 ms for the block kerne
 ## Setup
 
 ```bash
-# on a trn2.3xlarge with the SDK 2.33 DLAMI (300 GB+ disk)
+# on a trn2.3xlarge with the SDK 2.33 DLAMI (500 GB disk: FP32 download + BF16 copy + compile caches)
 git clone -b isaac05-action https://github.com/jimburtoft/vllm-neuron.git ~/vllm-neuron
 C=~/vllm-neuron/contrib/isaac05_omni
 source /opt/aws_neuronx_venv_pytorch_inference_vllm_omni_0_29_0_0_2_0/bin/activate
@@ -91,8 +91,8 @@ time; warm up every batch bucket before you measure.
 ## Performance (one trn2.3xlarge, BF16)
 
 **Robot actions**:
-- Setup: OpenPI websocket, 2 cameras x 3 frames at 256 x 256, joint state and instruction (462 prompt tokens), 50 x 7
-  action chunk, 10 flow steps.
+- Setup: OpenPI websocket, 2 cameras at 256 x 256 (3-step observation window), joint state and instruction (462
+  prompt tokens), 50 x 7 action chunk, 10 flow steps.
 - Measurement: concurrent clients, 60 s windows. Latency is the full websocket round trip.
 
 | concurrent clients | 1 | 2 | 4 | 8 | 16 | 24 | 32 | 48 |
@@ -130,7 +130,8 @@ Single-request decode is 6.1 ms per token at 2K context and 7.0 ms per token at 
 
 ## Known limits
 - Action path:
-  - One observation layout (2 x 3 frames at 256 x 256, L <= 512) per compiled graph set.
+  - One observation layout (2 cameras at 256 x 256, 3-step window, L <= 512) per compiled graph set.
+  - Requests are stateless: the 3-step window is filled from the current frame (no history across requests).
   - Batch size per engine step is capped at 16; B = 32 fails to compile with neuronx-cc 2.28 (NCC_INLA001).
   - Real-time chunking (action-prefix conditioning) is not wired in.
 - Text serving: `max_num_seqs` is capped at 128 by the decode megakernel.
