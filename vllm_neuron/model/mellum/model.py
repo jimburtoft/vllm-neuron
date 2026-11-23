@@ -254,6 +254,24 @@ def _per_expert_down_loader(
     return SafetensorsWeightLoader(transform=transform)
 
 
+def _expert_placement(num_layers: int, num_experts: int):
+    """MELLUM_EXPERT_PLACEMENT=<json file>: {"perm": [[expert ids for slots 0..E-1] per layer]} -- which checkpoint
+    expert each slot holds. With expert parallelism, slots [r*E/ep, (r+1)*E/ep) live on EP rank r, so a placement
+    that balances the routed load across ranks shortens the slowest rank's MoE. "balanced" uses the file shipped in
+    tools/mellum/data. None: identity."""
+    path = os.environ.get("MELLUM_EXPERT_PLACEMENT", "")
+    if not path:
+        return None
+    if path == "balanced":
+        path = os.path.join(os.path.dirname(__file__), "expert_placement_ep4.json")
+    import json
+
+    perm = json.load(open(path))["perm"]
+    if len(perm) < num_layers or any(sorted(p) != list(range(num_experts)) for p in perm[:num_layers]):
+        raise ValueError(f"MELLUM_EXPERT_PLACEMENT {path}: need {num_layers} permutations of {num_experts} experts")
+    return perm[:num_layers]
+
+
 class MellumSparseMoeBlock(nn.Module):
     """Router + routed experts. Owns post_attention_layernorm (the decode kernel fuses it).
 
@@ -1216,8 +1234,12 @@ class MellumForCausalLM(Gemma3ForCausalLM):
             "lm_head.weight": f"{prefix}embed_tokens.weight" if self.config.tie_word_embeddings else "lm_head.weight",
         }
         E = self.config.num_experts
+        perm = _expert_placement(len(self.model.layers), E)
         for i in range(len(self.model.layers)):
             hf, our = f"{prefix}layers.{i}", f"model.layers.{i}"
+            # optional expert placement (MELLUM_EXPERT_PLACEMENT): slot j of this layer holds checkpoint expert
+            # perm[i][j]; the router rows are permuted the same way (in load_weights), so routing is unchanged
+            pe = perm[i] if perm is not None else list(range(E))
             m[f"{our}.self_attn.qkv_proj_weight"] = [
                 f"{hf}.self_attn.q_proj.weight",
                 f"{hf}.self_attn.k_proj.weight",
@@ -1229,10 +1251,10 @@ class MellumForCausalLM(Gemma3ForCausalLM):
             m[f"{our}.input_layernorm.weight"] = f"{hf}.input_layernorm.weight"
             m[f"{our}.mlp.post_attention_layernorm.weight"] = f"{hf}.post_attention_layernorm.weight"
             m[f"{our}.mlp.router_weight"] = f"{hf}.mlp.gate.weight"
-            m[f"{our}.mlp.gate_up_proj_weight"] = [f"{hf}.mlp.experts.{e}.gate_proj.weight" for e in range(E)] + [
-                f"{hf}.mlp.experts.{e}.up_proj.weight" for e in range(E)
+            m[f"{our}.mlp.gate_up_proj_weight"] = [f"{hf}.mlp.experts.{e}.gate_proj.weight" for e in pe] + [
+                f"{hf}.mlp.experts.{e}.up_proj.weight" for e in pe
             ]
-            m[f"{our}.mlp.down_proj_weight"] = [f"{hf}.mlp.experts.{e}.down_proj.weight" for e in range(E)]
+            m[f"{our}.mlp.down_proj_weight"] = [f"{hf}.mlp.experts.{e}.down_proj.weight" for e in pe]
         return m
 
     def load_weights(self, checkpoint_path: str, device: torch.device, cache_dir: str | None) -> None:
@@ -1260,6 +1282,12 @@ class MellumForCausalLM(Gemma3ForCausalLM):
         for k, t in sd.items():
             if t.dtype != self.config.torch_dtype:
                 sd[k] = t.to(self.config.torch_dtype)
+        perm = _expert_placement(n, self.config.num_experts)
+        if perm is not None:
+            for i in range(n):
+                k = f"model.layers.{i}.mlp.router_weight"
+                if k in sd:
+                    sd[k] = sd[k][torch.tensor(perm[i], dtype=torch.long, device=sd[k].device)].contiguous()
         self.load_state_dict(sd, strict=False, assign=True)
         for layer in self.model.layers:
             if getattr(layer.mlp, "fp8_decode", False):
