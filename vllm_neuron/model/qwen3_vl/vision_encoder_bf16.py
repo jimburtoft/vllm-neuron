@@ -28,6 +28,8 @@ PARALLELISM SHARDING:
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -106,6 +108,14 @@ class Qwen3VLVisionMLP(nn.Module):
         self.fc2_bias = nn.Parameter(torch.empty(hidden_size, dtype=dtype))
 
         self._setup_weight_loaders()
+        if os.environ.get("QWEN3VL_VIS_MLP", "torch") == "nki" and not getattr(Qwen3VLVisionMLP, "_logged", False):
+            import logging
+
+            Qwen3VLVisionMLP._logged = True
+            logging.getLogger(__name__).warning(
+                "vision MLP: QWEN3VL_VIS_MLP=nki -> %s (I/rank=%d), LN fused=%s",
+                "nkilib" if self._nki_ok() else "torch (I/rank >= 4096)", self.intermediate_size_per_rank,
+                os.environ.get("QWEN3VL_VIS_LN", "") == "fused")
 
     def _setup_weight_loaders(self) -> None:
         """>>> PARALLELISM: TP sharding of MLP weights. <<<"""
@@ -135,6 +145,27 @@ class Qwen3VLVisionMLP(nn.Module):
                 is_storage_transposed=True,
             ),
         )
+
+    def _nki_ok(self) -> bool:
+        # QWEN3VL_VIS_MLP=nki: nkilib MLP kernel (skip_gate, exact-erf GELU, fc1 bias), optionally with the block's
+        # LayerNorm folded in (QWEN3VL_VIS_LN=fused; vision MLP -15..-20 ms / image).
+        # nkilib forces I-sharding at I/rank >= 4096, which drops the projection biases: keep torch there.
+        return os.environ.get("QWEN3VL_VIS_MLP", "torch") == "nki" and self.intermediate_size_per_rank < 4096
+
+    def forward_nki(self, hidden_states: torch.Tensor, ln=None) -> torch.Tensor:
+        from nkilib.core.utils.common_types import ActFnType, NormType
+
+
+        shp = hidden_states.shape
+        kw = {}
+        if ln is not None:
+            lw, lb, eps = ln
+            kw = dict(ln_w=lw.unsqueeze(0), norm_b=lb.unsqueeze(0), norm_type=NormType.LAYER_NORM, eps=eps)
+        out = NF.mlp(hidden_states.reshape(-1, shp[-1]), self.fc1_weight, self.fc1_weight, self.fc2_weight,
+                     skip_gate=True, act_fn=ActFnType.GELU, up_b=self.fc1_bias.unsqueeze(0), **kw).reshape(shp)
+        if self.world_size > 1:
+            self.tp_group.all_reduce(out)
+        return out + self.fc2_bias
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """MLP forward: fc1 → GELU → fc2 → all-reduce → + bias.
@@ -415,6 +446,14 @@ class Qwen3VLVisionBlock(nn.Module):
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states), cos, sin, bound_min, bound_max
         )
+        if self.mlp._nki_ok():
+            ln = None
+            x = hidden_states
+            if os.environ.get("QWEN3VL_VIS_LN", "") == "fused":
+                ln = (self.norm2.weight, self.norm2.bias, self.norm2.eps)
+            else:
+                x = self.norm2(hidden_states)
+            return hidden_states + self.mlp.forward_nki(x, ln=ln)
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 

@@ -8,6 +8,8 @@ bucket-aware admission control.
 """
 
 import logging
+import os
+import time
 from collections import deque
 from enum import Enum, auto
 from typing import TYPE_CHECKING
@@ -46,6 +48,10 @@ if TYPE_CHECKING:
     from vllm.v1.structured_output import StructuredOutputManager
 
 logger = logging.getLogger(__name__)
+
+# Packed prefill: every packed prompt is padded to this multiple (Qwen3.5 GDN chunk = 128).
+_PACKED_PREFILL_ALIGN = int(os.environ.get("VLLM_NEURON_PACKED_PREFILL_ALIGN", "128") or 128)
+_STEP_LOG_PATH = os.environ.get("VLLM_NEURON_STEP_LOG", "")
 
 
 def _kv_capacity_guidance() -> str:
@@ -278,8 +284,41 @@ class NeuronScheduler(Scheduler):
                 self.num_batched_tokens_buckets,
             )
 
-        # Prefill batch size limit (currently 1, may expand in future)
-        self.max_prefills_per_batch: int = 1
+        # Prefill batch size limit. 1 = one prompt per prefill step (stock).
+        # VLLM_NEURON_MAX_PREFILLS_PER_BATCH=N packs up to N waiting prompts into one prefill
+        # step while their total tokens fit the largest prefill bucket (the step is padded as a
+        # whole). Needs a model that keeps attention / recurrent state inside each packed
+        # request (Qwen3.5: QWEN35_PACKED_PREFILL=1) and no segmented prefill.
+        # Default: 8 when packing is eligible (Qwen3.5 MK on, no spec decode, MML <= largest bucket), else 1
+        # (see resolve_max_prefills_per_batch).
+        from vllm_neuron.utils.bucket_utils import resolve_max_prefills_per_batch
+
+        self.max_prefills_per_batch: int = resolve_max_prefills_per_batch(vllm_config)
+
+        if self.max_prefills_per_batch > 1 and vllm_config.speculative_config is not None:
+            raise ValueError(
+                "VLLM_NEURON_MAX_PREFILLS_PER_BATCH > 1 is not supported with speculative decoding (the packed "
+                "prefill path does not write the draft / GDN checkpoint layout). Unset it for MTP serving."
+            )
+        # Mixed mode (max_model_len > the largest prefill bucket): can_schedule packs only fresh prompts
+        # whose 128-aligned total fits the largest bucket; a prompt that does not fit is admitted only when nothing
+        # else waits, so it runs alone and its later chunks run alone too (has_prefill_in_running). The runner
+        # dispatches a 1-request step to the unpacked (segmented, prefix-KV) graph and a >1-request step to the
+        # packed graph, so a step never mixes a chunk with packed prompts.
+        self._packed_mixed = self.max_prefills_per_batch > 1 and self.max_model_len > max(
+            self.num_batched_tokens_buckets
+        )
+        if self._packed_mixed and max(self.num_batched_tokens_buckets) > self.max_num_scheduled_tokens:
+            raise ValueError(
+                "Packed prefill with max_model_len > the largest prefill bucket needs max_num_batched_tokens >= "
+                f"the largest bucket ({self.max_num_scheduled_tokens} < {max(self.num_batched_tokens_buckets)})."
+            )
+        if self._packed_mixed:
+            logger.info(
+                "PACKED PREFILL mode mixed: up to %d whole prompts (<= %d tokens total) per step; longer prompts "
+                "run alone as chunked prefill (max_model_len %d)",
+                self.max_prefills_per_batch, max(self.num_batched_tokens_buckets), self.max_model_len,
+            )
 
         # Parse num_seqs_buckets for decode batch size buckets
         if "num_seqs_buckets" in neuron_config:
@@ -327,6 +366,15 @@ class NeuronScheduler(Scheduler):
         self._max_kv_concurrent = (
             max_concurrent if max_concurrent > 0 else self.max_num_seqs
         )
+        # VLLM_NEURON_KV_ADMIT=tokens admits by reserved tokens (prompt + max_tokens,
+        # block-rounded) against the KV token pool instead of max_model_len per request (no preemption: every
+        # admitted request can run to its max_tokens). The per-request cap becomes the KV-only concurrency bound.
+        self._kv_admit_tokens = os.environ.get("VLLM_NEURON_KV_ADMIT", "max_model_len") == "tokens"
+        self._kv_pool_tokens = kv_cache_config.num_blocks * block_size if self._kv_admit_tokens else 0
+        self._kv_blk = block_size
+        if self._kv_admit_tokens:
+            self._max_kv_concurrent = self.max_num_seqs
+            logger.info("KV admission by reserved tokens: pool %d tokens (block %d)", self._kv_pool_tokens, block_size)
 
         if 0 < max_concurrent < self.max_num_seqs:
             logger.warning(
@@ -382,6 +430,20 @@ class NeuronScheduler(Scheduler):
                     grammar.rollback(len(jf_tokens))
 
         result = super().update_from_output(scheduler_output, model_runner_output)
+
+        if _STEP_LOG_PATH:
+            # Step log: one line per step = wall time since the previous step's output, step kind
+            # (n_prefill, n_decode, scheduled tokens). In a saturated engine the interval is the step cost.
+            now = time.time()
+            kind = getattr(scheduler_output, "_step_kind", None)
+            if kind is not None:
+                if getattr(self, "_step_log_f", None) is None:
+                    self._step_log_f = open(_STEP_LOG_PATH, "a", buffering=1 << 16)
+                    self._step_log_t = now
+                self._step_log_f.write(
+                    "%.6f %.3f %d %d %d\n" % (now, (now - self._step_log_t) * 1e3, kind[0], kind[1], kind[2])
+                )
+            self._step_log_t = now
 
         # Prefill-async pipeline: retire producers from the send-lane once their
         # KV send completes. super() above frees a finished-sending req and deletes
@@ -652,6 +714,17 @@ class NeuronScheduler(Scheduler):
         """
         return request.num_computed_tokens < request.num_prompt_tokens
 
+    def _kv_reserved(self, r) -> int:
+        need = r.num_prompt_tokens + (r.max_tokens or 0)
+        need = min(need, self.max_model_len)
+        return -(-need // self._kv_blk) * self._kv_blk
+
+    def _kv_tokens_fit(self, request) -> bool:
+        if not self._kv_admit_tokens:
+            return True
+        used = sum(self._kv_reserved(r) for r in self.running) + sum(self._kv_reserved(r) for r in self.waiting)
+        return used + self._kv_reserved(request) <= self._kv_pool_tokens
+
     def _kv_in_use(self) -> int:
         """Requests currently pinning KV blocks against the worst-case cap
         (_max_kv_concurrent): those in the running batch plus any producers
@@ -822,8 +895,29 @@ class NeuronScheduler(Scheduler):
         if self.has_prefill_in_running:
             return False
 
-        # Check prefill batch capacity (only 1 prefill at a time)
+        # Check prefill batch capacity (only 1 prefill at a time unless packing is on)
         if len(self.waiting) >= self.max_prefills_per_batch:
+            return False
+        if self.max_prefills_per_batch > 1 and self.waiting:
+            # Packed prefill: the running batch plus every packed prompt must fit max_num_seqs / the KV cap.
+            if len(self.running) + len(self.waiting) >= min(self.max_num_seqs, self._max_kv_concurrent):
+                return False
+            # Packed prefill: every packed prompt must be fully prefilled in this one step
+            # (no chunk of a packed prompt), so the real-token total must fit the largest
+            # prefill bucket; the whole step is then padded once. A prompt that does not fit
+            # waits for the next step (it goes first there, alone if it needs chunking).
+            # Each packed prompt is padded to a PACKED_PREFILL_ALIGN multiple (Qwen3.5: the GDN chunk, so every
+            # request starts on a chunk boundary).
+            budget = min(max(self.num_batched_tokens_buckets), self.max_num_scheduled_tokens)
+            al = _PACKED_PREFILL_ALIGN
+            # num_tokens (prompt + any output of a preempted request: it is recomputed as prefill)
+            used = sum(-(-r.num_tokens // al) * al for r in self.waiting)
+            if any(r.num_computed_tokens for r in self.waiting) or request.num_computed_tokens:
+                return False
+            if used + -(-request.num_tokens // al) * al > budget:
+                return False
+
+        if not self._kv_tokens_fit(request):
             return False
 
         # Prevent livelock: don't admit a new prefill if running requests
@@ -1044,6 +1138,39 @@ class NeuronScheduler(Scheduler):
                     total_padding_this_batch,
                     batch_overhead_pct,
                 )
+
+        # Packed prefill: the prefill graphs are keyed on the TOTAL token count, so
+        # pad the step as a whole (not each prompt) to one bucket. Every prompt keeps its real
+        # length and the last one absorbs the padding.
+        if prefill_count > 1:
+            pref_ids = [
+                rid
+                for rid in scheduler_output.num_scheduled_tokens
+                if self.requests.get(rid) is not None
+                and req_num_computed.get(rid, self.requests[rid].num_computed_tokens)
+                < self.requests[rid].num_prompt_tokens
+            ]
+            al = _PACKED_PREFILL_ALIGN
+            aligned = {
+                r: -(-scheduler_output.num_scheduled_tokens[r] // al) * al for r in pref_ids
+            }
+            total = sum(aligned.values())
+            bucket = self._calculate_padded_count(total)
+            for r in pref_ids:
+                scheduler_output.num_scheduled_tokens_padded[r] = aligned[r]
+            scheduler_output.num_scheduled_tokens_padded[pref_ids[-1]] += bucket - total
+            self._packed_steps = getattr(self, "_packed_steps", 0) + 1
+            self._packed_prompts = getattr(self, "_packed_prompts", 0) + len(pref_ids)
+            if self._packed_steps % 100 == 1:
+                logger.info(
+                    "PACKED PREFILL: %d prompts, %d tokens -> bucket %d (cumulative: %d packed steps, %.2f prompts/step)",
+                    len(pref_ids), total, bucket, self._packed_steps, self._packed_prompts / self._packed_steps,
+                )
+
+        if _STEP_LOG_PATH:
+            scheduler_output._step_kind = (
+                prefill_count, decode_count, sum(scheduler_output.num_scheduled_tokens.values())
+            )
 
         # Observe padded batch size metric for decode
         if decode_count > 0:

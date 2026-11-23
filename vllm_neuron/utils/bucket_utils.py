@@ -9,9 +9,73 @@ compiled model execution :
 """
 
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Packed multi-request prefill
+# =============================================================================
+
+# Default K when packing is eligible: K=8 was +67..+152 % output tok/s at 256/128 c=16..128 over K=1, with
+# GSM8K (n=1319) and passkey equal to K=1.
+DEFAULT_PACKED_PREFILLS = 8
+
+
+def resolve_max_prefills_per_batch(vllm_config: Any) -> int:
+    """Prompts packed into one prefill step (scheduler, runner and model must agree).
+
+    ``VLLM_NEURON_MAX_PREFILLS_PER_BATCH`` wins when set. Otherwise the default is
+    ``DEFAULT_PACKED_PREFILLS`` when every packing precondition holds: the Qwen3.5
+    decode megakernel is on (``QWEN35_DECODE_MK=1``), packing is not disabled
+    (``QWEN35_PACKED_PREFILL`` != 0), there is no speculative decoding, no DCP, and
+    ``max_model_len`` fits the largest prefill bucket (= ``max_num_batched_tokens``) or
+    ``packed_prefill_long_enabled()`` (Mixed mode: prompts longer than the bucket
+    run alone, chunked). Else 1 (one prompt per prefill step).
+    """
+    env = os.environ.get("VLLM_NEURON_MAX_PREFILLS_PER_BATCH", "")
+    if env:
+        return max(1, int(env))
+    try:
+        eligible = (
+            os.environ.get("QWEN35_DECODE_MK", "0") == "1"
+            and os.environ.get("QWEN35_PACKED_PREFILL", "1") != "0"
+            and vllm_config.speculative_config is None
+            and vllm_config.parallel_config.decode_context_parallel_size <= 1
+            and (
+                vllm_config.model_config.max_model_len
+                <= vllm_config.scheduler_config.max_num_batched_tokens
+                or packed_prefill_long_enabled()
+            )
+        )
+    except AttributeError:
+        eligible = False
+    return DEFAULT_PACKED_PREFILLS if eligible else 1
+
+
+def packed_prefill_long_enabled() -> bool:
+    """allow packed prefill when ``max_model_len`` > the largest prefill bucket.
+
+    Only gates the DEFAULT K (an explicit ``VLLM_NEURON_MAX_PREFILLS_PER_BATCH`` > 1 always runs mixed mode when
+    MML > the largest bucket). ``VLLM_NEURON_PACKED_PREFILL_LONG`` (default 1 since the gates passed at MML 8192: prefill token = K=1 on
+    21/22 mixed short + 3K-7K prompts (the 1 is a known bf16 tie), passkey 7K 10/10, GSM8K n=200 0.920 vs 0.905; 0 opts out). In that "mixed" mode a prefill
+    step is either a pack of whole fresh prompts that fit one bucket (K-row graph, packed model path) or exactly
+    one request -- a short prompt alone or one chunk of a long prompt (1-row graph, the unpacked segmented path
+    with prefix KV / GDN state continuation). Both graph variants are compiled per bucket.
+    """
+    return os.environ.get("VLLM_NEURON_PACKED_PREFILL_LONG", "1") != "0"
+
+
+def packed_prefill_mixed(vllm_config: Any, k: int) -> bool:
+    """True when K > 1 packing runs alongside chunked (single-request) prefill (MML > largest bucket)."""
+    try:
+        return k > 1 and (
+            vllm_config.model_config.max_model_len > vllm_config.scheduler_config.max_num_batched_tokens
+        )
+    except AttributeError:
+        return False
 
 
 # =============================================================================

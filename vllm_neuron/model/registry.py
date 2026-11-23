@@ -7,6 +7,7 @@ from .llama3 import Eagle3LlamaForCausalLM, PEagleLlamaForCausalLM
 from .qwen3 import DFlashQwen3ForCausalLM, Qwen3ForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 from .qwen3_asr import Qwen3ASRForConditionalGeneration
+from .qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
 
 
 def get_models() -> list[tuple[str, type]]:
@@ -27,6 +28,9 @@ def get_models() -> list[tuple[str, type]]:
         ("Qwen3ForCausalLM", Qwen3ForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
         ("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration),
+        ("Qwen3_5MoeForCausalLM", Qwen3_5MoeForCausalLM),
+        # hybrid decoder + vision tower (Isaac-0.5 / Qwen3.5-MoE VL); text-only serving: Qwen3_5MoeForCausalLM
+        ("Qwen3_5MoeForConditionalGeneration", Qwen3_5MoeForConditionalGeneration),
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural

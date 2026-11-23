@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isaac05-omni"
+version = "0.1.0"
+description = "Isaac-0.5 robot-action pipeline for vLLM-Omni on AWS Neuron"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm_omni.general_plugins"]
+isaac05 = "isaac05_omni:register"
+
+[project.entry-points."vllm.general_plugins"]
+isaac05 = "isaac05_omni:register"
+
+[tool.setuptools]
+packages = ["isaac05_omni"]

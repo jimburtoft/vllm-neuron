@@ -1837,16 +1837,22 @@ class NeuronWorker(WorkerBase):
         )
 
         jobs: list[tuple] = []
+        runner = self.model_runner
+        variants = getattr(runner, "prefill_pack_row_variants", lambda b: [None])
         for bucket_size, kv_seg_size in sorted(buckets, reverse=True):
-            model_input = self.model_runner._build_prefill_synthetic_inputs(
-                bucket_size, kv_seg_size, device=device
-            )
-            jobs.append(
-                self._build_trace_job(
-                    model_input,
-                    native_compile_only=native_compile_only,
+            # one job per prefill graph row variant (packed K rows / unpacked 1 row).
+            for rows in variants(bucket_size):
+                if rows is not None:
+                    runner._warmup_pack_rows = rows
+                model_input = runner._build_prefill_synthetic_inputs(
+                    bucket_size, kv_seg_size, device=device
                 )
-            )
+                jobs.append(
+                    self._build_trace_job(
+                        model_input,
+                        native_compile_only=native_compile_only,
+                    )
+                )
         return jobs
 
     def _build_decode_trace_jobs(
@@ -2278,7 +2284,11 @@ class NeuronWorker(WorkerBase):
                 kv_seg_size,
             )
             try:
-                self.model_runner.extract_prefill_graphs(bucket_size, kv_seg_size)
+                runner = self.model_runner
+                for rows in getattr(runner, "prefill_pack_row_variants", lambda b: [None])(bucket_size):
+                    if rows is not None:  # every prefill row variant of the bucket
+                        runner._warmup_pack_rows = rows
+                    runner.extract_prefill_graphs(bucket_size, kv_seg_size)
                 logger.info(
                     "  Successfully extracted graph for prefill bucket %s "
                     "with kv_segment_size %s",
@@ -2442,7 +2452,11 @@ class NeuronWorker(WorkerBase):
                     kv_seg_size,
                 )
                 try:
-                    self.model_runner.warmup_prefill(bucket_size, kv_seg_size)
+                    runner = self.model_runner
+                    for rows in getattr(runner, "prefill_pack_row_variants", lambda b: [None])(bucket_size):
+                        if rows is not None:  # warm every prefill row variant of the bucket
+                            runner._warmup_pack_rows = rows
+                        runner.warmup_prefill(bucket_size, kv_seg_size)
                     logger.info(
                         "  Successfully warmed up for prefill bucket %s "
                         "with kv_segment_size %s",

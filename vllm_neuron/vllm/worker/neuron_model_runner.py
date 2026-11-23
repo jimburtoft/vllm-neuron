@@ -117,6 +117,17 @@ from vllm_neuron.parallel.neuron_parallel_state import stamp_spmd_rank_tensors
 logger = logging.getLogger(__name__)
 
 
+# Packed multi-request prefill: prefill graphs carry this many sampling / state-slot rows. Resolved from
+# vllm_config in NeuronModelRunner.__init__ (resolve_max_prefills_per_batch, default).
+_PACK_K = 1
+# Mixed mode (K > 1 and max_model_len > the largest prefill bucket): a 1-request prefill step (a short prompt
+# alone or one chunk of a long prompt) runs the unpacked 1-row graph; only a >1-request step uses the K-row packed
+# graph. Both variants are compiled per bucket (packed only for buckets >= 2 x VLLM_NEURON_PACKED_PREFILL_ALIGN).
+_PACK_MIXED = False
+# in mixed mode, run a 1-request prefill step of a fresh whole prompt on the K-row packed graph
+# (VLLM_NEURON_PACKED_PREFILL_LONE=1; default 0). Chunks of long prompts always keep the 1-row segmented graph.
+_PACK_LONE = os.environ.get("VLLM_NEURON_PACKED_PREFILL_LONE", "0") == "1"
+
 NULL_BLOCK_ID = 0
 # Read-side sentinel for block tables; write-side padding uses NULL_BLOCK_ID.
 PAD_SLOT_ID = -1
@@ -867,6 +878,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.vocab_size = hf_config.vocab_size
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
+        global _PACK_K, _PACK_MIXED
+        from vllm_neuron.utils.bucket_utils import packed_prefill_mixed, resolve_max_prefills_per_batch
+
+        _PACK_K = resolve_max_prefills_per_batch(vllm_config)
+        _PACK_MIXED = packed_prefill_mixed(vllm_config, _PACK_K)
+        # Rows (sampling / state slot) of the prefill graph being warmed up / traced (1 or _PACK_K).
+        self._warmup_pack_rows = _PACK_K
+        # a lone fresh whole prompt in mixed mode runs the K-row packed graph (VLLM_NEURON_PACKED_PREFILL_LONE).
+        self._pack_lone = False
+        self._pack_lone_buckets = frozenset()
 
         # Initialize persistent batch and request tracking
         # Use provided device or default to neuron:0
@@ -1008,6 +1029,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             logger.info(
                 "Using default num_batched_tokens_buckets: %s",
                 self.neuron_config.num_batched_tokens_buckets,
+            )
+        if _PACK_MIXED and _PACK_LONE:
+            self._pack_lone_buckets = frozenset(
+                b for b in self.neuron_config.num_batched_tokens_buckets
+                if _PACK_K in self.prefill_pack_row_variants(b)
+            )
+            logger.info(
+                "PACKED PREFILL lone: a fresh whole prompt alone in a step runs the %d-row packed graph for buckets %s",
+                _PACK_K, sorted(self._pack_lone_buckets),
             )
 
         # Parse num_seqs_buckets from config or compute defaults
@@ -1239,6 +1269,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self.drafter = DFlashProposer(
                     self.vllm_config, self.device, self.on_device_sampling
                 )
+            elif self.speculative_config.method == "mtp":
+                # Qwen3.5 MTP head through the EAGLE fused-draft flow.
+                from vllm_neuron.vllm.spec_decode.mtp import MTPProposer
+
+                self.is_eagle3_spec = True
+                self.drafter = MTPProposer(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
             else:
                 raise ValueError(
                     f"Unsupported speculative decoding method: {self.speculative_config.method}"
@@ -1351,6 +1389,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if self.supports_mm_inputs and self.encoder_neuron_config is not None:
             self._init_encoder_cache(vllm_config)
 
+        # Stable per-request slots for model-owned state (hybrid GDN models).
+        # Created in load_model when the model sets ``uses_request_slots``.
+        self.state_slots = None
+
         # EPD EC (encoder-cache) transfer connector, worker-role. Built from
         # ec_transfer_config; None on the default monolith path (no ec_role).
         # A consumer (PD) uses it to pull vision embeddings over NIXL; a producer
@@ -1371,7 +1413,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # Cache numpy arange for efficient tensor operations
         self.arange_np = np.arange(
-            max(self.max_num_reqs + 1, self.max_model_len, self.max_num_batched_tokens),
+            # a packed prefill step can carry up to the largest prefill bucket.
+            max(self.max_num_reqs + 1, self.max_model_len, self.max_num_batched_tokens,
+                max(self.neuron_config.num_batched_tokens_buckets or [0])),
             dtype=np.int64,
         )
 
@@ -1463,6 +1507,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.max_encoder_blocks_per_request = get_max_encoder_blocks_per_request(
             hf_config, encoder_neuron_config
         )
+        # Packed multimodal prefill: a packed prefill step gathers the encoder
+        # blocks of up to _PACK_K requests, so the prefill graph's encoder-block input is sized for all of them.
+        # VLLM_NEURON_MM_PACK_BLOCKS overrides the total (default: per-request max x _PACK_K).
+        if _PACK_K > 1:
+            self.max_encoder_blocks_per_request = int(
+                os.environ.get("VLLM_NEURON_MM_PACK_BLOCKS", "0") or 0
+            ) or self.max_encoder_blocks_per_request * _PACK_K
+            logger.info("Packed multimodal prefill: %d encoder blocks per prefill step (K=%d)",
+                        self.max_encoder_blocks_per_request, _PACK_K)
 
         # Derive min_blocks_needed from scheduler's encoder_cache_size:
         #   encoder_cache_size = max(max_num_batched_tokens, max_single_mm_item_tokens)
@@ -2227,6 +2280,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.encoder_capture_backend = None
             self._compiled_encoder_attr = None
 
+        _unwrapped = getattr(self.model, "_orig_mod", self.model)
+        if getattr(_unwrapped, "uses_request_slots", False):
+            from vllm_neuron.vllm.worker.state_slots import StateSlotTable
+
+            self.state_slots = StateSlotTable(_unwrapped.num_request_slots)
+            logger.info(
+                "Model-owned state slots: %d (1 scratch)", _unwrapped.num_request_slots
+            )
+
         logger.info("NeuronModel loading complete (moved to device and compiled)")
 
         if self.drafter is not None:
@@ -2777,6 +2839,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        if self.state_slots is not None:
+            self.state_slots.release(scheduler_output.finished_req_ids)
+            # A preempted request recomputes from token 0 when it resumes.
+            self.state_slots.release(
+                getattr(scheduler_output, "preempted_req_ids", None) or ()
+            )
 
         # Free the cached encoder outputs.
         # NOTE: upstream GPUModelRunner stores encoder cache as a dict[str, torch.Tensor]
@@ -3455,11 +3523,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
               encoder_positions[i, j] = batch position for token j in block i.
               Sentinel value = num_tokens for don't-care positions.
         """
-        assert len(req_ids) == 1, (
-            f"_gather_mm_embeddings expects single-request prefill but got "
-            f"{len(req_ids)} requests. The prefill NEFF input is sized for "
-            f"max_encoder_blocks_per_request={self.max_encoder_blocks_per_request} "
-            f"which assumes one request per step."
+        # Packed multimodal prefill: up to _PACK_K requests per prefill step; the gather below walks every
+        # request with its batch offset (num_scheduled + padding), and the block budget was sized for K.
+        assert len(req_ids) <= max(1, _PACK_K), (
+            f"_gather_mm_embeddings: {len(req_ids)} requests in one prefill step > packed-prefill K={_PACK_K}. "
+            f"The prefill NEFF input is sized for {self.max_encoder_blocks_per_request} encoder blocks."
         )
         # EPD EC consumer: the NIXL READs for this step's vision items were issued
         # asynchronously (in _run_ec_consumer_lifecycle), so block until they land
@@ -3929,7 +3997,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.neuron_config.num_seqs_buckets,
             decode_token_threshold=self._decode_token_threshold(),
         )
-
+        padded_num_reqs = self._mk_contig_pad(num_reqs, padded_num_reqs, pre_strip_max_query_len)
         if reuse_dp_padding:
             # Async re-prep of the SAME step: the primary prep already issued
             # the reduce AND applied the strip (which mutated scheduler_output
@@ -4234,11 +4302,33 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Compute cached_seq_len for segmented prefill
         cached_seq_len = self._compute_cached_seq_len()
 
+        # VLLM_NEURON_PACKED_PREFILL_LONE=1 (mixed mode only): a 1-request prefill step whose request is a
+        # fresh WHOLE prompt (position 0, not a chunk) in a bucket that has a K-row graph runs the packed graph, as a
+        # 1-request step does when MML <= the largest bucket. The packed 2048 graph is ~30 % cheaper than the unpacked
+        # 1-row one (step log: 265 vs 367 ms). Chunks of long prompts keep the 1-row segmented graph.
+        self._pack_lone = bool(
+            _PACK_MIXED and _PACK_LONE and num_reqs == 1
+            and max_num_scheduled_tokens_padded > self._decode_token_threshold()
+            and max_num_scheduled_tokens_padded in self._pack_lone_buckets
+            and int(self.input_batch.num_computed_tokens_cpu[0]) == 0
+            and int(scheduler_output.num_scheduled_tokens[req_ids[0]])
+            >= int(self.input_batch.num_prompt_tokens[0])
+        )
         # Build attention metadata
+        # Packed prefill: the prefill graph was compiled with max_query_len == bucket (one request of
+        # bucket tokens) and that value is a dynamo guard, so report the step's total padded tokens.
+        self._packed_prefill_step = (
+            _PACK_K > 1 and num_reqs > 1
+            and max_num_scheduled_tokens_padded > self._decode_token_threshold()
+        )
+        _mql = (
+            total_num_scheduled_tokens_padded if self._packed_prefill_step
+            else max_num_scheduled_tokens_padded
+        )
         attn_metadata = self._build_attention_metadata(
             padded_num_reqs,
             total_num_scheduled_tokens_padded,  # Includes decode padding
-            max_num_scheduled_tokens_padded,
+            _mql,
             max_num_draft_tokens,
             cached_seq_len,
             max_decode_ctx_len=max_decode_ctx_len,
@@ -5531,6 +5621,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             block_size = spec.block_size
             blk_table = self.input_batch.block_table[kv_cache_group_id]
             blk_table_tensor = blk_table.get_device_tensor(padded_num_reqs)
+            # Packed prefill: the prefill graph keeps a 1-row block table (the packed model path writes KV
+            # through slot_mapping and attends over live keys only).
+            if _PACK_K > 1 and not is_decode and padded_num_reqs > 1:
+                blk_table_tensor = blk_table.get_device_tensor(1)
             # Clone so ``full_blk_table_tensor`` is a distinct tensor object
             # from ``blk_table_tensor``. Required because torch.compile's
             # input guards reject duplicate tensor identities, and warmup
@@ -5694,11 +5788,63 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 attn_metadata_i["raw_block_table_tensor"] = raw_blk_table_tensor
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
+            if self.state_slots is not None:
+                attn_metadata_i["request_slots"] = self._state_slot_tensor(
+                    # prefill graphs carry K slot rows (scratch-padded) when packing is on.
+                    # Mixed mode: a 1-request prefill step keeps the 1-row (unpacked) graph.
+                    _PACK_K
+                    if (_PACK_K > 1 and not is_decode
+                        and not (_PACK_MIXED and padded_num_reqs == 1 and not self._pack_lone))
+                    else blk_table_tensor.shape[0]
+                )
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
 
         return attn_metadata
+
+    def _mk_contig_pad(self, num_reqs: int, padded_num_reqs: int, max_query_len: int) -> int:
+        """a model with ``mk_contig`` runs decode in state-slot space (kernel row k = slot k), so the
+        decode batch must cover the largest slot in the batch: pad to the bucket of max(num_reqs, max slot + 1)."""
+        model = getattr(self.model, "_orig_mod", self.model)
+        if (
+            self.state_slots is None
+            or not getattr(model, "mk_contig", False)
+            or max_query_len != 1
+            or not self.neuron_config.num_seqs_buckets
+        ):
+            return padded_num_reqs
+        ids = self.input_batch.req_ids[:num_reqs]
+        need = max(self.state_slots.get(r) for r in ids) + 1
+        st = self.__dict__.setdefault("_mk_contig_stats", [0, 0, 0, None])  # steps, padded-up steps, changes, prev
+        st[0] += 1
+        comp = tuple(ids)
+        if comp != st[3]:
+            st[2] += 1
+            st[3] = comp
+        if need > max(self.neuron_config.num_seqs_buckets):
+            raise RuntimeError(
+                f"MK contig decode needs a batch bucket >= max state slot + 1 = {need}; "
+                "the largest num_seqs bucket must be >= max_num_seqs (or set QWEN35_MK_CONTIG=0)"
+            )
+        if need > padded_num_reqs:
+            from vllm_neuron.utils.bucket_utils import get_bucket_for_count
+
+            st[1] += 1
+            padded_num_reqs = get_bucket_for_count(need, self.neuron_config.num_seqs_buckets)
+        if st[0] % 500 == 0:
+            logger.info(
+                "MK contig: %d decode steps, %d padded past the num_reqs bucket, %d batch-composition changes",
+                st[0], st[1], st[2],
+            )
+        return padded_num_reqs
+
+    def _state_slot_tensor(self, padded_num_reqs: int) -> torch.Tensor:
+        """State slot per batch row (input_batch order); padded rows -> scratch."""
+        slots = self.state_slots.lookup(
+            self.input_batch.req_ids[: self.input_batch.num_reqs], padded_num_reqs
+        )
+        return torch.tensor(slots, dtype=torch.int32).to(self.device)
 
     def _build_warmup_attention_metadata(
         self,
@@ -5873,11 +6019,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             }
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
+            if self.state_slots is not None:
+                # Warmup rows read and write only the scratch slot.
+                attn_metadata_i["request_slots"] = torch.full(
+                    (self._warmup_pack_rows if (self._warmup_pack_rows > 1 and is_prefill) else num_reqs,),
+                    self.state_slots.scratch_slot,
+                    dtype=torch.int32,
+                    device=device,
+                )
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
 
         return attn_metadata
+
+    def prefill_pack_row_variants(self, bucket_size: int) -> list[int]:
+        """prefill graph row counts to compile for a bucket ([K] when packing everywhere, [1, K] in
+        mixed mode for buckets that can hold two aligned prompts, else [1])."""
+        if _PACK_K <= 1:
+            return [1]
+        if not _PACK_MIXED:
+            return [_PACK_K]
+        from vllm_neuron.vllm.core.scheduler import _PACKED_PREFILL_ALIGN
+
+        return [1, _PACK_K] if bucket_size >= 2 * _PACKED_PREFILL_ALIGN else [1]
 
     def _build_prefill_synthetic_inputs(
         self,
@@ -5915,8 +6080,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         else:
             rotary_position_ids = None
         positions = positions.to(device)
-        # Sample from last token only
-        logits_indices = torch.tensor([num_tokens - 1], dtype=torch.long).to(device)
+        # Sample from last token only. Packed prefill: K sampling rows (unused rows repeat the last index).
+        _rows = self._warmup_pack_rows
+        logits_indices = torch.full((_rows,), num_tokens - 1, dtype=torch.long).to(device)
 
         attn_metadata = self._build_warmup_attention_metadata(
             num_tokens=num_tokens,
@@ -5931,13 +6097,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # Create dummy sampling params for warmup
         dummy_sampling_params = torch.tensor(
-            [[0, 1.0, 1.0]],  # [top_k, top_p, temperature]
+            [[0, 1.0, 1.0]] * _rows,  # [top_k, top_p, temperature]
             dtype=torch.float32,
             device=device,
         )
 
         dummy_logit_mask = self._build_noop_logit_mask(
-            num_reqs, device, compiled_graph_input=True
+            _rows, device, compiled_graph_input=True
         )
 
         # Mirror rank_tensor onto the requested device. Same-device .to()
@@ -8955,6 +9121,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             sampling_params_tensor = sampling_params_tensor.to(self.device)
 
+        # Packed prefill: every prefill graph has K sampling rows; pad (repeat the last index / params).
+        if (
+            _PACK_K > 1
+            and spec_decode_metadata is None
+            and attn_metadata
+            and next(iter(attn_metadata.values()))["max_query_len"] > self._decode_token_threshold()
+            # Mixed mode: a 1-request step runs the 1-row graph (no padding to K).
+            and not (_PACK_MIXED and logits_indices.shape[0] == 1 and not self._pack_lone)
+        ):
+            _n = logits_indices.shape[0]
+            if _n < _PACK_K:
+                _li = logits_indices.cpu()
+                logits_indices = torch.cat([_li, _li[-1:].repeat(_PACK_K - _n)]).to(self.device)
+            if sampling_params_tensor is not None and sampling_params_tensor.shape[0] != _PACK_K:
+                _sp = sampling_params_tensor.cpu()[:_n]
+                if _sp.shape[0] < _PACK_K:
+                    _sp = torch.cat([_sp, _sp[-1:].repeat(_PACK_K - _sp.shape[0], 1)])
+                sampling_params_tensor = _sp.contiguous().to(self.device)
+
         # Execute model on Neuron device (compiled with vllm_neuron backend)
         model_kwargs = {
             "input_ids": input_ids,
@@ -11158,7 +11343,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             assert self.drafter.model is not None
             self.drafter.model.bind_kv_cache(kv_caches)
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
-            if isinstance(self.drafter, DFlashProposer):
+            if isinstance(self.drafter, DFlashProposer) or hasattr(
+                self.drafter, "alias_target_weights"
+            ):
                 self.drafter.alias_target_weights(target_model=self.model)
 
         if has_kv_transfer_group():

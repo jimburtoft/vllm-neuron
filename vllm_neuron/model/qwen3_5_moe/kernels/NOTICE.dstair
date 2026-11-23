@@ -1,0 +1,17 @@
+gated-deltanet-nki-trainium
+Copyright 2026 The Author(s)
+
+Licensed under the Apache License, Version 2.0 (the "License"); see LICENSE.
+
+This project provides AWS Neuron (NKI) kernel implementations of the Gated
+DeltaNet linear-attention operator used by the Qwen3.5-family hybrid
+architecture (model_type: qwen3_5_moe).
+
+The reference math and operator semantics follow the Qwen3.5 model
+architecture published by Alibaba Cloud / the Qwen team:
+  https://huggingface.co/Qwen/Qwen3.5-35B-A3B
+Qwen models are released under the Apache License, Version 2.0.
+
+This repository contains original kernel code (the NKI implementations and
+their PyTorch custom-op registrations); it does not redistribute any Qwen model
+weights.

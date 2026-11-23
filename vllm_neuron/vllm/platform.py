@@ -760,7 +760,13 @@ class NeuronPlatform(Platform):
         # max_num_batched_tokens. The encoder budget cap in NeuronScheduler
         # already prevents overflow without needing this flag.
 
-        if hasattr(model_config.hf_config, "vision_config"):
+        # A text-only run of a vision-capable checkpoint (e.g. Qwen3.5-MoE served
+        # through its text architecture) has no multimodal_config: no vision tower
+        # is built, so skip the vision-bucket auto-config.
+        if (
+            hasattr(model_config.hf_config, "vision_config")
+            and getattr(model_config, "multimodal_config", None) is not None
+        ):
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
         # Compute the per-item embed limit for request validation.
