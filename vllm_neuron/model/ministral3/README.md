@@ -54,14 +54,25 @@ therefore registers the architecture name for validation (`platform.pre_register
 
 - `VLLM_NEURON_FUSE_DECODE_NORMS=1`: the BF16 decode runs both RMSNorms inside the attention and MLP
   kernels (decode TPOT -8 % at batch 1 and 128).
-- nkilib from `jimburtoft/nki-library@qwen3-asr/2.33-champion` (overlay on the SDK 2.33 nkilib): the
-  batched block-KV decode attention writes the active token once per DMA-batch group and keeps the
-  fast K gather at the 512 decode bucket. With `"decode_context_length_buckets": [512, 1024]` the
-  decode step at batch 64-128 is 11 % faster. These changes go upstream through internal review.
+- nkilib from `jimburtoft/nki-library@ministral3/unified-2.33` (overlay on the SDK 2.33 nkilib):
+  - The batched block-KV decode attention writes the active token once per DMA-batch group and keeps the fast K
+    gather at the 512 decode bucket. With `"decode_context_length_buckets": [512, 1024]` the decode step at
+    batch 64-128 is 11 % faster than the SDK nkilib.
+  - Unpacked FP8 K loads through the DMA-transpose gather when a core holds at least 4 KV heads (TP=2).
+  - The per-token query scale for long context.
+  - These changes go upstream through review.
+  - Against the previous branch (`qwen3-asr/2.33-champion`) the unified branch is equal at batch 1 and up to
+    8 % faster at batch 128 (BF16 TP=4 decode TPOT 29.9 -> 27.6 ms).
+- `VLLM_NEURON_DECODE_VENDORED_ATTN=1` routes BF16 decode through the vendored attention block too (single
+  V-extraction DMA). It measured within 2 % of the default, so it is off.
 - Private NKI / vLLM caches per nkilib revision (the NKI trace-cache key does not hash nkilib source).
 - `VLLM_NEURON_SWA_REAL_ADMISSION=1`, KV cap 0.6.
 
 Recommended servers with it (one trn2.3xlarge, BF16, output tok/s at the throughput peak):
+
+FP8 KV: use the packed layout (`--kv-cache-dtype fp8_e4m3` with `"fp8_packed_kv": true` and
+`UNSAFE_FP8FNCAST=1`). It keeps BF16 accuracy (GSM8K 89.4 %) and is the fastest KV layout at 1k contexts and
+beyond. The unpacked layout is slower (3,661 vs 4,097 tok/s at 1024 / 1024) and needs single-shot prefill.
 
 | Use | Layout and settings | 128 / 128 | 1024 / 1024 | 4096 / 512 | 8192 / 1024 |
 |---|---|---|---|---|---|
@@ -173,6 +184,29 @@ At concurrency 16 and 32 (chat) it is 0.79x and 0.70x, so use it for latency-bou
 concurrency. GSM8K-256 accuracy is unchanged (90.6 %). `num_speculative_tokens` 4 compiles only
 with `--max-num-seqs` 16 or less (the draft sampler's 32,768-entry vocabulary limit) and is not
 faster than 3.
+
+**With the FP8 checkpoint and packed FP8 KV** (add `--kv-cache-dtype fp8_e4m3`, `"fp8_packed_kv": true`,
+`UNSAFE_FP8FNCAST=1 VLLM_NEURON_FP8_INPUT_SCALE_COMPENSATION=1`) the draft head stacks on the faster
+target. Output tok/s, 256 tokens, greedy:
+
+| prompts | c | FP8 + packed KV | + EAGLE-3 k=3 | BF16 + EAGLE-3 k=3 |
+|---|---|---|---|---|
+| GSM8K | 1 / 4 / 8 | 125 / 316 / 473 | **195 / 523 / 728** | 196 / 453 / 630 |
+| code | 1 / 4 / 8 | 127 / 374 / 585 | **178 / 516 / 803** | 178 / 446 / 648 |
+| chat | 1 / 4 / 8 | 127 / 328 / 571 | **149 / 425 / 651** | 146 / 363 / 527 |
+| chat | 16 / 32 | 780 / 1,008 | 149 (see below) / 1,007 | |
+
+- FP8 + EAGLE-3 is the best configuration at concurrency 1-8 for every prompt type. At 8 it is 1.14-1.54x over
+  FP8 alone, where BF16 + EAGLE-3 is already slower than plain BF16 on chat.
+- Median TPOT at c=1 is 4.6 ms on GSM8K (7.2 ms without EAGLE-3).
+- GSM8K-1319: 89.1 % with EAGLE-3, 89.6 % without (FP8 checkpoint).
+- At c=32 it equals plain FP8 (1,007 tok/s).
+- At c=16 one run on a 32-sequence server collapsed to 149 tok/s (TPOT 104 ms) with no preemption or KV
+  pressure. That is the same unexplained high-concurrency stall seen once with k=2 on BF16, so keep EAGLE-3
+  servers at `--max-num-seqs` 8.
+- Multi-token decode (the verify step) on the FP8 path uses the fused decode kernel
+  (`VLLM_NEURON_FP8_MULTITOKEN_KERNEL=0` restores single-token only). Before this change the server failed to
+  start, because the PyTorch fallback has no FP8 QKV.
 
 ## Long context (> 16384)
 
