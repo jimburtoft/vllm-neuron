@@ -10876,12 +10876,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # ``.contiguous()`` cannot resolve on Neuron device).
         self._futures_drafts_only = drafts_only
         # Packed prefill + EAGLE3 under async scheduling: wait for this step's
-        # target and draft NEFFs before the next (verify) step is dispatched on
-        # top of them. Without it the engine can hang on the first packed step
-        # (rank 0's sampled-token readback never completes; gpt-oss-trn2 tasks
-        # 094/095: 4 of 12 fresh starts hung, 0 of 18 when these NEFFs were
-        # waited for). Costs one wait per packed prefill step, not per decode
-        # step. VLLM_NEURON_PACKED_SPEC_SYNC=0 turns it off.
+        # target and draft NEFFs here, on the main thread, before the async
+        # output thread reads the step back. libtorch_neuronx_lite's
+        # NeuronTensorImpl::Await registers one completion eventfd per waiter
+        # with nrta_event_register_seq_id_completion, which REPLACES the
+        # previous FD of the sequence (nrt_async.h). When the output thread's
+        # .cpu() and this thread's draft input shift await the same pending
+        # execution, the first waiter is never woken and rank 0 hangs
+        # (gpt-oss-trn2 task 096: gdb shows the two registrations; 3 of 13 fresh
+        # starts hung without this wait, 0 of 34 with it). One wait per packed
+        # prefill step, not per decode step. VLLM_NEURON_PACKED_SPEC_SYNC=0
+        # turns it off.
         if (
             getattr(self, "_packed_req_indices_per_token", None) is not None
             and os.environ.get("VLLM_NEURON_PACKED_SPEC_SYNC", "1") != "0"
