@@ -316,7 +316,7 @@ are calibrated for `float8_e4m3fn` (448). Set `VLLM_NEURON_FP8_INPUT_SCALE_COMPE
 | Feature | Status | Notes |
 |---|---|---|
 | TP | ✅ | TP=4 validated; TP=2 validated on a 4-layer slice and with DP=2 |
-| TP=1 | ❌ | the decode MLP kernel fails with `NCC_INKI016 Stack out of memory` at intermediate size 14336 |
+| TP=1 | ✅ BF16 / ❌ FP8 | BF16 compiles (decode MLP without gate/up column tiling above 8192 per core) and passes the accuracy gate. TP=1 x DP=4 reaches only about half of TP=2 x DP=2 on trn2.3xlarge (weights leave 6 GiB per core for KV and graphs). FP8 at TP=1 fails: the fused QKV width 6144 exceeds the qkv kernel's 4096 |
 | DP | ✅ | TP=2 x DP=2 |
 | Prefix caching, segmented prefill | ✅ | validated at BS 6 |
 | Packed prefill | ✅ | short server |
