@@ -99,7 +99,7 @@ beyond. The unpacked layout is slower (3,661 vs 4,097 tok/s at 1024 / 1024) and 
 ```bash
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.6
 vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 \
-  --tokenizer-mode mistral --config-format hf --load-format safetensors --language-model-only \
+  --tokenizer-mode mistral --language-model-only \
   --max-model-len 10240 --max-num-batched-tokens 8192 --max-num-seqs 32 \
   --additional-config '{"neuron_config": {
      "num_batched_tokens_buckets": [128, 256, 512, 1024, 2048, 4096, 8192],
@@ -107,11 +107,11 @@ vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 
      "decode_context_length_buckets": [2048, 4096]}}'
 ```
 
-- `--config-format hf --load-format safetensors` are required when serving the Hugging Face model id.
-  For a `mistralai/...` hub id with a `params.json`, vLLM's `auto` picks the Mistral-native format and
-  inspects `PixtralForConditionalGeneration`, which fails to import with this transformers
-  (`cannot import name 'PixtralRotaryEmbedding'`). A local download directory resolves to `config.json` on
-  its own; the flags make both cases the same.
+- Serving the hub id works as is. These repositories also ship a Mistral-native `params.json`, which
+  vLLM's `--config-format auto` prefers for `mistralai/...` hub ids. That maps the repo to
+  `PixtralForConditionalGeneration`, which does not import with this transformers
+  (`cannot import name 'PixtralRotaryEmbedding'`). The plugin resolves `auto` to the HF `config.json` for
+  this architecture. An explicit `--config-format mistral` is not supported.
 - `--tokenizer-mode mistral` is required: the repository has no Jinja chat template for the
   HuggingFace tokenizer. The tekken tokenizer gives the same chat-templated token ids as
   transformers' `apply_chat_template`.
@@ -172,7 +172,7 @@ hf download flaitenberger/economize-eagle3-Ministral-3-8B-Instruct-2512 --local-
 python vllm_neuron/model/ministral3/convert_economize_eagle3.py economize-draft \
   Ministral-3-8B-Instruct-2512-BF16/config.json m3-eagle3 Ministral-3-8B-Instruct-2512-BF16
 vllm serve Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 --max-model-len 2048 \
-  --max-num-batched-tokens 2048 --max-num-seqs 32 --language-model-only --tokenizer-mode mistral --config-format hf --load-format safetensors \
+  --max-num-batched-tokens 2048 --max-num-seqs 32 --language-model-only --tokenizer-mode mistral \
   --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [2048], "decode_context_length_buckets": [1024], "on_device_sampling_config": {"all_greedy": "true"}}}' \
   --speculative-config '{"method": "eagle3", "model": "m3-eagle3", "num_speculative_tokens": 3}'
 ```
@@ -242,7 +242,7 @@ refuses a smaller value, because a chunked prompt would otherwise ignore its ear
 ```bash
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.5 VLLM_NEURON_SWA_REAL_ADMISSION=1
 vllm serve mistralai/Ministral-3-8B-Instruct-2512-BF16 --tensor-parallel-size 4 \
-  --tokenizer-mode mistral --config-format hf --load-format safetensors --limit-mm-per-prompt '{"image": 2}' \
+  --tokenizer-mode mistral --limit-mm-per-prompt '{"image": 2}' \
   --max-model-len 8192 --max-num-batched-tokens 4096 --max-num-seqs 64 --no-enable-prefix-caching \
   --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [512, 1024, 2048, 4096],
      "num_seqs_buckets": [1, 2, 4, 8, 16, 32, 48, 64], "decode_context_length_buckets": [2048]},

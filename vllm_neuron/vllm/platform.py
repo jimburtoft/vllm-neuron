@@ -201,6 +201,57 @@ def _apply_dcp_patch(ModelConfig):
     ModelConfig.verify_with_parallel_config = _patched_verify
 
 
+# config.json architectures the plugin implements on the HF config, for repos that ship both config.json and
+# a Mistral-native params.json (e.g. mistralai/Ministral-3-*). vLLM's config_format="auto" prefers params.json for
+# mistralai hub ids, which maps these repos to PixtralForConditionalGeneration (not importable with the
+# transformers in this environment, and not what the plugin implements).
+_HF_CONFIG_PREFERRED_ARCHS = frozenset({"Mistral3ForConditionalGeneration", "Ministral3ForCausalLM"})
+
+
+def _hf_config_architectures(model: str, revision) -> list[str]:
+    """Architectures in ``config.json`` (local dir, HF cache or hub), or [] if unavailable."""
+    import json
+    import os
+
+    try:
+        if os.path.isdir(model):
+            path = os.path.join(model, "config.json")
+        else:
+            from huggingface_hub import hf_hub_download
+
+            path = hf_hub_download(model, "config.json", revision=revision)
+        with open(path) as f:
+            return list(json.load(f).get("architectures") or [])
+    except Exception:  # noqa: BLE001 - no config.json / offline: keep vLLM's choice
+        return []
+
+
+def _patch_auto_config_format_for_hf_archs() -> None:
+    """``config_format="auto"`` -> ``"hf"`` when config.json names an architecture the plugin implements.
+
+    Applies only to ``auto`` (an explicit ``--config-format`` is untouched) and only to the architectures in
+    ``_HF_CONFIG_PREFERRED_ARCHS``. Weight loading is unaffected: the Neuron loader reads the files that
+    ``model.safetensors.index.json`` names.
+    """
+    from vllm.config import ModelConfig
+
+    if getattr(ModelConfig.__post_init__, "_neuron_cfg_fmt_patched", False):
+        return
+    _orig = ModelConfig.__post_init__
+
+    def _post_init(self, *args, **kwargs):
+        if str(getattr(self, "config_format", "auto")) in ("auto", "ConfigFormat.AUTO"):
+            model = self.hf_config_path or self.model
+            archs = _hf_config_architectures(str(model), getattr(self, "revision", None))
+            if _HF_CONFIG_PREFERRED_ARCHS.intersection(archs):
+                logger.info("config_format auto -> hf for %s (config.json architectures %s)", model, archs)
+                self.config_format = "hf"
+        return _orig(self, *args, **kwargs)
+
+    _post_init._neuron_cfg_fmt_patched = True
+    ModelConfig.__post_init__ = _post_init
+
+
 def register_validation_models() -> None:
     """Register architecture stand-ins that vLLM inspects before the worker
     registers the Neuron models. Runs in every process (plugin ``register``)
@@ -296,6 +347,7 @@ class NeuronPlatform(Platform):
         patch_vllm_config_for_neuron()
 
         register_validation_models()
+        _patch_auto_config_format_for_hf_archs()
 
         if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             from vllm.model_executor.models.registry import ModelRegistry
