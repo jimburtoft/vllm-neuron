@@ -77,6 +77,7 @@ from .config import LlamaConfig
 from .model import (
     _DECODE_MASK_CACHE_KEY,
     _segmented_attention_cp_prefill,
+    _decode_mlp_column_tiling,
     _per_head_cache_slots,
     llama4_query_scale,
     _validate_dcp_decode_sequence_length,
@@ -1455,6 +1456,7 @@ class LlamaMLP(nn.Module):
             gate_up_in_scale=self.gate_up_input_scale,
             down_in_scale=self.down_input_scale,
             output_dtype="bfloat16",
+            column_tiling=_decode_mlp_column_tiling(self.intermediate_size_per_rank),
         )
 
         # >>> PARALLELISM: Combine TP (+ MLP DP) shards. Both branches reduce

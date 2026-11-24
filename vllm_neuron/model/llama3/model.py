@@ -1245,6 +1245,25 @@ def _per_head_cache_slots(
 # =============================================================================
 
 
+# nkilib mlp_tkg's column-tiled gate/up projection stages the whole [T, I] gate and up results in fp32 SBUF;
+# at I >= 8192 per core (e.g. TP=1 for I = 14336) that fails to compile with NCC_INKI016 "Stack out of memory".
+# Above this width the decode MLP uses the LHS/RHS-swap gate/up path instead.
+_DECODE_MLP_COLUMN_TILING_MAX_I = 8192
+
+
+def _decode_mlp_column_tiling(intermediate_per_rank: int):
+    """``column_tiling`` for NF.mlp: ``None`` (kernel default) below the limit, ``False`` above it.
+
+    VLLM_NEURON_MLP_COLUMN_TILING=0/1 forces it off / leaves the default.
+    """
+    env = os.environ.get("VLLM_NEURON_MLP_COLUMN_TILING")
+    if env == "0":
+        return False
+    if env == "1":
+        return None
+    return False if intermediate_per_rank > _DECODE_MLP_COLUMN_TILING_MAX_I else None
+
+
 class LlamaMLP(nn.Module):
     """Dense MLP with TP intermediate sharding.
 
@@ -1377,6 +1396,7 @@ class LlamaMLP(nn.Module):
             norm_type=NormType.RMS_NORM if ln_w is not None else NormType.NO_NORM,
             fused_add_tensor=fused_add_tensor,
             store_fused_add_result=fused_add_tensor is not None,
+            column_tiling=_decode_mlp_column_tiling(self.intermediate_size_per_rank),
         )
         if fused_add_tensor is not None:
             output, fused_add_result = result
