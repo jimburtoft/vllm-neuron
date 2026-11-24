@@ -61,8 +61,8 @@ therefore registers the architecture name for validation (`platform.pre_register
   - Unpacked FP8 K loads through the DMA-transpose gather when a core holds at least 4 KV heads (TP=2).
   - The per-token query scale for long context.
   - These changes go upstream through review.
-  - Against the previous branch (`qwen3-asr/2.33-champion`) the unified branch is equal at batch 1 and up to
-    8 % faster at batch 128 (BF16 TP=4 decode TPOT 29.9 -> 27.6 ms).
+  - Against the earlier nkilib branch this guide used, the unified branch is equal at batch 1 and up to 8 %
+    faster at batch 128 (BF16 TP=4 decode TPOT 29.9 -> 27.6 ms).
 - `VLLM_NEURON_DECODE_VENDORED_ATTN=1` routes BF16 decode through the vendored attention block too (single
   V-extraction DMA). It measured within 2 % of the default, so it is off.
 - Private NKI / vLLM caches per nkilib revision (the NKI trace-cache key does not hash nkilib source).
