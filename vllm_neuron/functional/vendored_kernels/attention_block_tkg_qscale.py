@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# Vendored nkilib ``experimental.transformer.attention_block_tkg`` (nkilib 2.33, NKI 0.7)
-# with an optional per-token query scale ``q_scale`` [B, S_tkg] from
-# https://github.com/jimburtoft/nki-library/tree/ministral3/tkg-q-scale-2.33
-# (based on nki-library tag 2.33). Used only when a caller passes q_scale (Llama 4
-# attention temperature past original_max); remove once the released nkilib
-# carries ``q_scale``. Only the relative imports below were changed.
+# Vendored nkilib ``experimental.transformer.attention_block_tkg`` (NKI 0.7) from
+# https://github.com/jimburtoft/nki-library/tree/ministral3/unified-2.33: the nkilib 2.33 release plus
+#   * the batched-decode and single-token QKV changes of the qwen3-asr/2.33-champion branch,
+#   * an optional per-token query scale ``q_scale`` [B, S_tkg] (Llama 4 attention temperature),
+#   * a single DMA for the S_tkg = 1 multi-KV-head V extraction.
+# The core kernels it calls (attention_tkg, qkv_tkg, ...) come from the nkilib on PYTHONPATH; the same
+# branch provides them (scripts: setup_optimized.sh). Only the relative imports below were changed.
 #
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
@@ -634,6 +635,18 @@ def attention_block_tkg(
     rmsnorm_X_eps = 1e-3 if rmsnorm_X_eps == None else rmsnorm_X_eps
     # MX quantization requires output on HBM (SBUF output not yet supported by qkv_tkg_mx_impl)
     output_in_sbuf = n_bxs_tiles == 1 and not quantization_type_qkv.is_mx()
+    # B*S_tkg == 1: ask qkv_tkg for the weight-stationary d-major output [d_head, q_heads + 2*kv_heads]
+    # (one column per head), which feeds Q/K processing without head transposes. qkv_tkg falls back
+    # to the token-major [B*S_tkg, I] layout when its own preconditions are not met.
+    request_qkv_d_major = (
+        output_in_sbuf
+        and B * S_tkg == 1
+        and d_head == nl.tile_size.pmax
+        and quantization_type_qkv == QuantizationType.NONE
+        and bias_qkv == None
+        and not kv_quant
+        and not transposed_in
+    )
     QKV_out = qkv(
         input=X,
         fused_qkv_weights=W_qkv,
@@ -655,8 +668,16 @@ def attention_block_tkg(
         transposed_in=transposed_in,
         is_h_dim_4h_transposed=is_h_transposed_by_4,
         dtype_mode=dtype_mode,
+        output_d_major=request_qkv_d_major,
     )
-    QKV_out = QKV_out.reshape((B * S_tkg, I))
+    qkv_is_d_major = (
+        request_qkv_d_major
+        and len(QKV_out.shape) == 2
+        and QKV_out.shape[0] == nl.tile_size.pmax
+        and QKV_out.shape[1] == I // d_head
+    )
+    if not qkv_is_d_major:
+        QKV_out = QKV_out.reshape((B * S_tkg, I))
 
     # ========== Q/K Processing + V extraction: Transpose + RMSNorm pre + RoPE + RMSNorm post, K/V quantization ==========
     # Handles tiling internally: for each tile, loads QKV from HBM → SBUF (large batch)
@@ -664,7 +685,8 @@ def attention_block_tkg(
     # Input:  QKV_out [B*S_tkg, I] @ SBUF or HBM
     # Output: Q_tkg_sb [d_head, B*q_heads*S_tkg] @ SBUF, K_tkg_sb [d_head, B*S_tkg] @ SBUF,
     #         V_tkg_hbm [B, 1, S_tkg, d_head] @ HBM, V_tkg_sb [B*S_tkg, d_head] @ SBUF (small batch only)
-    Q_tkg_sb, K_tkg_sb, V_tkg_hbm, V_tkg_sb = _QKV_processing(
+    _qkv_processing_fn = _QKV_processing_d_major_b1 if qkv_is_d_major else _QKV_processing
+    Q_tkg_sb, K_tkg_sb, V_tkg_hbm, V_tkg_sb = _qkv_processing_fn(
         QKV=QKV_out,
         q_heads=q_heads,
         kv_heads=kv_heads,
@@ -882,6 +904,7 @@ def attention_block_tkg(
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
             fp8_packed=fp8_packed,
             return_cp_softmax_stats=is_CP,
+            kv_heads=kv_heads,
         )
 
         # Allocate softmax stats output tensors for CP (compact tile layout, not broadcast)
@@ -2052,8 +2075,161 @@ def _QKV_processing(
     return Q_sb, K_sb, V_hbm, V_sb
 
 
+def _QKV_processing_d_major_b1(
+    QKV: nl.NkiTensor,
+    q_heads: int,
+    kv_heads: int,
+    B: int,
+    S_tkg: int,
+    d_head: int,
+    n_bxs_tiles: int,
+    bxs_tile: int,
+    rmsnorm_pre_enabled: bool,
+    rmsnorm_pre_eps: float,
+    rmsnorm_pre_W_Q: Optional[nl.NkiTensor],
+    rmsnorm_pre_W_K: Optional[nl.NkiTensor],
+    cos: Optional[nl.NkiTensor],
+    sin: Optional[nl.NkiTensor],
+    rope_contiguous_layout: bool,
+    rmsnorm_post_enabled: bool,
+    rmsnorm_post_eps: float,
+    rmsnorm_post_W_Q: Optional[nl.NkiTensor],
+    rmsnorm_post_W_K: Optional[nl.NkiTensor],
+    kv_quant: bool,
+    kv_quant_dtype: Optional[str],
+    k_scale: Optional[nl.NkiTensor],
+    v_scale: Optional[nl.NkiTensor],
+    io_dtype,
+    sbm: SbufManager,
+) -> Tuple[nl.NkiTensor, nl.NkiTensor, nl.NkiTensor, Optional[nl.NkiTensor]]:
+    """
+    Q/K/V processing for B*S_tkg == 1 when QKV is d-major: QKV is [d_head, q_heads + 2*kv_heads]
+    @ SBUF with column n holding head n (Q heads, then K heads, then V heads), d_head == pmax.
+
+    Q and K are already in the [d_head, heads] layout attention_tkg consumes, so no head
+    transposes are needed. Q|K live in one [d_head, q_heads + kv_heads] buffer: the optional
+    pre-RoPE RMSNorm reads the QKV columns and writes it directly, then RoPE and the optional
+    post-RoPE RMSNorm run once over all Q|K heads. Q_sb / K_sb are column views of it. V^T is transposed
+    once to [kv_heads, d_head] and stored to HBM; the SBUF copy is also returned for the KV
+    cache update. Same contract as _QKV_processing.
+    """
+    kernel_assert(B * S_tkg == 1, f"d-major QKV processing requires B*S_tkg == 1, got {B * S_tkg}")
+    kernel_assert(d_head == nl.tile_size.pmax, f"d-major QKV processing requires d_head == pmax, got {d_head}")
+    kernel_assert(not kv_quant, "d-major QKV processing does not support kv_quant")
+    n_heads_total = q_heads + 2 * kv_heads
+    kernel_assert(
+        QKV.shape == (d_head, n_heads_total),
+        f"d-major QKV must be {(d_head, n_heads_total)}, got {QKV.shape}",
+    )
+
+    # Q and K share one contiguous [d_head, q_heads + kv_heads] buffer so the pre-RoPE RMSNorm
+    # and RoPE run once over all Q|K heads (cos/sin are the same for Q and K at B*S == 1).
+    n_qk = q_heads + kv_heads
+    QK_sb = sbm.alloc_stack((d_head, n_qk), dtype=io_dtype, buffer=nl.sbuf)
+    Q_sb = QK_sb[:, nl.ds(0, q_heads)]
+    K_sb = QK_sb[:, nl.ds(q_heads, kv_heads)]
+    V_hbm = nl.ndarray(
+        (B, kv_heads, S_tkg, d_head),
+        dtype=io_dtype,
+        buffer=nl.shared_hbm,
+        name=f"{sbm.get_name_prefix()}v_attention_hbm",
+    )
+
+    enable_rope = cos != None and sin != None
+    sb_cos, sb_sin = None, None
+    if enable_rope:
+        sb_cos = _to_sbuf(cos, sbm)
+        sb_sin = _to_sbuf(sin, sbm)
+
+    QK_src = QKV[:, nl.ds(0, n_qk)]
+    if rmsnorm_pre_enabled:
+        _rms_norm_qk_fused(QK_src, QK_sb, q_heads, kv_heads, rmsnorm_pre_eps, rmsnorm_pre_W_Q, rmsnorm_pre_W_K, sbm)
+    else:
+        nisa.tensor_copy(QK_sb, QK_src)
+
+    if enable_rope:
+        rotary_dim = sb_cos.shape[0] * 2
+        if rotary_dim < d_head:
+            rope_view = QK_sb[:rotary_dim, :].reshape((rotary_dim, B, n_qk, S_tkg))
+            RoPE_sbuf(rope_view, sb_cos, sb_sin, rope_view, convert_from_interleaved=not rope_contiguous_layout)
+        else:
+            QK_4d = QK_sb.reshape((d_head, B, n_qk, S_tkg))
+            RoPE_sbuf(QK_4d, sb_cos, sb_sin, QK_4d, convert_from_interleaved=not rope_contiguous_layout)
+
+    if rmsnorm_post_enabled:
+        _rms_norm_qk_fused(QK_sb, QK_sb, q_heads, kv_heads, rmsnorm_post_eps, rmsnorm_post_W_Q, rmsnorm_post_W_K, sbm)
+
+    # V^T [d_head, kv_heads] -> V [kv_heads, d_head] (rows ordered (b, h, s) with B = S = 1)
+    v_psum = nl.ndarray((kv_heads, d_head), dtype=io_dtype, buffer=nl.psum)
+    nisa.nc_transpose(v_psum, QKV[:, nl.ds(q_heads + kv_heads, kv_heads)])
+    v_all_sb = sbm.alloc_stack((kv_heads, d_head), dtype=io_dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(v_all_sb, v_psum)
+    nisa.dma_copy(V_hbm.reshape((B * kv_heads * S_tkg, d_head)), v_all_sb)
+
+    return Q_sb, K_sb, V_hbm, v_all_sb
+
+
+def _rms_norm_qk_fused(
+    x: nl.NkiTensor,
+    out: nl.NkiTensor,
+    q_heads: int,
+    kv_heads: int,
+    eps: float,
+    w_q: Optional[nl.NkiTensor],
+    w_k: Optional[nl.NkiTensor],
+    sbm: SbufManager,
+) -> None:
+    """
+    Per-head RMSNorm over d (partition dim) for a joint Q|K tile, d_head == pmax.
+
+    x, out: [d_head, q_heads + kv_heads] @ SBUF (out may alias x). Columns [0:q_heads] are
+    scaled by w_q and columns [q_heads:] by w_k ([1, d_head] @ HBM each, optional).
+    Same math as _rms_norm_inplace applied to Q and K separately, in one pass.
+    """
+    d_head, n_cols = x.shape
+    kernel_assert(d_head == nl.tile_size.pmax, f"_rms_norm_qk_fused requires d_head == pmax, got {d_head}")
+    kernel_assert(n_cols == q_heads + kv_heads, f"expected {q_heads + kv_heads} columns, got {n_cols}")
+
+    ones_sb = sbm.alloc_stack((d_head, d_head), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(ones_sb, 1.0)
+    eps_sb = sbm.alloc_stack((d_head, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(eps_sb, eps)
+    w_q_sb, w_k_sb = None, None
+    if w_q is not None:
+        w_q_sb = sbm.alloc_stack((d_head, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(w_q_sb, w_q.reshape((d_head, 1)))
+    if w_k is not None:
+        w_k_sb = sbm.alloc_stack((d_head, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(w_k_sb, w_k.reshape((d_head, 1)))
+
+    x_squared = sbm.alloc_stack((d_head, n_cols), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(x_squared, x, x, nl.multiply)
+    psum_sb = nl.ndarray((d_head, n_cols), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(psum_sb, stationary=ones_sb, moving=x_squared)
+    rsqrt_sb = sbm.alloc_stack((d_head, n_cols), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=rsqrt_sb, op=nl.rsqrt, data=psum_sb, bias=eps_sb, scale=1.0 / d_head)
+
+    if w_q_sb is None and w_k_sb is None:
+        nisa.tensor_tensor(out, x, rsqrt_sb, nl.multiply)
+        return
+    normed = sbm.alloc_stack((d_head, n_cols), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(normed, x, rsqrt_sb, nl.multiply)
+    for col0, n, w_sb in ((0, q_heads, w_q_sb), (q_heads, kv_heads, w_k_sb)):
+        if w_sb is None:
+            nisa.tensor_copy(out[:, nl.ds(col0, n)], normed[:, nl.ds(col0, n)])
+        else:
+            nisa.tensor_scalar(
+                dst=out[:, nl.ds(col0, n)], data=normed[:, nl.ds(col0, n)], op0=nl.multiply, operand0=w_sb
+            )
+
+
 def _rms_norm_inplace(
-    x: nl.NkiTensor, eps: float, n_d_tiles: int = 1, w: Optional[nl.NkiTensor] = None, sbm: Optional[SbufManager] = None
+    x: nl.NkiTensor,
+    eps: float,
+    n_d_tiles: int = 1,
+    w: Optional[nl.NkiTensor] = None,
+    sbm: Optional[SbufManager] = None,
+    out: Optional[nl.NkiTensor] = None,
 ) -> None:
     """
     RMS normalization in-place: x / sqrt(mean(x^2) + eps), optionally scaled by w.
@@ -2071,6 +2247,8 @@ def _rms_norm_inplace(
         n_d_tiles: number of d-tiles = d_head // pmax (1 for d_head <= pmax).
         w: [d_head, 1] @ HBM - optional scale gamma weights (d_head = n_d_tiles * pmax).
         sbm: SBUF memory manager
+        out: optional destination with x's shape; when given the result is written there instead
+            of back into x (x is then only read).
     """
     p_dim, total_free = x.shape
     kernel_assert(p_dim == nl.tile_size.pmax, f"partition dim must be {nl.tile_size.pmax}, got {p_dim}")
@@ -2125,8 +2303,9 @@ def _rms_norm_inplace(
             nisa.dma_copy(w_sb, w.reshape((d_head, 1))[nl.ds(i_d * nl.tile_size.pmax, nl.tile_size.pmax), :])
             nisa.tensor_scalar(dst=out_sb, data=out_sb, op0=nl.multiply, operand0=w_sb)
 
-        # Copy result back to x with original dtype
-        nisa.tensor_copy(dst=x_tile_view, src=out_sb)
+        # Copy result back to x (or out) with original dtype
+        dst_tile_view = x_tile_view if out is None else out[:, nl.ds(i_d * BnS, BnS)]
+        nisa.tensor_copy(dst=dst_tile_view, src=out_sb)
 
 
 ############################# KV cache update logic #############################

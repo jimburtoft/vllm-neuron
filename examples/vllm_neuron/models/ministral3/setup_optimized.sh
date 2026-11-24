@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Set up the optimized Ministral 3 stack on a trn2 host (SDK 2.33 vLLM DLAMI venv or the 2.33 vLLM container).
 #   vllm-neuron: this checkout (jimburtoft/vllm-neuron, branch ministral3-trn2-0.29)
-#   nkilib:      jimburtoft/nki-library, branch qwen3-asr/2.33-champion (batched block-KV decode attention:
-#                group stitch + dt4; overlays the SDK 2.33 nkilib)
+#   nkilib:      jimburtoft/nki-library, branch ministral3/unified-2.33 (overlays the SDK 2.33 nkilib):
+#                batched block-KV decode attention (group stitch + dt4), single-token QKV layout, per-token
+#                query scale (long context), single V-extraction DMA, unpacked-FP8 K via DMA transpose
 # Usage:  source examples/vllm_neuron/models/ministral3/setup_optimized.sh [nkilib_dir]
 set -e
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 NKI_DIR=${1:-$HERE/../nki-library}
 if [ ! -d "$NKI_DIR/src/nkilib_src/nkilib" ]; then
-  git clone -q -b qwen3-asr/2.33-champion https://github.com/jimburtoft/nki-library.git "$NKI_DIR"
+  git clone -q -b ministral3/unified-2.33 https://github.com/jimburtoft/nki-library.git "$NKI_DIR"
 fi
 export PYTHONPATH="$NKI_DIR/src/nkilib_src:$HERE${PYTHONPATH:+:$PYTHONPATH}"
 # The NKI trace-cache key does not hash nkilib source: keep caches private per nkilib revision.

@@ -285,5 +285,4 @@ are calibrated for `float8_e4m3fn` (448). Set `VLLM_NEURON_FP8_INPUT_SCALE_COMPE
 | FP8 checkpoint | ✅ (after scale renaming) | see FP8 |
 | EAGLE-3 speculative decoding | ✅ | public economize draft head after conversion (see above) |
 | Llama 4 query scaling (positions >= 16384) | ✅ | fused decode kernel with a per-token query scale (vendored kernel) |
-| FP8 KV cache | ✅ | with the FP8 checkpoint (scales 1.0) |
-| Eagle3 | not tested | |
+| FP8 KV cache | ✅ | packed (`"fp8_packed_kv": true`, recommended) or unpacked; BF16 or FP8 weights, scales 1.0 |

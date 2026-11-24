@@ -77,6 +77,7 @@ from .config import LlamaConfig
 from .model import (
     _DECODE_MASK_CACHE_KEY,
     _segmented_attention_cp_prefill,
+    _per_head_cache_slots,
     llama4_query_scale,
     _validate_dcp_decode_sequence_length,
     _validate_dcp_prefill_kv_cache,
@@ -1091,9 +1092,12 @@ class LlamaAttention(nn.Module):
         # (see LlamaAttention.forward_decode).
         kv_cache_update_idx = slot_mapping.view(B_local, S_decode).to(torch.uint32)
         nkh = self.num_key_value_heads_per_rank
+        # Multi-token decode (speculative verify, S_decode > 1) needs the kernel here too:
+        # the torch fallback cannot run static-FP8 QKV. VLLM_NEURON_FP8_MULTITOKEN_KERNEL=0 restores S=1 only.
+        _s_ok = S_decode == 1 or os.environ.get("VLLM_NEURON_FP8_MULTITOKEN_KERNEL", "1") != "0"
         if (
             nkh > 1
-            and S_decode == 1
+            and _s_ok
             and self.attention_dp_size == 1
             and not dcp_active
             and can_run_kernel(hidden_states)
@@ -1104,9 +1108,7 @@ class LlamaAttention(nn.Module):
             active_blocks_table = build_per_head_block_table(block_table, nkh).to(
                 torch.int32
             )
-            kv_cache_update_idx = build_per_head_slot_mapping(
-                slot_mapping, block_size, nkh, B_local
-            ).to(torch.uint32)
+            kv_cache_update_idx = _per_head_cache_slots(slot_mapping, block_size, nkh, B_local, S_decode)
 
         # The packed-fallback bucket hands the kernel a COMPUTED TEMPORARY, whose
         # aliased in-kernel write is dropped; consume the alias OUTPUT instead.

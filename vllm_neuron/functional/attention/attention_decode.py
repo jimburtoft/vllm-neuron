@@ -1942,7 +1942,8 @@ def attention_decode(
             import os as _os
 
             if q_scale is None and _os.environ.get("VLLM_NEURON_DECODE_VENDORED_ATTN") == "1":
-                # Opt-in: the vendored attention_block_tkg (task 037 V-extraction fix) without q_scale.
+                # Opt-in: the vendored attention_block_tkg (single V-extraction DMA, champion QKV path)
+                # without q_scale. With q_scale the vendored kernel is always used.
                 wrapped = wrap_nki(_torch_compatible_attention_block_tkg_kernel_qscale)
             elif q_scale is not None:
                 wrapped = wrap_nki(_torch_compatible_attention_block_tkg_kernel_qscale)
