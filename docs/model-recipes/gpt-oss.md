@@ -225,10 +225,11 @@ output differs from the BF16 KV cache after a few dozen tokens, as expected for 
 (`VLLM_NEURON_MAX_PREFILLS_PER_BATCH=16`) also works: +51 % at 64-token prompts and 64 concurrent requests.
 **EAGLE3 works with it at BF16 speed** (EAGLE3 command above plus the two FP8 settings; chat prompts, 256 output tokens,
 tokens/s BF16 KV / FP8 KV: 185-190 / 178-186 at 1 request, 411-413 / 411-414 at 4, 927-933 / 956-963 at 16; same
-acceptance, GSM8K 0.876). **Packed prefill + EAGLE3 + FP8 KV is not recommended**: time to first token is about 245 ms
-instead of 65 ms (packed steps rewrite the whole packed K cache), so output is 152-156 / 321-325 / 686-705 tokens/s at
-1 / 4 / 16 requests vs 178-186 / 411-414 / 956-963 without packing.
-Knobs: `VLLM_NEURON_LLAMA3_GQA_MULTI_TOKEN=0` (EAGLE3 draft decode back on the PyTorch path), `GPTOSS_FP8_PACKED_GQA=0` (PyTorch decode, about 20x slower), `GPTOSS_SEG_PACKED_K_WRITE=reswizzle` (the old
+acceptance, GSM8K 0.876). Packed prefill + EAGLE3 + FP8 KV runs at the speed of packed prefill + EAGLE3 + BF16 KV
+(since 2026-11-26, packed steps write only the new key pairs): 165-179 / 409-411 / 996-1,016 tokens/s at 1 / 4 / 16
+requests, time to first token 72 / 100 / 133-159 ms, GSM8K 0.888 (before: 150-156 / 319-321 / 671-690, 250-520 ms).
+Packed prefill + FP8 KV without EAGLE3: 2,224 tokens/s at 64-token prompts and 64 requests (before 2,085).
+Knobs: `VLLM_NEURON_LLAMA3_GQA_MULTI_TOKEN=0` (EAGLE3 draft decode back on the PyTorch path), `GPTOSS_FP8_PACKED_GQA=0` (PyTorch decode, about 20x slower), `GPTOSS_PACKED_STEP_K_WRITE=reswizzle` (packed-prefill steps back on the whole-cache write), `GPTOSS_SEG_PACKED_K_WRITE=reswizzle` (the old
 whole-cache prefill write, 4-5x slower), `VLLM_NEURON_PREFILL_KV_BLOCK_WRITE=packed|all|off` (single-step prefill).
 
 ## Known issues
