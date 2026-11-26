@@ -42,6 +42,7 @@ from vllm_neuron.functional.attention.attention_decode import (
 from vllm_neuron.model.kv_cache import (
     KVSpec,
     LayerSpec,
+    scatter_packed_k_by_position,
     scatter_packed_k_pairs_nogather,
     write_prefill_kv,
 )
@@ -132,6 +133,9 @@ DECODE_RSAG_TOKEN_THRESHOLD = 128
 _GPTOSS_KV_SCATTER = os.environ.get("GPTOSS_KV_WRITE", "scatter") != "kernel"
 _GPTOSS_FP8_PACKED_GQA = os.environ.get("GPTOSS_FP8_PACKED_GQA", "1") != "0"
 _GPTOSS_SEG_PACKED_K_PAIRS = os.environ.get("GPTOSS_SEG_PACKED_K_WRITE", "pairs") != "reswizzle"
+_GPTOSS_PACKED_STEP_K_BY_POSITION = (
+    os.environ.get("GPTOSS_PACKED_STEP_K_WRITE", "position") != "reswizzle"
+)
 
 _GPTOSS_PREFILL_IMPL = (
     MoECTEImplementation.shard_on_block
@@ -676,7 +680,14 @@ class GptOssAttention(nn.Module):
             )
 
     def _write_paged_kv_cache(
-        self, k, v, slot_mapping, block_size, full_prefill=True, segmented_chunk=False
+        self,
+        k,
+        v,
+        slot_mapping,
+        block_size,
+        full_prefill=True,
+        segmented_chunk=False,
+        packed_step=False,
     ):
         """Scatter post-RoPE K/V into the paged cache at slot_mapping positions.
 
@@ -705,6 +716,27 @@ class GptOssAttention(nn.Module):
             k_flat = k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
             v_flat = v.reshape(-1, self.head_dim).to(self.k_cache.dtype)
 
+        if packed_step and self.fp8_packed and _GPTOSS_PACKED_STEP_K_BY_POSITION:
+            # A packed-prefill step: prompts of any length back to back, each
+            # from a block boundary. Pair by cache position, with no cache read
+            # (GPTOSS_PACKED_STEP_K_WRITE=reswizzle restores the whole-cache
+            # un-swizzle / scatter / re-swizzle).
+            from vllm_neuron.model.kv_cache import paged_slot_indices
+
+            blocks, positions = paged_slot_indices(
+                slot_mapping, block_size, self.v_cache.shape[0]
+            )
+            nkh = self.num_key_value_heads_per_rank
+            index = (
+                blocks.repeat(nkh),
+                torch.arange(nkh, dtype=blocks.dtype, device=blocks.device).repeat_interleave(
+                    slot_mapping.shape[0]
+                ),
+                positions.repeat(nkh),
+            )
+            self.v_cache.index_put_(index, v_flat)
+            scatter_packed_k_by_position(self.k_cache, k_flat, slot_mapping, block_size)
+            return
         if segmented_chunk and self.fp8_packed and _GPTOSS_SEG_PACKED_K_PAIRS:
             # A segmented chunk starts at a block boundary and pads only after
             # its real tokens: write new K pairs only, with no read of the cache
@@ -936,7 +968,12 @@ class GptOssAttention(nn.Module):
             # per-token write; one prompt from position 0 writes whole blocks.
             packed_step = attn_metadata[layer_name].get("packed_bound_min") is not None
             self._write_paged_kv_cache(
-                k, v, slot_mapping, block_size, full_prefill=not packed_step
+                k,
+                v,
+                slot_mapping,
+                block_size,
+                full_prefill=not packed_step,
+                packed_step=packed_step,
             )
 
             # Full prefill: standard flash attention

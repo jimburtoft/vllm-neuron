@@ -504,3 +504,66 @@ def scatter_packed_k_pairs_nogather(
         k_rows = k_rows.to(torch.bfloat16)
     k_rows = k_rows.transpose(-1, -2).contiguous()  # [pairs, d, 2]
     k_cache.index_put_(index, k_rows.to(k_cache.dtype))
+
+
+def scatter_packed_k_by_position(
+    k_cache: torch.Tensor,
+    k_new: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Write new K into a packed FP8 K cache by cache position, with no cache read.
+
+    For a step whose prompts each start at a block boundary (fresh prompts at
+    position 0, or segmented chunks), packed back to back in any lengths: a
+    packed-prefill step with odd-length prompts breaks the step-level token
+    pairing that ``scatter_packed_k_pairs_nogather`` assumes, but every cache
+    pair (2k, 2k + 1) still holds two consecutive tokens of one prompt.
+
+    Each token at an even cache position writes its pair: lane 0 is the token,
+    lane 1 the next token of the step if that is the next position of the same
+    block, else zero (the position after a prompt's last token, unread until
+    decode writes it). Tokens at odd positions and padding (slot 0 or -1) write
+    to the null block. The partner is gathered from ``k_new``, never from the
+    cache.
+
+    Args:
+        k_cache: packed FP8 K cache ``[nb, nkh, bs // 2, d, 2]``.
+        k_new: ``[nkh, T, d]`` or ``[nkh * T, d]`` (head-major), cache dtype.
+        slot_mapping: ``[T]`` flat slots; padding 0 or -1.
+        block_size: tokens in one cache block.
+
+    Example:
+        >>> import torch
+        >>> kc = torch.zeros(4, 1, 2, 1, 2)
+        >>> # prompt A (3 tokens, block 2), prompt B (2 tokens, block 3), 1 pad
+        >>> k = torch.tensor([[[1.0], [2.0], [3.0], [4.0], [5.0], [0.0]]])
+        >>> scatter_packed_k_by_position(kc, k, torch.tensor([8, 9, 10, 12, 13, 0]), 4)
+        >>> kc[2, 0, :, 0].tolist(), kc[3, 0, 0, 0].tolist()
+        ([[1.0, 2.0], [3.0, 0.0]], [4.0, 5.0])
+    """
+    num_tokens = slot_mapping.shape[0]
+    d_head = k_new.shape[-1]
+    nkh = k_new.numel() // (num_tokens * d_head)
+    blocks, positions = paged_slot_indices(slot_mapping, block_size, k_cache.shape[0])
+    dev = blocks.device
+    t = torch.arange(num_tokens, dtype=blocks.dtype, device=dev)
+    nxt = torch.clamp(t + 1, max=num_tokens - 1)
+    has_partner = (
+        (blocks[nxt] == blocks) & (positions[nxt] == positions + 1) & (t + 1 < num_tokens)
+    )
+    lead = (torch.remainder(positions, 2) == 0) & (blocks > 0)
+    zero = torch.zeros_like(blocks)
+    pair_block = torch.where(lead, blocks, zero)
+    pair_outer = torch.where(lead, torch.div(positions, 2, rounding_mode="floor"), zero)
+    k3 = k_new.reshape(nkh, num_tokens, d_head)
+    if k3.dtype in _FP8_DTYPES:
+        k3 = k3.to(torch.bfloat16)
+    lane1 = torch.where(has_partner.view(1, num_tokens, 1), k3[:, nxt, :], torch.zeros_like(k3))
+    rows = torch.stack([k3, lane1], dim=-1).reshape(nkh * num_tokens, d_head, 2)
+    index = (
+        pair_block.repeat(nkh),
+        torch.arange(nkh, dtype=blocks.dtype, device=dev).repeat_interleave(num_tokens),
+        pair_outer.repeat(nkh),
+    )
+    k_cache.index_put_(index, rows.to(k_cache.dtype))
