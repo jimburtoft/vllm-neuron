@@ -364,6 +364,19 @@ class Qwen3Attention(nn.Module):
             k_flash = k.transpose(1, 2)
             v_flash = v
 
+            # Packed prefill (several prompts back to back, see
+            # vllm_neuron/vllm/core/packed_prefill.py): per-token [start, end)
+            # bounds make the causal attention block-diagonal.
+            bounds = {}
+            bmin = attn_metadata[layer_name].get("packed_bound_min")
+            if bmin is not None:
+                bmax = attn_metadata[layer_name]["packed_bound_max"]
+                nh = q_flash.shape[0]
+                bounds = dict(
+                    bound_min=bmin.view(1, tokens, 1).expand(nh, tokens, 1).contiguous(),
+                    bound_max=bmax.view(1, tokens, 1).expand(nh, tokens, 1).contiguous(),
+                )
+
             attn_output = NF.flash_attention(
                 q_flash,
                 k_flash,
@@ -371,6 +384,7 @@ class Qwen3Attention(nn.Module):
                 scale=self.scaling,
                 tp_q=False,
                 tp_out=True,
+                **bounds,
             )
 
         # Step 5: Output projection

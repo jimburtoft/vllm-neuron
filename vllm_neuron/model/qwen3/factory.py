@@ -15,6 +15,10 @@ class Qwen3ForCausalLM(nn.Module):
     Extends nn.Module to satisfy vLLM's ModelRegistry requirements.
     """
 
+    # Several whole prompts per prefill step (vllm_neuron/vllm/core/packed_prefill.py):
+    # the bf16 full-prefill attention takes per-token segment bounds.
+    supports_packed_prefill = True
+
     def __init__(
         self, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
     ) -> None:

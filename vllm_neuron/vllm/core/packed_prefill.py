@@ -122,6 +122,12 @@ def unsupported_reason(vllm_config: "VllmConfig") -> str | None:
         qc = getattr(hf, "quantization_config", None)
         if isinstance(qc, dict) and qc.get("quant_method"):
             return "llama3 packed prefill needs an unquantized (bf16) checkpoint"
+    if "Qwen3ForCausalLM" in archs:
+        # Only the bf16 qwen3 module honours the bounds (not the MXFP8 one).
+        hf = getattr(mc, "hf_config", None)
+        qc = getattr(hf, "quantization_config", None)
+        if isinstance(qc, dict) and qc.get("quant_method"):
+            return "qwen3 packed prefill needs an unquantized (bf16) checkpoint"
     if vllm_config.speculative_config is not None:
         return "speculative decoding is configured"
     if vllm_config.kv_transfer_config is not None:
